@@ -1,9 +1,6 @@
 """
 Sharp-Wave Ripple (SWR) Detection from Neuralynx .ncs files
 Algorithm: bz_FindRipples (Buzsaki lab, buzcode repository)
-Translated from MATLAB to Python — no external ripple_detection package needed.
-
-Run with: python detect_ripples.py
 """
 
 import os
