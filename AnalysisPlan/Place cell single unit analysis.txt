@@ -1,0 +1,24 @@
+Place cell single unit analysis
+
+
+1. Isolation distance, L ratio, and other quality metrics of cluster separation
+2. Mean firing rate
+3. Peak firing rate
+4. Signal-to-noise ratio
+5. Complex spike index (McHugh, Wilson et.al., 1996)
+6. ISI
+7. Autocorrelogram
+8. Spatial information score
+9. Spatial coherence score
+10. Sparsity score
+11. Number of fields/cell
+12. Size of Fields
+13. Percentage of place cells active/session
+14. Stability of place field across session
+15. Firing rate-speed correlation
+16. Compare all spatial features across environments. Especially rate remapping. Check if peak firing rates are different.
+17. Directionality index (forward vs Backward, CW vs CCW) (McHugh, Wilson et.al., 1996)
+18. Check for presence of head direction cells in CA1 (fix tracking for this, use the 4 LEDs)
+19. Field centroid distance from center
+20. How to quantify blobiness of a place field? Whatever analysis that is.
+21. Remapping between session (place and rate remapping)
