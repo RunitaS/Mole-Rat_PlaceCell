@@ -45,12 +45,12 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'X:/NMR_group_data/Runita/Analysis/Hpc2ndEdtn/Fa8477'
-output_excel = r'X:/NMR_group_data/Runita/Analysis/Hpc2ndEdtn/Fa8477/8477Peak.xlsx'
+root_folder  = r'C:/Runita/RIN_Analysis/TestCharacterization'
+output_excel = r'C:/Runita/RIN_Analysis/TestCharacterization/8477Peak.xlsx'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm  (Ulanovsky & Moss: 2 × 2 cm)
-arena_width_cm = 80.0         # physical arena width in cm
+arena_width_cm = 60.0         # physical arena width in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs  (50 ms)
 
