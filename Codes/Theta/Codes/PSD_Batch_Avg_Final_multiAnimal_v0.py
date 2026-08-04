@@ -21,7 +21,6 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import os
 from scipy import signal
-from fooof import FOOOF
 
 #%% Settings
 
@@ -31,8 +30,8 @@ from fooof import FOOOF
 ANIMALS = {
     'Fa8477': r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Fa8477',
     #'FaDDE42': r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/LFP/Main/DDE42',
-    'Fa23BD': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/23BDTest',
-    'Fa1059' : r'C:/Runita/NMR/analysis/AllSort_Results/LFP/1059Test',
+    'Fa23BD': r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Fa23BD',
+    'Fa1059' : r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Fa1059',
 }
 
 OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP'  # saved plots go here
@@ -446,112 +445,6 @@ for label, (freq_vec, mean_psd, sem_psd, n_files) in results.items():
 
     svg_path = os.path.join(OUTPUT_DIR, f'PSD_Batch_Avg_{label}.svg')
     png_path = os.path.join(OUTPUT_DIR, f'PSD_Batch_Avg_{label}.png')
-    fig.savefig(svg_path, format='svg', bbox_inches='tight')
-    fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
-    print(f'[{label}] SVG saved to: {svg_path}')
-    print(f'[{label}] PNG saved to: {png_path}')
-
-    plt.show()
-
-#%% FOOOF — remove the 1/f aperiodic component from each animal's averaged PSD
-# Same fit settings as used in the FA23BD-LFP notebook (peak_width_limits, max_n_peaks,
-# min_peak_height, aperiodic_mode='knee'). freq_range is kept at 1-20Hz so the fit never
-# sees the 50Hz notch left by clean_lfp()'s IIR filter — no interpolation needed.
-
-FOOOF_FREQ_RANGE = (1, 20)  # Hz
-FOOOF_KWARGS = dict(
-    peak_width_limits=[1, 12],
-    max_n_peaks=3,
-    min_peak_height=0.1,
-    aperiodic_mode='knee',
-)
-
-
-def fit_fooof_flatten(freq_vec, psd, freq_range=FOOOF_FREQ_RANGE, **fooof_kwargs):
-    """
-    Fit FOOOF to one power spectrum and return the fitted freq axis, the flattened
-    (periodic-only, 1/f-removed) spectrum in FOOOF's native log10(power) units, and
-    the fitted FOOOF model itself (for peak params, R^2, etc.).
-    """
-    kwargs = {**FOOOF_KWARGS, **fooof_kwargs}
-    fm = FOOOF(**kwargs)
-    fm.fit(freq_vec, psd, list(freq_range))
-    flat_psd = fm.power_spectrum - fm._ap_fit  # subtract aperiodic fit -> oscillatory component
-    return fm.freqs, flat_psd, fm
-
-
-fooof_results = {}
-for label, (freq_vec, mean_psd, sem_psd, n_files) in results.items():
-    freqs_fit, flat_psd, fm = fit_fooof_flatten(freq_vec, mean_psd)
-    fooof_results[label] = (freqs_fit, flat_psd, fm)
-    print(f'[{label}] FOOOF: aperiodic params (offset, knee, exponent) = '
-          f'{np.round(fm.aperiodic_params_, 4)}  |  R^2 = {fm.r_squared_:.3f}  |  '
-          f'{fm.peak_params_.shape[0]} peak(s) found')
-
-
-def draw_flattened_trace(ax, freqs_fit, flat_psd, fm, line_col):
-    """Plot one animal's FOOOF-flattened spectrum, marking the strongest fitted peak (if any)."""
-    ax.plot(freqs_fit, flat_psd, color=line_col, linewidth=2.0, zorder=3)
-    ax.axhline(0, color='#999999', linewidth=0.8, linestyle=':', zorder=1)
-
-    if fm.peak_params_.shape[0] > 0:
-        strongest = fm.peak_params_[np.argmax(fm.peak_params_[:, 1])]  # [CF, PW, BW], max by PW
-        peak_freq, peak_pw = strongest[0], strongest[1]
-        ax.axvline(peak_freq, color=line_col, linewidth=1.0, linestyle='--', alpha=0.55, zorder=2)
-        ax.plot(peak_freq, peak_pw, 'o', color=line_col, markersize=7, zorder=5)
-        ax.text(peak_freq + 0.5, peak_pw, f'{peak_freq:.1f} Hz',
-                color=line_col, fontsize=9, va='center', zorder=5)
-
-    return float(np.min(flat_psd)), float(np.max(flat_psd))
-
-
-def finalize_flattened_axes(ax, title, y_min, y_max):
-    ax.set_xlim(FOOOF_FREQ_RANGE)
-    pad = 0.1 * (y_max - y_min if y_max > y_min else 1.0)
-    ax.set_ylim(y_min - pad, y_max + pad)
-
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-    ax.set_xlabel('Frequency (Hz)', fontsize=13, labelpad=6)
-    ax.set_ylabel('Flattened power\n(log10 power − aperiodic fit)', fontsize=13, labelpad=6)
-    ax.set_title(title, fontsize=13, pad=14, fontweight='semibold')
-
-
-# --- Combined overlay of all animals (FOOOF-flattened) ---
-fig, ax = plt.subplots(figsize=(6.5, 5.5), dpi=1000)
-
-y_min_global, y_max_global = np.inf, -np.inf
-
-for label, (freqs_fit, flat_psd, fm) in fooof_results.items():
-    line_col, _ = STYLES.get(label, ('#333333', '#AAAAAA'))
-    y_lo, y_hi = draw_flattened_trace(ax, freqs_fit, flat_psd, fm, line_col)
-    y_min_global = min(y_min_global, y_lo)
-    y_max_global = max(y_max_global, y_hi)
-
-finalize_flattened_axes(ax, 'FOOOF-Flattened PSD (1/f removed) — All Animals', y_min_global, y_max_global)
-plt.tight_layout()
-
-svg_path = os.path.join(OUTPUT_DIR, 'PSD_Batch_Avg_FOOOF_flat.svg')
-png_path = os.path.join(OUTPUT_DIR, 'PSD_Batch_Avg_FOOOF_flat.png')
-fig.savefig(svg_path, format='svg', bbox_inches='tight')
-fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
-print(f'SVG saved to: {svg_path}')
-print(f'PNG saved to: {png_path}')
-
-plt.show()
-
-# --- One figure per animal (FOOOF-flattened) ---
-for label, (freqs_fit, flat_psd, fm) in fooof_results.items():
-    line_col, _ = STYLES.get(label, ('#333333', '#AAAAAA'))
-
-    fig, ax = plt.subplots(figsize=(6.5, 5.5), dpi=1000)
-    y_min, y_max = draw_flattened_trace(ax, freqs_fit, flat_psd, fm, line_col)
-    finalize_flattened_axes(ax, f'FOOOF-Flattened PSD (1/f removed) — {label}', y_min, y_max)
-    plt.tight_layout()
-
-    svg_path = os.path.join(OUTPUT_DIR, f'PSD_Batch_Avg_FOOOF_flat_{label}.svg')
-    png_path = os.path.join(OUTPUT_DIR, f'PSD_Batch_Avg_FOOOF_flat_{label}.png')
     fig.savefig(svg_path, format='svg', bbox_inches='tight')
     fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
     print(f'[{label}] SVG saved to: {svg_path}')
