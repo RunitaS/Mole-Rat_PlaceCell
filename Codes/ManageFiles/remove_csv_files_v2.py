@@ -9,10 +9,10 @@ import argparse
 import os
 import sys
 
-ROOT_DIRECTORY = "X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData"
+ROOT_DIRECTORY = "X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode"
 
 
-def remove_csv_files(directory, dry_run=True):
+def remove_csv_files(directory, dry_run=False):
     if not os.path.isdir(directory):
         print(f"Directory not found: {directory}")
         sys.exit(1)
@@ -43,4 +43,4 @@ if __name__ == "__main__":
     parser.add_argument("--delete", action="store_true", help="Actually delete files (default is dry-run)")
     args = parser.parse_args()
 
-    remove_csv_files(args.directory, dry_run=not args.delete)
+    remove_csv_files(args.directory, dry_run=False)

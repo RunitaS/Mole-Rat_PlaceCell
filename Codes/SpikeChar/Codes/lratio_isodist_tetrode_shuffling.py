@@ -4,22 +4,21 @@ L-Ratio and Isolation Distance for Neuralynx .ntt tetrode files.
 Python translation of the ADR / Ken Harris mclust MATLAB reference
 (IsolationDistance.m, L_Ratio.m from the Redish mclust package).
 
-For each subfolder under ROOT_DIR the script:
-  1. Picks the largest .ntt file (most spikes → most complete sort).
-  2. Reads cell_number and waveform data (32 samples × 4 channels per spike).
-  3. Builds the tetrode feature matrix FD, replicating mclust's default
+For every .ntt file found anywhere under ROOT_DIR the script:
+  1. Reads cell_number and waveform data (32 samples × 4 channels per spike).
+  2. Builds the tetrode feature matrix FD, replicating mclust's default
      ClusterSeparationFeatures = {'feature_Energy', 'feature_WavePC1'}
      (MClustSettings.m) exactly: for each of the 4 channels, one Energy
      value and one WavePC1 (shape-only, correlation-PCA) value, concatenated
      into a single (n_spikes, 8) matrix — the same FD that
      CalculateLRatio_and_IsolationDistance.m builds before calling
      IsolationDistance.m / L_Ratio.m.
-  4. For every sorted cluster (cell_number > 0) computes:
+  3. For every sorted cluster (cell_number > 0) computes:
        - Isolation Distance  (IsolationDistance.m — Harris et al. 2001)
        - L-ratio             (L_Ratio.m — Schmitzer-Torbert et al. 2005)
-  5. For every cluster, tests significance against a nearest-neighbour
+  4. For every cluster, tests significance against a nearest-neighbour
      shuffle null (see SHUFFLE-BASED SIGNIFICANCE TEST below).
-  6. Saves a colour-coded Excel file next to the .ntt file.
+  5. Saves a colour-coded Excel file next to that .ntt file, named after it.
        Green row  →  L-ratio < 0.2  AND  Isolation Distance > 10
        Plain row  →  does not satisfy both criteria
 
@@ -137,7 +136,6 @@ Redish AD — mclust (https://github.com/adredish/MClust)
 """
 
 import os
-import glob
 import numpy as np # type: ignore
 from scipy import stats # type: ignore
 import openpyxl # type: ignore
@@ -146,7 +144,7 @@ from openpyxl.utils import get_column_letter # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-ROOT_DIR           = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
+ROOT_DIR           = r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Concat'
 
 # Quality thresholds (for colour-coding only — raw values always saved)
 L_RATIO_THRESHOLD  = 0.2
@@ -467,14 +465,9 @@ def nearest_neighbor_shuffle(FD: np.ndarray, cluster_mask: np.ndarray,
     return result
 
 
-# ── Per-folder driver ─────────────────────────────────────────────────────────
+# ── Per-file driver ────────────────────────────────────────────────────────────
 
-def process_folder(folder: str):
-    ntt_files = glob.glob(os.path.join(folder, '*.ntt'))
-    if not ntt_files:
-        return
-
-    ntt_path = max(ntt_files, key=os.path.getsize)
+def process_ntt_file(ntt_path: str, folder: str):
     print(f'  [{os.path.relpath(folder, ROOT_DIR)}]  {os.path.basename(ntt_path)}')
 
     try:
@@ -633,10 +626,11 @@ def main(root_dir: str = ROOT_DIR):
     print(f'Scanning: {root_dir}\n')
     processed = 0
     for dirpath, _dirs, files in os.walk(root_dir):
-        if any(f.lower().endswith('.ntt') for f in files):
-            process_folder(dirpath)
-            processed += 1
-    print(f'\nDone. Processed {processed} folder(s).')
+        for fname in files:
+            if fname.lower().endswith('.ntt'):
+                process_ntt_file(os.path.join(dirpath, fname), dirpath)
+                processed += 1
+    print(f'\nDone. Processed {processed} .ntt file(s).')
 
 
 if __name__ == '__main__':
