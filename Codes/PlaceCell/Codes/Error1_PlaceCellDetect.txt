@@ -1,0 +1,32 @@
+Shift margin is 20× too small — PlaceCellCharacterization_SI_Spar_Cohr_PeakFR_MeanFR_Shuffling_TwoHalvesCopmare_ThetaMod_Batch_GPU_Final.py:319
+
+
+MARGIN_FRAMES = int(fps)   # 1 second of frames at either end
+The reference (Fenton) code excludes shifts within 20 seconds of a full wrap (start_t = 20000000 µs, end_t = duration - 20000000 µs). The current code only excludes shifts within 1 second (int(fps) = 30 frames at 30 fps).
+
+Why this matters: a circular time-shift null model only works if the shift is large enough to fully decorrelate the spike train's short-timescale structure (bursts, theta-cycle spiking, repeated visits to the same location) from the position track. A 1-second exclusion zone is far too narrow — bursty or theta-modulated cells can retain spurious spatial coherence for shifts of several seconds. This inflates the upper tail of the null SIR distribution, which is exactly what determines the 95th-percentile pass/fail threshold in _run_bootstrap. A real place cell with genuinely high SIR can fail to clear an artificially inflated bootstrap_p95 — precisely the "high SIR, low sparsity, fails bootstrap" pattern you're seeing.
+
+For a session of, say, 20 minutes at 30 fps (~36,000 frames), only ~0.17% of the shift range is excluded at each edge with the current margin — versus a much larger, deliberately conservative exclusion zone in the reference. Even a small fraction of "under-shifted" draws among 1000 bootstrap iterations can land in the top 5% and drag the p95 threshold up.
+
+Fix: raise MARGIN_FRAMES to match the reference's intent, e.g. MARGIN_FRAMES = 20 * fps (20 s), or make it a named constant like MIN_SHIFT_S = 20.
+
+Other findings (lower confidence / not bugs, but worth knowing)
+Not a differential bug, but compounds the effect: min_occ_s = 1.0 excludes bins with <1s occupancy from both the real map and every null map (occupancy/valid_mask is fixed and shared across all bootstrap draws since only spike-to-frame assignment is shuffled, not position). This doesn't bias real-vs-null comparison, but it does mean a cell's most concentrated firing (often in a rarely-visited bin) can be dropped before SIR/peak_fr are even computed — worth checking if that's contributing to borderline SIR/sparsity/peak_fr values independent of the bootstrap step.
+
+Computational core is correct. I verified _sir_from_spikes_locshuf (lines 270-297) uses the exact same formula, occupancy map, valid mask, and smoothing function as the real-data path in compute_metrics (lines 514-526) — no asymmetry there, no off-by-one indexing, no shape mismatches.
+
+bootstrap_sig direction is correct (real_sir > bootstrap_p95, one-tailed as intended).
+
+Differences between the two bootstrapping strategies
+Aspect	Reference (Fenton, pasted)	Current file (_run_bootstrap)
+What gets shuffled	Spike timestamps shifted by a random time offset, then re-binned via nearest-behavior-timestamp lookup	Spike frame indices shifted by a random integer number of frames (mod n_frames); position track itself untouched
+Minimum shift margin	20 s from either end of the recording	1 s from either end (int(fps) frames) — the likely bug
+SIR formula	Bits/second: Σ pᵢ·rᵢ·log2(rᵢ/r̄)	Bits/spike: Σ pᵢ·(rᵢ/r̄)·log2(rᵢ/r̄)
+Rate-map smoothing	Distance-weighted Gaussian (σ=3 bins, cutoff h=5 bins ≈ 6–10 cm), summed only over actual tracked samples within radius	Fixed 3×3 triangular (bilinear) image-convolution kernel (~1 bin ≈ 2 cm), edge-corrected by dividing by convolved mask
+Minimum occupancy per bin	None — any visited bin counts, even with 1 sample	Bins with <1 s occupancy (min_occ_s) are excluded entirely
+Spike-to-position binning	Nearest later behavior timestamp (np.where(t < behaviour_t)[0][0]), no gap limit	Nearest timestamp in either direction, gated by a 50 ms max gap (MAX_GAP_US); spikes beyond the gap are discarded
+Speed/teleport filtering	None	Frames with speed ≥ 0.006 px/µs are dropped before binning
+Parallelism	ProcessPoolExecutor, one session per process	ThreadPoolExecutor + optional GPU offload (cupy) for the smoothing convolution, with a GPU-utilization throttle
+Output metric per session	Single full-session SIR + bootstrap	Full session and first-half/second-half split, each independently bootstrapped
+Significance stat source	95th-percentile whisker read off the matplotlib boxplot object	np.percentile(sir_i, 95) computed directly (boxplot is only for the saved figure, redundant but consistent)
+Given the margin discrepancy is the standout, structural difference and directly explains your observed symptom (real place cells with strong, concentrated firing losing to an under-shuffled null), I'd recommend fixing MARGIN_FRAMES first and re-running the bootstrap on a few of the flagged high-SIR/low-sparsity cells to confirm they now pass.

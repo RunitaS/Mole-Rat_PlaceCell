@@ -18,6 +18,7 @@ MAX_WORKERS      = 4
 """
 
 import os
+import shutil
 import threading
 import time
 import concurrent.futures
@@ -105,12 +106,16 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'E:/Runita/Fa1059/Open'
-output_excel = r'E:/Runita/Fa1059/Open/sir_shuff_1059Opn_theta.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/wuuuut.xlsx'
+
+# Destination for .ntt + tracking files of confirmed place cells (folder pattern
+# replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
+Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
-arena_width_cm = 60.0         # physical arena width in cm
+arena_width_cm = 80.0         # physical arena width in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
@@ -121,6 +126,12 @@ THETA_POWER_THRESH  = 2.0     # theta peak must exceed N× mean spectrum power
 
 MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
+
+# 'pixel' or 'cm' – set interactively at startup (see __main__ below).
+# 'pixel' : tracking file has 'x'/'y'/'time' columns in pixels, converted to cm.
+# 'cm'    : tracking file is a .csv with time in column A, x (cm) in column D,
+#           y (cm) in column E – used directly, no pixel→cm conversion.
+COORD_UNITS = 'pixel'
 
 _gpu_semaphore = threading.Semaphore(2)
 
@@ -136,6 +147,19 @@ ntt_dtype = np.dtype([
     ('params',      '<u4', (8,)),
     ('waveforms',   '<i2', (32, 4)),
 ])
+
+ANIMAL_NAMES = ('Fa1059', 'Fa23BD', 'Fa8477', 'Fa5384')
+
+
+def _animal_relpath(dirpath: str) -> str | None:
+    """Return the portion of `dirpath` starting at the animal-ID folder
+    (Fa1059 / Fa23BD / Fa8477 / Fa5384), or None if no such folder is found.
+    """
+    parts = os.path.normpath(dirpath).split(os.sep)
+    for i, part in enumerate(parts):
+        if part in ANIMAL_NAMES:
+            return os.path.join(*parts[i:])
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -282,7 +306,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     """Location-shuffling bootstrap (matches MATLAB calcSI_v3_locshuf).
 
     For each permutation, the position time series is circularly shifted by a
-    random number of frames (at least 1 s from either end), while spike-to-frame
+    random number of frames (at least 20 s from either end), while spike-to-frame
     assignments remain unchanged.  This decorrelates spikes from positions without
     altering the animal's occupancy statistics.
     """
@@ -292,7 +316,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
                 'bootstrap_sig':  False}
 
     n_frames      = len(t)
-    MARGIN_FRAMES = int(fps)   # 1 second of frames at either end
+    MARGIN_FRAMES = int(20 * fps)   # 20 seconds of frames at either end (matches Fenton reference)
 
     if n_frames <= 2 * MARGIN_FRAMES:
         return {'bootstrap_mean': float('nan'),
@@ -365,9 +389,15 @@ def compute_metrics(csv_path: str, ntt_path: str,
     data = (pd.read_excel(csv_path) if csv_path.lower().endswith('.xlsx')
             else pd.read_csv(csv_path))
 
-    x = np.asarray(data['x'],    dtype=float)
-    y = np.asarray(data['y'],    dtype=float)
-    t = np.asarray(data['time'], dtype=float)
+    if COORD_UNITS == 'cm':
+        # Column A = timestamp, column D = x (cm), column E = y (cm)
+        t = np.asarray(data.iloc[:, 0], dtype=float)
+        x = np.asarray(data.iloc[:, 3], dtype=float)
+        y = np.asarray(data.iloc[:, 4], dtype=float)
+    else:
+        x = np.asarray(data['x'],    dtype=float)
+        y = np.asarray(data['y'],    dtype=float)
+        t = np.asarray(data['time'], dtype=float)
 
     mask = ~np.isin(x, [1, -1])
     x, y, t = x[mask], y[mask], t[mask]
@@ -401,12 +431,17 @@ def compute_metrics(csv_path: str, ntt_path: str,
          return ({'n_spikes': 0, 'n_discarded': 0, 'peak_fr': 0.0, 'mean_fr': 0.0, 'sir': 0.0}, {})
 
     # ── 2. Pixel → cm conversion ──────────────────────────────────────────────
-    x_span = x.max() - x.min()
-    y_span = y.max() - y.min()
-    px_per_cm = max(x_span, y_span) / arena_width_cm
+    if COORD_UNITS == 'cm':
+        # Coordinates are already in cm – just zero the origin for binning.
+        x_cm = x - x.min()
+        y_cm = y - y.min()
+    else:
+        x_span = x.max() - x.min()
+        y_span = y.max() - y.min()
+        px_per_cm = max(x_span, y_span) / arena_width_cm
 
-    x_cm = (x - x.min()) / px_per_cm
-    y_cm = (y - y.min()) / px_per_cm
+        x_cm = (x - x.min()) / px_per_cm
+        y_cm = (y - y.min()) / px_per_cm
 
     # ── 3. Bin tracking positions ─────────────────────────────────────────────
     n_bins_x = int(np.ceil(x_cm.max() / target_bin_cm))
@@ -630,16 +665,33 @@ def _run_job(args):
     return (full_row, first_row, second_row)
 # ── Batch scan ────────────────────────────────────────────────────────────────
 
+_PIXEL_ANSWERS = {'pixel', 'pixels', 'px'}
+_CM_ANSWERS    = {'cm', 'cms', 'centimeter', 'centimeters', 'centimetre', 'centimetres'}
+
 if __name__ == "__main__":
-    all_jobs = []
+    _coord_answer = input("Are the tracking coordinates in pixels or cm? [pixel/cm]: ").strip().lower()
+    while _coord_answer not in _PIXEL_ANSWERS | _CM_ANSWERS:
+        _coord_answer = input("Please enter 'pixel' or 'cm': ").strip().lower()
+    COORD_UNITS = 'pixel' if _coord_answer in _PIXEL_ANSWERS else 'cm'
+    print(f"Using '{COORD_UNITS}' tracking coordinates.\n")
+
+    all_jobs   = []
+    dir_to_csv = {}
     output_excel_basename = os.path.basename(output_excel).lower()
     for dirpath, _, filenames in os.walk(root_folder):
-        tracking_files = [f for f in filenames
-                          if f.lower().endswith(('.csv', '.xlsx'))
-                          and f.lower() != output_excel_basename]
+        tracking_files_all = [f for f in filenames
+                              if f.lower().endswith(('.csv', '.xlsx'))
+                              and f.lower() != output_excel_basename]
+        # '_cm.csv' files are the cm-converted tracking files; everything else
+        # (.xlsx, or a plain .csv without that suffix) is pixel-based tracking.
+        if COORD_UNITS == 'cm':
+            tracking_files = [f for f in tracking_files_all if f.lower().endswith('_cm.csv')]
+        else:
+            tracking_files = [f for f in tracking_files_all if not f.lower().endswith('_cm.csv')]
         ntt_files      = [f for f in filenames if f.lower().endswith('.ntt')]
         if len(tracking_files) == 1 and len(ntt_files) > 0:
             csv_path = os.path.join(dirpath, tracking_files[0])
+            dir_to_csv[dirpath] = csv_path
             for ntt_file in sorted(ntt_files):
                 all_jobs.append((dirpath, csv_path, ntt_file))
 
@@ -680,3 +732,36 @@ if __name__ == "__main__":
     print(f'\nDone. Results saved to {output_excel}')
     print(f'Total units processed : {len(df_full)}')
     print(f'Place cells found     : {df_full["place_cell"].sum()}')
+
+    # ── Copy .ntt + tracking files for confirmed place cells ───────────────────
+    # Replicates the folder structure from the animal-ID folder onwards
+    # (Fa1059 / Fa23BD / Fa8477 / Fa5384) under Output_PlaceTrue.
+
+    place_rows = df_full[df_full['place_cell'] == True]  # noqa: E712
+    copied_tracking_dirs = set()
+
+    for _, row in place_rows.iterrows():
+        session = row['session']
+        dirpath = root_folder if session == '.' else os.path.join(root_folder, session)
+        ntt_path = os.path.join(dirpath, row['unit'])
+
+        rel = _animal_relpath(dirpath)
+        if rel is None:
+            print(f'  [SKIP] Could not locate animal-ID folder in path: {dirpath}')
+            continue
+
+        dest_dir = os.path.join(Output_PlaceTrue, rel)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        if os.path.isfile(ntt_path):
+            shutil.copy2(ntt_path, dest_dir)
+        else:
+            print(f'  [SKIP] .ntt file not found: {ntt_path}')
+
+        if dirpath not in copied_tracking_dirs:
+            csv_path = dir_to_csv.get(dirpath)
+            if csv_path and os.path.isfile(csv_path):
+                shutil.copy2(csv_path, dest_dir)
+            copied_tracking_dirs.add(dirpath)
+
+    print(f'Place-cell files copied to : {Output_PlaceTrue}')
