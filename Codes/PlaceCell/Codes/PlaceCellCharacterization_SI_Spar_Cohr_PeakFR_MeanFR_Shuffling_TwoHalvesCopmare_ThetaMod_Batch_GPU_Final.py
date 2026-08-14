@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING, TypedDict
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import convolve
-from scipy.stats import pearsonr
+from scipy.ndimage import convolve, gaussian_filter1d
+from scipy.stats import pearsonr, linregress
 
 # Thread-safe Matplotlib imports for parallel rendering
 from matplotlib.figure import Figure
@@ -49,6 +49,11 @@ class _Metrics(TypedDict, total=False):
     bootstrap_sig:   bool | None
     theta_modulated: bool | None
     theta_peak_freq: float | None
+    speed_score:     float | None
+    speed_p_value:   float | None
+    speed_beta:      float | None
+    speed_f0:        float | None
+    speed_modulated: bool | None
     place_cell:      bool | None
     session:         str
     unit:            str
@@ -106,12 +111,12 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data'
-output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/wuuuut.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/wut.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
+Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
@@ -123,6 +128,12 @@ N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
 AUTOCORR_WINDOW_MS  = 500.0   # autocorrelogram half-window (ms)
 AUTOCORR_BIN_MS     = 5.0     # autocorrelogram bin size (ms)
 THETA_POWER_THRESH  = 2.0     # theta peak must exceed N× mean spectrum power
+
+SPEED_MIN_CMS       = 4.0     # lowest speed (cm/s) included in speed-modulation analysis
+SPEED_MAX_CMS       = 100.0   # highest speed (cm/s) included in speed-modulation analysis
+SPEED_BIN_CMS       = 2.0     # width of each speed bin (cm/s)
+SPEED_SMOOTH_S      = 0.08    # Gaussian smoothing window (s) applied to instantaneous firing rate
+SPEED_MIN_BIN_FRAC  = 0.01    # discard speed bins holding < this fraction of samples
 
 MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
@@ -263,6 +274,109 @@ def _compute_theta_modulation(
 
     theta_modulated = peak_power > thresh * float(power.mean())
     return theta_modulated, round(peak_freq, 2)
+
+
+# ── Speed modulation ──────────────────────────────────────────────────────────
+
+def _compute_speed_modulation(
+    x_cm:               np.ndarray,
+    y_cm:               np.ndarray,
+    t_us:               np.ndarray,
+    spike_ts_us:        np.ndarray,
+    pos_sample_rate_hz: float,
+    min_speed_cms:      float = SPEED_MIN_CMS,
+    max_speed_cms:      float = SPEED_MAX_CMS,
+    speed_bin_cms:      float = SPEED_BIN_CMS,
+    smooth_window_s:    float = SPEED_SMOOTH_S,
+    min_bin_frac:       float = SPEED_MIN_BIN_FRAC,
+) -> dict:
+    """Relates firing rate to running speed (ports MATLAB `speed_firing_runita`).
+
+      1. Per-frame running speed (cm/s) from consecutive positions, using the
+         actual inter-frame interval rather than an assumed fixed rate.
+      2. Instantaneous firing rate on the same frame base (spike count per
+         inter-frame interval / interval duration), Gaussian-smoothed.
+      3. Restrict to samples with min_speed_cms < speed < max_speed_cms.
+      4. Bin firing rate by speed (speed_bin_cms-wide bins), drop bins with
+         < min_bin_frac of the samples, and fit rate = beta*speed + f0 to the
+         binned means (beta/f0 naming kept from the MATLAB source).
+
+    x_cm, y_cm, t_us must be same-length position tracks (t_us in µs, sorted).
+    spike_ts_us must be in the same time base (µs).
+    Returns speed_score (r), speed_p_value, speed_beta (slope),
+    speed_f0 (intercept), speed_modulated (p < 0.05).
+    """
+    result = {'speed_score': float('nan'), 'speed_p_value': float('nan'),
+              'speed_beta': float('nan'), 'speed_f0': float('nan'),
+              'speed_modulated': None}
+
+    n = len(t_us)
+    if n < 3 or len(spike_ts_us) == 0:
+        return result
+
+    # ── Per-frame running speed (cm/s) ────────────────────────────────────────
+    dt_s = np.diff(t_us) * 1e-6
+    with np.errstate(invalid='ignore', divide='ignore'):
+        speed = np.hypot(np.diff(x_cm), np.diff(y_cm)) / dt_s
+    speed[dt_s <= 0] = np.nan
+    speed = np.append(speed, speed[-1])              # pad to length n
+
+    # ── Instantaneous firing rate on the same frame base ──────────────────────
+    interval_idx = np.searchsorted(t_us, spike_ts_us, side='right') - 1
+    interval_idx = np.clip(interval_idx, 0, n - 2)
+    counts = np.bincount(interval_idx, minlength=n - 1).astype(np.float64)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        fr_inst = counts / dt_s
+    fr_inst[dt_s <= 0] = np.nan
+    fr_inst = np.append(fr_inst, fr_inst[-1])         # pad to length n
+
+    finite = np.isfinite(fr_inst)
+    sigma_samples = max(smooth_window_s * pos_sample_rate_hz, 1e-6)
+    fr_smooth = gaussian_filter1d(np.where(finite, fr_inst, 0.0),
+                                   sigma=sigma_samples, mode='nearest')
+    fr_smooth[~finite] = np.nan
+
+    # ── Restrict to the usable speed range ─────────────────────────────────────
+    in_range = (speed > min_speed_cms) & (speed < max_speed_cms) & np.isfinite(fr_smooth)
+    if in_range.sum() < 3:
+        return result
+
+    speed_valid = speed[in_range]
+    rate_valid  = fr_smooth[in_range]
+    if np.std(speed_valid) == 0 or np.std(rate_valid) == 0:
+        return result
+
+    # ── Bin firing rate by speed ────────────────────────────────────────────────
+    speed_bins = np.arange(min_speed_cms, max_speed_cms + speed_bin_cms, speed_bin_cms)
+    n_bins     = len(speed_bins) - 1
+    bin_idx    = np.clip(np.digitize(speed_valid, speed_bins) - 1, 0, n_bins - 1)
+
+    bin_centres = 0.5 * (speed_bins[:-1] + speed_bins[1:])
+    mean_rate   = np.full(n_bins, np.nan)
+    n_per_bin   = np.zeros(n_bins, dtype=int)
+    for b in range(n_bins):
+        sel = bin_idx == b
+        n_per_bin[b] = int(sel.sum())
+        if n_per_bin[b] > 0:
+            mean_rate[b] = float(np.mean(rate_valid[sel]))
+
+    total_pts = n_per_bin.sum()
+    if total_pts == 0:
+        return result
+    mean_rate[(n_per_bin / total_pts) < min_bin_frac] = np.nan   # drop under-sampled bins
+
+    fit_sel = np.isfinite(mean_rate)
+    if fit_sel.sum() < 3:
+        return result
+
+    reg = linregress(bin_centres[fit_sel], mean_rate[fit_sel])
+
+    result['speed_score']     = round(float(reg.rvalue), 4)
+    result['speed_p_value']   = round(float(reg.pvalue), 4)
+    result['speed_beta']      = round(float(reg.slope), 4)
+    result['speed_f0']        = round(float(reg.intercept), 4)
+    result['speed_modulated'] = bool(reg.pvalue < 0.05)
+    return result
 
 
 # ── Bootstrap helpers ─────────────────────────────────────────────────────────
@@ -502,6 +616,7 @@ def compute_metrics(csv_path: str, ntt_path: str,
 
     # ── 8. Compute metrics ────────────────────────────────────────────────────
     ctx = dict(spike_ts=spike_ts[valid_spike], spike_frame=spike_frame, t=t,
+               x_cm=x_cm, y_cm=y_cm,
                beh_bx=beh_bx, beh_by=beh_by,
                occ_map=occ_map, valid_mask=valid_mask,
                n_bins_x=n_bins_x, n_bins_y=n_bins_y)
@@ -588,6 +703,8 @@ def _run_job(args):
         'sparsity': None, 'coherence':   None,
         'bootstrap_mean': None, 'bootstrap_p95': None, 'bootstrap_sig': None,
         'theta_modulated': None, 'theta_peak_freq': None,
+        'speed_score': None, 'speed_p_value': None,
+        'speed_beta': None, 'speed_f0': None, 'speed_modulated': None,
         'session': session_name, 'unit': ntt_file,
         'job_order': job_order, 'place_cell': None,
     }
@@ -633,6 +750,32 @@ def _run_job(args):
         else:
             metrics['theta_modulated'] = None
             metrics['theta_peak_freq'] = None
+
+        # Speed modulation
+        if ctx and ctx.get('spike_ts') is not None and len(ctx['spike_ts']) > 0:
+            try:
+                speed_res = _compute_speed_modulation(
+                    ctx['x_cm'], ctx['y_cm'], ctx['t'], ctx['spike_ts'], fps,
+                )
+                metrics['speed_score']     = speed_res['speed_score']
+                metrics['speed_p_value']   = speed_res['speed_p_value']
+                metrics['speed_beta']      = speed_res['speed_beta']
+                metrics['speed_f0']        = speed_res['speed_f0']
+                metrics['speed_modulated'] = speed_res['speed_modulated']
+            except Exception as e:
+                with _print_lock:
+                    print(f'  SPEED ERROR in {ntt_file} [{label}]: {e}')
+                metrics['speed_score']     = None
+                metrics['speed_p_value']   = None
+                metrics['speed_beta']      = None
+                metrics['speed_f0']        = None
+                metrics['speed_modulated'] = None
+        else:
+            metrics['speed_score']     = None
+            metrics['speed_p_value']   = None
+            metrics['speed_beta']      = None
+            metrics['speed_f0']        = None
+            metrics['speed_modulated'] = None
 
         metrics['session']   = session_name
         metrics['unit']      = ntt_file
@@ -718,7 +861,9 @@ if __name__ == "__main__":
     column_order = ['session', 'unit', 'n_spikes', 'n_discarded',
                     'peak_fr', 'mean_fr', 'sir', 'sparsity', 'coherence',
                     'bootstrap_mean', 'bootstrap_p95', 'bootstrap_sig',
-                    'theta_modulated', 'theta_peak_freq', 'place_cell']
+                    'theta_modulated', 'theta_peak_freq',
+                    'speed_score', 'speed_p_value', 'speed_beta', 'speed_f0', 'speed_modulated',
+                    'place_cell']
 
     df_full   = pd.DataFrame([r[0] for r in results], columns=column_order)
     df_first  = pd.DataFrame([r[1] for r in results], columns=column_order)

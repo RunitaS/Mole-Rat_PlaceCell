@@ -669,47 +669,55 @@ if __name__ == "__main__":
         'bootstrap_sig_after_removal', 'still_place_cell_after_removal',
     ]
 
+    # ── Pre-pass: assign sheet names & build the summary rows first, so the
+    # 'Summary' sheet can be written before the per-unit sheets (Excel keeps
+    # sheets in write order, so writing it first makes it the first tab). ────
+
     used_sheet_names = set()
     summary_rows = []
+    sorted_results = sorted(results, key=lambda r: (r[0], r[1]))
+
+    for session_name, ntt_file, fields, summary in sorted_results:
+        sheet_name = _safe_sheet_name(os.path.splitext(ntt_file)[0], used_sheet_names)
+
+        areas = [f['area_cm2'] for f in fields]
+        pcts  = [f['pct_of_occupied_area'] for f in fields]
+
+        summary_rows.append({
+            'session': session_name,
+            'unit': ntt_file,
+            'sheet_name': sheet_name,
+            'n_fields_detected': len(fields),
+            'field_areas_cm2':  '; '.join(f'{a:.2f}' for a in areas),
+            'field_pct_areas':  '; '.join(f'{p:.2f}' for p in pcts),
+            'total_field_area_cm2': round(sum(areas), 2) if areas else 0.0,
+            'total_pct_area_occupied': round(sum(pcts), 2) if pcts else 0.0,
+            'n_spikes': summary.get('n_spikes'),
+            'base_sir': summary.get('base_sir'),
+            'base_sparsity': summary.get('base_sparsity'),
+            'base_peak_fr': summary.get('base_peak_fr'),
+            'base_mean_fr': summary.get('base_mean_fr'),
+            'error': summary.get('error', ''),
+        })
+
+    summary_columns = [
+        'session', 'unit', 'sheet_name', 'n_fields_detected',
+        'field_areas_cm2', 'field_pct_areas',
+        'total_field_area_cm2', 'total_pct_area_occupied',
+        'n_spikes', 'base_sir', 'base_sparsity', 'base_peak_fr', 'base_mean_fr', 'error',
+    ]
+    df_summary = pd.DataFrame(summary_rows, columns=summary_columns)
 
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-        for session_name, ntt_file, fields, summary in sorted(results, key=lambda r: (r[0], r[1])):
-            sheet_name = _safe_sheet_name(os.path.splitext(ntt_file)[0], used_sheet_names)
+        df_summary.to_excel(writer, sheet_name='Summary', index=False)
 
+        for (session_name, ntt_file, fields, summary), row in zip(sorted_results, summary_rows):
+            sheet_name = row['sheet_name']
             if fields:
                 df = pd.DataFrame(fields, columns=field_columns)
             else:
                 df = pd.DataFrame(columns=field_columns)
             df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-            areas = [f['area_cm2'] for f in fields]
-            pcts  = [f['pct_of_occupied_area'] for f in fields]
-
-            summary_rows.append({
-                'session': session_name,
-                'unit': ntt_file,
-                'sheet_name': sheet_name,
-                'n_fields_detected': len(fields),
-                'field_areas_cm2':  '; '.join(f'{a:.2f}' for a in areas),
-                'field_pct_areas':  '; '.join(f'{p:.2f}' for p in pcts),
-                'total_field_area_cm2': round(sum(areas), 2) if areas else 0.0,
-                'total_pct_area_occupied': round(sum(pcts), 2) if pcts else 0.0,
-                'n_spikes': summary.get('n_spikes'),
-                'base_sir': summary.get('base_sir'),
-                'base_sparsity': summary.get('base_sparsity'),
-                'base_peak_fr': summary.get('base_peak_fr'),
-                'base_mean_fr': summary.get('base_mean_fr'),
-                'error': summary.get('error', ''),
-            })
-
-        summary_columns = [
-            'session', 'unit', 'sheet_name', 'n_fields_detected',
-            'field_areas_cm2', 'field_pct_areas',
-            'total_field_area_cm2', 'total_pct_area_occupied',
-            'n_spikes', 'base_sir', 'base_sparsity', 'base_peak_fr', 'base_mean_fr', 'error',
-        ]
-        df_summary = pd.DataFrame(summary_rows, columns=summary_columns)
-        df_summary.to_excel(writer, sheet_name='Summary', index=False)
 
     print(f'\nDone. Results saved to {output_excel}')
     print(f'Total units processed : {len(results)}')
