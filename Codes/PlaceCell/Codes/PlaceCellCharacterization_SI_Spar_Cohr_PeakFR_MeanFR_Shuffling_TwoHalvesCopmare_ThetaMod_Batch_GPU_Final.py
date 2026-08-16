@@ -129,11 +129,11 @@ AUTOCORR_WINDOW_MS  = 500.0   # autocorrelogram half-window (ms)
 AUTOCORR_BIN_MS     = 5.0     # autocorrelogram bin size (ms)
 THETA_POWER_THRESH  = 2.0     # theta peak must exceed N× mean spectrum power
 
-SPEED_MIN_CMS       = 4.0     # lowest speed (cm/s) included in speed-modulation analysis
-SPEED_MAX_CMS       = 100.0   # highest speed (cm/s) included in speed-modulation analysis
+SPEED_MIN_CMS       = 2.0     # lowest speed (cm/s) included in speed-modulation analysis
+SPEED_MAX_CMS       = 90.0   # highest speed (cm/s) included in speed-modulation analysis
 SPEED_BIN_CMS       = 2.0     # width of each speed bin (cm/s)
 SPEED_SMOOTH_S      = 0.08    # Gaussian smoothing window (s) applied to instantaneous firing rate
-SPEED_MIN_BIN_FRAC  = 0.01    # discard speed bins holding < this fraction of samples
+SPEED_MIN_BIN_FRAC  = 0.002   # discard speed bins holding < this fraction of samples
 
 MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
@@ -289,6 +289,8 @@ def _compute_speed_modulation(
     speed_bin_cms:      float = SPEED_BIN_CMS,
     smooth_window_s:    float = SPEED_SMOOTH_S,
     min_bin_frac:       float = SPEED_MIN_BIN_FRAC,
+    ntt_path:           str | None = None,
+    label:              str = '',
 ) -> dict:
     """Relates firing rate to running speed (ports MATLAB `speed_firing_runita`).
 
@@ -315,21 +317,53 @@ def _compute_speed_modulation(
         return result
 
     # ── Per-frame running speed (cm/s) ────────────────────────────────────────
+    # There are n position samples, hence n-1 "inter-frame intervals" between
+    # them. dt_s is the true duration of each of those intervals (in seconds),
+    # computed from the actual timestamps rather than assuming a fixed frame
+    # rate — the tracker's frame interval is not perfectly constant.
     dt_s = np.diff(t_us) * 1e-6
     with np.errstate(invalid='ignore', divide='ignore'):
+        # Euclidean distance travelled between consecutive frames, divided by
+        # how long that step took -> speed (cm/s) for each of the n-1 intervals.
         speed = np.hypot(np.diff(x_cm), np.diff(y_cm)) / dt_s
-    speed[dt_s <= 0] = np.nan
-    speed = np.append(speed, speed[-1])              # pad to length n
+    speed[dt_s <= 0] = np.nan          # guard against zero/negative dt (duplicate or out-of-order timestamps)
+    speed = np.append(speed, speed[-1])              # pad to length n (repeat last value for the final sample)
 
     # ── Instantaneous firing rate on the same frame base ──────────────────────
+    # Goal: turn the spike train into one firing-rate value per inter-frame
+    # interval, so it lines up 1-to-1 with the `speed` array above.
+    #
+    # searchsorted(t_us, spike_ts_us, side='right') - 1 finds, for every spike
+    # timestamp, the index of the position frame immediately *before* it —
+    # i.e. which of the n-1 intervals [t[i], t[i+1]) the spike falls into.
+    # side='right' means a spike landing exactly on a frame timestamp is
+    # assigned to the interval that *starts* at that timestamp.
     interval_idx = np.searchsorted(t_us, spike_ts_us, side='right') - 1
+    # Clip so spikes before the first frame or after the last frame don't
+    # produce an out-of-bounds index; they get folded into the first/last interval.
     interval_idx = np.clip(interval_idx, 0, n - 2)
+    # Count how many spikes fall in each of the n-1 intervals.
     counts = np.bincount(interval_idx, minlength=n - 1).astype(np.float64)
     with np.errstate(invalid='ignore', divide='ignore'):
+        # Instantaneous rate for interval i = (spikes in interval i) / (duration
+        # of interval i). This is a raw, un-smoothed, per-frame firing rate (Hz).
         fr_inst = counts / dt_s
     fr_inst[dt_s <= 0] = np.nan
-    fr_inst = np.append(fr_inst, fr_inst[-1])         # pad to length n
+    fr_inst = np.append(fr_inst, fr_inst[-1])         # pad to length n, same convention as `speed`
 
+    # Gaussian smoothing of the instantaneous rate.
+    # WINDOW SIZE: controlled by `smooth_window_s` (default SPEED_SMOOTH_S,
+    # currently 0.08 s = 80 ms). This is the *standard deviation* (sigma) of
+    # the Gaussian kernel, expressed in seconds, and is converted to samples
+    # via sigma_samples = smooth_window_s * pos_sample_rate_hz (the position
+    # tracking frame rate, e.g. 30 Hz -> sigma ≈ 2.4 samples ≈ 80 ms).
+    # scipy's gaussian_filter1d truncates the kernel at 4*sigma by default, so
+    # the *effective* smoothing window (full kernel support) spans roughly
+    # ±4*sigma_samples samples (~±320 ms at 30 Hz), not just ±sigma.
+    # NaNs (from bad dt) are temporarily zero-filled before filtering (so they
+    # don't propagate NaN through the whole kernel support) and then restored
+    # afterwards via the `finite` mask, so the output stays NaN exactly where
+    # the input was invalid.
     finite = np.isfinite(fr_inst)
     sigma_samples = max(smooth_window_s * pos_sample_rate_hz, 1e-6)
     fr_smooth = gaussian_filter1d(np.where(finite, fr_inst, 0.0),
@@ -337,6 +371,11 @@ def _compute_speed_modulation(
     fr_smooth[~finite] = np.nan
 
     # ── Restrict to the usable speed range ─────────────────────────────────────
+    # Very low speeds (near-stationary, e.g. grooming/resting) and very high
+    # speeds (tracking artifacts / jumps) are excluded so the fit isn't
+    # dominated by outliers or immobility-related firing (e.g. sharp-wave
+    # ripples during rest). Only frames with min_speed_cms < speed < max_speed_cms
+    # AND a valid (non-NaN) smoothed rate are kept.
     in_range = (speed > min_speed_cms) & (speed < max_speed_cms) & np.isfinite(fr_smooth)
     if in_range.sum() < 3:
         return result
@@ -347,13 +386,24 @@ def _compute_speed_modulation(
         return result
 
     # ── Bin firing rate by speed ────────────────────────────────────────────────
+    # Build speed_bin_cms-wide bin edges spanning [min_speed_cms, max_speed_cms]
+    # (e.g. 2 cm/s wide bins from 2 to 90 cm/s), giving n_bins bins.
     speed_bins = np.arange(min_speed_cms, max_speed_cms + speed_bin_cms, speed_bin_cms)
     n_bins     = len(speed_bins) - 1
+    # For every valid (speed, rate) sample, find which speed bin it falls in.
+    # np.digitize returns 1-indexed bin numbers; subtract 1 to make it
+    # 0-indexed, and clip to guard against samples exactly at/above the last
+    # edge (which digitize would otherwise put in an out-of-range bin).
     bin_idx    = np.clip(np.digitize(speed_valid, speed_bins) - 1, 0, n_bins - 1)
 
+    # bin_centres: the midpoint speed of each bin, used as the x-value in the
+    # final regression (rate vs. speed).
     bin_centres = 0.5 * (speed_bins[:-1] + speed_bins[1:])
     mean_rate   = np.full(n_bins, np.nan)
     n_per_bin   = np.zeros(n_bins, dtype=int)
+    # For each speed bin, average the (already Gaussian-smoothed) firing rate
+    # of every sample that fell in it. This collapses the noisy per-frame
+    # rate/speed cloud into one representative rate per speed bin.
     for b in range(n_bins):
         sel = bin_idx == b
         n_per_bin[b] = int(sel.sum())
@@ -363,12 +413,20 @@ def _compute_speed_modulation(
     total_pts = n_per_bin.sum()
     if total_pts == 0:
         return result
+    # Bins that hold too few samples (fraction of total < min_bin_frac, e.g.
+    # 0.2%) are unreliable estimates of mean rate at that speed, so they're
+    # discarded (set to NaN) rather than allowed to bias the regression —
+    # this matters most at the high-speed tail, which is sparsely sampled.
     mean_rate[(n_per_bin / total_pts) < min_bin_frac] = np.nan   # drop under-sampled bins
 
     fit_sel = np.isfinite(mean_rate)
     if fit_sel.sum() < 3:
         return result
 
+    # Linear regression of binned mean firing rate against bin-centre speed:
+    # rate = speed_beta * speed + speed_f0. reg.rvalue is the speed score
+    # (correlation coefficient r), reg.pvalue tests whether the slope is
+    # significantly different from zero (p < 0.05 => speed_modulated).
     reg = linregress(bin_centres[fit_sel], mean_rate[fit_sel])
 
     result['speed_score']     = round(float(reg.rvalue), 4)
@@ -376,6 +434,43 @@ def _compute_speed_modulation(
     result['speed_beta']      = round(float(reg.slope), 4)
     result['speed_f0']        = round(float(reg.intercept), 4)
     result['speed_modulated'] = bool(reg.pvalue < 0.05)
+
+    # ── speed-vs-rate plot ───────────────────────────────────────────────────
+    if ntt_path is not None:
+        fig = Figure()
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+
+        ax.scatter(speed_valid, rate_valid, s=3, color='0.75', alpha=0.4,
+                   label='raw samples')
+        ax.scatter(bin_centres[fit_sel], mean_rate[fit_sel], s=80, color='black',
+                   label='binned mean')
+
+        fit_x = np.array([bin_centres[fit_sel].min(), bin_centres[fit_sel].max()])
+        fit_y = reg.slope * fit_x + reg.intercept
+        ax.plot(fit_x, fit_y, 'r-', label='fit')
+
+        stats_txt = (f"r = {reg.rvalue:.3f}\n"
+                     f"slope = {reg.slope:.3f}\n"
+                     f"intercept = {reg.intercept:.3f}\n"
+                     f"p = {reg.pvalue:.3g}")
+        ax.text(0.02, 0.98, stats_txt, transform=ax.transAxes,
+               va='top', ha='left', fontsize=9,
+               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        ax.set_xlabel('speed (cm/s)')
+        ax.set_ylabel('firing rate (Hz)')
+        ax.legend(loc='lower right', fontsize=8)
+        fig.tight_layout()
+
+        ntt_name   = os.path.splitext(os.path.basename(ntt_path))[0]
+        save_dir   = os.path.join(os.path.dirname(ntt_path), 'speed modulation')
+        os.makedirs(save_dir, exist_ok=True)
+        lbl_suffix = f'_{label}' if label else ''
+        save_path  = os.path.join(save_dir, f'{ntt_name}{lbl_suffix}_speed_modulation.png')
+        fig.savefig(save_path, dpi=150)
+        print(f'  [SAVED] {save_path}')
+
     return result
 
 
@@ -756,6 +851,7 @@ def _run_job(args):
             try:
                 speed_res = _compute_speed_modulation(
                     ctx['x_cm'], ctx['y_cm'], ctx['t'], ctx['spike_ts'], fps,
+                    ntt_path=ntt_path, label=label,
                 )
                 metrics['speed_score']     = speed_res['speed_score']
                 metrics['speed_p_value']   = speed_res['speed_p_value']
