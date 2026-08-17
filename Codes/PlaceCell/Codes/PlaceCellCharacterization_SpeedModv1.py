@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, TypedDict
 import numpy as np
 import pandas as pd
 from scipy.ndimage import convolve, gaussian_filter1d
-from scipy.stats import pearsonr, linregress
+from scipy.stats import pearsonr, spearmanr, shapiro, t as _t_dist
 
 # Thread-safe Matplotlib imports for parallel rendering
 from matplotlib.figure import Figure
@@ -49,11 +49,19 @@ class _Metrics(TypedDict, total=False):
     bootstrap_sig:   bool | None
     theta_modulated: bool | None
     theta_peak_freq: float | None
-    speed_score:     float | None
-    speed_p_value:   float | None
-    speed_beta:      float | None
-    speed_f0:        float | None
-    speed_modulated: bool | None
+    speed_score:            float | None
+    speed_p_value:          float | None
+    speed_beta:             float | None
+    speed_f0:               float | None
+    speed_modulated:        bool | None
+    speed_spearman_r:       float | None
+    speed_spearman_p:       float | None
+    speed_normality_p:      float | None
+    speed_residuals_normal: bool | None
+    speed_shuffle_mean:     float | None
+    speed_shuffle_p95:      float | None
+    speed_shuffle_p:        float | None
+    speed_shuffle_sig:      bool | None
     place_cell:      bool | None
     session:         str
     unit:            str
@@ -129,11 +137,19 @@ AUTOCORR_WINDOW_MS  = 500.0   # autocorrelogram half-window (ms)
 AUTOCORR_BIN_MS     = 5.0     # autocorrelogram bin size (ms)
 THETA_POWER_THRESH  = 2.0     # theta peak must exceed N× mean spectrum power
 
-SPEED_MIN_CMS       = 1.0     # lowest speed (cm/s) included in speed-modulation analysis
-SPEED_MAX_CMS       = 90.0   # highest speed (cm/s) included in speed-modulation analysis
-SPEED_BIN_CMS       = 5.0 #2.0     # width of each speed bin (cm/s)
-SPEED_SMOOTH_S      = 0.3 #0.08    # Gaussian smoothing window (s) applied to instantaneous firing rate
+SPEED_MIN_CMS       = 2.0     # lowest speed (cm/s) included in speed-modulation analysis
+SPEED_MAX_CMS       = 60.0   # highest speed (cm/s) included in speed-modulation analysis
+SPEED_BIN_CMS       = 4.0 #2.0     # width of each speed bin (cm/s)
+# Gaussian smoothing sigma (s), applied SYMMETRICALLY to both the running-speed
+# trace and the instantaneous firing-rate trace before binning/regression (see
+# _compute_speed_modulation). 100-300 ms is the range used in the hippocampal-
+# formation speed-tuning literature (e.g. Kropff et al. 2015, "Speed cells in
+# the medial entorhinal cortex", Nature -- ~250 ms Gaussian sigma on both speed
+# and rate); 300 ms sits within that range.
+SPEED_SMOOTH_S      = 0.3 #0.08
 SPEED_MIN_BIN_FRAC  = 0.002   # discard speed bins holding < this fraction of samples
+SPEED_N_SHUFFLE          = 1000   # circular time-shifts for the speed-modulation shuffle test
+SPEED_SHUFFLE_MARGIN_S   = 20.0   # min |shift| (s) between real and shuffled alignment (matches SIR bootstrap convention)
 
 MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
@@ -174,6 +190,29 @@ def _animal_relpath(dirpath: str) -> str | None:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _benjamini_hochberg(pvals: 'pd.Series') -> 'pd.Series':
+    """Benjamini-Hochberg FDR-adjusted p-values. NaN entries (units where the
+    speed-modulation test could not be run) are passed through as NaN and
+    excluded from the correction (they're not part of the family of tests).
+    """
+    pvals = pd.Series(pvals, dtype=float)
+    valid = pvals.notna()
+    adj   = pd.Series(np.nan, index=pvals.index, dtype=float)
+    m     = int(valid.sum())
+    if m == 0:
+        return adj
+
+    idx_valid  = pvals[valid].sort_values().index
+    ranked_p   = pvals.loc[idx_valid].to_numpy()
+    ranks      = np.arange(1, m + 1)
+    raw_adj    = ranked_p * m / ranks
+    # Enforce monotonicity: adjusted p-values must not decrease as rank decreases.
+    monotone_adj = np.minimum.accumulate(raw_adj[::-1])[::-1]
+    monotone_adj = np.clip(monotone_adj, 0.0, 1.0)
+    adj.loc[idx_valid] = monotone_adj
+    return adj
+
 
 def _wait_for_gpu_slot(poll_interval: float = 0.5):
     if not _GPU or not _NVML:
@@ -278,6 +317,150 @@ def _compute_theta_modulation(
 
 # ── Speed modulation ──────────────────────────────────────────────────────────
 
+def _gaussian_smooth_track(arr: np.ndarray, sigma_samples: float) -> np.ndarray:
+    """Gaussian-smooth `arr` (NaN-safe): NaNs are zero-filled before filtering
+    (so they don't smear through the kernel support) and restored afterwards.
+    """
+    finite = np.isfinite(arr)
+    smoothed = gaussian_filter1d(np.where(finite, arr, 0.0),
+                                  sigma=sigma_samples, mode='nearest')
+    smoothed[~finite] = np.nan
+    return smoothed
+
+
+def _bin_rate_by_speed(speed_valid: np.ndarray, rate_valid: np.ndarray,
+                        speed_bins: np.ndarray, min_bin_frac: float):
+    """Bin (speed_valid, rate_valid) sample pairs into `speed_bins`-wide bins.
+
+    Returns (bin_centres, mean_rate, n_per_bin) where mean_rate is NaN for
+    empty bins and for bins holding < min_bin_frac of all in-range samples.
+    """
+    n_bins      = len(speed_bins) - 1
+    bin_centres = 0.5 * (speed_bins[:-1] + speed_bins[1:])
+    bin_idx     = np.clip(np.digitize(speed_valid, speed_bins) - 1, 0, n_bins - 1)
+
+    n_per_bin = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
+    sums      = np.bincount(bin_idx, weights=rate_valid, minlength=n_bins)
+    mean_rate = np.full(n_bins, np.nan)
+    nonzero   = n_per_bin > 0
+    mean_rate[nonzero] = sums[nonzero] / n_per_bin[nonzero]
+
+    total_pts = n_per_bin.sum()
+    if total_pts > 0:
+        mean_rate[(n_per_bin / total_pts) < min_bin_frac] = np.nan
+
+    return bin_centres, mean_rate, n_per_bin.astype(int)
+
+
+def _weighted_linregress(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> dict:
+    """Weighted least-squares fit y = slope*x + intercept, weighting each
+    point by `w` (here: n_per_bin, since a bin mean's variance scales as
+    ~1/n_per_bin -- a bin averaged from 2 samples should not carry the same
+    weight as one averaged from 2000).
+
+    Returns slope, intercept, weighted Pearson r, and a two-sided Wald
+    t-test p-value for H0: slope == 0 (df = n_points - 2).
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    n = len(x)
+
+    sw     = w.sum()
+    x_mean = np.sum(w * x) / sw
+    y_mean = np.sum(w * y) / sw
+    sxx    = np.sum(w * (x - x_mean) ** 2)
+    sxy    = np.sum(w * (x - x_mean) * (y - y_mean))
+    syy    = np.sum(w * (y - y_mean) ** 2)
+
+    slope     = sxy / sxx if sxx > 0 else float('nan')
+    intercept = y_mean - slope * x_mean if np.isfinite(slope) else float('nan')
+    r         = sxy / np.sqrt(sxx * syy) if sxx > 0 and syy > 0 else float('nan')
+
+    resid = y - (slope * x + intercept) if np.isfinite(slope) else np.full(n, np.nan)
+    df    = n - 2
+    if df > 0 and sxx > 0 and np.isfinite(slope):
+        mse      = np.sum(w * resid ** 2) / df
+        se_slope = np.sqrt(mse / sxx)
+        tstat    = slope / se_slope if se_slope > 0 else float('inf')
+        pvalue   = float(2.0 * _t_dist.sf(np.abs(tstat), df))
+    else:
+        pvalue = float('nan')
+
+    return {'slope': float(slope), 'intercept': float(intercept),
+            'r': float(r), 'pvalue': pvalue, 'resid': resid}
+
+
+def _speed_modulation_shuffle(
+    speed:               np.ndarray,
+    fr_smooth:           np.ndarray,
+    real_r:              float,
+    min_speed_cms:       float,
+    max_speed_cms:       float,
+    speed_bins:          np.ndarray,
+    min_bin_frac:        float,
+    pos_sample_rate_hz:  float,
+    n_shuffle:           int = SPEED_N_SHUFFLE,
+    margin_s:            float = SPEED_SHUFFLE_MARGIN_S,
+) -> dict:
+    """Circular time-shift shuffle test for speed modulation (analogous to the
+    SIR location-shuffle bootstrap, _run_bootstrap/_sir_from_spikes_locshuf).
+
+    The firing-rate trace is circularly rolled by a random offset (leaving
+    the speed trace, and hence its autocorrelation structure, untouched),
+    the whole binning + weighted-regression pipeline is re-run, and the null
+    distribution of |r| is compared against the real |r|. This breaks the
+    time-locked spike-speed relationship without assuming any particular
+    residual distribution, addressing the autocorrelation/non-Gaussian-
+    residual concerns that make the parametric linregress-style p-value
+    (from _weighted_linregress) potentially anti-conservative.
+    """
+    n = len(speed)
+    if n < 3 or not np.isfinite(real_r):
+        return {'speed_shuffle_mean': float('nan'), 'speed_shuffle_p95': float('nan'),
+                'speed_shuffle_p': float('nan'), 'speed_shuffle_sig': None}
+
+    margin_frames = int(margin_s * pos_sample_rate_hz)
+    if n <= 2 * margin_frames:
+        # Recording too short for the standard margin; fall back to a quarter
+        # of the track so shuffles still avoid near-trivial (small) shifts.
+        margin_frames = max(1, n // 4)
+    if n <= margin_frames:
+        return {'speed_shuffle_mean': float('nan'), 'speed_shuffle_p95': float('nan'),
+                'speed_shuffle_p': float('nan'), 'speed_shuffle_sig': None}
+
+    null_r = np.full(n_shuffle, np.nan)
+    for i in range(n_shuffle):
+        shift        = random.randint(margin_frames, n - margin_frames)
+        fr_shifted   = np.roll(fr_smooth, shift)
+        in_range_shf = ((speed > min_speed_cms) & (speed < max_speed_cms) &
+                         np.isfinite(fr_shifted))
+        if in_range_shf.sum() < 3:
+            continue
+        _, mean_rate_shf, n_per_bin_shf = _bin_rate_by_speed(
+            speed[in_range_shf], fr_shifted[in_range_shf], speed_bins, min_bin_frac)
+        fit_sel_shf = np.isfinite(mean_rate_shf)
+        if fit_sel_shf.sum() < 3:
+            continue
+        centres_shf = 0.5 * (speed_bins[:-1] + speed_bins[1:])
+        wls_shf = _weighted_linregress(centres_shf[fit_sel_shf], mean_rate_shf[fit_sel_shf],
+                                        n_per_bin_shf[fit_sel_shf].astype(np.float64))
+        null_r[i] = wls_shf['r']
+
+    null_r = null_r[np.isfinite(null_r)]
+    if len(null_r) == 0:
+        return {'speed_shuffle_mean': float('nan'), 'speed_shuffle_p95': float('nan'),
+                'speed_shuffle_p': float('nan'), 'speed_shuffle_sig': None}
+
+    # Two-sided permutation p-value (add-one smoothing avoids p == 0).
+    p_shuffle = float((1 + np.sum(np.abs(null_r) >= np.abs(real_r))) / (1 + len(null_r)))
+
+    return {'speed_shuffle_mean': round(float(np.mean(null_r)), 4),
+            'speed_shuffle_p95':  round(float(np.percentile(np.abs(null_r), 95)), 4),
+            'speed_shuffle_p':    round(p_shuffle, 4),
+            'speed_shuffle_sig':  bool(p_shuffle < 0.05)}
+
+
 def _compute_speed_modulation(
     x_cm:               np.ndarray,
     y_cm:               np.ndarray,
@@ -289,6 +472,7 @@ def _compute_speed_modulation(
     speed_bin_cms:      float = SPEED_BIN_CMS,
     smooth_window_s:    float = SPEED_SMOOTH_S,
     min_bin_frac:       float = SPEED_MIN_BIN_FRAC,
+    n_shuffle:          int = SPEED_N_SHUFFLE,
     ntt_path:           str | None = None,
     label:              str = '',
 ) -> dict:
@@ -297,20 +481,30 @@ def _compute_speed_modulation(
       1. Per-frame running speed (cm/s) from consecutive positions, using the
          actual inter-frame interval rather than an assumed fixed rate.
       2. Instantaneous firing rate on the same frame base (spike count per
-         inter-frame interval / interval duration), Gaussian-smoothed.
+         inter-frame interval / interval duration). Both speed and rate are
+         then Gaussian-smoothed with the SAME kernel (symmetric smoothing --
+         smoothing only the rate biases the fit, see SPEED_SMOOTH_S comment).
       3. Restrict to samples with min_speed_cms < speed < max_speed_cms.
       4. Bin firing rate by speed (speed_bin_cms-wide bins), drop bins with
          < min_bin_frac of the samples, and fit rate = beta*speed + f0 to the
-         binned means (beta/f0 naming kept from the MATLAB source).
+         binned means via WEIGHTED least squares (weight = n_per_bin), plus a
+         circular-shift shuffle test and a Spearman/normality check (beta/f0
+         naming kept from the MATLAB source).
 
     x_cm, y_cm, t_us must be same-length position tracks (t_us in µs, sorted).
     spike_ts_us must be in the same time base (µs).
-    Returns speed_score (r), speed_p_value, speed_beta (slope),
-    speed_f0 (intercept), speed_modulated (p < 0.05).
+    Returns speed_score (weighted Pearson r), speed_p_value (parametric),
+    speed_beta (slope), speed_f0 (intercept), speed_modulated (p < 0.05),
+    speed_spearman_r/p, speed_normality_p, speed_residuals_normal,
+    speed_shuffle_mean/p95/p, speed_shuffle_sig.
     """
     result = {'speed_score': float('nan'), 'speed_p_value': float('nan'),
               'speed_beta': float('nan'), 'speed_f0': float('nan'),
-              'speed_modulated': None}
+              'speed_modulated': None,
+              'speed_spearman_r': float('nan'), 'speed_spearman_p': float('nan'),
+              'speed_normality_p': float('nan'), 'speed_residuals_normal': None,
+              'speed_shuffle_mean': float('nan'), 'speed_shuffle_p95': float('nan'),
+              'speed_shuffle_p': float('nan'), 'speed_shuffle_sig': None}
 
     n = len(t_us)
     if n < 3 or len(spike_ts_us) == 0:
@@ -364,24 +558,25 @@ def _compute_speed_modulation(
     fr_inst[dt_s <= 0] = np.nan
     fr_inst = np.append(fr_inst, fr_inst[-1])         # pad to length n, same convention as `speed`
 
-    # Gaussian smoothing of the instantaneous rate.
+    # ── Symmetric Gaussian smoothing of BOTH speed and firing rate ───────────
     # WINDOW SIZE: controlled by `smooth_window_s` (default SPEED_SMOOTH_S,
-    # currently 0.08 s = 80 ms). This is the *standard deviation* (sigma) of
-    # the Gaussian kernel, expressed in seconds, and is converted to samples
-    # via sigma_samples = smooth_window_s * pos_sample_rate_hz (the position
-    # tracking frame rate, e.g. 30 Hz -> sigma ≈ 2.4 samples ≈ 80 ms).
+    # 0.3 s -- within the 100-300 ms range used in hippocampal-formation
+    # speed-tuning studies, e.g. Kropff et al. 2015). This is the *standard
+    # deviation* (sigma) of the Gaussian kernel, expressed in seconds, and is
+    # converted to samples via sigma_samples = smooth_window_s *
+    # pos_sample_rate_hz (the position tracking frame rate, e.g. 30 Hz).
     # scipy's gaussian_filter1d truncates the kernel at 4*sigma by default, so
     # the *effective* smoothing window (full kernel support) spans roughly
-    # ±4*sigma_samples samples (~±320 ms at 30 Hz), not just ±sigma.
-    # NaNs (from bad dt) are temporarily zero-filled before filtering (so they
-    # don't propagate NaN through the whole kernel support) and then restored
-    # afterwards via the `finite` mask, so the output stays NaN exactly where
-    # the input was invalid.
-    finite = np.isfinite(fr_inst)
+    # ±4*sigma_samples samples.
+    #
+    # Both `speed` and `fr_inst` are smoothed with the IDENTICAL kernel. If
+    # only the rate were smoothed (as before), the rate trace would gain
+    # temporal autocorrelation and reduced residual scatter around the fit
+    # that the (unsmoothed) speed trace doesn't share -- an asymmetric bias
+    # that can artificially tighten the fit and inflate significance.
     sigma_samples = max(smooth_window_s * pos_sample_rate_hz, 1e-6)
-    fr_smooth = gaussian_filter1d(np.where(finite, fr_inst, 0.0),
-                                   sigma=sigma_samples, mode='nearest')
-    fr_smooth[~finite] = np.nan
+    speed_smooth  = _gaussian_smooth_track(speed,   sigma_samples)
+    fr_smooth     = _gaussian_smooth_track(fr_inst, sigma_samples)
 
     # ── Restrict to the usable speed range ─────────────────────────────────────
     # Very low speeds (near-stationary, e.g. grooming/resting) and very high
@@ -389,11 +584,12 @@ def _compute_speed_modulation(
     # dominated by outliers or immobility-related firing (e.g. sharp-wave
     # ripples during rest). Only frames with min_speed_cms < speed < max_speed_cms
     # AND a valid (non-NaN) smoothed rate are kept.
-    in_range = (speed > min_speed_cms) & (speed < max_speed_cms) & np.isfinite(fr_smooth)
+    in_range = ((speed_smooth > min_speed_cms) & (speed_smooth < max_speed_cms) &
+                np.isfinite(fr_smooth))
     if in_range.sum() < 3:
         return result
 
-    speed_valid = speed[in_range]
+    speed_valid = speed_smooth[in_range]
     rate_valid  = fr_smooth[in_range]
     if np.std(speed_valid) == 0 or np.std(rate_valid) == 0:
         return result
@@ -402,51 +598,69 @@ def _compute_speed_modulation(
     # Build speed_bin_cms-wide bin edges spanning [min_speed_cms, max_speed_cms]
     # (e.g. 2 cm/s wide bins from 2 to 90 cm/s), giving n_bins bins.
     speed_bins = np.arange(min_speed_cms, max_speed_cms + speed_bin_cms, speed_bin_cms)
-    n_bins     = len(speed_bins) - 1
-    # For every valid (speed, rate) sample, find which speed bin it falls in.
-    # np.digitize returns 1-indexed bin numbers; subtract 1 to make it
-    # 0-indexed, and clip to guard against samples exactly at/above the last
-    # edge (which digitize would otherwise put in an out-of-range bin).
-    bin_idx    = np.clip(np.digitize(speed_valid, speed_bins) - 1, 0, n_bins - 1)
+    bin_centres, mean_rate, n_per_bin = _bin_rate_by_speed(
+        speed_valid, rate_valid, speed_bins, min_bin_frac)
 
-    # bin_centres: the midpoint speed of each bin, used as the x-value in the
-    # final regression (rate vs. speed).
-    bin_centres = 0.5 * (speed_bins[:-1] + speed_bins[1:])
-    mean_rate   = np.full(n_bins, np.nan)
-    n_per_bin   = np.zeros(n_bins, dtype=int)
-    # For each speed bin, average the (already Gaussian-smoothed) firing rate
-    # of every sample that fell in it. This collapses the noisy per-frame
-    # rate/speed cloud into one representative rate per speed bin.
-    for b in range(n_bins):
-        sel = bin_idx == b
-        n_per_bin[b] = int(sel.sum())
-        if n_per_bin[b] > 0:
-            mean_rate[b] = float(np.mean(rate_valid[sel]))
-
-    total_pts = n_per_bin.sum()
-    if total_pts == 0:
+    if n_per_bin.sum() == 0:
         return result
-    # Bins that hold too few samples (fraction of total < min_bin_frac, e.g.
-    # 0.2%) are unreliable estimates of mean rate at that speed, so they're
-    # discarded (set to NaN) rather than allowed to bias the regression —
-    # this matters most at the high-speed tail, which is sparsely sampled.
-    mean_rate[(n_per_bin / total_pts) < min_bin_frac] = np.nan   # drop under-sampled bins
 
     fit_sel = np.isfinite(mean_rate)
     if fit_sel.sum() < 3:
         return result
 
-    # Linear regression of binned mean firing rate against bin-centre speed:
-    # rate = speed_beta * speed + speed_f0. reg.rvalue is the speed score
-    # (correlation coefficient r), reg.pvalue tests whether the slope is
-    # significantly different from zero (p < 0.05 => speed_modulated).
-    reg = linregress(bin_centres[fit_sel], mean_rate[fit_sel])
+    # ── Weighted regression of binned mean firing rate against bin-centre
+    # speed: rate = speed_beta * speed + speed_f0, weighted by n_per_bin so a
+    # bin averaged from a handful of samples doesn't count as much as one
+    # averaged from thousands (unweighted OLS on the raw bin means treats
+    # them as equally precise, which they aren't).
+    w   = n_per_bin[fit_sel].astype(np.float64)
+    wls = _weighted_linregress(bin_centres[fit_sel], mean_rate[fit_sel], w)
 
-    result['speed_score']     = round(float(reg.rvalue), 4)
-    result['speed_p_value']   = round(float(reg.pvalue), 4)
-    result['speed_beta']      = round(float(reg.slope), 4)
-    result['speed_f0']        = round(float(reg.intercept), 4)
-    result['speed_modulated'] = bool(reg.pvalue < 0.05)
+    result['speed_score']     = round(wls['r'], 4) if np.isfinite(wls['r']) else float('nan')
+    result['speed_p_value']   = round(wls['pvalue'], 4) if np.isfinite(wls['pvalue']) else float('nan')
+    result['speed_beta']      = round(wls['slope'], 4) if np.isfinite(wls['slope']) else float('nan')
+    result['speed_f0']        = round(wls['intercept'], 4) if np.isfinite(wls['intercept']) else float('nan')
+    result['speed_modulated'] = (bool(wls['pvalue'] < 0.05)
+                                  if np.isfinite(wls['pvalue']) else None)
+
+    # ── Normality check + Spearman rank correlation ──────────────────────────
+    # Shapiro-Wilk on the WLS residuals (n_bins is small, typically ~10-40,
+    # well within Shapiro's valid range and more powerful there than KS).
+    # Firing-rate data is Poisson-like (variance scales with the mean, more
+    # so at low spike counts) and often shows a saturating/non-monotonic
+    # rather than strictly linear relation to speed, so normality is not
+    # guaranteed even after binning. Spearman rank correlation makes no
+    # distributional assumption and captures monotonic (not just linear)
+    # relationships, so it's reported alongside Pearson/WLS on every cell
+    # rather than only substituted in when normality fails -- that decision
+    # is left to downstream analysis, guided by speed_residuals_normal.
+    resid = wls['resid']
+    if fit_sel.sum() >= 3 and np.all(np.isfinite(resid)) and np.std(resid) > 0:
+        try:
+            _, shapiro_p = shapiro(resid)
+            result['speed_normality_p']      = round(float(shapiro_p), 4)
+            result['speed_residuals_normal'] = bool(shapiro_p > 0.05)
+        except Exception:
+            pass
+
+    rho, p_spearman = spearmanr(bin_centres[fit_sel], mean_rate[fit_sel])
+    if np.isfinite(rho):
+        result['speed_spearman_r'] = round(float(rho), 4)
+        result['speed_spearman_p'] = round(float(p_spearman), 4)
+
+    # ── Circular time-shift shuffle test ──────────────────────────────────────
+    # Augments the parametric WLS p-value above with a shuffle-based null
+    # distribution (same logic as the SIR location-shuffle bootstrap):
+    # circularly roll the firing-rate trace relative to the (fixed) speed
+    # trace many times, refit, and see how often |shuffled r| >= |real r|.
+    shuf = _speed_modulation_shuffle(
+        speed_smooth, fr_smooth, wls['r'],
+        min_speed_cms, max_speed_cms, speed_bins, min_bin_frac,
+        pos_sample_rate_hz, n_shuffle=n_shuffle)
+    result['speed_shuffle_mean'] = shuf['speed_shuffle_mean']
+    result['speed_shuffle_p95']  = shuf['speed_shuffle_p95']
+    result['speed_shuffle_p']    = shuf['speed_shuffle_p']
+    result['speed_shuffle_sig']  = shuf['speed_shuffle_sig']
 
     # ── speed-vs-rate plot ───────────────────────────────────────────────────
     if ntt_path is not None:
@@ -460,15 +674,19 @@ def _compute_speed_modulation(
                    label='binned mean')
 
         fit_x = np.array([bin_centres[fit_sel].min(), bin_centres[fit_sel].max()])
-        fit_y = reg.slope * fit_x + reg.intercept
-        ax.plot(fit_x, fit_y, 'r-', label='fit')
+        fit_y = wls['slope'] * fit_x + wls['intercept']
+        ax.plot(fit_x, fit_y, 'r-', label='WLS fit')
 
-        stats_txt = (f"r = {reg.rvalue:.3f}\n"
-                     f"slope = {reg.slope:.3f}\n"
-                     f"intercept = {reg.intercept:.3f}\n"
-                     f"p = {reg.pvalue:.3g}")
+        stats_txt = (f"r (WLS) = {wls['r']:.3f}\n"
+                     f"slope = {wls['slope']:.3f}\n"
+                     f"intercept = {wls['intercept']:.3f}\n"
+                     f"p (parametric) = {wls['pvalue']:.3g}\n"
+                     f"p (shuffle) = {shuf['speed_shuffle_p']}\n"
+                     f"spearman rho = {result['speed_spearman_r']}, "
+                     f"p = {result['speed_spearman_p']}\n"
+                     f"resid. normal (p) = {result['speed_normality_p']}")
         ax.text(0.02, 0.98, stats_txt, transform=ax.transAxes,
-               va='top', ha='left', fontsize=9,
+               va='top', ha='left', fontsize=8,
                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
         ax.set_xlabel('speed (cm/s)')
@@ -814,6 +1032,10 @@ def _run_job(args):
         'theta_modulated': None, 'theta_peak_freq': None,
         'speed_score': None, 'speed_p_value': None,
         'speed_beta': None, 'speed_f0': None, 'speed_modulated': None,
+        'speed_spearman_r': None, 'speed_spearman_p': None,
+        'speed_normality_p': None, 'speed_residuals_normal': None,
+        'speed_shuffle_mean': None, 'speed_shuffle_p95': None,
+        'speed_shuffle_p': None, 'speed_shuffle_sig': None,
         'session': session_name, 'unit': ntt_file,
         'job_order': job_order, 'place_cell': None,
     }
@@ -867,25 +1089,35 @@ def _run_job(args):
                     ctx['x_cm'], ctx['y_cm'], ctx['t'], ctx['spike_ts'], fps,
                     ntt_path=ntt_path, label=label,
                 )
-                metrics['speed_score']     = speed_res['speed_score']
-                metrics['speed_p_value']   = speed_res['speed_p_value']
-                metrics['speed_beta']      = speed_res['speed_beta']
-                metrics['speed_f0']        = speed_res['speed_f0']
-                metrics['speed_modulated'] = speed_res['speed_modulated']
+                metrics['speed_score']            = speed_res['speed_score']
+                metrics['speed_p_value']          = speed_res['speed_p_value']
+                metrics['speed_beta']             = speed_res['speed_beta']
+                metrics['speed_f0']               = speed_res['speed_f0']
+                metrics['speed_modulated']        = speed_res['speed_modulated']
+                metrics['speed_spearman_r']       = speed_res['speed_spearman_r']
+                metrics['speed_spearman_p']       = speed_res['speed_spearman_p']
+                metrics['speed_normality_p']      = speed_res['speed_normality_p']
+                metrics['speed_residuals_normal'] = speed_res['speed_residuals_normal']
+                metrics['speed_shuffle_mean']     = speed_res['speed_shuffle_mean']
+                metrics['speed_shuffle_p95']      = speed_res['speed_shuffle_p95']
+                metrics['speed_shuffle_p']        = speed_res['speed_shuffle_p']
+                metrics['speed_shuffle_sig']      = speed_res['speed_shuffle_sig']
             except Exception as e:
                 with _print_lock:
                     print(f'  SPEED ERROR in {ntt_file} [{label}]: {e}')
-                metrics['speed_score']     = None
-                metrics['speed_p_value']   = None
-                metrics['speed_beta']      = None
-                metrics['speed_f0']        = None
-                metrics['speed_modulated'] = None
+                for key in ('speed_score', 'speed_p_value', 'speed_beta', 'speed_f0',
+                            'speed_modulated', 'speed_spearman_r', 'speed_spearman_p',
+                            'speed_normality_p', 'speed_residuals_normal',
+                            'speed_shuffle_mean', 'speed_shuffle_p95',
+                            'speed_shuffle_p', 'speed_shuffle_sig'):
+                    metrics[key] = None
         else:
-            metrics['speed_score']     = None
-            metrics['speed_p_value']   = None
-            metrics['speed_beta']      = None
-            metrics['speed_f0']        = None
-            metrics['speed_modulated'] = None
+            for key in ('speed_score', 'speed_p_value', 'speed_beta', 'speed_f0',
+                        'speed_modulated', 'speed_spearman_r', 'speed_spearman_p',
+                        'speed_normality_p', 'speed_residuals_normal',
+                        'speed_shuffle_mean', 'speed_shuffle_p95',
+                        'speed_shuffle_p', 'speed_shuffle_sig'):
+                metrics[key] = None
 
         metrics['session']   = session_name
         metrics['unit']      = ntt_file
@@ -973,11 +1205,32 @@ if __name__ == "__main__":
                     'bootstrap_mean', 'bootstrap_p95', 'bootstrap_sig',
                     'theta_modulated', 'theta_peak_freq',
                     'speed_score', 'speed_p_value', 'speed_beta', 'speed_f0', 'speed_modulated',
+                    'speed_spearman_r', 'speed_spearman_p',
+                    'speed_normality_p', 'speed_residuals_normal',
+                    'speed_shuffle_mean', 'speed_shuffle_p95',
+                    'speed_shuffle_p', 'speed_shuffle_sig',
+                    'speed_p_value_fdr', 'speed_modulated_fdr',
+                    'speed_shuffle_p_fdr', 'speed_shuffle_sig_fdr',
                     'place_cell']
 
     df_full   = pd.DataFrame([r[0] for r in results], columns=column_order)
     df_first  = pd.DataFrame([r[1] for r in results], columns=column_order)
     df_second = pd.DataFrame([r[2] for r in results], columns=column_order)
+
+    # ── FDR (Benjamini-Hochberg) correction across the batch ───────────────────
+    # A fixed alpha = 0.05 applied cell-by-cell means ~5% of non-modulated
+    # cells get flagged "significant" by chance alone. Since the downstream
+    # question is typically "what fraction of the population is speed-
+    # modulated," BH-correct across all units tested in each sheet (each
+    # half is its own independent batch of tests) -- for both the parametric
+    # WLS p-value and the shuffle p-value.
+    for df in (df_full, df_first, df_second):
+        df['speed_p_value_fdr']     = _benjamini_hochberg(df['speed_p_value'])
+        df['speed_modulated_fdr']   = (df['speed_p_value_fdr'] < 0.05).astype(object)
+        df.loc[df['speed_p_value_fdr'].isna(), 'speed_modulated_fdr'] = None
+        df['speed_shuffle_p_fdr']   = _benjamini_hochberg(df['speed_shuffle_p'])
+        df['speed_shuffle_sig_fdr'] = (df['speed_shuffle_p_fdr'] < 0.05).astype(object)
+        df.loc[df['speed_shuffle_p_fdr'].isna(), 'speed_shuffle_sig_fdr'] = None
 
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         df_full.to_excel(writer,   sheet_name='Full',        index=False)
@@ -987,6 +1240,9 @@ if __name__ == "__main__":
     print(f'\nDone. Results saved to {output_excel}')
     print(f'Total units processed : {len(df_full)}')
     print(f'Place cells found     : {df_full["place_cell"].sum()}')
+    print(f'Speed-modulated (parametric, uncorrected) : {df_full["speed_modulated"].sum()}')
+    print(f'Speed-modulated (parametric, FDR-corrected): {df_full["speed_modulated_fdr"].sum()}')
+    print(f'Speed-modulated (shuffle, FDR-corrected)   : {df_full["speed_shuffle_sig_fdr"].sum()}')
 
     # ── Copy .ntt + tracking files for confirmed place cells ───────────────────
     # Replicates the folder structure from the animal-ID folder onwards
