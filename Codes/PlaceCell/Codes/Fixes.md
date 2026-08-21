@@ -5,6 +5,8 @@
 
 - [ ] **Check the shuffling analysis. SOmetime it gets 102/102 cells, other time it gets 100/102 cells as true place cells.**
 
+- [ ] **Check the part when triangular kernel smoothing is applied. It sould be after peak and SIR estimation.**
+
 
 # Speed modulation algo:
 
@@ -119,15 +121,39 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 
 # Speed mod to-do:
 
-- [ ] **Check if speed modulated cells are also theta modulated**
+- [ ] ** Try plotting the speed in time domain for every trial. Also, plot the dt_s, and Euclidean dist in time domain ** *dt_s is constant '33.33 or 33.34 msec'.
+
+- [ ] **Try merging two bins. This means that speed will be smoothed 2x but the spike bins will be wider That might reduce the scatter. check the bin size used for instantaneous firing rate in other papers. Maybe 33.33 msec is too low.**
+
+- [ ] **Quantify the time shifts to check the range of offsets**
+
+- [ ] **Resolution in Mcnaughton 1983 is pretty low. Replicate their resolution and check for speed modulation.**  
+*The animals's position was continuously sampled by the computer at a rate of 10 Hz. The resolution in the position measure was estimated at about 0.5 cm. Since instantaneous velocity was calculated from the distanced moved between sampling points its resolution was therefore about 5 cm/sec.*
+
+- [ ] **Change n,n+1 to n,n-1. Pad i=1 speed.**
+
+- [ ] ** Gaussian smoothing of speed is missing ** * Is it pre smoothed in compute_metrics? * *There was no speed or position smoothing anywhere in the code. Added position smoothing. Does the speed need further smoothing?*
+
+<NOTE>:One thing worth flagging: since the plot uses the already-smoothed position (jump-removed + Gaussian-smoothed from your earlier request), the speed trace will look cleaner than raw tracking speed — let me know if you instead wanted the raw, pre-smoothing speed plotted for QC/comparison purposes.
+
+- [ ] ** Change upper limit to 80cm/s **
 
 - [ ] **Use median instead of mean after time domain to speed domain transformation.**
+
+- [ ] ** Switch to stats to Linear Mixed Model instead ** *Not required. Data from same cell in same session doesn't require mixed model.*
+
+- [ ] ** Cross check shuffling analysis. Distribution of random shuffles is not Gaussian. It's a weird convex distribuiton ** *This is due to the fact that r values take either +ve or -ve values in range -1 to 1. You will get two peak at roughly -0.5 and 0.5.
 
 - [ ] **Place cells are modulated by speed but aren't speed cells. Check difference between Adriano Tort (2018) and MEC speed cells analysis, Kropff (2015). (e.g., McNaughton et al., 1983; Wiener et al., 1989; Czurko´et al., 1999; Hirase et al., 1999; Ekstrom et al., 2001; Maurer et al., 2005) have analyzed modulation. Place cells don't change firing at micro seconds level. Only god knows how the two differ! **
 
 - [ ] ** Change speed bin len: default is 2cm/s **
 
-- [ ] **Change smooting factor**
+- [ ] ** Change smooting factor **
+
+- [ ] ** Two methods possible for speed analysis. 1. Kropff/Tort: Correlate in time domain. 2. Bin the data and correlate speed bins. each wll yield different results **
+*Currently my data not yielding any positive results (post shufling) for even the binning methods which should have had speed modulation.*
+
+- [ ] **Add smoothing before binning.**
 
 - [ ] ** Smooth the speed as much as the spikes **
 
@@ -138,3 +164,6 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 - [ ] ** Chech distribution for normality. If not normal, use spearman **
 
 - [ ] ** Correct for multiple comparisons **
+
+- [ ] ** Check if speed modulated cells are also theta modulated ** *They are not!*
+        **WHY TF ARE SPEED MOD CELLS NOT THETA MOD?**

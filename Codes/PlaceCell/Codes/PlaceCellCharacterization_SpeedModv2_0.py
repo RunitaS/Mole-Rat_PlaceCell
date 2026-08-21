@@ -116,12 +116,12 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa1059/Day9/2_270'
-output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/wut_dts_test.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/wut.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Test'
+Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
@@ -298,49 +298,39 @@ def _smooth_tracking_position(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean and smooth the x/y tracking position before any downstream use.
 
-    Iterative jump removal + Gaussian smoothing:
-      1. Frame-to-frame steps between surviving ("good") samples that imply
-         a speed above `jump_thresh_cms` are treated as tracking artifacts.
-         This is re-tested against the shrinking good-sample set until no
-         new artifacts are found, so runs of two or more consecutive bad
-         frames (e.g. a tracker glitch that lingers for a few frames) are
-         caught — not just single-frame jumps relative to the immediately
-         preceding raw sample.
-      2. Artifact frames are filled by linear interpolation (in time) between
-         the nearest surviving good samples, rather than held at the last
-         good position — holding would freeze position then "snap" back at
-         the far edge of a dropout, itself implying an extra artificial
-         speed spike right at the resumption point.
-      3. The cleaned x/y traces are Gaussian-smoothed (`imgaussfilt` equivalent
+    Ports the MATLAB reference (jump removal + imgaussfilt), applied to
+    position instead of a pre-computed speed trace:
+      1. Frame-to-frame position steps that imply a speed above
+         `jump_thresh_cms` are treated as tracking artifacts; the offending
+         sample is replaced with the last artifact-free position (vectorised
+         forward-fill, equivalent to the MATLAB loop's `ispeed(i) = ispeed(i-1)`
+         but applied sequentially to x/y instead of speed).
+      2. The cleaned x/y traces are Gaussian-smoothed (`imgaussfilt` equivalent
          via `gaussian_filter1d`), sigma expressed in samples.
     """
     n = len(x_cm)
     if n < 2:
         return x_cm.copy(), y_cm.copy()
 
-    bad = np.zeros(n, dtype=bool)
-    for _ in range(n):
-        good_idx = np.where(~bad)[0]
-        if len(good_idx) < 2:
-            break
-        dt_good = np.diff(t_us[good_idx]) * 1e-6
-        with np.errstate(invalid='ignore', divide='ignore'):
-            step_speed = np.hypot(np.diff(x_cm[good_idx]), np.diff(y_cm[good_idx])) / dt_good
-        step_speed[dt_good <= 0] = 0.0
+    dt_s = np.diff(t_us) * 1e-6
+    with np.errstate(invalid='ignore', divide='ignore'):
+        step_speed = np.hypot(np.diff(x_cm), np.diff(y_cm)) / dt_s
+    step_speed[dt_s <= 0] = 0.0
 
-        newly_bad = step_speed > jump_thresh_cms
-        if not newly_bad.any():
-            break
-        # Mark the later sample of each offending pair as bad and re-test
-        # against the remaining good set next round.
-        bad[good_idx[1:][newly_bad]] = True
+    bad = np.zeros(n, dtype=bool)
+    bad[1:] = step_speed > jump_thresh_cms
 
     good_idx = np.where(~bad)[0]
-    if len(good_idx) == 0 or len(good_idx) == n:
+    if len(good_idx) == 0:
         x_clean, y_clean = x_cm.copy(), y_cm.copy()
     else:
-        x_clean = np.interp(t_us, t_us[good_idx], x_cm[good_idx])
-        y_clean = np.interp(t_us, t_us[good_idx], y_cm[good_idx])
+        # For every sample, find the nearest preceding artifact-free sample
+        # and hold its position — vectorised equivalent of the sequential
+        # "replace with previous value" loop.
+        fill_pos = np.clip(np.searchsorted(good_idx, np.arange(n), side='right') - 1,
+                            0, len(good_idx) - 1)
+        x_clean = x_cm[good_idx[fill_pos]]
+        y_clean = y_cm[good_idx[fill_pos]]
 
     x_smooth = gaussian_filter1d(x_clean, sigma=sigma_samples, mode='nearest')
     y_smooth = gaussian_filter1d(y_clean, sigma=sigma_samples, mode='nearest')
@@ -870,50 +860,6 @@ def _plot_and_save_speed(csv_path: str, arena_width_cm: float) -> None:
     print(f'  [SAVED] {save_path}')
 
 
-DT_S_TOL_MS = 1.0  # flag a frame interval as anomalous if it differs from the expected 1000/fps by more than this (ms)
-
-
-def _plot_and_save_dt_s(csv_path: str, arena_width_cm: float, fps: float) -> None:
-    """Plot the tracking inter-frame interval (dt_s) in the time domain for one
-    tracking file and save it next to it, flagging intervals that deviate from
-    the expected 1000/fps spacing (e.g. 33.33 ms at 30 fps).
-    """
-    _, _, t = _load_tracking(csv_path, arena_width_cm)
-    if len(t) < 2:
-        print(f'  [SKIP] Not enough valid tracking samples to plot dt_s: {csv_path}')
-        return
-
-    dt_ms  = np.diff(t) * 1e-3        # us -> ms
-    time_s = (t[1:] - t[0]) * 1e-6    # time of each interval (end timestamp), relative to session start
-
-    expected_ms  = 1000.0 / fps
-    is_anomalous = np.abs(dt_ms - expected_ms) > DT_S_TOL_MS
-    n_anom       = int(is_anomalous.sum())
-
-    fig    = Figure()
-    canvas = FigureCanvasAgg(fig)
-    ax     = fig.add_subplot(111)
-    ax.plot(time_s, dt_ms, marker='.', markersize=2, linestyle='None', color='0.4', alpha=0.5, label='dt_s')
-    ax.axhline(expected_ms, color='green', linewidth=0.8, linestyle='--',
-               label=f'expected ({expected_ms:.2f} ms)')
-    if n_anom > 0:
-        ax.scatter(time_s[is_anomalous], dt_ms[is_anomalous], color='red', s=10, zorder=3,
-                   label=f'off by >{DT_S_TOL_MS:.1f} ms (n={n_anom})')
-    ax.set_xlabel('time (s)')
-    ax.set_ylabel('inter-frame interval dt_s (ms)')
-    ax.set_title(os.path.splitext(os.path.basename(csv_path))[0])
-    ax.legend(loc='upper right', fontsize=8)
-    fig.tight_layout()
-
-    csv_name  = os.path.splitext(os.path.basename(csv_path))[0]
-    save_path = os.path.join(os.path.dirname(csv_path), f'{csv_name}_dt_s.png')
-    fig.savefig(save_path, dpi=150)
-
-    pct = 100 * n_anom / len(dt_ms)
-    print(f'  [SAVED] {save_path}   ({n_anom}/{len(dt_ms)} intervals off by >{DT_S_TOL_MS:.1f} ms, '
-          f'{pct:.2f}%; range {dt_ms.min():.2f}-{dt_ms.max():.2f} ms)')
-
-
 # ── Core metric computation ───────────────────────────────────────────────────
 
 def compute_metrics(csv_path: str, ntt_path: str,
@@ -1234,16 +1180,12 @@ if __name__ == "__main__":
     print(f'Found {total_units} unit(s) across all sessions.\n')
 
     # ── Speed-vs-time plots (one per tracking file) ─────────────────────────────
-    print(f'Generating speed and dt_s plots for {len(dir_to_csv)} tracking file(s)...')
+    print(f'Generating speed plots for {len(dir_to_csv)} tracking file(s)...')
     for csv_path in dir_to_csv.values():
         try:
             _plot_and_save_speed(csv_path, arena_width_cm)
         except Exception as e:
             print(f'  SPEED PLOT ERROR for {csv_path}: {e}')
-        try:
-            _plot_and_save_dt_s(csv_path, arena_width_cm, fps)
-        except Exception as e:
-            print(f'  DT_S PLOT ERROR for {csv_path}: {e}')
     print()
 
     job_args = [
