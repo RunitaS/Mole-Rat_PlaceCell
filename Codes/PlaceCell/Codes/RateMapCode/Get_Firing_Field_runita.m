@@ -8,7 +8,7 @@ function [placefield,placefield2] = Get_Firing_Field_runita(meanfiringmap,map,Nu
 % 2- share.s at least a side with other bins which contain spikes
 % if num of field flag is set to 1 then it only finds the largest field
 if nargin < 3
-    Num_of_fields_flag =1;
+    Num_of_fields_flag =20;
 end
 grps1 = [];
 % first increase size of map to remove edge effects

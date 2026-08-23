@@ -7,6 +7,8 @@
 
 - [ ] **Check the part when triangular kernel smoothing is applied. It sould be after peak and SIR estimation.**
 
+- [ ] **Plot place fields in python code** *Compare trajectory maps with rate maps. Pierre's code had some discrepancies.*
+
 
 # Speed modulation algo:
 
@@ -119,18 +121,35 @@ Each valid (speed, smoothed-rate) sample is assigned to a bin via np.digitize, a
 Bins holding fewer than min_bin_frac (default 0.2%) of all samples are dropped as unreliable — mainly affects the sparsely-sampled high-speed tail.
 The surviving bin centres/means are fit with linregress to get speed_beta (slope), speed_f0 (intercept), speed_score (r), and speed_p_value.
 
-# Speed mod to-do:
+## Speed mod to-do:
+
+- [ ] For all shuffling analysis throughout the code, use the same shuffled spike trains instead of creating new shufflis everytime. Computationally more efficient this way.
+
+- [ ] Add stats singificance step for r2 value before both speed domain and time domain analysis. Use cell for further analysis only if significance criteria is fulfilled. 
+
+- [ ] combine the binning analysis and time domain analysis and save all images in the same folder labelled speedVsfiring.
+
+- [ ] **Instantaneous firing rates for my plots are too low. What is the difference between intrinsic and instantaneous firing rates? Is intrinsic firing rate calculated/sec?**
+*Use this paper as ref.:https://www.nature.com/articles/s41598-020-58194-1*
+
+- [ ] **Replicate the methods mentioned in https://www.nature.com/articles/s41598-020-58194-1 . What TF is p-speed and n-speed? They have characterized the correct parameters for this analysis.** *p-speed is +ve speed correlation and n-speed is negative speed correlation.*
+
+- [ ] **Look for methods to control the scatter and outliers in lin. reg.**
+
+- [ ] **Apply speed modulation only to isolated place fields.**
 
 - [ ] ** Try plotting the speed in time domain for every trial. Also, plot the dt_s, and Euclidean dist in time domain ** *dt_s is constant '33.33 or 33.34 msec'.
 
-- [ ] **Try merging two bins. This means that speed will be smoothed 2x but the spike bins will be wider That might reduce the scatter. check the bin size used for instantaneous firing rate in other papers. Maybe 33.33 msec is too low.**
+- [ ] ** Try merging two bins. This means that speed will be smoothed 2x but the spike bins will be wider That might reduce the scatter. check the bin size used for instantaneous firing rate in other papers. Maybe 33.33 msec is too low.**
+
+- [ ] ** Unequal samples per speed bin problem: That's about how the regression itself is fit, not about correcting many tests. Right now (_compute_speed_modulation, PlaceCellCharacterization_SpeedModv3.py:519) linregress is fit on bin_centres vs mean_rate — each surviving speed bin contributes one point, equally weighted, regardless of whether it was built from 5000 samples or 50 samples (only SPEED_MIN_BIN_FRAC filters out the very sparsest bins, it doesn't equalize the rest). A sparsely-sampled bin has a noisier mean but the same leverage in the fit as a densely-sampled bin — that's a bias/variance issue in the regression's weighting, unrelated to multiple comparisons. The fix for that is either: weighted least squares, weighting each bin by n_per_bin (or 1/variance), instead of scipy.stats.linregress, or**
 
 - [ ] **Quantify the time shifts to check the range of offsets**
 
-- [ ] **Resolution in Mcnaughton 1983 is pretty low. Replicate their resolution and check for speed modulation.**  
+- [ ] ** Resolution in Mcnaughton 1983 is pretty low. Replicate their resolution and check for speed modulation.**  
 *The animals's position was continuously sampled by the computer at a rate of 10 Hz. The resolution in the position measure was estimated at about 0.5 cm. Since instantaneous velocity was calculated from the distanced moved between sampling points its resolution was therefore about 5 cm/sec.*
 
-- [ ] **Change n,n+1 to n,n-1. Pad i=1 speed.**
+- [ ] **Change n,n+1 to n,n-1. Pad i=1 speed.** ***Retrospective speed coding and prostpecive speed coding is a thing!*** *n,n+1 will give retrospective speed, while n,n-1 will give prospective speed*
 
 - [ ] ** Gaussian smoothing of speed is missing ** * Is it pre smoothed in compute_metrics? * *There was no speed or position smoothing anywhere in the code. Added position smoothing. Does the speed need further smoothing?*
 
@@ -138,7 +157,7 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 
 - [ ] ** Change upper limit to 80cm/s **
 
-- [ ] **Use median instead of mean after time domain to speed domain transformation.**
+- [ ] ** Use median instead of mean after time domain to speed domain transformation.**
 
 - [ ] ** Switch to stats to Linear Mixed Model instead ** *Not required. Data from same cell in same session doesn't require mixed model.*
 
@@ -153,7 +172,7 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 - [ ] ** Two methods possible for speed analysis. 1. Kropff/Tort: Correlate in time domain. 2. Bin the data and correlate speed bins. each wll yield different results **
 *Currently my data not yielding any positive results (post shufling) for even the binning methods which should have had speed modulation.*
 
-- [ ] **Add smoothing before binning.**
+- [ ] ** Add smoothing before binning.**
 
 - [ ] ** Smooth the speed as much as the spikes **
 
