@@ -1,4 +1,6 @@
-# Population vector analysis
+# Mean RM analysis
+
+
 
 Use also from Fenton paper:
 

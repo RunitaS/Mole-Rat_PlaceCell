@@ -129,7 +129,7 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa1059/Day8/2_180'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
 output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/wut_SpeedShuf_pValDebug_Median.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
@@ -636,6 +636,21 @@ def _compute_speed_modulation(
     if np.std(speed_valid) == 0 or np.std(rate_valid) == 0:
         return result
 
+    # ── Combined 2×2 speed-analysis figure ──────────────────────────────────────
+    # top-left: binned speed-modulation scatter/fit; bottom-left: its shuffle
+    # histogram. top-right: time-domain speed-vs-rate correlation (time series);
+    # bottom-right: its shuffle histogram. All four panels for this cell are
+    # drawn into one figure and saved together, in a single 'speed modulation'
+    # folder, rather than as four separate plots split across two folders.
+    fig_combined = ax_bin = ax_bin_shuf = ax_td = ax_td_shuf = None
+    if ntt_path is not None:
+        fig_combined = Figure(figsize=(14, 10))
+        FigureCanvasAgg(fig_combined)
+        ax_bin      = fig_combined.add_subplot(2, 2, 1)
+        ax_bin_shuf = fig_combined.add_subplot(2, 2, 3)
+        ax_td       = fig_combined.add_subplot(2, 2, 2)
+        ax_td_shuf  = fig_combined.add_subplot(2, 2, 4)
+
     # ── Time-domain correlation (Iwase et al. 2020 "speed score") ──────────────
     # Direct Pearson correlation between the smoothed speed and smoothed firing
     # rate, sample-by-sample across time — no speed-binning step, unlike the
@@ -651,6 +666,23 @@ def _compute_speed_modulation(
     # It's still used below as a cheap initial screen: a fit that isn't even
     # nominally significant on its face doesn't get the expensive shuffle.
     result['speed_p_value_td'] = round(float(p_td), 4)
+
+    # ── top-right panel: time-domain speed-vs-rate correlation (time series) ───
+    # Drawn unconditionally, mirroring the binned scatter/fit panel below (also
+    # independent of significance), so this panel is present whether or not the
+    # shuffle ends up running. The title is refined further down with the
+    # shuffle-based label/p-value once (if) that shuffle completes.
+    if ax_td is not None:
+        time_s = (t_us - t_us[0]) * 1e-6
+        ax_td.plot(time_s, speed_smooth, color='tab:blue', linewidth=0.6)
+        ax_td.set_xlabel('time (s)')
+        ax_td.set_ylabel('speed (cm/s)', color='tab:blue')
+        ax_td.tick_params(axis='y', labelcolor='tab:blue')
+        ax_td_twin = ax_td.twinx()
+        ax_td_twin.plot(time_s, fr_smooth, color='tab:orange', linewidth=0.6)
+        ax_td_twin.set_ylabel('firing rate (Hz)', color='tab:orange')
+        ax_td_twin.tick_params(axis='y', labelcolor='tab:orange')
+        ax_td.set_title(f"time-domain: r = {r_td:.3f} (parametric p = {p_td:.3g})")
 
     # ── Bin firing rate by speed ────────────────────────────────────────────────
     # Build speed_bin_cms-wide bin edges spanning [min_speed_cms, max_speed_cms]
@@ -738,6 +770,9 @@ def _compute_speed_modulation(
     MARGIN_FRAMES = int(SPEED_SHUFFLE_MARGIN_S * pos_sample_rate_hz)
     real_score    = float(reg.rvalue)
 
+    binned_shuf_drawn = False   # whether the bottom-left panel got real histogram content
+    td_shuf_drawn     = False   # whether the bottom-right panel got real histogram content
+
     if n_intervals > 2 * MARGIN_FRAMES and (binned_significant or td_significant):
         # Record which method(s) actually cleared the initial screen and
         # therefore get their null distribution built below.
@@ -783,6 +818,7 @@ def _compute_speed_modulation(
                     reg_s = _weighted_linregress(bin_centres_fit, binned_rate_fit, n_per_bin_fit)
                     shuff_scores[i] = reg_s.rvalue
 
+        # ── bottom-left panel: binned-fit shuffle histogram ─────────────────────
         valid_shuff = shuff_scores[np.isfinite(shuff_scores)]
         summ = _shuffle_ci_and_pvalue(real_score, shuff_scores)
         if summ is not None:
@@ -794,40 +830,23 @@ def _compute_speed_modulation(
             result['speed_shuffle_p']         = round(shuffle_p, 4)
             result['speed_modulated_shuffle'] = summ.modulated
 
-            # ── shuffle histogram plot (mirrors the SIR bootstrap histogram) ────
-            if ntt_path is not None:
-                fig_s = Figure()
-                canvas_s = FigureCanvasAgg(fig_s)
-                ax_s = fig_s.add_subplot(111)
-
-                hist_result_s = ax_s.hist(valid_shuff, 100, color='black')
+            if ax_bin_shuf is not None:
+                hist_result_s = ax_bin_shuf.hist(valid_shuff, 100, color='black')
                 counts_s: np.ndarray = np.asarray(hist_result_s[0])
                 max_count_s = float(counts_s.max()) if counts_s.max() > 0 else 1.0
 
-                ax_s.plot([real_score, real_score], [0, max_count_s], 'r-.')
+                ax_bin_shuf.plot([real_score, real_score], [0, max_count_s], 'r-.')
                 # 2.5% / 97.5% shuffle CI bounds, marking the significance cutoff.
-                ax_s.axvline(shuffle_lo, color='0.5', linestyle=':', linewidth=0.8)
-                ax_s.axvline(shuffle_hi, color='0.5', linestyle=':', linewidth=0.8)
+                ax_bin_shuf.axvline(shuffle_lo, color='0.5', linestyle=':', linewidth=0.8)
+                ax_bin_shuf.axvline(shuffle_hi, color='0.5', linestyle=':', linewidth=0.8)
                 sh_av = f"Shuffle mean r = {shuffle_mean:.3f}"
                 sh_ci = f"95% CI = [{shuffle_lo:.3f}, {shuffle_hi:.3f}]"
                 sh_p  = (f"Cell r = {real_score:.3f} "
                          f"({'p < 0.05' if result['speed_modulated_shuffle'] else 'ns'})")
-                ax_s.set_title(sh_av + '\n' + sh_ci + '\n' + sh_p, multialignment='center')
-
-                ax_s.set_ylabel('count')
-                ax_s.set_xlabel('speed score (r)')
-                fig_s.tight_layout()
-
-                # Saved alongside the binned scatter/fit plot (same 'speed modulation'
-                # folder) rather than a separate shuffling-only folder, so the fit and
-                # its significance check for a given cell live in one place.
-                ntt_name_s   = os.path.splitext(os.path.basename(ntt_path))[0]
-                save_dir_s   = os.path.join(os.path.dirname(ntt_path), 'speed modulation')
-                os.makedirs(save_dir_s, exist_ok=True)
-                lbl_suffix_s = f'_{label}' if label else ''
-                save_path_s  = os.path.join(save_dir_s, f'{ntt_name_s}{lbl_suffix_s}_speed_shuffling.png')
-                fig_s.savefig(save_path_s, dpi=150)
-                print(f'  [SAVED] {save_path_s}')
+                ax_bin_shuf.set_title(sh_av + '\n' + sh_ci + '\n' + sh_p, multialignment='center')
+                ax_bin_shuf.set_ylabel('count')
+                ax_bin_shuf.set_xlabel('speed score (r)')
+                binned_shuf_drawn = True
 
         # ── Time-domain shuffle summary + p-Speed/n-Speed classification ───────
         # Uses the exact same _shuffle_ci_and_pvalue helper as the binned result
@@ -858,99 +877,74 @@ def _compute_speed_modulation(
             else:
                 _td_label, _td_color = 'non-speed', 'black'
 
-            # ── SpeedCell diagnostic plots (time domain) ────────────────────────
-            if ntt_path is not None:
-                ntt_name_td  = os.path.splitext(os.path.basename(ntt_path))[0]
-                save_dir_td  = os.path.join(os.path.dirname(ntt_path), 'SpeedCell')
-                os.makedirs(save_dir_td, exist_ok=True)
-                lbl_suffix_td = f'_{label}' if label else ''
+            # Refine the top-right panel's title now that the shuffle-based
+            # label/p-value are known (the panel itself was already drawn above).
+            if ax_td is not None:
+                ax_td.set_title(f"{_td_label}  (r = {r_td:.3f}, shuffle p = {shuffle_p_td:.3g})",
+                                 color=_td_color, fontweight='bold')
 
-                # 1) Smoothed speed & smoothed firing rate overlaid across time —
-                #    the direct visual counterpart of the time-domain correlation
-                #    (rather than the rate-vs-speed cloud used for the binned fit).
-                fig_ts = Figure()
-                canvas_ts = FigureCanvasAgg(fig_ts)
-                ax1 = fig_ts.add_subplot(111)
-                time_s = (t_us - t_us[0]) * 1e-6
-
-                ax1.plot(time_s, speed_smooth, color='tab:blue', linewidth=0.6)
-                ax1.set_xlabel('time (s)')
-                ax1.set_ylabel('speed (cm/s)', color='tab:blue')
-                ax1.tick_params(axis='y', labelcolor='tab:blue')
-
-                ax2 = ax1.twinx()
-                ax2.plot(time_s, fr_smooth, color='tab:orange', linewidth=0.6)
-                ax2.set_ylabel('firing rate (Hz)', color='tab:orange')
-                ax2.tick_params(axis='y', labelcolor='tab:orange')
-
-                ax1.set_title(f"{_td_label}  (r = {r_td:.3f}, shuffle p = {shuffle_p_td:.3g})",
-                              color=_td_color, fontweight='bold')
-                fig_ts.tight_layout()
-
-                save_path_ts = os.path.join(save_dir_td, f'{ntt_name_td}{lbl_suffix_td}_speed_timeseries.png')
-                fig_ts.savefig(save_path_ts, dpi=150)
-                print(f'  [SAVED] {save_path_ts}')
-
-                # 2) Null distribution of the time-domain score, real score marked
-                #    (mirrors the binned shuffle histogram above).
-                fig_td = Figure()
-                canvas_td = FigureCanvasAgg(fig_td)
-                ax_td = fig_td.add_subplot(111)
-
-                hist_result_td = ax_td.hist(valid_shuff_td, 100, color='black')
+            # ── bottom-right panel: time-domain shuffle histogram ───────────────
+            if ax_td_shuf is not None:
+                hist_result_td = ax_td_shuf.hist(valid_shuff_td, 100, color='black')
                 counts_td: np.ndarray = np.asarray(hist_result_td[0])
                 max_count_td = float(counts_td.max()) if counts_td.max() > 0 else 1.0
 
-                ax_td.plot([r_td, r_td], [0, max_count_td], color=_td_color, linestyle='-.', linewidth=1.5)
-                ax_td.axvline(shuffle_lo_td, color='0.5', linestyle=':', linewidth=0.8)
-                ax_td.axvline(shuffle_hi_td, color='0.5', linestyle=':', linewidth=0.8)
+                ax_td_shuf.plot([r_td, r_td], [0, max_count_td], color=_td_color, linestyle='-.', linewidth=1.5)
+                ax_td_shuf.axvline(shuffle_lo_td, color='0.5', linestyle=':', linewidth=0.8)
+                ax_td_shuf.axvline(shuffle_hi_td, color='0.5', linestyle=':', linewidth=0.8)
 
                 title_td = (f"{_td_label}\n"
                             f"Cell r = {r_td:.3f}  "
                             f"(shuffle 95% CI = [{shuffle_lo_td:.3f}, {shuffle_hi_td:.3f}], "
                             f"p = {shuffle_p_td:.3g})")
-                ax_td.set_title(title_td, color=_td_color, fontweight='bold', multialignment='center')
-                ax_td.set_ylabel('count')
-                ax_td.set_xlabel('time-domain speed score (r)')
-                fig_td.tight_layout()
+                ax_td_shuf.set_title(title_td, color=_td_color, fontweight='bold', multialignment='center')
+                ax_td_shuf.set_ylabel('count')
+                ax_td_shuf.set_xlabel('time-domain speed score (r)')
+                td_shuf_drawn = True
 
-                save_path_td = os.path.join(save_dir_td, f'{ntt_name_td}{lbl_suffix_td}_speed_timedomain_shuffle.png')
-                fig_td.savefig(save_path_td, dpi=150)
-                print(f'  [SAVED] {save_path_td}')
+    # Shuffle panels that never ran (initial screen not significant, or not
+    # enough frames for the margin) get a placeholder instead of staying blank.
+    if ax_bin_shuf is not None and not binned_shuf_drawn:
+        ax_bin_shuf.text(0.5, 0.5, 'binned-fit shuffle not run\n(initial fit not significant)',
+                          ha='center', va='center', transform=ax_bin_shuf.transAxes)
+        ax_bin_shuf.set_xticks([]); ax_bin_shuf.set_yticks([])
+    if ax_td_shuf is not None and not td_shuf_drawn:
+        ax_td_shuf.text(0.5, 0.5, 'time-domain shuffle not run\n(initial correlation not significant)',
+                         ha='center', va='center', transform=ax_td_shuf.transAxes)
+        ax_td_shuf.set_xticks([]); ax_td_shuf.set_yticks([])
 
-    # ── speed-vs-rate plot ───────────────────────────────────────────────────
-    if ntt_path is not None:
-        fig = Figure()
-        canvas = FigureCanvasAgg(fig)
-        ax = fig.add_subplot(111)
-
-        ax.scatter(speed_valid, rate_valid, s=3, color='0.75', alpha=0.4,
-                   label='raw samples')
-        ax.scatter(bin_centres[fit_sel], binned_rate[fit_sel], s=80, color='black',
-                   label='binned median')
+    # ── top-left panel: binned speed-modulation scatter/fit ─────────────────────
+    if ax_bin is not None:
+        ax_bin.scatter(speed_valid, rate_valid, s=3, color='0.75', alpha=0.4,
+                        label='raw samples')
+        ax_bin.scatter(bin_centres[fit_sel], binned_rate[fit_sel], s=80, color='black',
+                        label='binned median')
 
         fit_x = np.array([bin_centres[fit_sel].min(), bin_centres[fit_sel].max()])
         fit_y = reg.slope * fit_x + reg.intercept
-        ax.plot(fit_x, fit_y, 'r-', label='fit')
+        ax_bin.plot(fit_x, fit_y, 'r-', label='fit')
 
         stats_txt = (f"binned: r = {reg.rvalue:.3f}, slope = {reg.slope:.3f}, "
                      f"intercept = {reg.intercept:.3f}, p = {reg.pvalue:.3g}\n"
                      f"time-domain: r = {r_td:.3f}, p(shuffle) = {result['speed_shuffle_p_td']}")
-        ax.text(0.02, 0.98, stats_txt, transform=ax.transAxes,
-               va='top', ha='left', fontsize=9,
-               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        ax_bin.text(0.02, 0.98, stats_txt, transform=ax_bin.transAxes,
+                    va='top', ha='left', fontsize=9,
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-        ax.set_xlabel('speed (cm/s)')
-        ax.set_ylabel('firing rate (Hz)')
-        ax.legend(loc='lower right', fontsize=8)
-        fig.tight_layout()
+        ax_bin.set_xlabel('speed (cm/s)')
+        ax_bin.set_ylabel('firing rate (Hz)')
+        ax_bin.legend(loc='lower right', fontsize=8)
+
+    # ── save the combined 2×2 figure ─────────────────────────────────────────────
+    if fig_combined is not None:
+        fig_combined.tight_layout()
 
         ntt_name   = os.path.splitext(os.path.basename(ntt_path))[0]
         save_dir   = os.path.join(os.path.dirname(ntt_path), 'speed modulation')
         os.makedirs(save_dir, exist_ok=True)
         lbl_suffix = f'_{label}' if label else ''
         save_path  = os.path.join(save_dir, f'{ntt_name}{lbl_suffix}_speed_modulation.png')
-        fig.savefig(save_path, dpi=150)
+        fig_combined.savefig(save_path, dpi=150)
         print(f'  [SAVED] {save_path}')
 
     return result
