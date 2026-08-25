@@ -16,7 +16,7 @@ import matplotlib.ticker as ticker
 
 from fooof import FOOOF, FOOOFGroup
 from fooof.utils import interpolate_spectrum, trim_spectrum
-from fooof.analysis import get_band_peak
+from fooof.analysis import get_band_peak_fm, get_band_peak_fg
 from fooof.bands import Bands
 from fooof.plts.spectra import plot_spectra_shading
 

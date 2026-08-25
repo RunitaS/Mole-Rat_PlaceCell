@@ -36,6 +36,9 @@ Resample to a uniform grid in arc length (cc = linspace(0, arc.max(), N)), inter
 Now resampled is the field-index value as a function of distance traveled, evenly sampled — a proper spatial signal.
 
 ## Step 5 — Spatial bandpass filter: bandpass_filter + auto_filter_band
+
+To understand fourier transform and bandpass filtering spatial signal better, go through theory explained here: https://github.com/zeelbhatt/image-fourier-transform.github.io.git 
+
 The field-index trace along the path rises and falls once per traversal of the field ("pass"), roughly like a spatial oscillation whose period equals the field's spatial extent. To isolate that oscillation (and reject slow drift and fast noise from residual jitter):
 
 Butterworth bandpass filter (filtfilt, zero-phase) applied to resampled, in units of cycles per unit distance.
