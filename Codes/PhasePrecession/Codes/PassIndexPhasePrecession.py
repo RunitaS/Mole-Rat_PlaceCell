@@ -6,24 +6,28 @@ https://github.com/jrclimer/Pass_Index -- a local copy is in
 ./Pass_Index-master for reference). Linear-circular regression follows
 Kempter et al. (2012, J Neurosci Methods 207:113-124).
 
-Data layout expected per session folder (DATA_FOLDER):
+ROOT_FOLDER is searched recursively; every folder that directly contains at
+least one .ncs and at least one .ntt file is treated as a session and
+processed independently, with its own output written alongside it. Data
+layout expected per session folder:
     *.ncs   Neuralynx continuous (LFP) files. The first one (natural sort of
             filename) is used as the theta reference channel.
     *.ntt   Neuralynx tetrode spike files, one file per already-isolated unit
             (as produced by this repo's SUA_MUA_classification.py /
             concat_ntt.py pipeline). Every .ntt file in the folder is
             processed as one unit.
-    tracking file (.xlsx or .csv), auto-detected as the first spreadsheet
-            file in the folder unless TRACKING_FILE is set. Column order is
-            fixed: col 0 = timestamp, col 1 = x, col 2 = y (column names are
-            ignored).
+    tracking .csv file, auto-detected as the first .csv in the folder.
+            Column order is fixed: col A = timestamp, col B = x (pixels,
+            unused), col C = y (pixels, unused), col D = x (cm), col E = y
+            (cm) (column names are ignored). Columns D/E are used directly;
+            no pixel-to-cm conversion is performed.
 
 Assumption: tracking timestamps are on the same absolute clock as the
 Neuralynx acquisition system (typical when tracking is exported from the
 same recording system). Set TRACKING_TIME_UNIT below to match the units the
 timestamp column is actually stored in.
 
-Requires: numpy, scipy, pandas, matplotlib, openpyxl (for .xlsx tracking).
+Requires: numpy, scipy, pandas, matplotlib.
 """
 
 from __future__ import annotations
@@ -46,14 +50,11 @@ from scipy.special import erf
 # Configuration -- EDIT THESE
 # ============================================================================
 
-DATA_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa23BD/Day5/1Cntrl")
-TRACKING_FILE = None          # None = auto-detect first .xlsx/.csv in DATA_FOLDER
-OUTPUT_DIR = None             # None = DATA_FOLDER / "PhasePrecession_PassIndex"
+ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True")
 
 TRACKING_TIME_UNIT = 'us'     # 'us', 'ms', or 's' -- units of the tracking timestamp column
-PIXELS_PER_CM = None          # set to a number to convert tracking x/y from pixels to cm
 
-METHOD = 'grid'              # 'place' (recommended for place cells) or 'grid'
+METHOD = 'place'              # 'place' (recommended for place cells) or 'grid'
 BINSIDE = 'auto'              # spatial bin size (position units, e.g. cm). 'auto' = 4
 SMTH_WIDTH = 'auto'           # rate-map Gaussian smoothing width. 'auto' = 3 * BINSIDE
 FILTER_BAND = 'auto'          # (low, high) cycles/unit-distance for the spatial filter
@@ -129,9 +130,8 @@ def load_ncs(path: Path):
 def load_ntt_spike_times(path: Path):
     """Load a Neuralynx .ntt file. Returns dict {cell_number: spike_times_s}.
 
-    cell_number 0 is dropped when at least one non-zero cluster is present
-    (0 = unsorted/noise in MClust convention); otherwise all spikes (cell 0)
-    are kept as a single unit.
+    cell_number 0 (unsorted/noise in MClust convention) is always dropped;
+    only sorted, non-zero clusters are returned as units.
     """
     ntt_dtype = np.dtype([
         ('timestamp', '<u8'),
@@ -146,8 +146,7 @@ def load_ntt_spike_times(path: Path):
 
     units = {}
     unique_cells = np.unique(cell_numbers)
-    if len(unique_cells) > 1 and 0 in unique_cells:
-        unique_cells = unique_cells[unique_cells != 0]
+    unique_cells = unique_cells[unique_cells != 0]
     for cell in unique_cells:
         units[int(cell)] = np.sort(timestamps_s[cell_numbers == cell])
     return units
@@ -158,44 +157,37 @@ def load_ntt_spike_times(path: Path):
 # ============================================================================
 
 def _find_tracking_file(folder: Path) -> Path:
-    candidates = sorted(folder.glob('*.xlsx')) + sorted(folder.glob('*.csv'))
+    candidates = sorted(folder.glob('*.csv'))
     if not candidates:
-        raise FileNotFoundError(f'No .xlsx/.csv tracking file found in {folder}')
+        raise FileNotFoundError(f'No .csv tracking file found in {folder}')
     return candidates[0]
 
 
-def load_tracking(path: Path, time_unit: str = 'us', pixels_per_cm: float | None = None):
-    """Load tracking coordinates. Column order is fixed: timestamp, x, y.
+def load_tracking(path: Path, time_unit: str = 'us'):
+    """Load tracking coordinates already in cm.
 
-    Returns (pos_ts_s, pos_xy) sorted by ascending timestamp, with NaN and
+    Column order is fixed: col 0 = timestamp, col 1 = x (pixels, unused),
+    col 2 = y (pixels, unused), col 3 = x (cm), col 4 = y (cm).
+
+    Returns (pos_ts_s, pos_xy_cm) sorted by ascending timestamp, with NaN and
     duplicate-timestamp rows removed.
     """
-    if path.suffix.lower() == '.csv':
-        probe = pd.read_csv(path, header=None, nrows=1)
-    else:
-        probe = pd.read_excel(path, header=None, nrows=1)
+    probe = pd.read_csv(path, header=None, nrows=1)
 
     has_header = False
-    for val in probe.iloc[0, :3]:
+    for val in probe.iloc[0, :5]:
         try:
             float(val)
         except (TypeError, ValueError):
             has_header = True
             break
 
-    read_kwargs = {'header': 0 if has_header else None}
-    if path.suffix.lower() == '.csv':
-        df = pd.read_csv(path, **read_kwargs)
-    else:
-        df = pd.read_excel(path, **read_kwargs)
+    df = pd.read_csv(path, header=0 if has_header else None)
 
-    data = df.iloc[:, :3].to_numpy(dtype=np.float64)
+    data = df.iloc[:, [0, 3, 4]].to_numpy(dtype=np.float64)
     time_scale = {'us': 1e-6, 'ms': 1e-3, 's': 1.0}[time_unit]
     pos_ts = data[:, 0] * time_scale
     pos_xy = data[:, 1:3]
-
-    if pixels_per_cm:
-        pos_xy = pos_xy / pixels_per_cm
 
     valid = ~np.any(np.isnan(data), axis=1)
     pos_ts, pos_xy = pos_ts[valid], pos_xy[valid]
@@ -303,12 +295,26 @@ def _interp_nearest_extrap(x_ref, y_ref, x_query):
 
 
 def bandpass_filter(data, low, high, fs, order=3):
+    """Zero-phase Butterworth bandpass, always via second-order sections.
+
+    SOS form avoids the b/a transfer-function representation's numerical
+    instability (spurious pole at z=1) for narrow or near-DC bands. Wn is
+    clamped into the valid open interval (0, 1) relative to Nyquist so a
+    degenerate auto-selected band (e.g. from a very sparse/diffuse field
+    estimate) raises a clear error instead of a cryptic scipy exception.
+    """
     nyq = fs / 2.0
-    wn = [low / nyq, high / nyq]
-    b, a = signal.butter(order, wn, btype='band')
-    filtered = signal.filtfilt(b, a, data)
+    low_n = max(low / nyq, 1e-6)
+    high_n = min(high / nyq, 1 - 1e-6)
+    if low_n >= high_n:
+        raise ValueError(
+            f'invalid filter band after clamping to Nyquist: '
+            f'requested ({low:.4g}, {high:.4g}), fs={fs:.4g} -> '
+            f'normalized ({low_n:.4g}, {high_n:.4g})'
+        )
+    sos = signal.butter(order, [low_n, high_n], btype='band', output='sos')
+    filtered = signal.sosfiltfilt(sos, data)
     if np.any(np.isnan(filtered)):
-        sos = signal.butter(order, wn, btype='band', output='sos')
         filtered = signal.sosfilt(sos, data)
     return filtered
 
@@ -547,28 +553,29 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
 # Batch main
 # ============================================================================
 
-def main():
-    data_folder = DATA_FOLDER
-    output_dir = OUTPUT_DIR or (data_folder / 'PhasePrecession_PassIndex')
+def find_session_folders(root: Path) -> list[Path]:
+    """Recursively find folders directly containing both .ncs and .ntt files."""
+    ncs_parents = {p.parent for p in root.rglob('*.ncs')}
+    return sorted(folder for folder in ncs_parents if any(folder.glob('*.ntt')))
+
+
+def process_session(data_folder: Path):
+    output_dir = data_folder / 'PhasePrecession_PassIndex'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncs_files = sorted(data_folder.glob('*.ncs'), key=_natural_key)
-    if not ncs_files:
-        raise FileNotFoundError(f'No .ncs files found in {data_folder}')
     theta_ncs = ncs_files[0]
     print(f'Using LFP file: {theta_ncs.name}')
     lfp_sig, lfp_ts, lfp_fs = load_ncs(theta_ncs)
 
-    tracking_path = TRACKING_FILE or _find_tracking_file(data_folder)
-    print(f'Using tracking file: {Path(tracking_path).name}')
-    pos_ts, pos_xy = load_tracking(Path(tracking_path), TRACKING_TIME_UNIT, PIXELS_PER_CM)
+    tracking_path = _find_tracking_file(data_folder)
+    print(f'Using tracking file: {tracking_path.name}')
+    pos_ts, pos_xy = load_tracking(tracking_path, TRACKING_TIME_UNIT)
 
     t_start = max(pos_ts.min(), lfp_ts.min())
     t_stop = min(pos_ts.max(), lfp_ts.max())
 
     ntt_files = sorted(data_folder.glob('*.ntt'), key=_natural_key)
-    if not ntt_files:
-        raise FileNotFoundError(f'No .ntt files found in {data_folder}')
 
     summary_rows = []
     for ntt_path in ntt_files:
@@ -610,7 +617,21 @@ def main():
     df = pd.DataFrame(summary_rows)
     csv_path = output_dir / 'PassIndex_Summary.csv'
     df.to_csv(csv_path, index=False)
-    print(f'\nDone. {len(df)} unit(s) processed. Summary saved to {csv_path}')
+    print(f'Done. {len(df)} unit(s) processed. Summary saved to {csv_path}')
+
+
+def main():
+    session_folders = find_session_folders(ROOT_FOLDER)
+    if not session_folders:
+        raise FileNotFoundError(f'No folders with both .ncs and .ntt files found under {ROOT_FOLDER}')
+
+    for data_folder in session_folders:
+        print(f'\n=== Session: {data_folder} ===')
+        try:
+            process_session(data_folder)
+        except Exception as exc:
+            print(f'ERROR processing {data_folder}: {exc}')
+            continue
 
 
 if __name__ == '__main__':

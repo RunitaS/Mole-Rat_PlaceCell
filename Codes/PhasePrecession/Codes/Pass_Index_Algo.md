@@ -72,7 +72,7 @@ anglereg finds the best-fit slope s (cycles of theta phase per unit of pass inde
 First does a rough initial slope estimate by finding a phase offset φ that best linearizes the circular variable (minimizing squared residual of a normal linear fit after "unrolling" the phase — phi_cost).
 Then refines by directly maximizing the mean resultant vector length of θ − 2πs·x over candidate slopes s (this is the proper circular objective — it's insensitive to the arbitrary 2π wrapping ambiguity that a naive least-squares fit would fall prey to). Two starting points (slope0 and its reciprocal-negative) are tried via Nelder-Mead to avoid local minima, unless SLOPE_BNDS constrains the search to one bounded region.
 Final intercept b = circular mean of residuals.
-kempter_lincirc computes the circular-linear correlation coefficient ρ and its p-value:
+kempter_lincirc computes the circular-linear correlation coefficient ρ and its p-value: 
 Converts x (pass index) to a phase-like variable φ = s·x mod 2π using the fitted slope.
 Computes circular means φ̄, θ̄ of both variables.
 ρ = correlation between sin(θ−θ̄) and sin(φ−φ̄) (the circular analogue of Pearson's r), signed by the slope's direction.
@@ -95,6 +95,7 @@ density = spk_density / occ_density, Gaussian-smoothed — this is the 2D analog
 
 ## Step 11 — Output: plot_unit_summary
 Six-panel figure per unit: trajectory colored by pass index, rate map, field-index map, phase-vs-pass-index scatter with fitted regression line (doubled to 720° for visibility), the density heatmap, and a text summary (ρ, p, slope, precessing flag). main loops this over every .ntt file/unit in the session folder and writes a CSV summary.
+*Example plots from OG Climer paper: https://onlinelibrary.wiley.com/doi/10.1111/ejn.12256* 
 
 **why pass index instead of raw position: Ordinary phase precession analysis regresses theta phase against linear position within a single, well-defined 1D field crossing. That breaks down in 2D open fields with curved, variable-speed trajectories and multiple field passes at different entry angles. The pass index sidesteps this by deriving a local, field-shape-relative progress variable (via spatial filtering + Hilbert phase of the field-index trace) that behaves consistently across arbitrarily-shaped passes, then applies the same Kempter circular-linear regression machinery to test for phase-position coupling against that variable instead of raw x/y.**
 
