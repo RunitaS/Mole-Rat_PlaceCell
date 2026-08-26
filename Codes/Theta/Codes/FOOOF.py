@@ -178,7 +178,7 @@ def notch_filter(x, fs_hz, freqs, Q=30.0):
 def detrend_signal(x, dtype='linear'):
     """Remove a polynomial trend (default: linear) from the full LFP trace,
     to clear slow drift that a notch filter alone doesn't address."""
-    return signal.detrend(np.asarray(x, dtype=np.float64), type=dtype)
+    return signal.detrend(np.asarray(x, dtype=np.float64), type=dtype) # type: ignore # type: ignore
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -235,7 +235,7 @@ def compute_psd_clean_epochs(lfp, fs_hz, nperseg, mad_thresh=5.0,
     psd_stack = None
     f = None
     for i in range(n_total):
-        f, Pi = signal.welch(epochs[i], fs=fs_hz, window=win,
+        f, Pi = signal.welch(epochs[i], fs=fs_hz, window=win, # type: ignore
                              nperseg=nperseg, noverlap=0, detrend='constant')
         if psd_stack is None:
             psd_stack = np.empty((n_total, Pi.size))
@@ -272,7 +272,7 @@ def compute_psd_clean_epochs(lfp, fs_hz, nperseg, mad_thresh=5.0,
             keep = np.ones(n_total, dtype=bool)
             n_clean = n_total
 
-    Pxx = psd_stack[keep].mean(axis=0)
+    Pxx = psd_stack[keep].mean(axis=0) # type: ignore
     return f, Pxx, n_clean, n_total
 
 
@@ -334,7 +334,7 @@ def compute_velocity_from_position(csv_path):
         speed_smooth = speed_raw.copy()
     else:
         speed_smooth = savgol_filter(speed_raw, window, SPEED_SMOOTH_POLY)
-    speed_smooth = np.clip(speed_smooth, 0, None)
+    speed_smooth = np.clip(speed_smooth, 0, None) # type: ignore
 
     return time_us, speed_smooth
 
@@ -432,8 +432,8 @@ def process_animal(label, folder):
             if freq_vec is None:
                 freq_vec = f
 
-            df        = f[1] - f[0]
-            valid_idx = (f >= NORM_BAND[0]) & (f <= NORM_BAND[1])
+            df        = f[1] - f[0] # type: ignore
+            valid_idx = (f >= NORM_BAND[0]) & (f <= NORM_BAND[1]) # type: ignore
             total_power = np.sum(Pxx[valid_idx]) * df
             Pxx_norm    = Pxx / total_power
 
@@ -514,7 +514,7 @@ def build_fooof_results(results, fooof_settings=None, fooof_range=None,
         fg.fit(freqs, psds_norm, fooof_range)
 
         if save_fits:
-            animal_dir = os.path.join(save_dir, animal)
+            animal_dir = os.path.join(save_dir, animal) # type: ignore
             os.makedirs(animal_dir, exist_ok=True)
 
         for i in range(psds_norm.shape[0]):
@@ -534,7 +534,7 @@ def build_fooof_results(results, fooof_settings=None, fooof_range=None,
 
             if save_fits:
                 fig, ax = plt.subplots(figsize=(5, 3))
-                _style_fooof_fit_ax(ax, fm, xlim=fit_xlim,
+                _style_fooof_fit_ax(ax, fm, xlim=fit_xlim, # type: ignore
                                     title=f"{animal}: {os.path.basename(file_names[i])}")
                 stem = re.sub(r'[\\/]+', '_', os.path.splitext(file_names[i])[0])
                 fig.savefig(os.path.join(animal_dir, f'{stem}_fooof_fit.png'),

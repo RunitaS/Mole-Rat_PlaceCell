@@ -2,6 +2,46 @@
 
 - How does it check for continuity?
 
+## ED_min calculation
+
+**How ED_min is computed**
+ED_min is produced inside quantify_xcorr_epochs, for each epoch, in three stages:
+
+1. Build a reference bank of "pure oscillation" autocorrelograms (create_sine_ref_xcorrs)
+For each candidate frequency f in the reference range (ACG_FREQ_RANGE, stepped by ACG_FREQ_RES), a pure sine wave is synthesized and self-correlated:
+
+
+refsig = np.sin(2*np.pi*freq*reft)
+refxc  = correlate(refsig, refsig, 'full') / max(...)   # peak-normalised to 1 at zero-lag
+Each reference column refXC[:, n] is a normalized autocorrelogram — 1 at zero lag, oscillating between roughly −1 and 1 elsewhere, depending on frequency. refED[n] = ||refXC[:, n]||₂ is the Euclidean (L2) norm of that reference vector across all lags (L431).
+
+2. Compute the data epoch's own normalized autocorrelogram (L493-L494)
+
+
+xc = correlate(dataepoch, dataepoch, 'full') / max(...)   # also peak-normalised to 1 at zero-lag
+3. Compare the data's ACG shape against every reference, keep the best match (L498-L505)
+
+
+sq_diff = (refXC - xc[:, None])**2
+ED      = sqrt(nansum(sq_diff, axis=0))   # Euclidean distance to each reference, lag-by-lag
+normED  = ED / refED                       # normalised by that reference's own norm
+mi      = argmin(normED)
+ED_min[n]  = normED[mi]                    # distance to the *closest*-matching reference
+freq_est[n] = ref_freqs[mi]                 # the frequency of that best-matching reference
+So ED_min is the normalized Euclidean distance between the epoch's actual autocorrelogram shape and the single best-fitting pure-sinusoid autocorrelogram from the reference bank, at whatever frequency minimizes that distance. 0 = the data's ACG is (nearly) identical to some pure sinusoid's ACG — clean, strongly rhythmic activity. Larger values mean the epoch's ACG shape doesn't resemble a pure oscillation at any tested frequency.
+
+What's the maximum value it can take?
+There's no fixed, built-in ceiling (like the [−1, 1] bound of a correlation coefficient). It's a ratio of Euclidean distance to the reference's own norm, so its scale is geometry-dependent, not a normalized similarity score. That's exactly why L114-L116 says "There's no universal cutoff — inspect the ED_min column's distribution in your own data... before picking a value."
+
+That said, you can reason about the practical range:
+
+Both xc and each refXC column are pinned to 1 at zero lag (autocorrelation always peaks there) and otherwise bounded in roughly [-1, 1].
+If the data has essentially no oscillatory structure (e.g., noise-like, delta-shaped ACG), ED_min tends toward a value just under 1 (worked out from the math: sqrt(1 - 1/refED²), which → 1 as the reference gets long/oscillatory).
+If the data's ACG is actively out-of-phase / dissimilar in shape from every candidate reference (e.g., an oscillation frequency well outside the reference bank, or a noisy/irregular ACG that anti-correlates with the sinusoid shape over much of the lag range), the distance can exceed 1. A rough geometric estimate (treating a sinusoid's mean-square power as ~0.5) puts the plausible practical ceiling around ~2, though this isn't a hard proven bound — it depends on epoch length, the reference frequency range, and NaN padding.
+Your observed range of 0.0–1.6 is consistent with this — it's within the plausible envelope and not a sign of a bug. There isn't a clean textbook maximum (no "max is 1" or "max is 2" guarantee) — the code's own guidance is correct: plot results_df['ED_min'].hist() on your data and pick ACG_ED_MIN_THRESH based on where the distribution separates "good sinusoidal fits" from "poor fits," rather than assuming a universal cutoff.
+
+
+# Soraya Dunn MATLAB code:
 
 function [XC, xcTbl] = quantify_xcorr_epochs(data_epochs,freq_range,freq_resolution)
 try

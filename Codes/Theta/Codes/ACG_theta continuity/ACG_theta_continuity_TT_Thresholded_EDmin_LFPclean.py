@@ -53,7 +53,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ROOT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_v2_imob1cms')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_v2_EDminThresh')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 
 # ---- Acquisition ----
@@ -75,6 +75,13 @@ NOTCH_Q        = 30.0
 
 # ---- Artifact rejection (epoch-wise peak-to-peak, robust MAD outlier) ----
 MAD_THRESH = 5.0
+
+# ---- Delta/theta epoch filter (epoch-wise Welch PSD band-power comparison) ----
+# An epoch is rejected if its delta-band power exceeds its theta-band power --
+# noisy epochs are often dominated by low-frequency artifact that would
+# otherwise pass through amplitude-based (MAD) rejection as slow theta.
+DELTA_BAND = (1.0, 3.0)  # Hz
+THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 
 # ---- Velocity / running-speed epoch gating ----
 # Every .ncs file's session folder is expected to hold one tracking .csv with
@@ -114,7 +121,7 @@ ACG_PEAK_PROMINENCE = 0.05      # matches findMinMax(refxc, 0.05, 'fixed') in th
 # filtering. There's no universal cutoff -- inspect the ED_min column's
 # distribution in your own data (e.g. results_df['ED_min'].hist()) before
 # picking a value.
-ACG_ED_MIN_THRESH = None
+ACG_ED_MIN_THRESH = 1.0
 
 # Movement classification -- single-threshold binary split: epoch median
 # speed above SPEED_THRESH_CMS -> 'moving', at/below it -> 'immobile'.
@@ -457,9 +464,12 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
     XC     : (2*winlength-1, nepochs) normalised data autocorrelograms
     result : DataFrame, one row per epoch, columns:
              ED_min, freq, peak1, peak1_idx, trough1, trough1_idx,
-             trough2, trough2_idx, peakrange, peakrangenorm, skipped
+             trough2, trough2_idx, peakrange, peakrangenorm, skipped,
+             skipped_edmin
              ('skipped' covers both too-short epochs and, if `ed_min_thresh`
-             is set, epochs with a poor sinusoid fit)
+             is set, epochs with a poor sinusoid fit; 'skipped_edmin' flags
+             only the latter, so the ED_min-specific rejection rate can be
+             reported separately from too-short-epoch skips)
     """
     data_epochs = np.asarray(data_epochs, dtype=np.float64)
     winlength, nepochs = data_epochs.shape
@@ -481,6 +491,7 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
     peakrange = np.full(nepochs, np.nan)
     peakrangenorm = np.full(nepochs, np.nan)
     skipped = np.zeros(nepochs, dtype=bool)
+    skipped_edmin = np.zeros(nepochs, dtype=bool)
 
     for n in range(nepochs):
         col = data_epochs[:, n]
@@ -507,6 +518,7 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
 
         if ed_min_thresh is not None and ED_min[n] > ed_min_thresh:
             skipped[n] = True
+            skipped_edmin[n] = True
 
         p1_lo, p1_hi = refP1range[:, mi]
         seg = xc_full[p1_lo:p1_hi + 1]
@@ -543,6 +555,7 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
         'peakrange': peakrange,
         'peakrangenorm': peakrangenorm,
         'skipped': skipped,
+        'skipped_edmin': skipped_edmin,
     })
     return XC, result
 
@@ -558,11 +571,37 @@ def build_epochs(lfp, nperseg):
     return epochs, n_total
 
 
-def reject_artifact_epochs(epochs, mad_thresh=MAD_THRESH):
+def reject_deltatheta_epochs(epochs, fs_hz, low_band=DELTA_BAND, theta_band=THETA_BAND):
+    """Boolean keep-mask: per-epoch Welch PSD is used to reject epochs whose
+    delta-band (`low_band`) power exceeds their theta-band (`theta_band`)
+    power. Meant to run BEFORE reject_artifact_epochs -- see
+    process_ncs_for_acg, which passes this mask on to reject_artifact_epochs
+    as `ref_mask` so the MAD reference statistics aren't skewed by epochs
+    already excluded here."""
+    n_total, nperseg = epochs.shape
+    win = signal.get_window('hann', nperseg)
+    keep = np.ones(n_total, dtype=bool)
+    for i in range(n_total):
+        f, Pxx = signal.welch(epochs[i], fs=fs_hz, window=win, # type: ignore
+                              nperseg=nperseg, noverlap=0, detrend='constant')
+        df = f[1] - f[0]
+        idx_low   = (f >= low_band[0])   & (f <= low_band[1])
+        idx_theta = (f >= theta_band[0]) & (f <= theta_band[1])
+        low_pow   = np.sum(Pxx[idx_low]) * df
+        theta_pow = np.sum(Pxx[idx_theta]) * df
+        keep[i] = low_pow <= theta_pow
+    return keep
+
+
+def reject_artifact_epochs(epochs, mad_thresh=MAD_THRESH, ref_mask=None):
     """Boolean keep-mask: epoch-wise peak-to-peak amplitude, robust (MAD)
-    outlier rejection."""
+    outlier rejection. If `ref_mask` is given (e.g. the mask returned by
+    reject_deltatheta_epochs), the median/MAD reference statistics are
+    computed only from epochs[ref_mask], so epochs already excluded upstream
+    can't skew the robust threshold -- z-scores are still returned for every
+    epoch."""
     p2p = epochs.max(axis=1) - epochs.min(axis=1)
-    return ~_robust_high_outliers(p2p, mad_thresh)
+    return ~_robust_high_outliers(p2p, mad_thresh, ref_mask=ref_mask)
 
 
 def classify_epoch_movement(time_us, speed, n_total, nperseg, fs_hz, lfp_start_us,
@@ -620,7 +659,9 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
 
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
-    keep_artifact = reject_artifact_epochs(epochs)
+    keep_deltatheta = reject_deltatheta_epochs(epochs, fs_acg)
+    keep_artifact = keep_deltatheta & reject_artifact_epochs(
+        epochs, ref_mask=keep_deltatheta)
 
     pos_path = find_position_file(fpath)
     if pos_path is None:
@@ -683,8 +724,12 @@ def process_root_directory(root_dir):
                 res[k] = v
             n_moving = int((res['movement'] == 'moving').sum())
             n_immobile = int((res['movement'] == 'immobile').sum())
+            n_edmin_rejected = int(res['skipped_edmin'].sum())
+            pct_edmin_rejected = 100 * n_edmin_rejected / len(res) if len(res) else 0.0
             print(f'  OK: {rel}  [{len(res)} epochs kept: '
-                  f'{n_moving} moving, {n_immobile} immobile]')
+                  f'{n_moving} moving, {n_immobile} immobile; '
+                  f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected} '
+                  f'({pct_edmin_rejected:.1f}%)]')
             all_results.append(res)
         except Exception as e:
             print(f'  SKIP: {rel} -- {e}')
@@ -817,7 +862,7 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  mode='both', speed_vmax=50.0, moving_cmap='viridis',
                                  moving_alpha=0.5, immobile_color='black',
                                  immobile_edgecolor='#FFB3BA', immobile_edgewidth=0.8,
-                                 n_bins=25, log_counts=True):
+                                 n_bins=25, log_counts=True, show_edmin_annotation=True):
     """Shared drawing routine for the Fig. 4e/h-style scatter: frequency vs.
     normalised autocorrelogram peak range. Immobile epochs (speed doesn't
     meaningfully vary) are drawn solid jet-black with a pastel-red outline;
@@ -825,7 +870,11 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     speed) at `moving_alpha` opacity, layered on top -- this two-tone scheme
     keeps the two heavily-overlapping point clouds visually distinguishable.
     Marginal count histograms follow the same colouring, and moving/immobile
-    centroids are marked as green diamonds.
+    centroids are marked as green diamonds. An annotation in `ax_main`
+    reports the percentage of epochs (within `animal`'s scope, if given)
+    excluded by the ED_min fit-quality threshold (ACG_ED_MIN_THRESH) -- these
+    never reach the scatter/centroids since they're filtered out via
+    'skipped'.
 
     `mode` selects which group(s) are drawn: 'both' (default), 'moving', or
     'immobile'. Axes/bins are always scaled to the full (both-group)
@@ -834,6 +883,10 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     plot_freq_peakrange_summary(), plot_figure4_style(), and
     plot_freq_peakrange_by_movement().
     """
+    scope = df if animal is None else df[df['animal'] == animal]
+    n_edmin_rejected = int(scope['skipped_edmin'].sum())
+    pct_edmin_rejected = 100 * n_edmin_rejected / len(scope) if len(scope) else 0.0
+
     sub = df[~df['skipped']].copy()
     if animal is not None:
         sub = sub[sub['animal'] == animal]
@@ -870,6 +923,12 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     ax_main.set_ylabel('Autocorr. peak range')
     ax_main.set_ylim(0, 1)
     ax_main.legend(loc='upper left', frameon=False, fontsize=7)
+    if show_edmin_annotation:
+        ax_main.text(0.98, 0.02,
+                     f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
+                     f'rejected ({n_edmin_rejected}/{len(scope)})',
+                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
+                     color='0.3')
 
     cmap_obj = plt.get_cmap(moving_cmap)
 
@@ -960,10 +1019,17 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     compared for overlap in the merged panel. Immobile epochs are drawn with
     a pastel-red outline in every panel.
 
+    A footer below the panels reports the ED_min fit-quality rejection rate
+    (within `animal`'s scope, if given): the overall percentage of epochs
+    excluded by ACG_ED_MIN_THRESH, how that rejected set splits between
+    immobility and mobility epochs, and -- correcting for imbalanced
+    moving/immobile epoch counts -- the percentage of immobility epochs
+    (resp. mobility epochs) that were themselves above the ED_min threshold.
+
     Returns (fig, centroids_df) -- centroids_df is from the merged panel.
     """
     fig = plt.figure(figsize=figsize)
-    outer = fig.add_gridspec(1, 3, wspace=0.6)
+    outer = fig.add_gridspec(1, 3, wspace=0.6, bottom=0.22, top=0.88)
 
     centroids = None
     for col, (mode, title) in enumerate((('moving', 'Mobility'),
@@ -978,7 +1044,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
         sc, c = _draw_freq_peakrange_scatter(
             df, ax_main, ax_top, ax_right, animal=animal, mode=mode,
             speed_vmax=speed_vmax, moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-            immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor)
+            immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor,
+            show_edmin_annotation=False)
         ax_top.set_title(title)
         if sc is not None:
             cbar = fig.colorbar(sc, ax=ax_right, fraction=0.25, pad=0.45)
@@ -988,6 +1055,36 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
 
     if animal:
         fig.suptitle(animal)
+
+    scope = df if animal is None else df[df['animal'] == animal]
+    n_edmin_rejected = int(scope['skipped_edmin'].sum())
+    pct_edmin_rejected = 100 * n_edmin_rejected / len(scope) if len(scope) else 0.0
+    edmin_rej = scope[scope['skipped_edmin']]
+    n_edmin_immobile = int((edmin_rej['movement'] == 'immobile').sum())
+    n_edmin_moving = int((edmin_rej['movement'] == 'moving').sum())
+    pct_edmin_immobile = 100 * n_edmin_immobile / n_edmin_rejected if n_edmin_rejected else 0.0
+    pct_edmin_moving = 100 * n_edmin_moving / n_edmin_rejected if n_edmin_rejected else 0.0
+
+    # Same rejected counts, but normalised within each movement state's own
+    # total (not the pooled rejected-epoch total above) -- e.g. 1/100
+    # immobility epochs above ED_min threshold -> 1%, independent of how many
+    # moving epochs there are. This corrects for imbalanced moving/immobile
+    # epoch counts (e.g. an animal that was active for most of the session).
+    n_immobile_total = int((scope['movement'] == 'immobile').sum())
+    n_moving_total = int((scope['movement'] == 'moving').sum())
+    pct_immobile_edmin_of_immobile = 100 * n_edmin_immobile / n_immobile_total if n_immobile_total else 0.0
+    pct_moving_edmin_of_moving = 100 * n_edmin_moving / n_moving_total if n_moving_total else 0.0
+
+    fig.text(0.5, 0.02,
+             f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected}/{len(scope)} '
+             f'epochs overall ({pct_edmin_rejected:.1f}%)\n'
+             f'ED_min rejected epochs in immobility ({pct_edmin_immobile:.1f}%) | '
+             f'ED_min rejected epochs in mobility ({pct_edmin_moving:.1f}%)\n'
+             f'% of total immobility epochs with ED_min > {ACG_ED_MIN_THRESH}: '
+             f'{pct_immobile_edmin_of_immobile:.1f}% ({n_edmin_immobile}/{n_immobile_total}) | '
+             f'% of total mobility epochs with ED_min > {ACG_ED_MIN_THRESH}: '
+             f'{pct_moving_edmin_of_moving:.1f}% ({n_edmin_moving}/{n_moving_total})',
+             ha='center', va='bottom', fontsize=8, color='0.2')
 
     return fig, centroids
 
@@ -1057,6 +1154,11 @@ if __name__ == '__main__':
     os.makedirs(FIGURE_DIR, exist_ok=True)
 
     results_df = process_root_directory(ROOT_DIR)
+
+    n_edmin_rejected = int(results_df['skipped_edmin'].sum())
+    pct_edmin_rejected = 100 * n_edmin_rejected / len(results_df) if len(results_df) else 0.0
+    print(f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected}/{len(results_df)} '
+          f'epochs overall ({pct_edmin_rejected:.1f}%)')
 
     results_path = os.path.join(OUTPUT_DIR, 'acg_theta_continuity_epochs.csv')
     results_df.to_csv(results_path, index=False)

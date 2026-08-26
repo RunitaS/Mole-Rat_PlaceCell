@@ -24,7 +24,7 @@ InstFirRate(numel(ts)+1:end) = [];
 
 minspeed = 4; %(cm/s)
 maxspeed = 50;
-speedBinLengthCm = [2];
+speedBinLengthCm = [4];
 speedBins = [minspeed:speedBinLengthCm:maxspeed+speedBinLengthCm];
 fit2bins = [1,numel(find(speedBins<maxspeed+speedBinLengthCm))];
 ToCompare = find(InstSpeed>minspeed & InstSpeed<maxspeed);
