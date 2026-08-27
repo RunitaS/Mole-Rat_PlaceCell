@@ -14,7 +14,7 @@
 
 - [ ] **Check values of hilbert transformed phases of pass index to verify skewed blobby/multip peak fields**
 
-- [ ] **When using LFP data from a tetrode that's not same as spike data, for all place cells from this tetrode, calculate te common offet for peak firing from trough of theta.**
+- [ ] **When using LFP data from a tetrode that's not same as spike data, for all place cells from this tetrode, calculate te common offset for peak firing from trough of theta.**
 
 - [ ] **Value of Φ0 will give the y intercept which mentions the preffered phase of theta. If not centered around 180, this can be problematic?**
 

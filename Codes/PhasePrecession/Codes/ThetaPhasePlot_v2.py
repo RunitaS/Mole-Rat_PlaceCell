@@ -48,7 +48,7 @@ def load_lfp_files(folder_path, sampling_rate=32000, downsample_factor=128):
         lfp_raw = np.memmap(os.path.join(folder_path, file), dtype=ncs_dtype, mode='r', offset=16*1024)
         data = np.concatenate(lfp_raw['samples'])
         downsampled_data = data[::downsample_factor]
-        filtered_data = bandpass_filter(downsampled_data, 3, 6, sampling_rate // downsample_factor)
+        filtered_data = bandpass_filter(downsampled_data, 3, 7, sampling_rate // downsample_factor)
         
         raw_lfp_data[file] = downsampled_data
         lfp_data[file] = filtered_data
