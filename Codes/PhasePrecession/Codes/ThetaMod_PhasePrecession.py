@@ -718,6 +718,35 @@ def plot_polar_theta(phase_deg, mrl, pref_phase_deg, rayleigh_p, is_sig, title, 
     plt.close(fig)
 
 
+def plot_phase_histogram(phase_deg, is_sig, title, out_path: Path,
+                          bin_size_deg=PHASE_BIN_SIZE_DEG):
+    """Linear histogram of spike counts vs. Hilbert-transform theta phase
+    bin (same phase data and bin width as plot_polar_theta, shown over two
+    repeated 360-degree cycles for readability)."""
+    edges_deg = np.arange(0, 360 + bin_size_deg, bin_size_deg)
+    counts, _ = np.histogram(phase_deg, bins=edges_deg)
+    centers_deg = edges_deg[:-1] + bin_size_deg / 2
+
+    centers_dup = np.concatenate([centers_deg, centers_deg + 360])
+    counts_dup = np.concatenate([counts, counts])
+
+    face_color = '#B3B3B3' if is_sig else '#D9D9D9'
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.bar(centers_dup, counts_dup, width=bin_size_deg, align='center',
+           facecolor=face_color, edgecolor='black', linewidth=0.5)
+    ax.set_xlim(0, 720)
+    ax.set_xticks(np.arange(0, 720 + 1, 180))
+    ax.set_xlabel('Theta phase (deg)')
+    ax.set_ylabel('Spike count')
+    sig_str = 'SIGNIFICANT' if is_sig else 'not significant'
+    ax.set_title(f'{title}\nn={len(phase_deg)} spikes ({sig_str})', fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_unit_summary(pos_xy, results, title, out_path: Path):
     """Step 3: 6-panel Pass Index phase-precession summary figure."""
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
@@ -803,7 +832,7 @@ def find_session_folders(root: Path) -> list[Path]:
 
 
 def process_session(data_folder: Path, rng) -> list[dict]:
-    output_dir = data_folder / 'ThetaPhasePrecession_Combined'
+    output_dir = data_folder / 'ThetaMod_PhasePrecession'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncs_files = sorted(data_folder.glob('*.ncs'), key=_natural_key)
@@ -847,6 +876,10 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                 plot_polar_theta(phase_deg, metrics['MRL'], metrics['PreferredPhase_deg'],
                                   metrics['Rayleigh_p'], metrics['SignificantThetaModulation'],
                                   unit_label, polar_path)
+
+                hist_path = output_dir / f'{unit_label}_PhaseHistogram.png'
+                plot_phase_histogram(phase_deg, metrics['SignificantThetaModulation'],
+                                      unit_label, hist_path)
                 print(f'  {unit_label}: TMI={metrics["TMI"]:.3f} '
                       f'(p={metrics["TMI_shuffle_p"]:.3g}, '
                       f'{"theta-modulated" if metrics["TMI_Significant"] else "not theta-modulated"})')
@@ -897,6 +930,47 @@ def process_session(data_folder: Path, rng) -> list[dict]:
     return rows
 
 
+def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Population-level summary counts/percentages for the 'Summary' sheet.
+
+    Each row's Count/Denominator/Percent together cover one pair of
+    (number, percentage) items: total cells; SignificantThetaModulation;
+    TMI_Significant (theta-modulated); PrecessionTested; and is_precessing
+    counted two ways -- out of all theta-modulated (TMI_Significant) cells,
+    and out of only the subset that was actually precession-tested (some
+    theta-modulated cells are skipped, e.g. no tracking file or too few
+    overlapping spikes).
+    """
+    def pct(n, d):
+        return (100.0 * n / d) if d > 0 else np.nan
+
+    total_cells = len(df)
+    n_sig_theta = int((df['SignificantThetaModulation'] == True).sum())      # noqa: E712
+    n_tmi_sig = int((df['TMI_Significant'] == True).sum())                   # noqa: E712
+    n_precession_tested = int((df['PrecessionTested'] == True).sum())        # noqa: E712
+    n_precessing = int((df['is_precessing'] == True).sum())                  # noqa: E712
+
+    rows = [
+        dict(Metric='SignificantThetaModulation (Rayleigh) cells',
+             Count=n_sig_theta, Denominator=total_cells, DenominatorLabel='total cells',
+             Percent=pct(n_sig_theta, total_cells)),
+        dict(Metric='TMI_Significant (theta-modulated) cells',
+             Count=n_tmi_sig, Denominator=total_cells, DenominatorLabel='total cells',
+             Percent=pct(n_tmi_sig, total_cells)),
+        dict(Metric='PrecessionTested cells',
+             Count=n_precession_tested, Denominator=total_cells, DenominatorLabel='total cells',
+             Percent=pct(n_precession_tested, total_cells)),
+        dict(Metric='is_precessing cells (of theta-modulated cells)',
+             Count=n_precessing, Denominator=n_tmi_sig, DenominatorLabel='theta-modulated cells',
+             Percent=pct(n_precessing, n_tmi_sig)),
+        dict(Metric='is_precessing cells (of precession-tested cells)',
+             Count=n_precessing, Denominator=n_precession_tested,
+             DenominatorLabel='precession-tested cells',
+             Percent=pct(n_precessing, n_precession_tested)),
+    ]
+    return pd.DataFrame(rows, columns=['Metric', 'Count', 'Denominator', 'DenominatorLabel', 'Percent'])
+
+
 def main():
     if 360 % PHASE_BIN_SIZE_DEG != 0:
         raise ValueError('PHASE_BIN_SIZE_DEG must divide 360 evenly.')
@@ -923,8 +997,11 @@ def main():
                'rho', 'precession_p', 'slope_deg_per_pass', 'is_precessing', 'is_recessing',
                'PrecessionSkippedReason']
     df = pd.DataFrame(all_rows, columns=columns)
+    summary_df = build_summary_stats(df)
     excel_path = ROOT_FOLDER / OUTPUT_EXCEL_NAME
-    df.to_excel(excel_path, sheet_name='ThetaPhase', index=False)
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='ThetaPhase', index=False)
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
     print(f'\nDone. {len(df)} unit(s) processed. Summary saved to {excel_path}')
 
 

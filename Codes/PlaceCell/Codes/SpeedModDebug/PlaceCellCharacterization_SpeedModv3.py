@@ -626,8 +626,12 @@ def _compute_speed_modulation(
     # dominated by outliers or immobility-related firing (e.g. sharp-wave
     # ripples during rest). Only frames with min_speed_cms < speed < max_speed_cms
     # (evaluated on the smoothed speed, matching the smoothed rate it's compared
-    # against) AND a valid (non-NaN) smoothed rate are kept.
-    in_range = (speed_smooth > min_speed_cms) & (speed_smooth < max_speed_cms) & np.isfinite(fr_smooth)
+    # against), a valid (non-NaN) smoothed rate, AND a nonzero raw instantaneous
+    # rate (fr_inst, i.e. at least one spike fell in that interval) are kept --
+    # silent frames carry no information about the rate-vs-speed relationship
+    # and would otherwise just dilute it toward zero.
+    in_range = ((speed_smooth > min_speed_cms) & (speed_smooth < max_speed_cms)
+                & np.isfinite(fr_smooth) & (fr_inst > 0))
     if in_range.sum() < 3:
         return result
 

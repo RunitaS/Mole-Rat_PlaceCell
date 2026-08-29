@@ -167,3 +167,41 @@ So the result looks like a staircase: as the animal moves smoothly through the a
 _fill_nan_nearest (line 280) then patches any samples that landed in a bin with zero occupancy elsewhere (fi_map was NaN there) by nearest-neighbor fill, so there are no gaps.
 
 This is exactly the input sample_along_arc then takes and re-samples onto a uniform arc-length grid (previous explanation) — so the full pipeline is: time series of positions → binned spatial rate map → binned 0-1 field-index map → re-expanded to a field-index time series by lookup → re-expressed as a field-index distance series by arc-length resampling.
+
+### Field entry direction control
+
+Does it control for entry direction? **Yes, but implicitly, not via an explicit direction check/flag.**
+
+field_index_per_position assigns each position sample a scalar purely from its (x, y) location in the field-index map — this value is direction-agnostic by itself (same spot, same value, regardless of which way the animal is moving).
+sample_along_arc then resamples that spatial trace in the true chronological/arc-length order of the actual trajectory (ts_m, pos_ts), not along a fixed spatial axis.
+The bandpass filter + Hilbert transform (lines 468-470) is applied to that resampled trace in real time order, so the instantaneous phase rotates in the direction the animal actually moved through the field on that lap.
+Because the phase is derived from the signal's real temporal order rather than absolute position, a left→right traversal and a right→left traversal of the same field both get a pass-index that increases from entry toward exit — the "direction control" falls out of using trajectory time rather than needing a separate correction step.
+
+Does it always start at entry and end at exit? Not exactly/explicitly — there's no code that detects a field-entry or field-exit event and anchors the curve to those boundaries. Instead:
+
+The Hilbert-transform phase (pass_index_trace, line 470) is continuous across the whole session, cycling through −1→+1 once per oscillation of the filtered field-index signal.
+One "cycle" corresponds to one field pass only because filter_band (from auto_filter_band, tuned to the field's spatial size at ~10% peak rate) is chosen to match the field's characteristic scale — so the trough/rise of the filtered signal roughly coincides with the animal being outside/at the edge of the field, and the peak with the field center.
+So −1 and +1 approximate entry and exit as an emergent consequence of the filter band matching field size, not as an explicit per-pass normalization (there's no (pos - entry) / (exit - entry) style computation).
+If two passes have different real entry/exit points (e.g., animal doesn't fully clear the field, or field boundary is fuzzy), the −1/+1 endpoints won't precisely coincide with the true behavioral entry/exit — they're an approximation driven by the filtering, not a hard constraint.
+
+
+### Grid mode of pass index
+
+Grid mode isn't a "per-field" mode — it's for genuine grid cells, and neither mode separates multiple fields.
+
+From Pass_Index_Algo.md:26-27:
+
+method='place': min-max normalizes the whole rate map so the single global peak = 1, lowest bin = 0. Explicitly documented as "appropriate for a single, roughly unimodal place field."
+method='grid': rank/percentile-normalizes instead, so that multiple repeating fields with different peak rates (as real grid cells have) all get treated comparably. It also uses a fixed spatial filter band tuned to typical grid spacing (PassIndexPhasePrecession.py:322-324: hardcoded ~170/26.7 unit period), not derived from your data at all.
+Critically, in both modes the whole session's trajectory is processed as one continuous signal (PassIndexPhasePrecession.py:424-445):
+
+One rate map / field-index map for the whole arena.
+One field-index time series resampled along the whole path (arc-length).
+One bandpass filter + Hilbert transform → one pass_index_trace for the entire session.
+One kempter_lincirc regression fitting all spikes from all fields together into a single rho/p/slope.
+So switching to grid mode will not give you separate phase-precession fits per field. It will just change the normalization (rank-based) and swap in a fixed grid-spacing filter band — it still pools everything into one regression, and that fixed band is tuned to grid-cell spacing (~170/26.7 units), not your place fields' actual size, so it's likely to be a poor match unless your fields happen to repeat at that scale.
+
+For multi-field place cells, this pipeline has no built-in per-field segmentation. If you want per-field precession, you'd need to:
+
+Detect each field's spatial extent (e.g., connected regions ≥10% of that field's local peak) separately, and
+Run compute_pass_index once per field, restricting pos_xy/spk_ts (or masking the rate map) to that field's region only, each with its own auto_filter_band computed from that field's own diameter.
