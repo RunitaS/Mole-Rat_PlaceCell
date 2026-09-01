@@ -23,7 +23,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy import signal
 
-from ThetaMod_PhasePRecession import (
+from Understanding_PassIndex.ThetaMod_PhasePRecession import (
     ROOT_FOLDER, TRACKING_TIME_UNIT, METHOD, BINSIDE, SMTH_WIDTH, FILTER_BAND,
     MIN_SPIKES_FOR_FIT, find_session_folders, _find_tracking_file, _natural_key,
     load_tracking, load_ntt_spike_times, spk_pos, rate_map, field_index_map,

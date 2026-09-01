@@ -1,9 +1,9 @@
 **Place cell characterization**
-# to-do: speed modulation
+# to-do:
 
 - [ ] ***`Major fix! Exclude cluster 0 spike in this and all other codes!`*** 
 
-
+- [ ] **Add Mehta skewness score calc to individual place fields.**
 
 - [ ] **Check the shuffling analysis. SOmetime it gets 102/102 cells, other time it gets 100/102 cells as true place cells.**
 
@@ -125,14 +125,18 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 
 ## Speed mod to-do:
 
-- [ ] For all shuffling analysis throughout the code, use the same shuffled spike trains instead of creating new shufflis everytime. Computationally more efficient this way.
+- [ ] **For all shuffling analysis throughout the code, use the same shuffled spike trains instead of creating new shufflis everytime. Computationally more efficient this way.** *store it in memap and use whenever a shuffling criteria is to be applied.*
 
-- [ ] Add stats singificance step for r2 value before both speed domain and time domain analysis. Use cell for further analysis only if significance criteria is fulfilled. 
+- [ ] **Use GLM to predict factor causing the cell to be either n or p type speed modulated.** *PTP model has already quantified the different parameters affecting the differential speed modulation. Cross check in your data if their prediction fits the cause of n and p type speed mod. spuriosu correlations.*
 
-- [ ] combine the binning analysis and time domain analysis and save all images in the same folder labelled speedVsfiring.
+- [x] ** Add stats singificance step for r2 value before both speed domain and time domain analysis. Use cell for further analysis only if significance criteria is fulfilled.** 
+
+- [x] ** combine the binning analysis and time domain analysis and save all images in the same folder labelled speedVsfiring.**
 
 - [ ] **Instantaneous firing rates for my plots are too low. What is the difference between intrinsic and instantaneous firing rates? Is intrinsic firing rate calculated/sec?**
 *Use this paper as ref.:https://www.nature.com/articles/s41598-020-58194-1*
+
+- [ ] **Add n and p speed types to binning methods doendent on slope of lin. reg.**
 
 - [ ] **Replicate the methods mentioned in https://www.nature.com/articles/s41598-020-58194-1 . What TF is p-speed and n-speed? They have characterized the correct parameters for this analysis.** *p-speed is +ve speed correlation and n-speed is negative speed correlation.*
 
@@ -140,51 +144,51 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 
 - [ ] **Apply speed modulation only to isolated place fields.**
 
-- [ ] ** Try plotting the speed in time domain for every trial. Also, plot the dt_s, and Euclidean dist in time domain ** *dt_s is constant '33.33 or 33.34 msec'.
+- [x] ** Try plotting the speed in time domain for every trial. Also, plot the dt_s, and Euclidean dist in time domain ** *dt_s is constant '33.33 or 33.34 msec'.
 
-- [ ] ** Try merging two bins. This means that speed will be smoothed 2x but the spike bins will be wider That might reduce the scatter. check the bin size used for instantaneous firing rate in other papers. Maybe 33.33 msec is too low.**
+- [x] ** Try merging two bins. This means that speed will be smoothed 2x but the spike bins will be wider That might reduce the scatter. check the bin size used for instantaneous firing rate in other papers. Maybe 33.33 msec is too low.**
 
-- [ ] ** Unequal samples per speed bin problem: That's about how the regression itself is fit, not about correcting many tests. Right now (_compute_speed_modulation, PlaceCellCharacterization_SpeedModv3.py:519) linregress is fit on bin_centres vs mean_rate — each surviving speed bin contributes one point, equally weighted, regardless of whether it was built from 5000 samples or 50 samples (only SPEED_MIN_BIN_FRAC filters out the very sparsest bins, it doesn't equalize the rest). A sparsely-sampled bin has a noisier mean but the same leverage in the fit as a densely-sampled bin — that's a bias/variance issue in the regression's weighting, unrelated to multiple comparisons. The fix for that is either: weighted least squares, weighting each bin by n_per_bin (or 1/variance), instead of scipy.stats.linregress, or**
+- [x] ** Unequal samples per speed bin problem: That's about how the regression itself is fit, not about correcting many tests. Right now (_compute_speed_modulation, PlaceCellCharacterization_SpeedModv3.py:519) linregress is fit on bin_centres vs mean_rate — each surviving speed bin contributes one point, equally weighted, regardless of whether it was built from 5000 samples or 50 samples (only SPEED_MIN_BIN_FRAC filters out the very sparsest bins, it doesn't equalize the rest). A sparsely-sampled bin has a noisier mean but the same leverage in the fit as a densely-sampled bin — that's a bias/variance issue in the regression's weighting, unrelated to multiple comparisons. The fix for that is either: weighted least squares, weighting each bin by n_per_bin (or 1/variance), instead of scipy.stats.linregress, or**
 
 - [ ] **Quantify the time shifts to check the range of offsets**
 
-- [ ] ** Resolution in Mcnaughton 1983 is pretty low. Replicate their resolution and check for speed modulation.**  
+- [x] ** Resolution in Mcnaughton 1983 is pretty low. Replicate their resolution and check for speed modulation.**  
 *The animals's position was continuously sampled by the computer at a rate of 10 Hz. The resolution in the position measure was estimated at about 0.5 cm. Since instantaneous velocity was calculated from the distanced moved between sampling points its resolution was therefore about 5 cm/sec.*
 
 - [ ] **Change n,n+1 to n,n-1. Pad i=1 speed.** ***Retrospective speed coding and prostpecive speed coding is a thing!*** *n,n+1 will give retrospective speed, while n,n-1 will give prospective speed*
 
-- [ ] ** Gaussian smoothing of speed is missing ** * Is it pre smoothed in compute_metrics? * *There was no speed or position smoothing anywhere in the code. Added position smoothing. Does the speed need further smoothing?*
+- [x] ** Gaussian smoothing of speed is missing ** * Is it pre smoothed in compute_metrics? * *There was no speed or position smoothing anywhere in the code. Added position smoothing. Does the speed need further smoothing?*
 
 <NOTE>:One thing worth flagging: since the plot uses the already-smoothed position (jump-removed + Gaussian-smoothed from your earlier request), the speed trace will look cleaner than raw tracking speed — let me know if you instead wanted the raw, pre-smoothing speed plotted for QC/comparison purposes.
 
-- [ ] ** Change upper limit to 80cm/s **
+- [x] ** Change upper limit to 80cm/s **
 
-- [ ] ** Use median instead of mean after time domain to speed domain transformation.**
+- [x] ** Use median instead of mean after time domain to speed domain transformation.**
 
-- [ ] ** Switch to stats to Linear Mixed Model instead ** *Not required. Data from same cell in same session doesn't require mixed model.*
+- [x] ** Switch to stats to Linear Mixed Model instead ** *Not required. Data from same cell in same session doesn't require mixed model.*
 
-- [ ] ** Cross check shuffling analysis. Distribution of random shuffles is not Gaussian. It's a weird convex distribuiton ** *This is due to the fact that r values take either +ve or -ve values in range -1 to 1. You will get two peak at roughly -0.5 and 0.5.
+- [x] ** Cross check shuffling analysis. Distribution of random shuffles is not Gaussian. It's a weird convex distribuiton ** *This is due to the fact that r values take either +ve or -ve values in range -1 to 1. You will get two peak at roughly -0.5 and 0.5.
 
-- [ ] **Place cells are modulated by speed but aren't speed cells. Check difference between Adriano Tort (2018) and MEC speed cells analysis, Kropff (2015). (e.g., McNaughton et al., 1983; Wiener et al., 1989; Czurko´et al., 1999; Hirase et al., 1999; Ekstrom et al., 2001; Maurer et al., 2005) have analyzed modulation. Place cells don't change firing at micro seconds level. Only god knows how the two differ! **
+- [x] **Place cells are modulated by speed but aren't speed cells. Check difference between Adriano Tort (2018) and MEC speed cells analysis, Kropff (2015). (e.g., McNaughton et al., 1983; Wiener et al., 1989; Czurko´et al., 1999; Hirase et al., 1999; Ekstrom et al., 2001; Maurer et al., 2005) have analyzed modulation. Place cells don't change firing at micro seconds level. Only god knows how the two differ! **
 
-- [ ] ** Change speed bin len: default is 2cm/s **
+- [x] ** Change speed bin len: default is 2cm/s **
 
-- [ ] ** Change smooting factor **
+- [x] ** Change smooting factor **
 
-- [ ] ** Two methods possible for speed analysis. 1. Kropff/Tort: Correlate in time domain. 2. Bin the data and correlate speed bins. each wll yield different results **
+- [x] ** Two methods possible for speed analysis. 1. Kropff/Tort: Correlate in time domain. 2. Bin the data and correlate speed bins. each wll yield different results **
 *Currently my data not yielding any positive results (post shufling) for even the binning methods which should have had speed modulation.*
 
-- [ ] ** Add smoothing before binning.**
+- [x] ** Add smoothing before binning.**
 
-- [ ] ** Smooth the speed as much as the spikes **
+- [x] ** Smooth the speed as much as the spikes **
 
-- [ ] ** Change range to 2-60cm/s **
+- [x] ** Change range to 2-60cm/s **
 
-- [ ] ** Add shuffling procedure to confirm results **
+- [x] ** Add shuffling procedure to confirm results **
 
-- [ ] ** Chech distribution for normality. If not normal, use spearman **
+- [x] ** Chech distribution for normality. If not normal, use spearman **
 
-- [ ] ** Correct for multiple comparisons **
+- [x] ** Correct for multiple comparisons **
 
-- [ ] ** Check if speed modulated cells are also theta modulated ** *They are not!*
-        **WHY TF ARE SPEED MOD CELLS NOT THETA MOD?**
+- [x] ** Check if speed modulated cells are also theta modulated ** *They are not!*
+        ** WHY TF ARE SPEED MOD CELLS NOT THETA MOD?** *Read Buzsaki's PTP model paper*

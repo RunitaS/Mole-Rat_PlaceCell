@@ -1,10 +1,17 @@
 # Theta Mod Prec Fixes
 
+- [ ] **<Major fix: Add only significant theta epochs for phase precession>**
+
 - [ ] **Currently there are considerable number of phase processing cells. Check for forward vs backward phase precession to remove the possibility of these being entry through butt.** *Not doable until Nauman is done with his analysis.*
+
+- [ ] **Neurons could be theta phase rolling instead of processing.** *Net phase relationship is different from instantaneous relationship.*
+<Cross check with Aditi's phase precession code>
 
 - [ ] **Cross check procesion code with Hemanya's code.**
 
 - [ ] **Go through the condition for significant slope**
+
+
 
 ## Pass Index Fixes
 
@@ -25,8 +32,9 @@
 
 - [ ] **When using LFP data from a tetrode that's not same as spike data, for all place cells from this tetrode, calculate te common offset for peak firing from trough of theta.** 
 *Precession should be from 250 to 420, procession should be from 80 to 230 degrees of theta phase. Look for max spiking and match that with peak and trough of theta. The average shifting window can be used to calculate offset. Calc avg across all phase precession/processing cells on that dat form that TT.*
+<Preffered solution: Calculate the phase difference between noisy and nearest clean neighbour from uber clean LFP epochs, offset the clean LFP by that amount and use this new LFP signal for spike-LFP analysis. Pad the signal for the offset time window.>
 
-- [ ] **Add plot with spikes overlayed on theta signal to visually inspect the preffered phase of spikes.**
+- [x] < Add plot with spikes overlayed on theta signal to visually inspect the preffered phase of spikes.>
 
 - [ ] **Value of Φ0 will give the y intercept which mentions the preffered phase of theta. If not centered around 180, this can be problematic?**
 
@@ -35,12 +43,12 @@
 
 - [x] ** Current code requires a reference channel for LFP data. My data is already referenced at rec level**
 
-- [ ] **look into the grid mode in <field_index_map>. How does it determine different fields? Do we need to provide this info before hand? Is it determines multifields, what algo is used for this?**
+- [x] ** look into the grid mode in <field_index_map>. How does it determine different fields? Do we need to provide this info before hand? Is it determines multifields, what algo is used for this?**
 NOTE: grid: fixed band tuned to typical grid spacing. *Make sure you change this to irregular spacing*
 
-- [ ] **Add Max 50msec ts distance criteria to spike_ts and pos_ts matching** 
+- [x] ** Add Max 50msec ts distance criteria to spike_ts and pos_ts matching** 
 
-- [x] **Make sure that spikes from cluster 0 are skipped.**
+- [x] ** Make sure that spikes from cluster 0 are skipped.**
 *Fixed: `load_ntt_spike_times` now unconditionally drops cell_number 0 (unsorted/noise), instead of only dropping it when other clusters were also present.*
 
 
