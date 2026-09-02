@@ -16,7 +16,7 @@
 - Place cell discovered by them, later in 1980s Jim Ranck discovered HD cells, and Mosers discovered the grid cells.
 - Several other spatially selective cells discovered in the last 5 decades, each representing a unique spatial feature of the environment.
 - Orchestra leads to formation of stable internal maps of external space.
-- Memory retained thorugh out life and dynamic
+- Memory retained thorugh out life and dynamic.
 
 ## Spatial cells
 
