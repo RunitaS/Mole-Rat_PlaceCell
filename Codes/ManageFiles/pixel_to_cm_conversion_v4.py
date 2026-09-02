@@ -32,10 +32,10 @@ import numpy as np
 import pandas as pd
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
-ROOT_DIR = r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode'  # root folder containing subfolders with .xlsx tracking files
+ROOT_DIR = r'X:/NMR_group_data/Runita/Tracking/Fa5384Tracking/FinalTracking/Open'  # root folder containing subfolders with .xlsx tracking files
 # Real-world size (cm) of the longer tracked axis, used as the default for
 # any subfolder not listed in ARENA_SIZE_CM_BY_FOLDER below.
-DEFAULT_ARENA_SIZE_CM = __
+DEFAULT_ARENA_SIZE_CM = 60
 
 # Per-folder overrides: {subfolder_name: arena_size_cm}
 # Add an entry here for any session whose arena size differs from the default

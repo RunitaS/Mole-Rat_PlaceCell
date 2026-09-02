@@ -41,7 +41,7 @@ import numpy as np
 # Configuration -- EDIT THESE
 # ---------------------------------------------------------------------------
 
-ROOT_DIR = Path(r"X:\NMR_group_data\Runita\Data\Ephys_Data\AllSortedData\Tetrode\Fa1059")
+ROOT_DIR = Path(r"X:/NMR_group_data/Runita/AllData_Backup/AllSortedData/Tetrode/Fa5834/ExpDay1_Cntrl_23Oct25")
 # Cut files are saved into a subfolder created next to each source folder's
 # own files (i.e. inside the same folder the .nev/.ncs/.ntt came from), so
 # there is no separate output root to configure.
