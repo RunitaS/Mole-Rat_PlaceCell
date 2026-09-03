@@ -22,12 +22,11 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
-ROOT_DIR = r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode'  # root folder to search recursively
+ROOT_DIR = r'X:/NMR_group_data/Runita/AllData_Backup/AllSortedData/Tetrode'  # root folder to search recursively
 OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/OccupancyMaps/CorrectionTest'  # all .png maps are saved here (flat, not mirrored)
 
 BIN_SIZE_CM = 2       # spatial bin edge length, cm
 SMOOTHING_SIGMA = 1.5   # Gaussian smoothing sigma, in bins; set to 0 to disable
-MAX_VELOCITY_CM_S = 90  # speed threshold, cm/sec; faster jumps are interpolated out
 DPI = 300
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -69,39 +68,7 @@ def load_tracking(csv_path):
     return t[valid], x[valid], y[valid]
 
 
-def filter_velocity(t, x, y, max_velocity_cms):
-    """Interpolate out points reached at more than max_velocity_cms.
-
-    For each i where the speed from point i to point i+1 exceeds the
-    threshold, point i's x/y is replaced by linear interpolation between
-    its neighbors (i-1, i+1) at time t[i]. Endpoints (no neighbor on one
-    side) are left as-is.
-    """
-    x = x.copy()
-    y = y.copy()
-
-    dt_sec = np.diff(t) / 1000.0
-    dist = np.hypot(np.diff(x), np.diff(y))
-    with np.errstate(divide='ignore', invalid='ignore'):
-        speed = np.where(dt_sec > 0, dist / dt_sec, 0.0)
-
-    bad_idx = np.where(speed > max_velocity_cms)[0]  # index i of the offending ith point
-    for i in bad_idx:
-        if i == 0 or i == len(x) - 1:
-            continue
-        t_prev, t_next = t[i - 1], t[i + 1]
-        if t_next == t_prev:
-            continue
-        frac = (t[i] - t_prev) / (t_next - t_prev)
-        x[i] = x[i - 1] + frac * (x[i + 1] - x[i - 1])
-        y[i] = y[i - 1] + frac * (y[i + 1] - y[i - 1])
-
-    return x, y
-
-
-def compute_occupancy_map(t, x, y, bin_size_cm, smoothing_sigma, max_velocity_cms=MAX_VELOCITY_CM_S):
-    x, y = filter_velocity(t, x, y, max_velocity_cms)
-
+def compute_occupancy_map(t, x, y, bin_size_cm, smoothing_sigma):
     x_edges = np.arange(x.min(), x.max() + bin_size_cm, bin_size_cm)
     y_edges = np.arange(y.min(), y.max() + bin_size_cm, bin_size_cm)
 

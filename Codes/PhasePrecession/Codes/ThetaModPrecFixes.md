@@ -2,6 +2,8 @@
 
 - [ ] **<Major fix: Add only significant theta epochs for phase precession>**
 
+- [ ] **Cross check if pass index code is executed according to Climer's code. Description in MEC paper does not match python code. Could be because of method used for grid cells,**
+
 - [ ] **Currently there are considerable number of phase processing cells. Check for forward vs backward phase precession to remove the possibility of these being entry through butt.** *Not doable until Nauman is done with his analysis.*
 
 - [ ] **Neurons could be theta phase rolling instead of processing.** *Net phase relationship is different from instantaneous relationship.*
