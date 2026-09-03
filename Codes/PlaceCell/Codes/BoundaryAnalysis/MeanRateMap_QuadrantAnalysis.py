@@ -3,14 +3,23 @@
 Mean Rate Map & Quadrant Analysis (S1H + Figure 1B/D, after Muessig et al.)
 
 Reproduces, for place cells pooled across multiple recording days:
-  - Fig S1H : overall mean (unsmoothed) firing-rate map per arena, fine spatial bins.
-  - Fig 1B  : quadrant-wise proportion of place-field peak locations.
-  - Fig 1D  : quadrant-wise mean firing rate.
+  - Fig S1H : overall mean (unsmoothed) firing-rate map per arena, fine spatial bins
+              (2 x 2 cm; genuinely 2D for every arena, including the linear track's
+              length x width).
+  - Fig 1B/D: quadrant mean maps (Fig 1A method) -- the whole-arena map is cut into
+              4 regions, each registered into one reference region's coordinates,
+              and the 4 registered copies are averaged bin-by-bin, giving one small
+              *multi-bin* heatmap (not a single scalar per quadrant):
+                * open_field      : mirror-reflection fold (x and y independently) -> small square heatmap
+                * circular_track  : 90 deg angular roll fold -> small arc heatmap (no distinct walls)
+                * linear_track    : mirror-reflection fold (length x width) -> small rectangle heatmap
+              Fig 1B pools each cell's one peak location into the folded grid (proportion
+              of peaks per bin); Fig 1D folds the single overall (Fig S1H) mean rate map.
 
 Arenas (edit ARENA_CONFIGS['root'] below):
-  1. circular_track : 1D circular track, outer dia 80 cm, inner dia 72 cm -> arc quadrants
-  2. linear_track    : 80 x 8 cm linear track (vertical sessions auto-rotated 90 deg CCW) -> rectangle quadrants
-  3. open_field      : circular open field, dia 60 cm -> pie quadrants
+  1. circular_track : 1D circular track, outer dia 80 cm, inner dia 72 cm
+  2. linear_track    : 80 x 8 cm linear track (vertical sessions auto-rotated 90 deg CCW)
+  3. open_field      : circular open field, dia 60 cm
 
 Tracking load/clean/smooth (pixel<->cm handling, jump removal, Gaussian smoothing), spike-position
 matching (50 ms gate) and place-cell qualification (n_spikes>50, 1<peak_fr<15 Hz, SIR>0.5,
@@ -39,7 +48,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from matplotlib.colors import Normalize
-from matplotlib.patches import Wedge, Rectangle
 
 # ============================================================================
 # CONFIGURATION -- edit root folders + geometry below
@@ -218,6 +226,78 @@ def _triangular_smooth_1d(fr: np.ndarray, valid: np.ndarray, wrap: bool = False)
 
 
 # ============================================================================
+# Quadrant mean-map folding (Muessig et al. Figure 1A)
+#
+# "The full map is divided into quadrants rotated around the center of the
+# environment (c) such that all walls a are mapped onto a' and all walls b
+# are mapped onto b'." I.e. the whole-arena binned map is cut into 4 regions,
+# each region is registered into one reference region's coordinate frame, and
+# the 4 registered copies are averaged bin-by-bin -- producing a single
+# small *multi-bin* map, not a scalar per region.
+#
+# Each handler builds a `quad_idx_flat` array (length n_bins) mapping every
+# whole-arena bin to its bin index in the folded reference region (or -1 if
+# the bin has no fold partner, e.g. an odd leftover center row/column), plus
+# `n_quad_bins`. These two generic helpers then do the actual folding; only
+# how `quad_idx_flat` is built (rotation, roll, or reflection) differs per
+# arena's symmetry.
+# ============================================================================
+
+def _fold_peak_bin(quad_idx_flat: np.ndarray, bin_idx: int) -> int:
+    return int(quad_idx_flat[bin_idx])
+
+
+def _fold_mean_map(quad_idx_flat: np.ndarray, n_quad_bins: int,
+                    values_flat: np.ndarray, valid_flat: np.ndarray) -> tuple:
+    q = quad_idx_flat
+    m = (q >= 0) & valid_flat
+    sums = np.zeros(n_quad_bins, dtype=np.float64)
+    weights = np.zeros(n_quad_bins, dtype=np.float64)
+    if m.any():
+        np.add.at(sums, q[m], values_flat[m])
+        np.add.at(weights, q[m], 1.0)
+    out = np.full(n_quad_bins, np.nan)
+    wm = weights > 0
+    out[wm] = sums[wm] / weights[wm]
+    return out, wm
+
+
+def _build_reflect_quadrant_fold(nx: int, ny: int) -> tuple:
+    """Registers each of the 4 quadrants of an (nx, ny) bin grid onto one reference
+    quadrant [0:nx//2, 0:ny//2] by mirror-reflecting each axis about its own midpoint
+    independently, so a quadrant's bx-boundary always lands on the reference's
+    bx-boundary and its by-boundary always lands on the reference's by-boundary --
+    i.e. wall a always maps onto wall a', wall b always onto wall b', for all 4
+    quadrants (Muessig et al. Fig 1A).
+
+    A plain 90 deg rotation of the whole grid does NOT do this: rotating swaps the
+    two axes, so for 2 of the 4 quadrants (those related to the reference by 90 or
+    270 deg, as opposed to the diagonal 180 deg one) a quadrant's bx-wall ends up
+    registered against the reference's by-wall instead of its bx-wall -- the two
+    wall sides get cross-matched rather than matched straight.
+    """
+    half_x, half_y = nx // 2, ny // 2
+    I, J = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
+    local_i, local_j = np.meshgrid(np.arange(half_x), np.arange(half_y), indexing='ij')
+    local_flat = local_i * half_y + local_j
+
+    transforms = [
+        (I,                J),
+        (nx - 1 - I,       J),
+        (I,                ny - 1 - J),
+        (nx - 1 - I,       ny - 1 - J),
+    ]
+    quad_idx = np.full((nx, ny), -1, dtype=int)
+    for Ti, Tj in transforms:
+        sub_i = Ti[:half_x, :half_y]
+        sub_j = Tj[:half_x, :half_y]
+        quad_idx[sub_i, sub_j] = local_flat
+
+    n_quad_bins = half_x * half_y
+    return quad_idx.ravel(), n_quad_bins, (half_x, half_y)
+
+
+# ============================================================================
 # Arena geometry handlers
 #
 # Each handler converts (x_cm, y_cm) into a single flat spatial-bin index per
@@ -243,6 +323,8 @@ class OpenFieldHandler:
         r = np.hypot(XX - self.cx, YY - self.cy)
         self.geom_valid = (r <= self.diameter / 2.0).ravel()
 
+        self._build_quadrant_fold()
+
     def orient(self, x_cm, y_cm):
         return x_cm, y_cm
 
@@ -259,12 +341,19 @@ class OpenFieldHandler:
         v2  = valid_flat.reshape(self.nx, self.ny)
         return _triangular_smooth_2d(fr2, v2).ravel()
 
-    def quadrant_of_bin(self):
-        xs = (np.arange(self.nx) + 0.5) * self.bin_cm
-        ys = (np.arange(self.ny) + 0.5) * self.bin_cm
-        XX, YY = np.meshgrid(xs, ys, indexing='ij')
-        ang = np.degrees(np.arctan2(YY - self.cy, XX - self.cx)) % 360.0
-        return ((ang // 90).astype(int) % 4).ravel()
+    def _build_quadrant_fold(self):
+        """Folds the 4 quadrants of the (nx, ny) bin grid onto one reference quadrant
+        via independent mirror reflection of each axis (see _build_reflect_quadrant_fold)
+        so that wall a always maps onto wall a' and wall b always onto wall b', for all
+        4 quadrants -- per Muessig et al. Fig 1A."""
+        self._quad_idx_flat, self.n_quad_bins, self.quad_shape = \
+            _build_reflect_quadrant_fold(self.nx, self.ny)
+
+    def fold_peak_bin(self, bin_idx):
+        return _fold_peak_bin(self._quad_idx_flat, bin_idx)
+
+    def fold_mean_map(self, values_flat, valid_flat):
+        return _fold_mean_map(self._quad_idx_flat, self.n_quad_bins, values_flat, valid_flat)
 
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
         grid = np.full(self.n_bins, np.nan)
@@ -278,17 +367,17 @@ class OpenFieldHandler:
         ax.axis('off')
         return im
 
-    def plot_quadrants(self, ax, quadrant_values, cmap, norm):
-        for q in range(4):
-            val = quadrant_values[q]
-            color = cmap(norm(val)) if np.isfinite(val) else 'lightgray'
-            w = Wedge((self.cx, self.cy), self.diameter / 2.0, q * 90, (q + 1) * 90,
-                      facecolor=color, edgecolor='k', linewidth=1)
-            ax.add_patch(w)
-        ax.set_xlim(0, self.diameter)
-        ax.set_ylim(0, self.diameter)
+    def plot_quadrant_map(self, ax, values_flat, valid_flat, cmap, norm):
+        half = self.quad_shape[0]
+        grid = np.full(self.n_quad_bins, np.nan)
+        grid[valid_flat] = values_flat[valid_flat]
+        grid2 = grid.reshape(half, half)
+        side = half * self.bin_cm
+        im = ax.imshow(np.ma.masked_invalid(grid2.T), origin='lower',
+                        extent=[0, side, 0, side], cmap=cmap, norm=norm)
         ax.set_aspect('equal')
         ax.axis('off')
+        return im
 
 
 class CircularTrackHandler:
@@ -304,8 +393,12 @@ class CircularTrackHandler:
         self.radial_tol_cm = 4.0
 
         circumference = 2 * np.pi * self.mean_r
-        self.n_bins = max(8, int(round(circumference / bin_cm)))
+        # kept as a multiple of 4 so the quadrant fold below splits into 4 exactly
+        # equal-length arcs (see _build_quadrant_fold)
+        self.n_bins = max(8, 4 * int(round(circumference / bin_cm / 4.0)))
         self.bin_width_deg = 360.0 / self.n_bins
+
+        self._build_quadrant_fold()
 
     def orient(self, x_cm, y_cm):
         return x_cm, y_cm
@@ -320,9 +413,23 @@ class CircularTrackHandler:
     def smooth(self, fr_flat, valid_flat):
         return _triangular_smooth_1d(fr_flat, valid_flat, wrap=True)
 
-    def quadrant_of_bin(self):
-        centers_deg = (np.arange(self.n_bins) + 0.5) * self.bin_width_deg
-        return (centers_deg // 90).astype(int) % 4
+    def _build_quadrant_fold(self):
+        """Per the user's choice for arenas without distinct walls: split the ring
+        into 4 equal 90 deg arcs (arbitrary angular quartering) and fold them onto
+        one reference arc, keeping the along-track bins within that arc intact."""
+        qn = self.n_bins // 4
+        quad_idx = np.empty(self.n_bins, dtype=int)
+        for k in range(4):
+            seg = np.arange(k * qn, (k + 1) * qn)
+            quad_idx[seg] = np.arange(qn)
+        self._quad_idx_flat = quad_idx
+        self.n_quad_bins = qn
+
+    def fold_peak_bin(self, bin_idx):
+        return _fold_peak_bin(self._quad_idx_flat, bin_idx)
+
+    def fold_mean_map(self, values_flat, valid_flat):
+        return _fold_mean_map(self._quad_idx_flat, self.n_quad_bins, values_flat, valid_flat)
 
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
         theta_edges = np.linspace(0, 2 * np.pi, self.n_bins + 1)
@@ -336,27 +443,36 @@ class CircularTrackHandler:
         ax.grid(False)
         return pcm
 
-    def plot_quadrants(self, ax, quadrant_values, cmap, norm):
-        for q in range(4):
-            val = quadrant_values[q]
-            color = cmap(norm(val)) if np.isfinite(val) else 'lightgray'
-            w = Wedge((self.cx, self.cy), self.outer_r, q * 90, (q + 1) * 90,
-                      width=self.outer_r - self.inner_r,
-                      facecolor=color, edgecolor='k', linewidth=1)
-            ax.add_patch(w)
-        ax.set_xlim(0, self.outer_d)
-        ax.set_ylim(0, self.outer_d)
-        ax.set_aspect('equal')
-        ax.axis('off')
+    def plot_quadrant_map(self, ax, values_flat, valid_flat, cmap, norm):
+        theta_edges = np.linspace(0, np.pi / 2, self.n_quad_bins + 1)
+        r_edges = np.array([self.inner_r, self.outer_r])
+        vals = np.where(valid_flat, values_flat, np.nan)[None, :]
+        ax.set_theta_zero_location('E')
+        ax.set_theta_direction(1)
+        pcm = ax.pcolormesh(theta_edges, r_edges, vals, cmap=cmap, norm=norm, shading='auto')
+        ax.set_thetamin(0)
+        ax.set_thetamax(90)
+        ax.set_ylim(0, self.outer_r + 5)
+        ax.set_yticklabels([])
+        ax.grid(False)
+        return pcm
 
 
 class LinearTrackHandler:
     def __init__(self, cfg: dict, bin_cm: float):
         self.length = cfg['length_cm']
         self.width  = cfg['width_cm']
-        self.n_bins = max(4, int(round(self.length / bin_cm)))
-        self.bin_cm = self.length / self.n_bins
+        # genuine 2D binning: bins along the track length AND across its width, so
+        # the fine map has multiple rows in both dimensions (not just columns along
+        # length with a single uniform row across width).
+        self.nx = max(4, int(round(self.length / bin_cm)))   # along length
+        self.ny = max(2, int(round(self.width  / bin_cm)))   # across width
+        self.bin_cm_x = self.length / self.nx
+        self.bin_cm_y = self.width  / self.ny
+        self.n_bins = self.nx * self.ny
         self.arena_width_cm = self.length
+
+        self._build_quadrant_fold()
 
     def orient(self, x_cm, y_cm):
         """Vertical-session tracks (long axis along y) are rotated 90 deg CCW so every
@@ -375,38 +491,53 @@ class LinearTrackHandler:
         return x_cm, y_cm
 
     def to_bins(self, x_cm, y_cm):
-        pos = np.clip(x_cm, 0, self.length)
-        bin_idx = np.clip((pos / self.bin_cm).astype(int), 0, self.n_bins - 1)
-        sample_valid = np.ones_like(pos, dtype=bool)
-        return bin_idx, sample_valid
+        px = np.clip(x_cm, 0, self.length)
+        py = np.clip(y_cm, 0, self.width)
+        bx = np.clip((px / self.bin_cm_x).astype(int), 0, self.nx - 1)
+        by = np.clip((py / self.bin_cm_y).astype(int), 0, self.ny - 1)
+        flat = bx * self.ny + by
+        sample_valid = np.ones_like(px, dtype=bool)
+        return flat, sample_valid
 
     def smooth(self, fr_flat, valid_flat):
-        return _triangular_smooth_1d(fr_flat, valid_flat, wrap=False)
+        fr2 = fr_flat.reshape(self.nx, self.ny)
+        v2  = valid_flat.reshape(self.nx, self.ny)
+        return _triangular_smooth_2d(fr2, v2).ravel()
 
-    def quadrant_of_bin(self):
-        centers = (np.arange(self.n_bins) + 0.5) * self.bin_cm
-        return np.clip((centers // (self.length / 4.0)).astype(int), 0, 3)
+    def _build_quadrant_fold(self):
+        """A linear track's two axes (length vs. width) aren't interchangeable like a
+        square's, so folding uses mirror reflection about each axis' own midpoint
+        (see _build_reflect_quadrant_fold): each 'quadrant' = one length-end x one
+        width-side corner, analogous to the paper's wall-corner quadrants."""
+        self._quad_idx_flat, self.n_quad_bins, self.quad_shape = \
+            _build_reflect_quadrant_fold(self.nx, self.ny)
+
+    def fold_peak_bin(self, bin_idx):
+        return _fold_peak_bin(self._quad_idx_flat, bin_idx)
+
+    def fold_mean_map(self, values_flat, valid_flat):
+        return _fold_mean_map(self._quad_idx_flat, self.n_quad_bins, values_flat, valid_flat)
 
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
-        vals = np.where(valid_flat, values_flat, np.nan)[None, :]
-        edges = np.linspace(0, self.length, self.n_bins + 1)
-        pcm = ax.pcolormesh(edges, [0, self.width], vals, cmap=cmap, norm=norm, shading='auto')
-        ax.set_aspect('equal')
+        grid = np.full(self.n_bins, np.nan)
+        grid[valid_flat] = values_flat[valid_flat]
+        grid2 = grid.reshape(self.nx, self.ny)
+        im = ax.imshow(np.ma.masked_invalid(grid2.T), origin='lower',
+                        extent=[0, self.length, 0, self.width],
+                        aspect='equal', cmap=cmap, norm=norm)
         ax.axis('off')
-        return pcm
+        return im
 
-    def plot_quadrants(self, ax, quadrant_values, cmap, norm):
-        seg = self.length / 4.0
-        for q in range(4):
-            val = quadrant_values[q]
-            color = cmap(norm(val)) if np.isfinite(val) else 'lightgray'
-            rect = Rectangle((q * seg, 0), seg, self.width,
-                             facecolor=color, edgecolor='k', linewidth=1)
-            ax.add_patch(rect)
-        ax.set_xlim(0, self.length)
-        ax.set_ylim(0, self.width)
-        ax.set_aspect('auto')
+    def plot_quadrant_map(self, ax, values_flat, valid_flat, cmap, norm):
+        half_x, half_y = self.quad_shape
+        grid = np.full(self.n_quad_bins, np.nan)
+        grid[valid_flat] = values_flat[valid_flat]
+        grid2 = grid.reshape(half_x, half_y)
+        im = ax.imshow(np.ma.masked_invalid(grid2.T), origin='lower',
+                        extent=[0, half_x * self.bin_cm_x, 0, half_y * self.bin_cm_y],
+                        aspect='equal', cmap=cmap, norm=norm)
         ax.axis('off')
+        return im
 
 
 def make_handler(cfg: dict):
@@ -647,32 +778,27 @@ def pool_fine_map(handler, results: list) -> tuple:
 
 
 def pool_quadrant_peak_proportion(handler, results: list) -> tuple:
+    """Fig 1B: proportion of place-cell peaks, folded onto one reference quadrant
+    (Fig 1A). Each cell contributes its one peak bin, remapped into the reference
+    quadrant's local coordinates -- unlike the mean-rate map below, a peak is a
+    single location so it is not itself averaged across the 4 folded regions."""
     place = [r for r in results if r['place_cell'] and r['peak_bin'] is not None]
-    q_of_bin = handler.quadrant_of_bin()
-    counts = np.zeros(4)
+    counts = np.zeros(handler.n_quad_bins)
     for r in place:
-        counts[q_of_bin[r['peak_bin']]] += 1
+        q = handler.fold_peak_bin(r['peak_bin'])
+        if q >= 0:
+            counts[q] += 1
     total = counts.sum()
-    pct = counts / total * 100.0 if total > 0 else np.full(4, np.nan)
+    pct = counts / total * 100.0 if total > 0 else np.full(handler.n_quad_bins, np.nan)
     return pct, int(total)
 
 
-def pool_quadrant_mean_rate(handler, results: list) -> np.ndarray:
-    place = [r for r in results if r['place_cell']]
-    if not place:
-        return np.full(4, np.nan)
-    q_of_bin = handler.quadrant_of_bin()
-    per_cell = np.full((len(place), 4), np.nan)
-    for i, r in enumerate(place):
-        valid, occ, fr = r['valid'], r['occ_map'], r['fr_raw']
-        for q in range(4):
-            sel = valid & (q_of_bin == q)
-            occ_q = occ[sel].sum()
-            if occ_q <= 0:
-                continue
-            spk_q = (fr[sel] * occ[sel]).sum()
-            per_cell[i, q] = spk_q / occ_q
-    return np.nanmean(per_cell, axis=0)
+def pool_quadrant_mean_rate(handler, results: list) -> tuple:
+    """Fig 1D: quadrant mean rate map, obtained by folding (Fig 1A) the single overall
+    unsmoothed mean rate map across all place cells (same map as Fig S1H) -- per the
+    Methods, Fig 1D/1E use "the overall mean rate maps for all cells" (unsmoothed)."""
+    mean_map, valid = pool_fine_map(handler, results)
+    return handler.fold_mean_map(np.where(valid, mean_map, 0.0), valid)
 
 
 # ============================================================================
@@ -734,21 +860,25 @@ def plot_fig_1BD(arena_handlers: dict, arena_results: dict, save_path: str):
         peak_pct[key] = pool_quadrant_peak_proportion(handler, arena_results[key])
         rate[key]     = pool_quadrant_mean_rate(handler, arena_results[key])
 
-    cmap_b, norm_b = make_cmap_norm(np.concatenate([v[0] for v in peak_pct.values()]))
-    cmap_d, norm_d = make_cmap_norm(np.concatenate(list(rate.values())))
+    cmap_b, norm_b = make_cmap_norm(np.concatenate([pct for pct, _ in peak_pct.values()]))
+    cmap_d, norm_d = make_cmap_norm(np.concatenate([vals[valid] for vals, valid in rate.values()]))
 
     fig = plt.figure(figsize=(15, 10))
     axes_b, axes_d = [], []
     for i, key in enumerate(_ARENA_ORDER):
         handler = arena_handlers[key]
+        proj = 'polar' if key == 'circular_track' else None
 
-        ax_b = fig.add_subplot(2, 3, i + 1)
-        handler.plot_quadrants(ax_b, peak_pct[key][0], cmap_b, norm_b)
-        ax_b.set_title(f'{_ARENA_TITLES[key]}\nPeak proportion (%), n={peak_pct[key][1]}')
+        pct, total = peak_pct[key]
+        pct_valid = np.isfinite(pct)
+        ax_b = fig.add_subplot(2, 3, i + 1, projection=proj)
+        handler.plot_quadrant_map(ax_b, np.nan_to_num(pct), pct_valid, cmap_b, norm_b)
+        ax_b.set_title(f'{_ARENA_TITLES[key]}\nPeak proportion (%), n={total}')
         axes_b.append(ax_b)
 
-        ax_d = fig.add_subplot(2, 3, i + 4)
-        handler.plot_quadrants(ax_d, rate[key], cmap_d, norm_d)
+        vals, valid = rate[key]
+        ax_d = fig.add_subplot(2, 3, i + 4, projection=proj)
+        handler.plot_quadrant_map(ax_d, np.nan_to_num(vals), valid, cmap_d, norm_d)
         ax_d.set_title(f'{_ARENA_TITLES[key]}\nMean firing rate (Hz)')
         axes_d.append(ax_d)
 
@@ -757,7 +887,7 @@ def plot_fig_1BD(arena_handlers: dict, arena_results: dict, save_path: str):
     sm_d = cm.ScalarMappable(cmap=cmap_d, norm=norm_d); sm_d.set_array([])
     fig.colorbar(sm_d, ax=axes_d, shrink=0.6, label='Mean firing rate (Hz)')
 
-    fig.suptitle('Figure 1B/D -- Quadrant-wise peak location (top) and mean firing rate (bottom)')
+    fig.suptitle('Figure 1B/D -- Quadrant mean maps: folded peak-location proportion (top) and mean firing rate (bottom)')
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
     print(f'[SAVED] {save_path}')
@@ -767,15 +897,16 @@ def export_excel(arena_handlers: dict, arena_results: dict, out_path: str):
     rows = []
     for key, results in arena_results.items():
         handler = arena_handlers[key]
-        q_of_bin = handler.quadrant_of_bin()
         for r in results:
-            q = int(q_of_bin[r['peak_bin']]) if r['peak_bin'] is not None else None
+            q = handler.fold_peak_bin(r['peak_bin']) if r['peak_bin'] is not None else None
+            if q is not None and q < 0:
+                q = None
             rows.append(dict(
                 arena=key, session=r['session'], unit=r['unit'],
                 n_spikes=r['n_spikes'], peak_fr=r['peak_fr'], mean_fr=r['mean_fr'],
                 sir=r['sir'], sparsity=r['sparsity'],
                 bootstrap_sig=r['bootstrap_sig'], place_cell=r['place_cell'],
-                peak_quadrant=q,
+                peak_quadrant_bin=q,
             ))
     df = pd.DataFrame(rows)
     df.to_excel(out_path, index=False)
