@@ -27,12 +27,21 @@ Algorithm summary (Supplementary Fig. 5):
   Peak range close to 1 => a clean, sinusoidal (theta-like) oscillation;
   close to 0 => a flat/non-oscillatory autocorrelogram.
 
-This script is fully self-contained: it reads Neuralynx .ncs files directly
-(no dependency on FOOOF.py) and recursively processes every .ncs file found
-under a single ROOT_DIR (see Configuration below).
+This script reads Neuralynx .ncs files directly and recursively processes
+every .ncs file found under a single ROOT_DIR (see Configuration below).
+
+Before epoching/ACG, each file's cleaned (notch-filtered, detrended) trace
+has its aperiodic (1/f) component estimated with FOOOF and removed via
+spectral whitening (see APPLY_FOOOF_APERIODIC_REMOVAL /
+fit_fooof_and_remove_aperiodic below), so the ACG peak-range quantification
+runs on the aperiodic-removed residual rather than the raw LFP. One
+diagnostic figure (original spectrum, full model, aperiodic fit) is saved
+per file under FOOOF_FIT_DIR -- inspect these to confirm the aperiodic fit
+tracks the broadband spectrum shape before trusting the residual signal.
 """
 
 import os
+import re
 import numpy as np
 import pandas as pd
 from scipy import signal
@@ -41,6 +50,9 @@ from scipy.ndimage import gaussian_filter1d
 
 import seaborn as sns
 import matplotlib.pyplot as plt
+
+from fooof import FOOOF
+from fooof.sim.gen import gen_aperiodic
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -53,7 +65,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ROOT_DIR = r'F:/Temp/Theta/fBOSC_Res'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_v2_EDminThresh')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_FOOOF')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 
 # ---- Acquisition ----
@@ -73,14 +85,18 @@ ncs_dtype = np.dtype([
 LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]  # harmonics below Nyquist (FS_ACG/2 = 500 Hz)
 NOTCH_Q        = 30.0
 
+# ---- Low-pass filtering ----
+# The raw .ncs trace is broadband (acquired 1-500 Hz). Restrict the signal
+# used for ACG/reference-sinusoid matching to <100 Hz so high-frequency
+# content (well above the 3-7 Hz theta band of interest) can't distort the
+# autocorrelogram shape.
+LOWPASS_CUTOFF_HZ = 100.0  # Hz
+LOWPASS_ORDER = 4          # Butterworth order (zero-phase via filtfilt)
+
 # ---- Artifact rejection (epoch-wise peak-to-peak, robust MAD outlier) ----
 MAD_THRESH = 5.0
 
-# ---- Delta/theta epoch filter (epoch-wise Welch PSD band-power comparison) ----
-# An epoch is rejected if its delta-band power exceeds its theta-band power --
-# noisy epochs are often dominated by low-frequency artifact that would
-# otherwise pass through amplitude-based (MAD) rejection as slow theta.
-DELTA_BAND = (1.0, 3.0)  # Hz
+# ---- Theta band (used for FOOOF fit-quality plot shading) ----
 THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 
 # ---- Velocity / running-speed epoch gating ----
@@ -127,6 +143,30 @@ ACG_ED_MIN_THRESH = 1.0
 # speed above SPEED_THRESH_CMS -> 'moving', at/below it -> 'immobile'.
 SPEED_THRESH_CMS = 4.0
 
+# ---- FOOOF aperiodic (1/f) removal ----
+# Before epoching/ACG, each file's cleaned (notch-filtered, detrended)
+# continuous trace has its aperiodic (1/f) component estimated with FOOOF and
+# removed via spectral whitening: the FFT amplitude spectrum is divided by
+# sqrt(10**aperiodic_fit) at every frequency inside FOOOF_RANGE (frequencies
+# outside are left untouched), then inverse-FFT'd back to a residual trace
+# that keeps periodic/oscillatory structure but has the broadband 1/f trend
+# removed. quantify_xcorr_epochs already normalises every epoch's
+# autocorrelogram by its own peak value, so the residual's absolute scale
+# doesn't matter for the ACG measurement -- only that the aperiodic *shape*
+# across frequency is removed before the theta-band autocorrelation is
+# quantified.
+APPLY_FOOOF_APERIODIC_REMOVAL = True
+FOOOF_RANGE    = (1.0, 100.0)   # Hz -- FOOOF fit range + spectral-whitening range
+FOOOF_SETTINGS = dict(
+    peak_width_limits=[1.0, 8.0],
+    max_n_peaks=6,
+    min_peak_height=0.1,
+    peak_threshold=2.0,
+    aperiodic_mode='knee',      # fits a spectral knee -- appropriate over a wide (1-40 Hz) range
+)
+FOOOF_PSD_NPERSEG_SEC = 4.0    # s -- Welch window used only to build the spectrum FOOOF is fit to
+FOOOF_FIT_DIR = os.path.join(FIGURE_DIR, 'fooof_individual_fits')  # per-file fit-quality plots
+
 
 # %% ==================== .ncs / tracking data import ==============================
 
@@ -162,6 +202,101 @@ def detrend_signal(x, dtype='linear'):
     """Remove a polynomial trend (default: linear) from the full LFP trace,
     to clear slow drift that a notch filter alone doesn't address."""
     return signal.detrend(np.asarray(x, dtype=np.float64), type=dtype) # type: ignore
+
+
+def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
+    """Zero-phase Butterworth low-pass filter (filtfilt, so no phase distortion
+    of the theta-band content the ACG matching cares about)."""
+    nyq = fs_hz / 2.0
+    b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
+    return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
+
+
+def _style_fooof_fit_ax(ax, fm, xlim=None, title='FOOOF fit', theta_band=THETA_BAND):
+    """Plot an already-fit FOOOF model (original spectrum, full model,
+    aperiodic fit) onto `ax`, styled for a quick visual check of whether the
+    aperiodic (1/f) component was estimated well before it's subtracted from
+    the LFP (fit_fooof_and_remove_aperiodic saves one of these per file)."""
+    fm.plot(ax=ax, add_legend=False)
+
+    line_styles = [
+        ("Original PSD", "#333333", "-",  1.6),
+        ("Full Model",   "#1263E6", "--", 1.4),
+        ("Aperiodic",    "#EA080C", "--", 1.4),
+    ]
+    for line, (label, color, ls, lw) in zip(ax.lines, line_styles):
+        line.set_color(color)
+        line.set_label(label)
+        line.set_linestyle(ls)
+        line.set_linewidth(lw)
+        line.set_alpha(0.9)
+
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    ax.text(0.5, 1.09, title, transform=ax.transAxes,
+            ha='center', va='bottom', fontsize=9)
+    ax.text(0.5, 1.0, f"R²={fm.r_squared_:.3f}, error={fm.error_:.3f}",
+            transform=ax.transAxes, ha='center', va='bottom', fontsize=7.5)
+
+    if theta_band is not None:
+        ax.axvspan(theta_band[0], theta_band[1], color='green', alpha=0.12, zorder=0)
+
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.set_xlabel('Frequency (Hz)', fontsize=9)
+    ax.set_ylabel('Power', fontsize=9)
+    ax.grid(False)
+    ax.legend(fontsize=7, frameon=False, loc='upper right')
+
+
+def fit_fooof_and_remove_aperiodic(lfp, fs_hz, freq_range=FOOOF_RANGE,
+                                   fooof_settings=None, label=None,
+                                   save_fit_plot=False, save_dir=None):
+    """Fit FOOOF to the Welch PSD of `lfp` and remove the fitted aperiodic
+    (1/f) component from the time-domain signal via spectral whitening (see
+    the APPLY_FOOOF_APERIODIC_REMOVAL config note for the rationale).
+
+    If `save_fit_plot` is True, saves one figure (original spectrum, full
+    model, aperiodic fit) to `save_dir/<label>_fooof_fit.png` -- inspect
+    these to check the aperiodic fit is tracking the broadband spectrum
+    shape (and not, e.g., chasing the theta peak) before trusting the
+    residual signal.
+
+    Returns
+    -------
+    lfp_flat : ndarray, same length as `lfp` -- residual after aperiodic removal
+    fm       : fitted FOOOF model (aperiodic_params_, r_squared_, error_)
+    """
+    fooof_settings = fooof_settings or FOOOF_SETTINGS
+    nperseg = int(min(len(lfp), round(fs_hz * FOOOF_PSD_NPERSEG_SEC)))
+    f, Pxx = signal.welch(lfp, fs=fs_hz, nperseg=nperseg)
+
+    fm = FOOOF(**fooof_settings, verbose=False)
+    fm.fit(f, Pxx, list(freq_range))
+
+    if save_fit_plot:
+        fig, ax = plt.subplots(figsize=(5, 3.2))
+        _style_fooof_fit_ax(ax, fm, xlim=(freq_range[0], freq_range[1]),
+                            title=label or 'FOOOF fit')
+        os.makedirs(save_dir, exist_ok=True)
+        stem = re.sub(r'[^A-Za-z0-9_.-]+', '_', label or 'fit')
+        fig.savefig(os.path.join(save_dir, f'{stem}_fooof_fit.png'),
+                   dpi=200, bbox_inches='tight')
+        plt.close(fig)
+
+    n = len(lfp)
+    X = np.fft.rfft(lfp)
+    freqs_fft = np.fft.rfftfreq(n, d=1.0 / fs_hz)
+
+    in_range = (freqs_fft >= freq_range[0]) & (freqs_fft <= freq_range[1])
+    log_ap = gen_aperiodic(freqs_fft[in_range], fm.aperiodic_params_, fm.aperiodic_mode)
+    ap_amp = np.sqrt(10 ** log_ap)
+    ap_amp[ap_amp <= 0] = np.min(ap_amp[ap_amp > 0]) if np.any(ap_amp > 0) else 1.0
+
+    X_flat = X.copy()
+    X_flat[in_range] = X[in_range] / ap_amp
+
+    lfp_flat = np.fft.irfft(X_flat, n=n)
+    return lfp_flat, fm
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -571,35 +706,12 @@ def build_epochs(lfp, nperseg):
     return epochs, n_total
 
 
-def reject_deltatheta_epochs(epochs, fs_hz, low_band=DELTA_BAND, theta_band=THETA_BAND):
-    """Boolean keep-mask: per-epoch Welch PSD is used to reject epochs whose
-    delta-band (`low_band`) power exceeds their theta-band (`theta_band`)
-    power. Meant to run BEFORE reject_artifact_epochs -- see
-    process_ncs_for_acg, which passes this mask on to reject_artifact_epochs
-    as `ref_mask` so the MAD reference statistics aren't skewed by epochs
-    already excluded here."""
-    n_total, nperseg = epochs.shape
-    win = signal.get_window('hann', nperseg)
-    keep = np.ones(n_total, dtype=bool)
-    for i in range(n_total):
-        f, Pxx = signal.welch(epochs[i], fs=fs_hz, window=win, # type: ignore
-                              nperseg=nperseg, noverlap=0, detrend='constant')
-        df = f[1] - f[0]
-        idx_low   = (f >= low_band[0])   & (f <= low_band[1])
-        idx_theta = (f >= theta_band[0]) & (f <= theta_band[1])
-        low_pow   = np.sum(Pxx[idx_low]) * df
-        theta_pow = np.sum(Pxx[idx_theta]) * df
-        keep[i] = low_pow <= theta_pow
-    return keep
-
-
 def reject_artifact_epochs(epochs, mad_thresh=MAD_THRESH, ref_mask=None):
     """Boolean keep-mask: epoch-wise peak-to-peak amplitude, robust (MAD)
-    outlier rejection. If `ref_mask` is given (e.g. the mask returned by
-    reject_deltatheta_epochs), the median/MAD reference statistics are
-    computed only from epochs[ref_mask], so epochs already excluded upstream
-    can't skew the robust threshold -- z-scores are still returned for every
-    epoch."""
+    outlier rejection. If `ref_mask` is given, the median/MAD reference
+    statistics are computed only from epochs[ref_mask], so epochs already
+    excluded upstream can't skew the robust threshold -- z-scores are still
+    returned for every epoch."""
     p2p = epochs.max(axis=1) - epochs.min(axis=1)
     return ~_robust_high_outliers(p2p, mad_thresh, ref_mask=ref_mask)
 
@@ -639,10 +751,18 @@ def classify_epoch_movement(time_us, speed, n_total, nperseg, fs_hz, lfp_start_u
 # %% ==================== Per-file / root-directory processing =====================
 
 def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FREQ_RES,
-                        epoch_sec=EPOCH_SEC, fs_acg=FS_ACG, ed_min_thresh=ACG_ED_MIN_THRESH):
+                        epoch_sec=EPOCH_SEC, fs_acg=FS_ACG, ed_min_thresh=ACG_ED_MIN_THRESH,
+                        fooof_label=None):
     """Load one .ncs file, resample/clean it, split it into epochs labelled by
     movement state, and compute the ACG peak-range quantification for every
     clean moving/immobile epoch.
+
+    If APPLY_FOOOF_APERIODIC_REMOVAL is True, the aperiodic (1/f) component
+    is fit with FOOOF and removed from the cleaned trace (see
+    fit_fooof_and_remove_aperiodic) BEFORE low-pass filtering/epoching, so
+    the ACG is computed on the residual (aperiodic-removed) signal rather
+    than the raw LFP. `fooof_label` names the saved FOOOF fit-quality figure
+    (defaults to the file's basename).
 
     `ed_min_thresh` is forwarded to quantify_xcorr_epochs -- epochs with a
     poor sinusoid fit (ED_min above threshold) are marked 'skipped' rather
@@ -650,18 +770,33 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     'epoch_index'/'file'; filter on '~skipped' downstream as usual.
 
     Returns a DataFrame (one row per epoch) with the quantify_xcorr_epochs
-    columns plus 'movement', 'median_speed_cms', and 'epoch_index'.
+    columns plus 'movement', 'median_speed_cms', 'epoch_index', and (if
+    FOOOF aperiodic removal is enabled) 'fooof_r_squared', 'fooof_error',
+    'fooof_offset', 'fooof_knee', 'fooof_exponent' (constant per file).
     """
     lfp, lfp_start_us = load_ncs(fpath)
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
 
+    fooof_info = {}
+    if APPLY_FOOOF_APERIODIC_REMOVAL:
+        lfp, fm = fit_fooof_and_remove_aperiodic(
+            lfp, fs_acg, freq_range=FOOOF_RANGE,
+            label=fooof_label or os.path.splitext(os.path.basename(fpath))[0],
+            save_fit_plot=True, save_dir=FOOOF_FIT_DIR)
+        offset_p, *rest_p = fm.aperiodic_params_
+        knee_p = rest_p[0] if len(rest_p) == 2 else np.nan
+        exponent_p = rest_p[-1]
+        fooof_info = {'fooof_r_squared': fm.r_squared_, 'fooof_error': fm.error_,
+                      'fooof_offset': offset_p, 'fooof_knee': knee_p,
+                      'fooof_exponent': exponent_p}
+
+    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
-    keep_deltatheta = reject_deltatheta_epochs(epochs, fs_acg)
-    keep_artifact = keep_deltatheta & reject_artifact_epochs(
-        epochs, ref_mask=keep_deltatheta)
+    keep_artifact = reject_artifact_epochs(epochs)
 
     pos_path = find_position_file(fpath)
     if pos_path is None:
@@ -685,19 +820,31 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     # absolute path -- lets get_epoch_waveform() re-fetch this exact epoch's
     # raw waveform later (e.g. for plot_example_epoch), regardless of cwd
     result['file'] = os.path.abspath(fpath)
+    for k, v in fooof_info.items():
+        result[k] = v
     return result
 
 
 def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
-    """Re-derive the cleaned (resampled / notch-filtered / detrended) waveform
-    of one specific epoch from its source .ncs file, for illustrative
-    plotting (plot_example_epoch). `fpath` + `epoch_index` should come from
-    the 'file' / 'epoch_index' columns of a process_ncs_for_acg results row.
+    """Re-derive the cleaned (resampled / notch-filtered / detrended /
+    FOOOF-aperiodic-removed / low-pass filtered) waveform of one specific
+    epoch from its source .ncs file, for illustrative plotting
+    (plot_example_epoch). `fpath` + `epoch_index` should come from the
+    'file' / 'epoch_index' columns of a process_ncs_for_acg results row.
+
+    Mirrors process_ncs_for_acg's cleaning chain (including the
+    APPLY_FOOOF_APERIODIC_REMOVAL step, without re-saving a fit-quality
+    figure) so the plotted waveform matches what the ACG was actually
+    computed on.
     """
     lfp, _ = load_ncs(fpath)
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
+    if APPLY_FOOOF_APERIODIC_REMOVAL:
+        lfp, _fm = fit_fooof_and_remove_aperiodic(
+            lfp, fs_acg, freq_range=FOOOF_RANGE, save_fit_plot=False)
+    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, _ = build_epochs(lfp, nperseg)
     return epochs[int(epoch_index)]
@@ -718,7 +865,7 @@ def process_root_directory(root_dir):
     for fpath in ncs_files:
         rel = os.path.relpath(fpath, root_dir)
         try:
-            res = process_ncs_for_acg(fpath)
+            res = process_ncs_for_acg(fpath, fooof_label=rel)
             meta = parse_metadata_from_path(rel)
             for k, v in meta.items():
                 res[k] = v
@@ -753,6 +900,154 @@ def summarize_peak_range(df, group_cols=('animal', 'channel', 'movement')):
                  q75=lambda x: x.quantile(0.75),
                  n='count')
             .reset_index())
+
+
+# Ranges the matched-sinusoid frequency estimate ('freq' column, i.e.
+# freq_est in quantify_xcorr_epochs) is bucketed into for
+# compute_freq_range_counts -- inclusive [lo, hi] on both ends, matching the
+# 0.1 Hz step of the reference bank (ACG_FREQ_RES) so no freq_est value can
+# fall between two ranges.
+FREQ_HIST_BIN_EDGES = [(3.0, 3.9), (4.0, 4.9), (5.0, 5.9), (6.0, 7.0)]
+
+
+def compute_freq_range_counts(df, bin_edges=FREQ_HIST_BIN_EDGES):
+    """Count of (non-skipped) epochs whose matched-sinusoid freq_est falls in
+    each [lo, hi] range of `bin_edges`, clubbing all epochs together
+    (all animals/channels/movement states)."""
+    freq = df.loc[~df['skipped'], 'freq']
+    labels = [f'{lo:g}-{hi:g}' for lo, hi in bin_edges]
+    counts = [int(((freq >= lo) & (freq <= hi)).sum()) for lo, hi in bin_edges]
+    return pd.DataFrame({'freq_range': labels, 'count': counts})
+
+
+def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
+    """Line-histogram of matched-sinusoid freq_est ('freq' column) for
+    accepted (non-skipped) epochs.
+
+    If `animal` is given, restricted to that animal's epochs; otherwise
+    clubbed across all animals/channels/movement states. Same continuous-bin,
+    line-plot formatting as plot_edmin_rejected_freq_histogram.
+
+    Returns (fig, ax, freq series).
+    """
+    scope = df if animal is None else df[df['animal'] == animal]
+    freq = scope.loc[~scope['skipped'], 'freq']
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if freq.empty:
+        ax.set_title('No accepted epochs')
+        return fig, ax, freq
+
+    bin_edges = np.linspace(freq.min(), freq.max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    counts, _ = np.histogram(freq, bins=bin_edges)
+    ax.plot(centers, counts, marker='o', markersize=3, linewidth=1.2, color='#4C72B0')
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Epoch count')
+    title = f'freq_est of accepted epochs (n={len(freq)})'
+    ax.set_title(f'{animal}: {title}' if animal else title)
+    fig.tight_layout()
+    return fig, ax, freq
+
+
+def plot_freq_est_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
+    """Line-overlay version of plot_freq_est_histogram: one line per animal,
+    all drawn on shared bins/axes so animals' freq_est distributions can be
+    compared directly. Restricted to accepted (non-skipped) epochs.
+
+    Returns (fig, ax).
+    """
+    accepted = df.loc[~df['skipped'], ['animal', 'freq']]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if accepted.empty:
+        ax.set_title('No accepted epochs')
+        return fig, ax
+
+    bin_edges = np.linspace(accepted['freq'].min(), accepted['freq'].max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    for animal_label in sorted(accepted['animal'].unique()):
+        freq = accepted.loc[accepted['animal'] == animal_label, 'freq']
+        counts, _ = np.histogram(freq, bins=bin_edges)
+        ax.plot(centers, counts, marker='o', markersize=3, linewidth=1.2,
+               label=f'{animal_label} (n={len(freq)})')
+
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Epoch count')
+    ax.set_title('freq_est of accepted epochs, by animal')
+    ax.legend(fontsize=7, frameon=False)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_edmin_rejected_freq_histogram(df, animal=None, ed_min_thresh=ACG_ED_MIN_THRESH,
+                                       bins=30, ax=None, figsize=(5, 4)):
+    """Histogram of matched-sinusoid freq_est ('freq' column) for epochs
+    rejected by the ED_min fit-quality gate (ED_min >= `ed_min_thresh`).
+
+    If `animal` is given, restricted to that animal's epochs; otherwise
+    clubbed across all animals/channels/movement states.
+
+    Returns (fig, ax, rejected_freq series).
+    """
+    scope = df if animal is None else df[df['animal'] == animal]
+    rejected_freq = scope.loc[scope['ED_min'] >= ed_min_thresh, 'freq']
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    ax.hist(rejected_freq, bins=bins, color='#C44E52', edgecolor='black')
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Epoch count')
+    title = f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs (n={len(rejected_freq)})'
+    ax.set_title(f'{animal}: {title}' if animal else title)
+    fig.tight_layout()
+    return fig, ax, rejected_freq
+
+
+def plot_edmin_rejected_freq_histogram_overlay(df, ed_min_thresh=ACG_ED_MIN_THRESH, bins=30,
+                                               ax=None, figsize=(6, 4)):
+    """Line-overlay version of plot_edmin_rejected_freq_histogram: one line
+    per animal (rather than separate bar-histogram figures), all drawn on
+    shared bins/axes so animals' freq_est distributions can be compared
+    directly. Restricted to epochs rejected by the ED_min fit-quality gate
+    (ED_min >= `ed_min_thresh`).
+
+    Returns (fig, ax).
+    """
+    rejected = df.loc[df['ED_min'] >= ed_min_thresh, ['animal', 'freq']]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if rejected.empty:
+        ax.set_title(f'No epochs with ED_min >= {ed_min_thresh:g}')
+        return fig, ax
+
+    bin_edges = np.linspace(rejected['freq'].min(), rejected['freq'].max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    for animal_label in sorted(rejected['animal'].unique()):
+        freq = rejected.loc[rejected['animal'] == animal_label, 'freq']
+        counts, _ = np.histogram(freq, bins=bin_edges)
+        ax.plot(centers, counts, marker='o', markersize=3, linewidth=1.2,
+               label=f'{animal_label} (n={len(freq)})')
+
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Epoch count')
+    ax.set_title(f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs, by animal')
+    ax.legend(fontsize=7, frameon=False)
+    fig.tight_layout()
+    return fig, ax
 
 
 def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
@@ -1152,8 +1447,22 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
 if __name__ == '__main__':
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(FIGURE_DIR, exist_ok=True)
+    if APPLY_FOOOF_APERIODIC_REMOVAL:
+        os.makedirs(FOOOF_FIT_DIR, exist_ok=True)
 
     results_df = process_root_directory(ROOT_DIR)
+
+    if APPLY_FOOOF_APERIODIC_REMOVAL:
+        # one row per file -- fooof_* columns are constant across a file's epochs
+        fooof_cols = ['fooof_r_squared', 'fooof_error', 'fooof_offset',
+                      'fooof_knee', 'fooof_exponent']
+        fooof_quality_df = (results_df.groupby('file')[fooof_cols]
+                            .first().reset_index())
+        fooof_quality_path = os.path.join(OUTPUT_DIR, 'fooof_aperiodic_fit_quality.csv')
+        fooof_quality_df.to_csv(fooof_quality_path, index=False)
+        print(f'Saved FOOOF aperiodic fit quality ({len(fooof_quality_df)} files) '
+              f'-> {fooof_quality_path}')
+        print(f'FOOOF individual fit plots -> {FOOOF_FIT_DIR}')
 
     n_edmin_rejected = int(results_df['skipped_edmin'].sum())
     pct_edmin_rejected = 100 * n_edmin_rejected / len(results_df) if len(results_df) else 0.0
@@ -1169,6 +1478,28 @@ if __name__ == '__main__':
     summary_df.to_csv(summary_path, index=False)
     print(f'Saved summary -> {summary_path}')
 
+    # Matched-sinusoid freq_est histogram, clubbed across ALL epochs (every
+    # animal/channel/movement state pooled together)
+    fig_freqhist, _ax_freqhist, _freq_est = plot_freq_est_histogram(results_df)
+    freqhist_path = os.path.join(FIGURE_DIR, 'freq_est_histogram.png')
+    fig_freqhist.savefig(freqhist_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_freqhist)
+    print(f'Saved figure -> {freqhist_path}')
+
+    freq_range_counts_df = compute_freq_range_counts(results_df)
+    freq_range_counts_path = os.path.join(OUTPUT_DIR, 'freq_est_range_counts.csv')
+    freq_range_counts_df.to_csv(freq_range_counts_path, index=False)
+    print(f'Saved freq_est range counts -> {freq_range_counts_path}')
+
+    # freq_est histogram restricted to epochs rejected by the ED_min
+    # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH), clubbed across ALL
+    # epochs (every animal/channel/movement state pooled together)
+    fig_edminfreq, _ax_edminfreq, _edmin_rejected_freq = plot_edmin_rejected_freq_histogram(results_df)
+    edminfreq_path = os.path.join(FIGURE_DIR, 'edmin_rejected_freq_est_histogram.png')
+    fig_edminfreq.savefig(edminfreq_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edminfreq)
+    print(f'Saved figure -> {edminfreq_path}')
+
     all_centroids = []
     for animal_label in results_df['animal'].unique(): # type: ignore # type: ignore
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -1178,6 +1509,25 @@ if __name__ == '__main__':
         fig.savefig(fig_path, dpi=200)
         plt.close(fig)
         print(f'Saved figure -> {fig_path}')
+
+        # freq_est histogram of this animal's accepted (non-skipped) epochs
+        fig_freqhist_a, _ax_freqhist_a, _freq_est_a = plot_freq_est_histogram(
+            results_df, animal=animal_label)
+        freqhist_a_path = os.path.join(
+            FIGURE_DIR, f'{animal_label}_freq_est_histogram.png')
+        fig_freqhist_a.savefig(freqhist_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_freqhist_a)
+        print(f'Saved figure -> {freqhist_a_path}')
+
+        # freq_est histogram of this animal's epochs rejected by the ED_min
+        # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH)
+        fig_edminfreq_a, _ax_edminfreq_a, _rej_freq_a = plot_edmin_rejected_freq_histogram(
+            results_df, animal=animal_label)
+        edminfreq_a_path = os.path.join(
+            FIGURE_DIR, f'{animal_label}_edmin_rejected_freq_est_histogram.png')
+        fig_edminfreq_a.savefig(edminfreq_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_edminfreq_a)
+        print(f'Saved figure -> {edminfreq_a_path}')
 
         # Fig. 4-style: example moving/immobile epochs + freq-vs-peak-range
         # scatter with movement centroids
@@ -1201,6 +1551,23 @@ if __name__ == '__main__':
             print(f'Saved figure -> {split_path}')
         except ValueError as e:
             print(f'  SKIP mobility/immobility split plot for {animal_label}: {e}')
+
+    # freq_est line-overlay of accepted epochs, one line per animal on shared
+    # axes for direct comparison
+    fig_freqhist_ov, _ax_freqhist_ov = plot_freq_est_histogram_overlay(results_df)
+    freqhist_ov_path = os.path.join(FIGURE_DIR, 'freq_est_histogram_by_animal_overlay.png')
+    fig_freqhist_ov.savefig(freqhist_ov_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_freqhist_ov)
+    print(f'Saved figure -> {freqhist_ov_path}')
+
+    # freq_est line-overlay of ED_min-rejected epochs, one line per animal on
+    # shared axes for direct comparison
+    fig_edminfreq_ov, _ax_edminfreq_ov = plot_edmin_rejected_freq_histogram_overlay(results_df)
+    edminfreq_ov_path = os.path.join(
+        FIGURE_DIR, 'edmin_rejected_freq_est_histogram_by_animal_overlay.png')
+    fig_edminfreq_ov.savefig(edminfreq_ov_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edminfreq_ov)
+    print(f'Saved figure -> {edminfreq_ov_path}')
 
     if all_centroids:
         centroids_df = pd.concat(all_centroids, ignore_index=True)

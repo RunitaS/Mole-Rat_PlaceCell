@@ -90,6 +90,7 @@
 
 ## Comparision between species
 
+- DIfferent aniamls, different ecological niches, , unique set of DNA content, perceptive abilities, makign them exhibit their unique set of behaviors.
 - Mechanism conserved across mammalian species? 
 - Bats for example are a well studied species which diverged from rodent relatives around 95 mya in the cretaceous period. Despite having diverged from widley studied rats and mice not too long ago, the characteristics of their hippocampal spatial representations despite their fundamental nature remaining conserved have some very drastic differences which clearly seem to be shaped by the ecological niche, both in terms of the landscape of physical space and their perceptive abilities. *Add note on what he difference are to highlight your point, theta is rarely present (usually thought to e a requisite for spatial info processing in rodents), even when it is present is mostly correlated with echolocation. 3D space represnetation is lot more refined compared to rodents navigating in 2D space. High prevalence of social reps in hippocampus.*
 - Macaque and human hippocampus dominated by sptial view cells, very few pure place cells like htose observed in rats and mice.

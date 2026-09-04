@@ -88,8 +88,8 @@ from scipy.special import erf
 # Configuration -- EDIT THESE
 # ============================================================================
 
-ROOT_FOLDER = Path(r"X:/NMR_group_data/Runita/Analysis/Thesis")
-OUTPUT_EXCEL_NAME = 'theta_phase.xlsx'   # written to ROOT_FOLDER
+ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True")
+OUTPUT_EXCEL_NAME = 'theta_phase_corrected.xlsx'   # written to ROOT_FOLDER
 
 TRACKING_TIME_UNIT = 'us'     # 'us', 'ms', or 's' -- units of the tracking timestamp column
 

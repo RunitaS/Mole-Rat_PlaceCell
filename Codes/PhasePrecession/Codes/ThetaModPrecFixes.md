@@ -2,6 +2,21 @@
 
 - [ ] **<Major fix: Add only significant theta epochs for phase precession>**
 
+- [x] < Major fix:> ** Stats are wrong. Steeper slopes show no signif phase precession. flat ones do. Mostly dpendent on spike numbers.**
+
+Bug 1 (primary cause of your symptom): anglereg's slope search tried only two Nelder-Mead starting points on a highly multimodal objective (many aliased local maxima), unbounded. For any real precession slope beyond near-zero, it frequently converged to an essentially arbitrary slope — confirmed in simulation (true slope 1.0 → fitted −14.3, true slope 2.0 → fitted −10.2, etc.). Flat cells were the one regime it reliably got right, which is exactly why flat-looking cells passed and steep ones didn't.
+→ Fixed: replaced with a bounded coarse-grid search (±4 cycles/unit over the observed pass-index range) followed by local refinement at the best grid point.
+
+Bug 2 (compounding, on top of bug 1): kempter_lincirc computed the fitted phase as mod(s*x, 2π) instead of mod(2π*s*x, 2π) — missing the same 2π factor the optimizer itself uses. This decoupled the reported ρ/p from the actual fitted slope for anything but tiny slopes, so even a correctly-fit steep cell could come back non-significant.
+→ Fixed: added the missing 2π.
+
+Bug 3 (secondary, per your go-ahead): slope_deg_per_pass used rad2deg(2π·s), which is degrees per 1 unit of pass index, not per the full pass (pass index spans 2 units, −1 to +1) as the docstring/classification logic intended — under-reporting by 2×.
+→ Fixed: now rad2deg(4π·s).
+
+*Verified the fix against simulated spikes with known ground-truth slopes: slope recovery went from essentially random to accurate, and significance now tracks true signal strength/spike count instead of being inverted. This will change which cells your pipeline calls significantly precessing/recessing (previously-flagged "flat but significant" cells will likely lose significance, and genuinely steep cells should gain it) — you'll want to re-run the pipeline to regenerate theta_phase.xlsx before drawing conclusions from it. I left ThetaModPrecFixes.md's corresponding TODO item unchecked since I didn't touch that file — let me know if you'd like me to check it off.*
+
+- [x] < Major fix:> ** Change field threshold from 10% to 20%.**
+
 - [ ] **Cross check if pass index code is executed according to Climer's code. Description in MEC paper does not match python code. Could be because of method used for grid cells,**
 
 - [ ] **Currently there are considerable number of phase processing cells. Check for forward vs backward phase precession to remove the possibility of these being entry through butt.** *Not doable until Nauman is done with his analysis.*

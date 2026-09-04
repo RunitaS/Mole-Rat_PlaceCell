@@ -38,6 +38,7 @@ import pandas as pd
 from scipy import signal
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
+from scipy.stats import pearsonr, spearmanr
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -72,6 +73,14 @@ ncs_dtype = np.dtype([
 # ---- 50 Hz line-noise cleaning (European mains) ----
 LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]  # harmonics below Nyquist (FS_ACG/2 = 500 Hz)
 NOTCH_Q        = 30.0
+
+# ---- Low-pass filtering ----
+# The raw .ncs trace is broadband (acquired 1-500 Hz). Restrict the signal
+# used for ACG/reference-sinusoid matching to <100 Hz so high-frequency
+# content (well above the 3-7 Hz theta band of interest) can't distort the
+# autocorrelogram shape.
+LOWPASS_CUTOFF_HZ = 100.0  # Hz
+LOWPASS_ORDER = 4          # Butterworth order (zero-phase via filtfilt)
 
 # ---- Artifact rejection (epoch-wise peak-to-peak, robust MAD outlier) ----
 MAD_THRESH = 5.0
@@ -162,6 +171,14 @@ def detrend_signal(x, dtype='linear'):
     """Remove a polynomial trend (default: linear) from the full LFP trace,
     to clear slow drift that a notch filter alone doesn't address."""
     return signal.detrend(np.asarray(x, dtype=np.float64), type=dtype) # type: ignore
+
+
+def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
+    """Zero-phase Butterworth low-pass filter (filtfilt, so no phase distortion
+    of the theta-band content the ACG matching cares about)."""
+    nyq = fs_hz / 2.0
+    b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
+    return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -656,6 +673,7 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
+    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
 
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
@@ -689,15 +707,17 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
 
 
 def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
-    """Re-derive the cleaned (resampled / notch-filtered / detrended) waveform
-    of one specific epoch from its source .ncs file, for illustrative
-    plotting (plot_example_epoch). `fpath` + `epoch_index` should come from
-    the 'file' / 'epoch_index' columns of a process_ncs_for_acg results row.
+    """Re-derive the cleaned (resampled / notch-filtered / detrended / low-pass
+    filtered) waveform of one specific epoch from its source .ncs file, for
+    illustrative plotting (plot_example_epoch). `fpath` + `epoch_index` should
+    come from the 'file' / 'epoch_index' columns of a process_ncs_for_acg
+    results row.
     """
     lfp, _ = load_ncs(fpath)
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
+    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, _ = build_epochs(lfp, nperseg)
     return epochs[int(epoch_index)]
@@ -753,6 +773,253 @@ def summarize_peak_range(df, group_cols=('animal', 'channel', 'movement')):
                  q75=lambda x: x.quantile(0.75),
                  n='count')
             .reset_index())
+
+
+# Ranges the matched-sinusoid frequency estimate ('freq' column, i.e.
+# freq_est in quantify_xcorr_epochs) is bucketed into for
+# compute_freq_range_counts -- inclusive [lo, hi] on both ends, matching the
+# 0.1 Hz step of the reference bank (ACG_FREQ_RES) so no freq_est value can
+# fall between two ranges.
+FREQ_HIST_BIN_EDGES = [(3.0, 3.9), (4.0, 4.9), (5.0, 5.9), (6.0, 7.0)]
+
+
+def compute_freq_range_counts(df, bin_edges=FREQ_HIST_BIN_EDGES):
+    """Count of (non-skipped) epochs whose matched-sinusoid freq_est falls in
+    each [lo, hi] range of `bin_edges`, clubbing all epochs together
+    (all animals/channels/movement states)."""
+    freq = df.loc[~df['skipped'], 'freq']
+    labels = [f'{lo:g}-{hi:g}' for lo, hi in bin_edges]
+    counts = [int(((freq >= lo) & (freq <= hi)).sum()) for lo, hi in bin_edges]
+    return pd.DataFrame({'freq_range': labels, 'count': counts})
+
+
+def _mean_count_per_recording(sub, bin_edges):
+    """Per-bin epoch count histogrammed separately for each recording
+    ('file' column) in `sub`, then averaged across those recordings.
+
+    Normalises for animals/groups having different numbers of recordings
+    (files) contributing epochs -- a plain pooled histogram would otherwise
+    just track how many recordings/epochs went into each group rather than
+    the underlying freq_est distribution. Returns (mean_counts, n_recordings).
+    """
+    files = sub['file'].unique()
+    if len(files) == 0:
+        return np.zeros(len(bin_edges) - 1), 0
+    per_file_counts = np.array([
+        np.histogram(sub.loc[sub['file'] == f, 'freq'], bins=bin_edges)[0]
+        for f in files
+    ])
+    return per_file_counts.mean(axis=0), len(files)
+
+
+def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
+    """Line-histogram of matched-sinusoid freq_est ('freq' column) for
+    accepted (non-skipped) epochs, plotted as the mean epoch count per
+    recording (see _mean_count_per_recording) rather than the pooled
+    absolute count, so groups with more recordings don't just read higher.
+
+    If `animal` is given, restricted to that animal's epochs; otherwise
+    clubbed across all animals/channels/movement states.
+
+    Returns (fig, ax, freq series).
+    """
+    scope = df if animal is None else df[df['animal'] == animal]
+    accepted = scope.loc[~scope['skipped'], ['file', 'freq']]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if accepted.empty:
+        ax.set_title('No accepted epochs')
+        return fig, ax, accepted['freq']
+
+    bin_edges = np.linspace(accepted['freq'].min(), accepted['freq'].max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    mean_counts, n_files = _mean_count_per_recording(accepted, bin_edges)
+    ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2, color='#4C72B0')
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Mean epoch count per recording')
+    title = f'freq_est of accepted epochs (n={len(accepted)} epochs, {n_files} recordings)'
+    ax.set_title(f'{animal}: {title}' if animal else title)
+    fig.tight_layout()
+    return fig, ax, accepted['freq']
+
+
+def plot_freq_est_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
+    """Line-overlay version of plot_freq_est_histogram: one line per animal
+    (mean epoch count per recording, see _mean_count_per_recording), all
+    drawn on shared bins/axes so animals' freq_est distributions can be
+    compared directly regardless of how many recordings each contributed.
+    Restricted to accepted (non-skipped) epochs.
+
+    Returns (fig, ax).
+    """
+    accepted = df.loc[~df['skipped'], ['animal', 'file', 'freq']]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if accepted.empty:
+        ax.set_title('No accepted epochs')
+        return fig, ax
+
+    bin_edges = np.linspace(accepted['freq'].min(), accepted['freq'].max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    for animal_label in sorted(accepted['animal'].unique()):
+        sub = accepted[accepted['animal'] == animal_label]
+        mean_counts, n_files = _mean_count_per_recording(sub, bin_edges)
+        ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2,
+               label=f'{animal_label} (n={len(sub)} epochs, {n_files} rec)')
+
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Mean epoch count per recording')
+    ax.set_title('freq_est of accepted epochs, by animal')
+    ax.legend(fontsize=7, frameon=False)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_edmin_rejected_freq_histogram(df, animal=None, ed_min_thresh=ACG_ED_MIN_THRESH,
+                                       bins=30, ax=None, figsize=(5, 4)):
+    """Line-histogram of matched-sinusoid freq_est ('freq' column) for
+    epochs rejected by the ED_min fit-quality gate (ED_min >= `ed_min_thresh`),
+    plotted as the mean epoch count per recording (see
+    _mean_count_per_recording) rather than the pooled absolute count, so
+    groups with more recordings don't just read higher.
+
+    If `animal` is given, restricted to that animal's epochs; otherwise
+    clubbed across all animals/channels/movement states.
+
+    Returns (fig, ax, rejected_freq series).
+    """
+    scope = df if animal is None else df[df['animal'] == animal]
+    rejected = scope.loc[scope['ED_min'] >= ed_min_thresh, ['file', 'freq']]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if rejected.empty:
+        ax.set_title(f'No epochs with ED_min >= {ed_min_thresh:g}')
+        return fig, ax, rejected['freq']
+
+    bin_edges = np.linspace(rejected['freq'].min(), rejected['freq'].max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    mean_counts, n_files = _mean_count_per_recording(rejected, bin_edges)
+    ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2, color='#C44E52')
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Mean epoch count per recording')
+    title = (f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs '
+             f'(n={len(rejected)} epochs, {n_files} recordings)')
+    ax.set_title(f'{animal}: {title}' if animal else title)
+    fig.tight_layout()
+    return fig, ax, rejected['freq']
+
+
+def plot_edmin_rejected_freq_histogram_overlay(df, ed_min_thresh=ACG_ED_MIN_THRESH, bins=30,
+                                               ax=None, figsize=(6, 4)):
+    """Line-overlay version of plot_edmin_rejected_freq_histogram: one line
+    per animal (mean epoch count per recording, see _mean_count_per_recording),
+    all drawn on shared bins/axes so animals' freq_est distributions can be
+    compared directly regardless of how many recordings each contributed.
+    Restricted to epochs rejected by the ED_min fit-quality gate
+    (ED_min >= `ed_min_thresh`).
+
+    Returns (fig, ax).
+    """
+    rejected = df.loc[df['ED_min'] >= ed_min_thresh, ['animal', 'file', 'freq']]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if rejected.empty:
+        ax.set_title(f'No epochs with ED_min >= {ed_min_thresh:g}')
+        return fig, ax
+
+    bin_edges = np.linspace(rejected['freq'].min(), rejected['freq'].max(), bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    for animal_label in sorted(rejected['animal'].unique()):
+        sub = rejected[rejected['animal'] == animal_label]
+        mean_counts, n_files = _mean_count_per_recording(sub, bin_edges)
+        ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2,
+               label=f'{animal_label} (n={len(sub)} epochs, {n_files} rec)')
+
+    ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
+    ax.set_ylabel('Mean epoch count per recording')
+    ax.set_title(f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs, by animal')
+    ax.legend(fontsize=7, frameon=False)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
+                                color='#4C72B0', point_size=10, alpha=0.3):
+    """Scatter of ED_min (fit-quality distance to the closest-matching
+    reference sinusoid) vs. peakrangenorm (normalised autocorrelogram peak
+    range), to test whether a poor sinusoid fit (high ED_min) predicts a low
+    peak range.
+
+    Deliberately NOT filtered on 'skipped'/'skipped_edmin' -- that flag is
+    itself an ED_min threshold, so filtering on it would truncate exactly the
+    high-ED_min epochs the hypothesis is about. Only epochs with no ED_min at
+    all (too-short epochs, ED_min is NaN) are excluded.
+
+    Reports Pearson r and Spearman rho (each with a p-value) and overlays a
+    linear least-squares fit line plus the ACG_ED_MIN_THRESH cutoff.
+
+    Returns (fig, ax, stats_dict) where stats_dict has keys 'pearson_r',
+    'pearson_p', 'spearman_r', 'spearman_p', 'n'.
+    """
+    scope = df if animal is None else df[df['animal'] == animal]
+    sub = scope.dropna(subset=['ED_min', 'peakrangenorm'])
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if len(sub) < 2:
+        ax.set_title('Not enough epochs for correlation')
+        return fig, ax, {'pearson_r': np.nan, 'pearson_p': np.nan,
+                         'spearman_r': np.nan, 'spearman_p': np.nan, 'n': len(sub)}
+
+    x = sub['ED_min'].to_numpy()
+    y = sub['peakrangenorm'].to_numpy()
+
+    r_p, p_p = pearsonr(x, y)
+    r_s, p_s = spearmanr(x, y)
+
+    ax.scatter(x, y, s=point_size, color=color, alpha=alpha, edgecolor='none', zorder=2)
+
+    slope, intercept = np.polyfit(x, y, 1)
+    x_line = np.array([x.min(), x.max()])
+    ax.plot(x_line, slope * x_line + intercept, color='black', linewidth=1.5, zorder=4,
+            label='linear fit')
+
+    ax.axvline(ACG_ED_MIN_THRESH, color='#C44E52', linestyle='--', linewidth=1, zorder=3,
+              label=f'ED_min threshold ({ACG_ED_MIN_THRESH:g})')
+
+    ax.set_xlabel('ED_min (distance to closest-matching reference sinusoid)')
+    ax.set_ylabel('Autocorr. peak range (norm.)')
+    title = 'ED_min vs. normalised peak range'
+    ax.set_title(f'{animal}: {title}' if animal else title)
+    ax.legend(loc='upper right', fontsize=7, frameon=False)
+
+    stats_text = (f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
+                 f'Spearman rho = {r_s:.3f} (p = {p_s:.2e})\n'
+                 f'n = {len(sub)}')
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
+           fontsize=8, color='0.1',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
+
+    fig.tight_layout()
+    return fig, ax, {'pearson_r': r_p, 'pearson_p': p_p,
+                     'spearman_r': r_s, 'spearman_p': p_s, 'n': len(sub)}
 
 
 def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
@@ -1169,6 +1436,39 @@ if __name__ == '__main__':
     summary_df.to_csv(summary_path, index=False)
     print(f'Saved summary -> {summary_path}')
 
+    # Matched-sinusoid freq_est histogram, clubbed across ALL epochs (every
+    # animal/channel/movement state pooled together)
+    fig_freqhist, _ax_freqhist, _freq_est = plot_freq_est_histogram(results_df)
+    freqhist_path = os.path.join(FIGURE_DIR, 'freq_est_histogram.png')
+    fig_freqhist.savefig(freqhist_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_freqhist)
+    print(f'Saved figure -> {freqhist_path}')
+
+    freq_range_counts_df = compute_freq_range_counts(results_df)
+    freq_range_counts_path = os.path.join(OUTPUT_DIR, 'freq_est_range_counts.csv')
+    freq_range_counts_df.to_csv(freq_range_counts_path, index=False)
+    print(f'Saved freq_est range counts -> {freq_range_counts_path}')
+
+    # freq_est histogram restricted to epochs rejected by the ED_min
+    # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH), clubbed across ALL
+    # epochs (every animal/channel/movement state pooled together)
+    fig_edminfreq, _ax_edminfreq, _edmin_rejected_freq = plot_edmin_rejected_freq_histogram(results_df)
+    edminfreq_path = os.path.join(FIGURE_DIR, 'edmin_rejected_freq_est_histogram.png')
+    fig_edminfreq.savefig(edminfreq_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edminfreq)
+    print(f'Saved figure -> {edminfreq_path}')
+
+    # ED_min vs. normalised peak range -- test whether a poor sinusoid fit
+    # (high ED_min) predicts a low peak range, clubbed across ALL epochs
+    fig_edmin_pr, _ax_edmin_pr, edmin_pr_stats = plot_edmin_vs_peakrangenorm(results_df)
+    edmin_pr_path = os.path.join(FIGURE_DIR, 'edmin_vs_peakrangenorm.png')
+    fig_edmin_pr.savefig(edmin_pr_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edmin_pr)
+    print(f'Saved figure -> {edmin_pr_path}  '
+          f"(Pearson r={edmin_pr_stats['pearson_r']:.3f}, "
+          f"Spearman rho={edmin_pr_stats['spearman_r']:.3f}, n={edmin_pr_stats['n']})")
+    edmin_pr_stats_rows = [{'animal': 'ALL', **edmin_pr_stats}]
+
     all_centroids = []
     for animal_label in results_df['animal'].unique(): # type: ignore # type: ignore
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -1178,6 +1478,34 @@ if __name__ == '__main__':
         fig.savefig(fig_path, dpi=200)
         plt.close(fig)
         print(f'Saved figure -> {fig_path}')
+
+        # freq_est histogram of this animal's accepted (non-skipped) epochs
+        fig_freqhist_a, _ax_freqhist_a, _freq_est_a = plot_freq_est_histogram(
+            results_df, animal=animal_label)
+        freqhist_a_path = os.path.join(
+            FIGURE_DIR, f'{animal_label}_freq_est_histogram.png')
+        fig_freqhist_a.savefig(freqhist_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_freqhist_a)
+        print(f'Saved figure -> {freqhist_a_path}')
+
+        # freq_est histogram of this animal's epochs rejected by the ED_min
+        # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH)
+        fig_edminfreq_a, _ax_edminfreq_a, _rej_freq_a = plot_edmin_rejected_freq_histogram(
+            results_df, animal=animal_label)
+        edminfreq_a_path = os.path.join(
+            FIGURE_DIR, f'{animal_label}_edmin_rejected_freq_est_histogram.png')
+        fig_edminfreq_a.savefig(edminfreq_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_edminfreq_a)
+        print(f'Saved figure -> {edminfreq_a_path}')
+
+        # ED_min vs. normalised peak range, this animal only
+        fig_edmin_pr_a, _ax_edmin_pr_a, edmin_pr_stats_a = plot_edmin_vs_peakrangenorm(
+            results_df, animal=animal_label)
+        edmin_pr_a_path = os.path.join(FIGURE_DIR, f'{animal_label}_edmin_vs_peakrangenorm.png')
+        fig_edmin_pr_a.savefig(edmin_pr_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_edmin_pr_a)
+        print(f'Saved figure -> {edmin_pr_a_path}')
+        edmin_pr_stats_rows.append({'animal': animal_label, **edmin_pr_stats_a})
 
         # Fig. 4-style: example moving/immobile epochs + freq-vs-peak-range
         # scatter with movement centroids
@@ -1202,8 +1530,30 @@ if __name__ == '__main__':
         except ValueError as e:
             print(f'  SKIP mobility/immobility split plot for {animal_label}: {e}')
 
+    # freq_est line-overlay of accepted epochs, one line per animal on shared
+    # axes for direct comparison
+    fig_freqhist_ov, _ax_freqhist_ov = plot_freq_est_histogram_overlay(results_df)
+    freqhist_ov_path = os.path.join(FIGURE_DIR, 'freq_est_histogram_by_animal_overlay.png')
+    fig_freqhist_ov.savefig(freqhist_ov_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_freqhist_ov)
+    print(f'Saved figure -> {freqhist_ov_path}')
+
+    # freq_est line-overlay of ED_min-rejected epochs, one line per animal on
+    # shared axes for direct comparison
+    fig_edminfreq_ov, _ax_edminfreq_ov = plot_edmin_rejected_freq_histogram_overlay(results_df)
+    edminfreq_ov_path = os.path.join(
+        FIGURE_DIR, 'edmin_rejected_freq_est_histogram_by_animal_overlay.png')
+    fig_edminfreq_ov.savefig(edminfreq_ov_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edminfreq_ov)
+    print(f'Saved figure -> {edminfreq_ov_path}')
+
     if all_centroids:
         centroids_df = pd.concat(all_centroids, ignore_index=True)
         centroids_path = os.path.join(OUTPUT_DIR, 'acg_theta_continuity_centroids.csv')
         centroids_df.to_csv(centroids_path, index=False)
         print(f'Saved movement centroids -> {centroids_path}')
+
+    edmin_pr_stats_df = pd.DataFrame(edmin_pr_stats_rows)
+    edmin_pr_stats_path = os.path.join(OUTPUT_DIR, 'edmin_vs_peakrangenorm_stats.csv')
+    edmin_pr_stats_df.to_csv(edmin_pr_stats_path, index=False)
+    print(f'Saved ED_min vs. peakrangenorm correlation stats -> {edmin_pr_stats_path}')

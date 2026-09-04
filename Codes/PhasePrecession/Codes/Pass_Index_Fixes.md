@@ -2,6 +2,8 @@
 
 ## Fies to-do:
 
+- [ ] <Major fix:> **Stats are wrong. Steeper slopes show no signif phase precession. flat ones do. Mostly dpendent on spike numbers.**
+
 - [x] ** Fix the <ERROR (Filter not stable due to sum(a) == 0, i.e., having a pole at z = 1!)>**
 *Fixed: `bandpass_filter` now designs via SOS (`output='sos'` + `sosfiltfilt`) instead of b/a + `filtfilt`, which was numerically unstable for narrow/near-DC bands.*
 
