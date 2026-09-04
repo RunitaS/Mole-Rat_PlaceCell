@@ -350,7 +350,7 @@ def _interp_nearest_extrap(x_ref, y_ref, x_query):
     return y_ref[idx]
 
 
-def bandpass_filter(data, low, high, fs, order=3):
+def bandpass_filter(data, low, high, fs, order=4):
     """Zero-phase Butterworth bandpass, always via second-order sections.
 
     SOS form avoids the b/a transfer-function representation's numerical

@@ -16,3 +16,6 @@ Theta analysis
    b. Phase locking (verify with shuffling analysis)
 11. Compare theta power/frequency in magnetic field vs zero field
 12. Compare theta power between animals in different arenas
+
+Post thesis ananlysis
+1. Characterize 1/f aperiodic signal slope and shape. Indicative of brai state and different in epileptic brains. Alo holds info on excitatory and inhibitory balance.

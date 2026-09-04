@@ -129,12 +129,12 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
-output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/wut_SpeedShuf_pValDebug_Median.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Test'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Test/wut_Test_CorrCode.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2'
+Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Test/Test_Res'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
