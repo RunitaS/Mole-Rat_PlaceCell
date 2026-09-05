@@ -8,7 +8,7 @@ output_excel = r'F:/Check/1059_Nest_Day10/sir_shuff.xlsx'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
-arena_width_cm = 60.0         # physical arena width in cm
+arena_width_cm = 80.0         # physical arena length/width in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
@@ -25,14 +25,14 @@ import types
 import random
 from typing import TYPE_CHECKING, TypedDict
 
-import numpy as np
-import pandas as pd
-from scipy.ndimage import convolve
-from scipy.stats import pearsonr
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
+from scipy.ndimage import convolve # type: ignore
+from scipy.stats import pearsonr # type: ignore
 
 # Thread-safe Matplotlib imports for parallel rendering
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure # type: ignore
+from matplotlib.backends.backend_agg import FigureCanvasAgg # type: ignore
 
 
 class _Metrics(TypedDict, total=False):
@@ -109,12 +109,12 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'C:/Runita/NMR/analysis/TAC6/Data/Open'
-output_excel = r'C:/Runita/NMR/analysis/TAC6/Data/Open/Open_BoundaryAnalysis_v2.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa1059'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa1059/Linear_BoundaryAnalysis.xlsx'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
-arena_width_cm = 60.0         # physical arena diameter in cm (circular arena)
+arena_width_cm = 80.0         # physical arena length in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
@@ -132,7 +132,14 @@ RPV_MAX_PCT      = 0.1    # max % ISI violations allowed for SUA
 WF_SNR_MIN       = 3.0    # minimum waveform peak-to-peak SNR for SUA
 WF_CV_MAX        = 0.4    # maximum waveform amplitude CV for SUA
 
-EDGE_ZONE_THRESHOLD_CM = 9.25   # bins ≤ this distance from the wall are "edge"
+EDGE_ZONE_THRESHOLD_CM = 2.0   # bins ≤ this distance from the wall are "edge"
+
+# 'pixel' or 'cm' – set interactively at startup (see __main__ below).
+# Tracking CSV/xlsx columns (by position): A = time, B = x (pixel), C = y (pixel),
+# D = x (cm), E = y (cm).
+# 'pixel' : use columns B/C, converted to cm via arena_width_cm.
+# 'cm'    : use columns D/E directly, no pixel→cm conversion.
+COORD_UNITS = 'pixel'
 
 _gpu_semaphore = threading.Semaphore(2)
 
@@ -144,23 +151,12 @@ def classify_edge_centre(
     n_bins_x: int,
     n_bins_y: int,
     target_bin_cm: float,
-    arena_diameter_cm: float,
+    max_x_cm: float,
+    max_y_cm: float,
     edge_threshold_cm: float = EDGE_ZONE_THRESHOLD_CM,
+    track_width_cm: float = 8.0
 ) -> dict:
-    """Locate the peak-firing bin and classify it as 'edge' or 'centre'.
-
-    For a circular arena:
-      - The arena centre in cm is (radius, radius) where radius = diameter / 2.
-      - Each bin centre is at ((bx + 0.5) * bin_cm, (by + 0.5) * bin_cm).
-      - Distance from the wall = arena_radius - distance_from_centre.
-      - A bin is 'edge' when dist_from_wall <= edge_threshold_cm.
-
-    Returns a dict with:
-        peak_bin_x_cm     – x coordinate (cm) of peak firing bin centre
-        peak_bin_y_cm     – y coordinate (cm) of peak firing bin centre
-        dist_from_wall_cm – distance from the nearest wall (cm)
-        zone              – 'edge' or 'centre'
-    """
+    """Locate the peak-firing bin and classify it as 'edge' or 'centre' based on tracking spans."""
     nan = float('nan')
     result: dict = {
         'peak_bin_x_cm':    nan,
@@ -181,21 +177,26 @@ def classify_edge_centre(
     peak_x_cm = (float(peak_bx) + 0.5) * target_bin_cm
     peak_y_cm = (float(peak_by) + 0.5) * target_bin_cm
 
-    # Arena geometry
-    arena_radius_cm = arena_diameter_cm / 2.0
-    centre_x_cm     = arena_radius_cm
-    centre_y_cm     = arena_radius_cm
+    # Determine orientation: Horizontal if X span > Y span
+    if max_x_cm > max_y_cm:
+        center_cm = max_y_cm / 2.0
+        dist_from_center_cm = abs(peak_y_cm - center_cm)
+    else:
+        # Vertical
+        center_cm = max_x_cm / 2.0
+        dist_from_center_cm = abs(peak_x_cm - center_cm)
 
-    dist_from_centre_cm = float(np.hypot(peak_x_cm - centre_x_cm,
-                                         peak_y_cm - centre_y_cm))
-    dist_from_wall_cm   = max(0.0, arena_radius_cm - dist_from_centre_cm)
+    # Apply the 2cm threshold logic
+    zone = 'centre' if dist_from_center_cm < edge_threshold_cm else 'edge'
+    
+    # Distance from closest wall: track is 8 cm wide, so max distance from wall is 4 cm.
+    # We use max(0.0, ...) to ensure tracking noise doesn't yield negative wall distances.
+    dist_from_wall_cm = max(0.0, (track_width_cm / 2.0) - dist_from_center_cm)
 
-    zone = 'edge' if dist_from_wall_cm <= edge_threshold_cm else 'centre'
-
-    result['peak_bin_x_cm']     = round(peak_x_cm,          3)
-    result['peak_bin_y_cm']     = round(peak_y_cm,          3)
-    result['dist_from_wall_cm'] = round(dist_from_wall_cm,  3)
-    result['zone']               = zone
+    result['peak_bin_x_cm']     = round(peak_x_cm, 3)
+    result['peak_bin_y_cm']     = round(peak_y_cm, 3)
+    result['dist_from_wall_cm'] = round(dist_from_wall_cm, 3)
+    result['zone']              = zone
     return result
 
 
@@ -506,19 +507,26 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
             'bootstrap_sig':  bootstrap_sig}
 
 
-# ── Core metric computation ───────────────────────────────────────────────────
+# ── Tracking load / bin (shared by spike metrics and the occupancy pre-check) ─
 
-def compute_metrics(csv_path: str, ntt_path: str,
-                    arena_width_cm: float, target_bin_cm: float,
-                    half: str | None = None) -> tuple:
+def _load_and_bin_tracking(csv_path: str, arena_width_cm: float, target_bin_cm: float,
+                           half: str | None = None):
+    """Load, clean, optionally slice (half/quartile) and spatially bin tracking data.
 
+    Returns (t, beh_bx, beh_by, n_bins_x, n_bins_y, max_x_cm, max_y_cm) or None if no
+    samples remain.
+    """
     # ── 1. Load & clean tracking ──────────────────────────────────────────────
     data = (pd.read_excel(csv_path) if csv_path.lower().endswith('.xlsx')
             else pd.read_csv(csv_path))
 
-    x = np.asarray(data['x'],    dtype=float)
-    y = np.asarray(data['y'],    dtype=float)
-    t = np.asarray(data['time'], dtype=float)
+    t = np.asarray(data.iloc[:, 0], dtype=float)
+    if COORD_UNITS == 'cm':
+        x = np.asarray(data.iloc[:, 3], dtype=float)   # column D
+        y = np.asarray(data.iloc[:, 4], dtype=float)   # column E
+    else:
+        x = np.asarray(data.iloc[:, 1], dtype=float)   # column B
+        y = np.asarray(data.iloc[:, 2], dtype=float)   # column C
 
     mask = ~np.isin(x, [1, -1])
     x, y, t = x[mask], y[mask], t[mask]
@@ -527,14 +535,14 @@ def compute_metrics(csv_path: str, ntt_path: str,
     dx = np.append(np.diff(x), 0)
     dy = np.append(np.diff(y), 0)
     dt = np.append(np.diff(t), 1) # pad with 1 to avoid div-by-zero on last frame
-    
+
     dxy = np.hypot(dx, dy)
     valid_dt = dt > 0
-    
+
     # Pre-allocate speed array to handle duplicate timestamps safely
     speed = np.zeros_like(dxy)
     speed[valid_dt] = dxy[valid_dt] / dt[valid_dt]
-    
+
     keep = np.where(valid_dt & (speed < 0.006))[0]
     x, y, t = x[keep], y[keep], t[keep]
 
@@ -559,15 +567,20 @@ def compute_metrics(csv_path: str, ntt_path: str,
             x, y, t = x[3*q:],    y[3*q:],    t[3*q:]
 
     if len(t) == 0:
-         return ({'n_spikes': 0, 'n_discarded': 0, 'peak_fr': 0.0, 'mean_fr': 0.0, 'sir': 0.0}, {})
+        return None
 
     # ── 2. Pixel → cm conversion ──────────────────────────────────────────────
-    x_span = x.max() - x.min()
-    y_span = y.max() - y.min()
-    px_per_cm = max(x_span, y_span) / arena_width_cm
+    if COORD_UNITS == 'cm':
+        # Coordinates are already in cm – just zero the origin for binning.
+        x_cm = x - x.min()
+        y_cm = y - y.min()
+    else:
+        x_span = x.max() - x.min()
+        y_span = y.max() - y.min()
+        px_per_cm = max(x_span, y_span) / arena_width_cm
 
-    x_cm = (x - x.min()) / px_per_cm
-    y_cm = (y - y.min()) / px_per_cm
+        x_cm = (x - x.min()) / px_per_cm
+        y_cm = (y - y.min()) / px_per_cm
 
     # ── 3. Bin tracking positions ─────────────────────────────────────────────
     n_bins_x = int(np.ceil(x_cm.max() / target_bin_cm))
@@ -575,6 +588,134 @@ def compute_metrics(csv_path: str, ntt_path: str,
 
     beh_bx = np.clip((x_cm / target_bin_cm).astype(int), 0, n_bins_x - 1)
     beh_by = np.clip((y_cm / target_bin_cm).astype(int), 0, n_bins_y - 1)
+
+    return t, beh_bx, beh_by, n_bins_x, n_bins_y, float(x_cm.max()), float(y_cm.max())
+
+
+def _build_occupancy_map(t: np.ndarray, beh_bx: np.ndarray, beh_by: np.ndarray,
+                         n_bins_x: int, n_bins_y: int) -> np.ndarray:
+    """Build the occupancy-time map (seconds per bin) from binned tracking frames."""
+    dt_frames     = np.empty(len(t), dtype=np.float64)
+    dt_frames[0]  = 1.0 / fps
+    raw_dt        = np.diff(t) * 1e-6
+
+    # Cap dt_frames to avoid artificial occupancy hotspots when tracking drops
+    max_frame_s   = 2.0 / fps
+    dt_frames[1:] = np.minimum(raw_dt, max_frame_s)
+
+    occ_map = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    np.add.at(occ_map, (beh_bx, beh_by), dt_frames)
+    return occ_map
+
+
+def _zone_occupancy_pct(occ_map: np.ndarray, valid_mask: np.ndarray,
+                        n_bins_x: int, n_bins_y: int,
+                        target_bin_cm: float, max_x_cm: float, max_y_cm: float,
+                        edge_threshold_cm: float = EDGE_ZONE_THRESHOLD_CM) -> tuple[float, float]:
+    """Return (edge_pct, centre_pct) of total occupied time spent in each zone.
+
+    Mirrors classify_edge_centre's linear-track logic: the track's long axis is
+    the run direction, and a bin is 'centre' when its distance from the track's
+    mid-line (along the short axis) is below edge_threshold_cm.
+    """
+    total_occ_s = float(occ_map[valid_mask].sum())
+    if total_occ_s <= 0:
+        return 0.0, 0.0
+
+    bx_idx, by_idx = np.meshgrid(np.arange(n_bins_x), np.arange(n_bins_y), indexing='ij')
+    bin_x_cm = (bx_idx.astype(np.float64) + 0.5) * target_bin_cm
+    bin_y_cm = (by_idx.astype(np.float64) + 0.5) * target_bin_cm
+
+    # Determine orientation: Horizontal if X span > Y span
+    if max_x_cm > max_y_cm:
+        centre_line_cm       = max_y_cm / 2.0
+        dist_from_centre_cm  = np.abs(bin_y_cm - centre_line_cm)
+    else:
+        centre_line_cm       = max_x_cm / 2.0
+        dist_from_centre_cm  = np.abs(bin_x_cm - centre_line_cm)
+
+    centre_mask  = (dist_from_centre_cm < edge_threshold_cm) & valid_mask
+    centre_occ_s = float(occ_map[centre_mask].sum())
+    edge_occ_s   = total_occ_s - centre_occ_s
+
+    return 100.0 * edge_occ_s / total_occ_s, 100.0 * centre_occ_s / total_occ_s
+
+
+def compute_session_zone_occupancy(csv_path: str, arena_width_cm: float, target_bin_cm: float):
+    """Compute the session's edge-vs-centre occupancy-time split from tracking alone.
+
+    Returns (edge_pct, centre_pct, occ_map, valid_mask, n_bins_x, n_bins_y, max_x_cm, max_y_cm),
+    or None if the tracking file yields no valid samples.
+    """
+    track = _load_and_bin_tracking(csv_path, arena_width_cm, target_bin_cm, half=None)
+    if track is None:
+        return None
+    t, beh_bx, beh_by, n_bins_x, n_bins_y, max_x_cm, max_y_cm = track
+
+    occ_map    = _build_occupancy_map(t, beh_bx, beh_by, n_bins_x, n_bins_y)
+    valid_mask = occ_map >= min_occ_s
+
+    edge_pct, centre_pct = _zone_occupancy_pct(occ_map, valid_mask, n_bins_x, n_bins_y,
+                                               target_bin_cm, max_x_cm, max_y_cm)
+    return edge_pct, centre_pct, occ_map, valid_mask, n_bins_x, n_bins_y, max_x_cm, max_y_cm
+
+
+def _plot_occupancy_map(occ_map: np.ndarray, valid_mask: np.ndarray,
+                        target_bin_cm: float, max_x_cm: float, max_y_cm: float,
+                        edge_pct: float, centre_pct: float, csv_path: str,
+                        edge_threshold_cm: float = EDGE_ZONE_THRESHOLD_CM) -> str:
+    """Render and save a 2-D occupancy-time heat map annotated with the edge/centre split.
+
+    Since the track is linear, the centre zone is shown as a band around the
+    track's mid-line rather than a concentric circle.
+    """
+    n_bins_x, n_bins_y = occ_map.shape
+    plot_map = np.where(valid_mask, occ_map, np.nan)
+
+    fig    = Figure(figsize=(6, 5))
+    canvas = FigureCanvasAgg(fig)
+    ax     = fig.add_subplot(111)
+
+    extent = [0, n_bins_x * target_bin_cm, 0, n_bins_y * target_bin_cm]
+    im = ax.imshow(plot_map.T, origin='lower', extent=extent, cmap='viridis')
+    fig.colorbar(im, ax=ax, label='occupancy (s)')
+
+    if max_x_cm > max_y_cm:
+        centre_line_cm = max_y_cm / 2.0
+        ax.axhline(centre_line_cm - edge_threshold_cm, color='red', linewidth=1.5, linestyle='--')
+        ax.axhline(centre_line_cm + edge_threshold_cm, color='red', linewidth=1.5, linestyle='--')
+    else:
+        centre_line_cm = max_x_cm / 2.0
+        ax.axvline(centre_line_cm - edge_threshold_cm, color='red', linewidth=1.5, linestyle='--')
+        ax.axvline(centre_line_cm + edge_threshold_cm, color='red', linewidth=1.5, linestyle='--')
+
+    ax.set_xlim(0, n_bins_x * target_bin_cm)
+    ax.set_ylim(0, n_bins_y * target_bin_cm)
+    ax.set_aspect('equal')
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+    ax.set_title(f'Occupancy map\nEdge zone: {edge_pct:.1f}%   Centre zone: {centre_pct:.1f}%')
+    fig.tight_layout()
+
+    csv_name  = os.path.splitext(os.path.basename(csv_path))[0]
+    save_dir  = os.path.join(os.path.dirname(csv_path), 'occupancy_maps')
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'{csv_name}_occupancy_map.png')
+    fig.savefig(save_path, dpi=150)
+    print(f'  [SAVED] {save_path}')
+    return save_path
+
+
+# ── Core metric computation ───────────────────────────────────────────────────
+
+def compute_metrics(csv_path: str, ntt_path: str,
+                    arena_width_cm: float, target_bin_cm: float,
+                    half: str | None = None) -> tuple:
+
+    track = _load_and_bin_tracking(csv_path, arena_width_cm, target_bin_cm, half=half)
+    if track is None:
+        return ({'n_spikes': 0, 'n_discarded': 0, 'peak_fr': 0.0, 'mean_fr': 0.0, 'sir': 0.0}, {})
+    t, beh_bx, beh_by, n_bins_x, n_bins_y, max_x_cm, max_y_cm = track
 
     # ── 4. Load spikes & nearest-timestamp assignment (50 ms gate) ────────────
     spike_data = np.memmap(ntt_path, dtype=ntt_dtype, mode='r', offset=16 * 1024)
@@ -602,20 +743,10 @@ def compute_metrics(csv_path: str, ntt_path: str,
     sp_by = beh_by[spike_frame]
 
     # ── 5. Build occupancy and spike-count maps ────────────────────────────────
-    dt_frames        = np.empty(len(t), dtype=np.float64)
-    dt_frames[0]     = 1.0 / fps
-    raw_dt           = np.diff(t) * 1e-6
-    
-    # Cap dt_frames to avoid artificial occupancy hotspots when tracking drops
-    # E.g., if a gap is > ~2 frames, only credit the standard frame rate to prevent inflation
-    max_frame_s      = 2.0 / fps
-    dt_frames[1:]    = np.minimum(raw_dt, max_frame_s)
-
-    occ_map   = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    occ_map   = _build_occupancy_map(t, beh_bx, beh_by, n_bins_x, n_bins_y)
     spike_map = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
 
-    np.add.at(occ_map,   (beh_bx, beh_by), dt_frames)
-    np.add.at(spike_map, (sp_bx,  sp_by),  1.0)
+    np.add.at(spike_map, (sp_bx, sp_by), 1.0)
 
     valid_mask = occ_map >= min_occ_s
 
@@ -631,7 +762,8 @@ def compute_metrics(csv_path: str, ntt_path: str,
                beh_bx=beh_bx, beh_by=beh_by,
                occ_map=occ_map, valid_mask=valid_mask,
                fr_smooth=fr_smooth,
-               n_bins_x=n_bins_x, n_bins_y=n_bins_y)
+               n_bins_x=n_bins_x, n_bins_y=n_bins_y,
+               max_x_cm=max_x_cm, max_y_cm=max_y_cm)
 
     if not valid_mask.any():
         return ({'n_spikes': n_spikes, 'n_discarded': n_discarded,
@@ -814,12 +946,15 @@ def _run_job(args):
         # ── Edge / Centre zone classification (full session only) ─────────────
         if half is None and ctx:
             zone_info = classify_edge_centre(
-                fr_smooth       = ctx['fr_smooth'],
-                valid_mask      = ctx['valid_mask'],
-                n_bins_x        = ctx['n_bins_x'],
-                n_bins_y        = ctx['n_bins_y'],
-                target_bin_cm   = target_bin_cm,
-                arena_diameter_cm = arena_width_cm,
+                fr_smooth         = ctx['fr_smooth'],
+                valid_mask        = ctx['valid_mask'],
+                n_bins_x          = ctx['n_bins_x'],
+                n_bins_y          = ctx['n_bins_y'],
+                target_bin_cm     = target_bin_cm,
+                max_x_cm          = ctx['max_x_cm'],
+                max_y_cm          = ctx['max_y_cm'],
+                edge_threshold_cm = EDGE_ZONE_THRESHOLD_CM,
+                track_width_cm    = 8.0 # From the prompt specs
             )
         else:
             zone_info = {'peak_bin_x_cm': None, 'peak_bin_y_cm': None,
@@ -882,8 +1017,18 @@ def _run_job(args):
     return (full_row, first_row, second_row)
 # ── Batch scan ────────────────────────────────────────────────────────────────
 
+_PIXEL_ANSWERS = {'pixel', 'pixels', 'px'}
+_CM_ANSWERS    = {'cm', 'cms', 'centimeter', 'centimeters', 'centimetre', 'centimetres'}
+
 if __name__ == "__main__":
+    _coord_answer = input("Are the tracking coordinates in pixels or cm? [pixel/cm]: ").strip().lower()
+    while _coord_answer not in _PIXEL_ANSWERS | _CM_ANSWERS:
+        _coord_answer = input("Please enter 'pixel' or 'cm': ").strip().lower()
+    COORD_UNITS = 'pixel' if _coord_answer in _PIXEL_ANSWERS else 'cm'
+    print(f"Using '{COORD_UNITS}' tracking coordinates.\n")
+
     all_jobs = []
+    occupancy_records = []
     output_excel_basename = os.path.basename(output_excel).lower()
     for dirpath, _, filenames in os.walk(root_folder):
         tracking_files = [f for f in filenames
@@ -891,7 +1036,33 @@ if __name__ == "__main__":
                           and f.lower() != output_excel_basename]
         ntt_files      = [f for f in filenames if f.lower().endswith('.ntt')]
         if len(tracking_files) == 1 and len(ntt_files) > 0:
-            csv_path = os.path.join(dirpath, tracking_files[0])
+            csv_path     = os.path.join(dirpath, tracking_files[0])
+            session_name = os.path.relpath(dirpath, root_folder)
+
+            try:
+                occ_result = compute_session_zone_occupancy(csv_path, arena_width_cm, target_bin_cm)
+            except Exception as _e:
+                print(f'  OCCUPANCY MAP ERROR in {session_name}: {_e}')
+                occ_result = None
+
+            if occ_result is not None:
+                edge_pct, centre_pct, occ_map, valid_mask, _n_bx, _n_by, _max_x, _max_y = occ_result
+                print(f'  {session_name}: edge zone = {edge_pct:.1f}%   centre zone = {centre_pct:.1f}%')
+                try:
+                    _plot_occupancy_map(occ_map, valid_mask, target_bin_cm, _max_x, _max_y,
+                                        edge_pct, centre_pct, csv_path)
+                except Exception as _e:
+                    print(f'  OCCUPANCY PLOT ERROR in {session_name}: {_e}')
+                occupancy_records.append({
+                    'session': session_name, 'tracking_file': tracking_files[0],
+                    'edge_pct': round(edge_pct, 2), 'centre_pct': round(centre_pct, 2),
+                })
+            else:
+                occupancy_records.append({
+                    'session': session_name, 'tracking_file': tracking_files[0],
+                    'edge_pct': None, 'centre_pct': None,
+                })
+
             for ntt_file in sorted(ntt_files):
                 all_jobs.append((dirpath, csv_path, ntt_file))
 
@@ -962,7 +1133,7 @@ if __name__ == "__main__":
         }
 
     # ── Edge vs Centre t-test (place cells only, full session) ────────────────
-    from scipy.stats import ttest_ind
+    from scipy.stats import ttest_ind # type: ignore
 
     pc_full       = df_full[df_full['place_cell'].eq(True)].copy()
     n_edge        = int((pc_full['zone'] == 'edge').sum())
@@ -1008,6 +1179,8 @@ if __name__ == "__main__":
     df_summary_full   = pd.DataFrame(_summary_stats(df_full))
     df_summary_first  = pd.DataFrame(_summary_stats(df_first))
     df_summary_second = pd.DataFrame(_summary_stats(df_second))
+    df_occupancy      = pd.DataFrame(occupancy_records,
+                                     columns=['session', 'tracking_file', 'edge_pct', 'centre_pct'])
 
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         df_full.to_excel(writer,          sheet_name='Full',              index=False)
@@ -1017,6 +1190,7 @@ if __name__ == "__main__":
         df_summary_first.to_excel(writer, sheet_name='Summary_First',     index=False)
         df_summary_second.to_excel(writer,sheet_name='Summary_Second',    index=False)
         df_zone_ttest.to_excel(writer,    sheet_name='Zone_EdgeCentre',   index=False)
+        df_occupancy.to_excel(writer,     sheet_name='Occupancy',         index=False)
 
     n_sua         = int(df_full['is_sua'].eq(True).sum())
     n_mua         = int(df_full['is_sua'].eq(False).sum())
