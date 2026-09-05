@@ -1,6 +1,22 @@
 # Mean RM analysis
 
 
+## Quadrant division
+
+(The earlier, simpler diagnostics are still there too — QuadrantFold_Diagnostic_*.png.)
+
+Each new figure walks the full cut → register → average protocol in 3 rows:
+
+Row 1 — overview: whole arena split into 4 raw quadrants/arcs, the fold colour-code over the whole grid, and the final folded reference region.
+Row 2 — each of the 4 quadrants/arcs individually, as physically cut (no transform applied) — you can see they're mirror images of each other (Q1/Q2 flip left-right, Q1/Q3 flip up-down, Q1/Q4 flip both; for the ring, each arc keeps its true 0–90/90–180/180–270/270–360° position).
+Row 3 — the same 4 pieces after registration (the actual transform handler._quad_idx_flat applies), plus their bin-by-bin average = the real fold output.
+What to look for: in Row 3, all 4 registered panels should look pixel-identical to each other (same colour in the same spot = same bin matched). That's true for all three arenas here — open field and linear track show clean mirror-registration (Row 2 mirrored → Row 3 identical), and the circular track's 4 arcs roll onto the reference arc with no rotation artifact. So for the current default geometry configs, the matching itself is internally consistent — no axis-swap or transpose bug.
+
+One caveat that these plots can't surface (since they only test index-space symmetry, not real geometry): _build_reflect_quadrant_fold centers the fold on the bin-grid center (nx*bin_cm/2), not the arena's physical center (diameter_cm/2). Those coincide exactly for the current configs (60 cm / 2 cm bins, 80×8 cm / 2 cm bins — all exact), so there's no offset today. But if you ever run this with a target_bin_cm or arena dimension that doesn't divide evenly, the circular/rectangular boundary would sit slightly off the fold axis, and quadrant partners near the edge could mismatch — worth checking if that's where your "wrong result" is coming from.
+
+
+## Population vector analysis on mean RM
+
 
 Use also from Fenton paper:
 
