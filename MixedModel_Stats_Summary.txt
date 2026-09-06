@@ -1,0 +1,34 @@
+=== Theta Frequency vs Speed ===
+          Mixed Linear Model Regression Results
+=========================================================
+Model:            MixedLM Dependent Variable: Frequency  
+No. Observations: 43186   Method:             REML       
+No. Groups:       19      Scale:              1.3415     
+Min. group size:  1698    Log-Likelihood:     -67683.6870
+Max. group size:  3627    Converged:          Yes        
+Mean group size:  2272.9                                 
+----------------------------------------------------------
+           Coef.   Std.Err.    z     P>|z|  [0.025  0.975]
+----------------------------------------------------------
+Intercept   4.341     0.100  43.446  0.000   4.145   4.537
+Speed      -0.002     0.001  -2.990  0.003  -0.003  -0.001
+Group Var   0.188     0.055                               
+=========================================================
+
+
+=== Theta Power vs Speed ===
+                      Mixed Linear Model Regression Results
+=================================================================================
+Model:                 MixedLM     Dependent Variable:     Power                 
+No. Observations:      43186       Method:                 REML                  
+No. Groups:            19          Scale:                  12453276942571606.0000
+Min. group size:       1698        Log-Likelihood:         -861559.9761          
+Max. group size:       3627        Converged:              Yes                   
+Mean group size:       2272.9                                                    
+---------------------------------------------------------------------------------
+                 Coef.           Std.Err.     z   P>|z|    [0.025       0.975]   
+---------------------------------------------------------------------------------
+Intercept         54489547.556 12115798.800 4.497 0.000 30743018.265 78236076.848
+Speed               157075.570    55387.504 2.836 0.005    48518.057   265633.083
+Group Var 2777878463571045.500  8366930.056                                      
+=================================================================================
