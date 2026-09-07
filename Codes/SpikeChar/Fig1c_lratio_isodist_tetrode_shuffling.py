@@ -28,7 +28,7 @@ ALGORITHM — line-by-line correspondence to the MATLAB reference
 ═══════════════════════════════════════════════════════════════════════════════
 
 MATLAB mahal(Y, X)
-  Returns the SQUARED Mahalanobis distance d² of every row of Y from the
+  Returns the SQUARED    of every row of Y from the
   distribution defined by X (mean and covariance of X, ddof=1).
   Equivalent Python:
       mean  = X.mean(axis=0)

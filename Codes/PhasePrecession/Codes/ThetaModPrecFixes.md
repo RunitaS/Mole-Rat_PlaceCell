@@ -1,6 +1,8 @@
 # Theta Mod Prec Fixes
 
-- [ ] **<Major fix: Add only significant theta epochs for phase precession>**
+- [ ] <Major fix:> **Use wavelet transform instead of interpolation to assign instantaneous phase and power to theta trace.**
+
+- [ ] **<Major fix:> Add only significant theta epochs for phase precession>**
 
 - [x] < Major fix:> ** Stats are wrong. Steeper slopes show no signif phase precession. flat ones do. Mostly dpendent on spike numbers.**
 

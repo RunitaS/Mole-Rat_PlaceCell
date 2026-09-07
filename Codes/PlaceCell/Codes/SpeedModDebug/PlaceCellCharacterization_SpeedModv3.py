@@ -44,9 +44,15 @@ class _Metrics(TypedDict, total=False):
     sir:             float | None
     sparsity:        float | None
     coherence:       float | None
+    stability_score:    float | None
+    stability_p_value:  float | None
+    stability_n_bins:   int | None
     bootstrap_mean:  float | None
     bootstrap_p95:   float | None
     bootstrap_sig:   bool | None
+    coherence_bootstrap_mean: float | None
+    coherence_bootstrap_p95:  float | None
+    coherence_bootstrap_sig:  bool | None
     theta_modulated: bool | None
     theta_peak_freq: float | None
     speed_score:     float | None
@@ -129,19 +135,21 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Test'
-output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Test/wut_Test_CorrCode.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059/Test.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Test/Test_Res'
-
+Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059'
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
 arena_width_cm = 80.0         # physical arena width in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
+
+STABILITY_MIN_BINS = 5        # min jointly-occupied bins (>= min_occ_s in BOTH halves)
+                               # required before a split-half stability r is reported
 
 AUTOCORR_WINDOW_MS  = 500.0   # autocorrelogram half-window (ms)
 AUTOCORR_BIN_MS     = 5.0     # autocorrelogram bin size (ms)
@@ -159,7 +167,7 @@ SPEED_SHUFFLE_MARGIN_S = 20.0 # min circular-shift offset (s) from either end, m
 POS_JUMP_THRESH_CMS  = 80.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
 POS_SMOOTH_SIGMA_SMP = 1.0   # Gaussian smoothing sigma (in samples) applied to x/y tracking position
 
-SPEED_MOD_DOWNSAMPLE_FACTOR = 3   # downsample tracking for speed-modulation analysis only:
+SPEED_MOD_DOWNSAMPLE_FACTOR = 1   # downsample tracking for speed-modulation analysis only:
                                    # 30 fps -> 15 fps by keeping every alternate frame. The
                                    # 33.33 ms native bin made the speed-vs-firing-rate cloud
                                    # too scattered; speed/rate are recomputed on this coarser
@@ -956,13 +964,19 @@ def _compute_speed_modulation(
 
 # ── Bootstrap helpers ─────────────────────────────────────────────────────────
 
-def _sir_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd: int,
+def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd: int,
                               beh_bx: np.ndarray, beh_by: np.ndarray,
                               occ_map: np.ndarray, valid_mask: np.ndarray,
-                              n_bins_x: int, n_bins_y: int) -> float:
-    """Compute SIR after circularly shifting the position time series by `rnd` frames.
-    Spike-to-frame assignments are kept fixed; only the location at each frame changes.
-    Equivalent to MATLAB: locs_rand = [locs(rnd:end); locs(1:rnd-1)]
+                              n_bins_x: int, n_bins_y: int) -> tuple[float, float]:
+    """Compute SIR and spatial coherence from the same location-shuffled spike
+    train after circularly shifting the position time series by `rnd` frames.
+    Spike-to-frame assignments are kept fixed; only the location at each frame
+    changes. Equivalent to MATLAB: locs_rand = [locs(rnd:end); locs(1:rnd-1)]
+
+    Both metrics are derived from the single shuffled rate map built here
+    (fr_raw feeds both SIR and coherence directly) so that each bootstrap
+    iteration only needs one shuffled spike train, matching the real-data
+    pipeline where both SIR and coherence use the non-smoothed map.
     """
     n_frames   = len(beh_bx)
     shuf_frame = (spike_frame_indices + rnd) % n_frames
@@ -973,24 +987,33 @@ def _sir_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd: int,
     fr_raw = np.zeros_like(spike_map)
     np.divide(spike_map, occ_map, out=fr_raw, where=valid_mask)
 
-    fr_smooth   = _triangular_smooth(fr_raw, valid_mask)
     total_occ_s = occ_map[valid_mask].sum()
     pi_flat     = occ_map[valid_mask] / total_occ_s
-    ri_flat     = fr_smooth[valid_mask]
+    ri_flat     = fr_raw[valid_mask]
     r_mean      = float(np.sum(pi_flat * ri_flat))
 
     if r_mean <= 0:
-        return 0.0
-    nonzero = ri_flat > 0
-    ratio   = ri_flat[nonzero] / r_mean
-    return float(np.sum(pi_flat[nonzero] * ratio * np.log2(ratio)))
+        sir = 0.0
+    else:
+        nonzero = ri_flat > 0
+        ratio   = ri_flat[nonzero] / r_mean
+        sir     = float(np.sum(pi_flat[nonzero] * ratio * np.log2(ratio)))
+
+    coherence = _compute_coherence(fr_raw, valid_mask, n_bins_x, n_bins_y)
+
+    return sir, coherence
+
+
+_NULL_COHERENCE_BOOTSTRAP = {'coherence_bootstrap_mean': float('nan'),
+                             'coherence_bootstrap_p95':  float('nan'),
+                             'coherence_bootstrap_sig':  None}
 
 
 def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
                    beh_bx: np.ndarray, beh_by: np.ndarray,
                    occ_map: np.ndarray, valid_mask: np.ndarray,
                    n_bins_x: int, n_bins_y: int,
-                   real_sir: float, ntt_path: str,
+                   real_sir: float, real_coherence: float, ntt_path: str,
                    label: str = '') -> dict:
     """Location-shuffling bootstrap (matches MATLAB calcSI_v3_locshuf).
 
@@ -998,11 +1021,17 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     random number of frames (at least 20 s from either end), while spike-to-frame
     assignments remain unchanged.  This decorrelates spikes from positions without
     altering the animal's occupancy statistics.
+
+    SIR and spatial coherence share the same N_BOOTSTRAP shuffled spike trains
+    (one shuffle per iteration feeds both metrics via
+    `_sir_and_coherence_from_spikes_locshuf`) rather than running two separate
+    bootstraps, halving the shuffle-generation cost.
     """
     if len(spike_frame_indices) == 0:
         return {'bootstrap_mean': float('nan'),
                 'bootstrap_p95':  float('nan'),
-                'bootstrap_sig':  False}
+                'bootstrap_sig':  False,
+                **_NULL_COHERENCE_BOOTSTRAP}
 
     n_frames      = len(t)
     MARGIN_FRAMES = int(20 * fps)   # 20 seconds of frames at either end (matches Fenton reference)
@@ -1010,25 +1039,39 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     if n_frames <= 2 * MARGIN_FRAMES:
         return {'bootstrap_mean': float('nan'),
                 'bootstrap_p95':  float('nan'),
-                'bootstrap_sig':  None}
+                'bootstrap_sig':  None,
+                **_NULL_COHERENCE_BOOTSTRAP}
 
     sir_i = np.zeros(N_BOOTSTRAP, dtype=np.float64)
+    coh_i = np.zeros(N_BOOTSTRAP, dtype=np.float64)
     for i in range(N_BOOTSTRAP):
-        rnd      = random.randint(MARGIN_FRAMES, n_frames - MARGIN_FRAMES)
-        sir_i[i] = _sir_from_spikes_locshuf(spike_frame_indices, rnd,
-                                             beh_bx, beh_by,
-                                             occ_map, valid_mask,
-                                             n_bins_x, n_bins_y)
+        rnd  = random.randint(MARGIN_FRAMES, n_frames - MARGIN_FRAMES)
+        sir_i[i], coh_i[i] = _sir_and_coherence_from_spikes_locshuf(
+            spike_frame_indices, rnd,
+            beh_bx, beh_by,
+            occ_map, valid_mask,
+            n_bins_x, n_bins_y)
 
     bootstrap_mean = float(np.mean(sir_i))
     bootstrap_p95  = float(np.percentile(sir_i, 95))
     bootstrap_sig  = bool(real_sir > bootstrap_p95)
 
-    # ── histogram plot ────────────────────────────────────────────────────────
+    coh_valid = coh_i[np.isfinite(coh_i)]
+    if len(coh_valid) > 0:
+        coherence_bootstrap_mean = float(np.mean(coh_valid))
+        coherence_bootstrap_p95  = float(np.percentile(coh_valid, 95))
+        coherence_bootstrap_sig  = (bool(real_coherence > coherence_bootstrap_p95)
+                                     if np.isfinite(real_coherence) else None)
+    else:
+        coherence_bootstrap_mean = float('nan')
+        coherence_bootstrap_p95  = float('nan')
+        coherence_bootstrap_sig  = None
+
+    # ── histogram plots (SIR left, coherence right) ─────────────────────────────
     # Thread-safe Object-Oriented Figure generation prevents race conditions
-    fig = Figure()
+    fig = Figure(figsize=(10, 4.5))
     canvas = FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    ax = fig.add_subplot(121)
 
     hist_result = ax.hist(sir_i, 100, color='black')
     counts: np.ndarray = np.asarray(hist_result[0])
@@ -1053,6 +1096,36 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     ax.set_ylabel('count')
     ax.set_xlabel('spatial information rate (bits/spike)')
     ax.set_ylim(-max_count / 7, max_count * 1.1)
+
+    ax2 = fig.add_subplot(122)
+    if len(coh_valid) > 0:
+        hist_result2 = ax2.hist(coh_valid, 100, color='black')
+        counts2: np.ndarray = np.asarray(hist_result2[0])
+        max_count2 = float(counts2.max()) if counts2.max() > 0 else 1.0
+
+        box_plot2 = ax2.boxplot(coh_valid, whis=[5, 95], vert=False, showfliers=False, # type: ignore
+                                positions=[-max_count2 / 10], widths=max_count2 / 15)
+        if np.isfinite(real_coherence):
+            ax2.plot([real_coherence, real_coherence], [0, max_count2], 'r-.')
+
+        ci95_2 = float(box_plot2['whiskers'][1].get_xdata()[1])
+        bs_av2 = f"Bootstrap mean coherence (z) = {coherence_bootstrap_mean:.3f}"
+        up_ci2 = f"Upper 95% CI = {ci95_2:.3f}"
+        bs_p2  = (f"Cell coherence (z) = {real_coherence:.3f} "
+                 f"({'p < 0.05' if coherence_bootstrap_sig else 'ns'})")
+        ax2.set_title(bs_av2 + '\n' + up_ci2 + '\n' + bs_p2, multialignment='center')
+
+        ax2.set_yticks([0, max_count2 * 0.25, max_count2 * 0.5,
+                       max_count2 * 0.75, max_count2])
+        ax2.set_yticklabels([str(round(v, 1))
+                            for v in (0, max_count2 * 0.25, max_count2 * 0.5,
+                                      max_count2 * 0.75, max_count2)])
+        ax2.set_ylim(-max_count2 / 7, max_count2 * 1.1)
+    else:
+        ax2.text(0.5, 0.5, 'coherence shuffle not available\n(insufficient valid bins)',
+                 ha='center', va='center', transform=ax2.transAxes)
+    ax2.set_ylabel('count')
+    ax2.set_xlabel('spatial coherence (Fisher z)')
     fig.tight_layout()
 
     ntt_name   = os.path.splitext(os.path.basename(ntt_path))[0]
@@ -1065,7 +1138,12 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
 
     return {'bootstrap_mean': round(bootstrap_mean, 4),
             'bootstrap_p95':  round(bootstrap_p95,  4),
-            'bootstrap_sig':  bootstrap_sig}
+            'bootstrap_sig':  bootstrap_sig,
+            'coherence_bootstrap_mean': (round(coherence_bootstrap_mean, 4)
+                                          if not np.isnan(coherence_bootstrap_mean) else float('nan')),
+            'coherence_bootstrap_p95':  (round(coherence_bootstrap_p95, 4)
+                                          if not np.isnan(coherence_bootstrap_p95) else float('nan')),
+            'coherence_bootstrap_sig':  coherence_bootstrap_sig}
 
 
 # ── Tracking load/clean/convert ────────────────────────────────────────────────
@@ -1224,6 +1302,110 @@ def _plot_and_save_dt_s(csv_path: str, arena_width_cm: float, fps: float) -> Non
           f'{pct:.2f}%; range {dt_ms.min():.2f}-{dt_ms.max():.2f} ms)')
 
 
+def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
+                       n_bins_x: int, n_bins_y: int) -> float:
+    """Spatial coherence: correlation of each bin's non-smoothed rate with the
+    mean rate of its (up to 8) occupied neighbours, Fisher Z-transformed.
+    """
+    valid_idx    = np.argwhere(valid_mask)
+    fr_bin_vals  = []
+    fr_nbr_means = []
+    for bx, by in valid_idx:
+        nbr_vals = [
+            fr_raw[bx + dx, by + dy]
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if not (dx == 0 and dy == 0)
+            and 0 <= bx + dx < n_bins_x
+            and 0 <= by + dy < n_bins_y
+            and valid_mask[bx + dx, by + dy]
+        ]
+        if nbr_vals:
+            fr_bin_vals.append(fr_raw[bx, by])
+            fr_nbr_means.append(float(np.mean(nbr_vals)))
+
+    if len(fr_bin_vals) > 2:
+        r_coef, _ = pearsonr(fr_bin_vals, fr_nbr_means)
+        r_coef    = float(np.clip(r_coef, -0.9999, 0.9999)) # type: ignore
+        return float(0.5 * np.log((1 + r_coef) / (1 - r_coef)))
+    return float('nan')
+
+
+def _compute_split_half_stability(ctx: dict,
+                                   min_valid_bins: int = STABILITY_MIN_BINS) -> dict:
+    """Split-half spatial stability: Pearson correlation of the raw
+    (non-smoothed) firing-rate map between the first and second half of the
+    session.
+
+    Uses the SAME spatial grid as the full-session ratemap (ctx['beh_bx'] /
+    ctx['beh_by'], built from the full session's extent) for both halves, so
+    corresponding array entries refer to the same physical bin in both --
+    unlike the independent first/second-half rows above (which each derive
+    their own pixel->cm scaling and grid from only that half's tracking
+    samples and are therefore NOT bin-aligned with each other). The session
+    is split at the midpoint frame (matching the first/second-half
+    convention used elsewhere in this script).
+
+    NaN-bin handling: a bin with < min_occ_s occupancy in either half has no
+    reliable firing-rate estimate for that half, so such bins are dropped
+    from the correlation rather than imputed to 0 Hz (which would spuriously
+    push the correlation toward zero or negative) or imputed via the other
+    half's rate (which would inflate it). Only bins visited >= min_occ_s in
+    BOTH halves are correlated -- the standard split-half approach in the
+    place-cell literature. If fewer than `min_valid_bins` bins survive this,
+    the score is left as NaN rather than reported from too few points.
+    """
+    result = {'stability_score': float('nan'), 'stability_p_value': float('nan'),
+              'stability_n_bins': 0}
+    if not ctx:
+        return result
+
+    t           = ctx['t']
+    beh_bx      = ctx['beh_bx']
+    beh_by      = ctx['beh_by']
+    spike_frame = ctx['spike_frame']
+    dt_frames   = ctx['dt_frames']
+    n_bins_x    = ctx['n_bins_x']
+    n_bins_y    = ctx['n_bins_y']
+
+    n = len(t)
+    if n < 2:
+        return result
+    mid = n // 2
+
+    occ_first  = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    occ_second = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    np.add.at(occ_first,  (beh_bx[:mid], beh_by[:mid]), dt_frames[:mid])
+    np.add.at(occ_second, (beh_bx[mid:], beh_by[mid:]), dt_frames[mid:])
+
+    spk_first  = spike_frame < mid
+    spk_second = ~spk_first
+
+    spike_first  = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    spike_second = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    np.add.at(spike_first,  (beh_bx[spike_frame[spk_first]],  beh_by[spike_frame[spk_first]]),  1.0)
+    np.add.at(spike_second, (beh_bx[spike_frame[spk_second]], beh_by[spike_frame[spk_second]]), 1.0)
+
+    valid_first  = occ_first  >= min_occ_s
+    valid_second = occ_second >= min_occ_s
+    common_valid = valid_first & valid_second
+
+    n_common = int(common_valid.sum())
+    result['stability_n_bins'] = n_common
+    if n_common < min_valid_bins:
+        return result
+
+    fr_first  = spike_first[common_valid]  / occ_first[common_valid]
+    fr_second = spike_second[common_valid] / occ_second[common_valid]
+
+    if np.std(fr_first) == 0 or np.std(fr_second) == 0:
+        return result
+
+    r, p = pearsonr(fr_first, fr_second)
+    result['stability_score']   = round(float(r), 4)
+    result['stability_p_value'] = round(float(p), 4)
+    return result
+
+
 # ── Core metric computation ───────────────────────────────────────────────────
 
 def compute_metrics(csv_path: str, ntt_path: str,
@@ -1302,6 +1484,7 @@ def compute_metrics(csv_path: str, ntt_path: str,
                x_cm=x_cm, y_cm=y_cm,
                beh_bx=beh_bx, beh_by=beh_by,
                occ_map=occ_map, valid_mask=valid_mask,
+               dt_frames=dt_frames,
                n_bins_x=n_bins_x, n_bins_y=n_bins_y)
 
     if not valid_mask.any():
@@ -1312,15 +1495,17 @@ def compute_metrics(csv_path: str, ntt_path: str,
     total_occ_s = occ_map[valid_mask].sum()
     pi_flat     = occ_map[valid_mask] / total_occ_s
     ri_flat     = fr_smooth[valid_mask]
+    ri_flat_raw = fr_raw[valid_mask]
     r_mean      = float(np.sum(pi_flat * ri_flat))
+    r_mean_raw  = float(np.sum(pi_flat * ri_flat_raw))
 
-    peak_fr = float(fr_smooth[valid_mask].max())
+    peak_fr = float(fr_raw[valid_mask].max())
     mean_fr = r_mean
 
     sir = 0.0
-    if r_mean > 0:
-        nonzero = ri_flat > 0
-        ratio   = ri_flat[nonzero] / r_mean
+    if r_mean_raw > 0:
+        nonzero = ri_flat_raw > 0
+        ratio   = ri_flat_raw[nonzero] / r_mean_raw
         sir     = float(np.sum(pi_flat[nonzero] * ratio * np.log2(ratio)))
 
     # Sparsity = (Σ pi ri)² / Σ pi ri²   (Skaggs et al. 1996)
@@ -1329,28 +1514,7 @@ def compute_metrics(csv_path: str, ntt_path: str,
     sparsity = float((spar_num ** 2) / spar_den) if spar_den > 0 else 0.0
 
     # Spatial coherence: non-smoothed map vs 8-neighbour mean (Fisher Z)
-    valid_idx    = np.argwhere(valid_mask)
-    fr_bin_vals  = []
-    fr_nbr_means = []
-    for bx, by in valid_idx:
-        nbr_vals = [
-            fr_raw[bx + dx, by + dy]
-            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
-            if not (dx == 0 and dy == 0)
-            and 0 <= bx + dx < n_bins_x
-            and 0 <= by + dy < n_bins_y
-            and valid_mask[bx + dx, by + dy]
-        ]
-        if nbr_vals:
-            fr_bin_vals.append(fr_raw[bx, by])
-            fr_nbr_means.append(float(np.mean(nbr_vals)))
-
-    if len(fr_bin_vals) > 2:
-        r_coef, _ = pearsonr(fr_bin_vals, fr_nbr_means)
-        r_coef    = float(np.clip(r_coef, -0.9999, 0.9999)) # type: ignore
-        coherence = float(0.5 * np.log((1 + r_coef) / (1 - r_coef)))
-    else:
-        coherence = float('nan')
+    coherence = _compute_coherence(fr_raw, valid_mask, n_bins_x, n_bins_y)
 
     metrics = {
         'n_spikes':    n_spikes,
@@ -1368,7 +1532,9 @@ def compute_metrics(csv_path: str, ntt_path: str,
 
 _print_lock = threading.Lock()
 
-_NULL_BOOTSTRAP = {'bootstrap_mean': None, 'bootstrap_p95': None, 'bootstrap_sig': None}
+_NULL_BOOTSTRAP = {'bootstrap_mean': None, 'bootstrap_p95': None, 'bootstrap_sig': None,
+                   'coherence_bootstrap_mean': None, 'coherence_bootstrap_p95': None,
+                   'coherence_bootstrap_sig': None}
 
 def _run_job(args):
     unit_idx, total_units, job_order, dirpath, csv_path, ntt_file = args
@@ -1384,7 +1550,10 @@ def _run_job(args):
         'n_spikes': None, 'n_discarded': None,
         'peak_fr':  None, 'mean_fr':     None, 'sir': None,
         'sparsity': None, 'coherence':   None,
+        'stability_score': None, 'stability_p_value': None, 'stability_n_bins': None,
         'bootstrap_mean': None, 'bootstrap_p95': None, 'bootstrap_sig': None,
+        'coherence_bootstrap_mean': None, 'coherence_bootstrap_p95': None,
+        'coherence_bootstrap_sig': None,
         'theta_modulated': None, 'theta_peak_freq': None,
         'speed_score': None, 'speed_p_value': None, 'speed_r2': None,
         'speed_beta': None, 'speed_f0': None, 'speed_modulated': None,
@@ -1400,13 +1569,13 @@ def _run_job(args):
         'job_order': job_order, 'place_cell': None,
     }
 
-    def _build_row(half: str | None, label: str) -> dict:
+    def _build_row(half: str | None, label: str) -> tuple[dict, dict]:
         try:
             metrics, ctx = compute_metrics(csv_path, ntt_path, arena_width_cm, target_bin_cm, half=half)
         except Exception as e:
             with _print_lock:
                 print(f'  ERROR in {ntt_file} [{label}]: {e}')
-            return dict(_err_row)
+            return dict(_err_row), {}
 
         if not ctx:
             bootst = _NULL_BOOTSTRAP
@@ -1415,7 +1584,8 @@ def _run_job(args):
                 bootst = _run_bootstrap(
                     ctx['spike_frame'], ctx['t'], ctx['beh_bx'], ctx['beh_by'],
                     ctx['occ_map'], ctx['valid_mask'], ctx['n_bins_x'], ctx['n_bins_y'],
-                    metrics.get('sir', 0.0), ntt_path, label=label,  # type: ignore
+                    metrics.get('sir', 0.0), metrics.get('coherence', float('nan')),  # type: ignore
+                    ntt_path, label=label,
                 )
             except Exception as e:
                 with _print_lock:
@@ -1425,6 +1595,9 @@ def _run_job(args):
         metrics['bootstrap_mean'] = bootst.get('bootstrap_mean')
         metrics['bootstrap_p95']  = bootst.get('bootstrap_p95')
         metrics['bootstrap_sig']  = bootst.get('bootstrap_sig')
+        metrics['coherence_bootstrap_mean'] = bootst.get('coherence_bootstrap_mean')
+        metrics['coherence_bootstrap_p95']  = bootst.get('coherence_bootstrap_p95')
+        metrics['coherence_bootstrap_sig']  = bootst.get('coherence_bootstrap_sig')
 
         # Theta modulation
         spike_ts = ctx.get('spike_ts') if ctx else None
@@ -1534,29 +1707,55 @@ def _run_job(args):
         metrics['unit']      = ntt_file
         metrics['job_order'] = job_order
 
-        n_spikes = metrics.get('n_spikes')
-        sir      = metrics.get('sir')
-        peak_fr  = metrics.get('peak_fr')
-        sparsity = metrics.get('sparsity')
-        boot_sig = metrics.get('bootstrap_sig')
+        n_spikes      = metrics.get('n_spikes')
+        sir           = metrics.get('sir')
+        peak_fr       = metrics.get('peak_fr')
+        sparsity      = metrics.get('sparsity')
+        boot_sig      = metrics.get('bootstrap_sig')
+        coh_boot_sig  = metrics.get('coherence_bootstrap_sig')
 
-        if (n_spikes is not None) and (sir is not None) and (peak_fr is not None) and (sparsity is not None) and (boot_sig is not None):
+        if ((n_spikes is not None) and (sir is not None) and (peak_fr is not None)
+                and (sparsity is not None) and (boot_sig is not None) and (coh_boot_sig is not None)):
             metrics['place_cell'] = (
                 int(n_spikes)    >  50   and
                 float(peak_fr)   >  1.0  and
-                float(peak_fr)   < 15.0  and
+                float(peak_fr)   < 25.0  and
                 float(sir)       >  0.5  and
-                float(sparsity)  <  0.9  and
-                boot_sig is True
+                float(sparsity)  <  0.75  and
+                boot_sig is True         and
+                coh_boot_sig is True
             )
         else:
             metrics['place_cell'] = None
 
-        return metrics
+        return metrics, ctx
 
-    full_row   = _build_row(None,     'full')
-    first_row  = _build_row('first',  'first_half')
-    second_row = _build_row('second', 'second_half')
+    full_row,  full_ctx = _build_row(None,     'full')
+    first_row, _        = _build_row('first',  'first_half')
+    second_row, _       = _build_row('second', 'second_half')
+
+    # Split-half spatial stability (Pearson r of the raw ratemap between the
+    # first and second half of the SESSION) -- computed once here on the
+    # full-session grid, not from the independently-binned first/second-half
+    # rows above (see _compute_split_half_stability docstring). Reported only
+    # on the full-session row; not a per-half quantity.
+    try:
+        stability = _compute_split_half_stability(full_ctx)
+    except Exception as e:
+        with _print_lock:
+            print(f'  STABILITY ERROR in {ntt_file}: {e}')
+        stability = {'stability_score': None, 'stability_p_value': None, 'stability_n_bins': None}
+
+    full_row['stability_score']   = stability.get('stability_score')
+    full_row['stability_p_value'] = stability.get('stability_p_value')
+    full_row['stability_n_bins']  = stability.get('stability_n_bins')
+
+    first_row['stability_score']   = None
+    first_row['stability_p_value'] = None
+    first_row['stability_n_bins']  = None
+    second_row['stability_score']   = None
+    second_row['stability_p_value'] = None
+    second_row['stability_n_bins']  = None
 
     return (full_row, first_row, second_row)
 # ── Batch scan ────────────────────────────────────────────────────────────────
@@ -1626,7 +1825,9 @@ if __name__ == "__main__":
 
     column_order = ['session', 'unit', 'n_spikes', 'n_discarded',
                     'peak_fr', 'mean_fr', 'sir', 'sparsity', 'coherence',
+                    'stability_score', 'stability_p_value', 'stability_n_bins',
                     'bootstrap_mean', 'bootstrap_p95', 'bootstrap_sig',
+                    'coherence_bootstrap_mean', 'coherence_bootstrap_p95', 'coherence_bootstrap_sig',
                     'theta_modulated', 'theta_peak_freq',
                     'speed_score', 'speed_p_value', 'speed_r2', 'speed_beta', 'speed_f0', 'speed_modulated',
                     'speed_shuffle_mean', 'speed_shuffle_lo', 'speed_shuffle_hi',

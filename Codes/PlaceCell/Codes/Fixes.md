@@ -1,11 +1,13 @@
 **Place cell characterization**
 # to-do:
 
-- [ ] ***`Major fix! Exclude cluster 0 spike in this and all other codes!`*** 
+- [ ] <Major fix:> **too many place cells discarded in the speed code, check why the criteria is so stringent. Almost half the cells are throw away.**
+
+- [x] ***`Major fix! Exclude cluster 0 spike in this and all other codes!`*** 
 
 - [ ] **Add Mehta skewness score calc to individual place fields.**
 
-- [ ] **Check the shuffling analysis. SOmetime it gets 102/102 cells, other time it gets 100/102 cells as true place cells.**
+- [x] ** Check the shuffling analysis. SOmetime it gets 102/102 cells, other time it gets 100/102 cells as true place cells.**
 
 - [ ] **Check the part when triangular kernel smoothing is applied. It sould be after peak and SIR estimation.**
 
