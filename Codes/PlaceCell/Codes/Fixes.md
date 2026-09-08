@@ -1,6 +1,8 @@
 **Place cell characterization**
 # to-do:
 
+- [ ] <Major fix:> **Change all triangular smoothing kernels to Gaussian smoothing kernels. Triangular smoothing is not ideal for place cells.**
+
 - [ ] <Major fix:> **Check if the triangular smoothong procedure over or under smooths the 1D circular track data.** *Compare with raw RM.*
 
 - [ ] <Major fix:> **too many place cells discarded in the speed code, check why the criteria is so stringent. Almost half the cells are throw away.**

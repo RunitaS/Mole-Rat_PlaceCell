@@ -109,9 +109,11 @@ COORD_UNITS = 'pixel'
 
 _gpu_semaphore = threading.Semaphore(2)
 
-_TRIANGULAR_KERNEL = np.array([[1, 2, 1],
-                                [2, 4, 2],
-                                [1, 2, 1]], dtype=np.float64) / 16.0
+# Hockeimer et al. 2025 (eLife 85599): ratemaps binned at 10 px (2.1 cm) per
+# bin, smoothed with a Gaussian kernel of sigma = 1.5 bins. Stored here as a
+# physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
+# bin size (target_bin_cm) this script is run with.
+GAUSSIAN_SIGMA_CM = 1.5 * 2.1
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),
@@ -133,14 +135,27 @@ def _wait_for_gpu_slot(poll_interval: float = 0.5):
         time.sleep(poll_interval)
 
 
-def _triangular_smooth(fr_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+def _gaussian_kernel(sigma_bins: float) -> np.ndarray:
+    """2D Gaussian kernel, sigma given in bins, truncated at 3 sigma."""
+    radius = max(1, int(np.ceil(3 * sigma_bins)))
+    ax = np.arange(-radius, radius + 1)
+    xx, yy = np.meshgrid(ax, ax, indexing='ij')
+    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma_bins ** 2))
+    kernel /= kernel.sum()
+    return kernel
+
+
+def _gaussian_smooth(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
+    sigma_bins = GAUSSIAN_SIGMA_CM / bin_cm
+    kernel = _gaussian_kernel(sigma_bins)
+
     fr_in   = np.where(valid_mask, fr_map, 0.0)
     mask_in = valid_mask.astype(np.float64)
 
     if _GPU:
         fr_gpu   = cp.asarray(fr_in, dtype=cp.float64)
         mask_gpu = cp.asarray(mask_in, dtype=cp.float64)
-        kern_gpu = cp.asarray(_TRIANGULAR_KERNEL, dtype=cp.float64)
+        kern_gpu = cp.asarray(kernel, dtype=cp.float64)
         _wait_for_gpu_slot()
         _gpu_semaphore.acquire()
         try:
@@ -153,8 +168,8 @@ def _triangular_smooth(fr_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray
         finally:
             _gpu_semaphore.release()
     else:
-        smoothed_fr      = convolve(fr_in,   _TRIANGULAR_KERNEL, mode='constant', cval=0.0)
-        smoothed_weights = convolve(mask_in, _TRIANGULAR_KERNEL, mode='constant', cval=0.0)
+        smoothed_fr      = convolve(fr_in,   kernel, mode='constant', cval=0.0)
+        smoothed_weights = convolve(mask_in, kernel, mode='constant', cval=0.0)
 
     smoothed = np.zeros_like(smoothed_fr)
     valid_weights = smoothed_weights > 0
@@ -281,7 +296,7 @@ def build_ratemap(csv_path: str, ntt_path: str,
 
     fr_raw = np.zeros_like(occ_map)
     fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
-    fr_smooth = _triangular_smooth(fr_raw, valid_mask)
+    fr_smooth = _gaussian_smooth(fr_raw, valid_mask, target_bin_cm)
 
     ctx = dict(spike_ts=spike_ts[valid_spike], spike_frame=spike_frame, t=t,
                beh_bx=beh_bx, beh_by=beh_by,

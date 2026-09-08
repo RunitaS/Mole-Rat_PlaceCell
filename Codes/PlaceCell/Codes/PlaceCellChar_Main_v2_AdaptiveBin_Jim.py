@@ -136,7 +136,7 @@ def _gpu_util_pct() -> int:
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059/AdptBin'
-output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059AdptBinTest_AdptBin.xlsx'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059AdptBin/Test_AdptBin.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
