@@ -20,6 +20,31 @@
 
 ## Spatial cells
 
+### Head direction cells
+- Discovered seredipitously in the doresal presubiculum also known as the postsubiculum while hunting for the source of place cells' spatial representations. 
+- Jim Ranch in the 1980's discovered cells that preferred firing when the head was oriented at a specific orientation in the horizontal plane.
+- SImilar to place cells, head direction cells are also known to anchor their representation to external cue, callibrating their cmpass to reliable sensory landmarks, more prominently the global distal cues. 
+- However, in specific brain regions self motion cues like those derived from the vestibular system can reliable stabilize the head direction representations.
+- The distribution of preffered firing directions across multiple cells is found to be uniformly distributed and these cells are known to have a ring attractor network hence the firing pattern of the cells in a specific brain region encoding head direction of the animal fire in register with each other leading a coherent rotation of their representatins in case of reoritentation of the directional signal. This enables a stable internally maintained network that doesn't drift easily. 
+- The head direction code is found to be distributed across several brain regions with it's origins in upstream vestibular brain nuclei liek the dorsal tegmental nuclus and the lateral mammilary nucleus which encode the angular head velocity, a precursor that is later refined into pure head orientation selctive head direction signal. Further downstream, brain areas such as the aforementioned postsubiculum, several thelamic nuclei mainly the anterodorsal thalamic nuclei, lateral dorsal and reuniens thalamic nuclei, and also cortical brian regions like the MEC, the retrosplenial cortex, the parasubiculum and the posterior parietal cortex are also known to contain head directon signal in rodents.
+
+### Grid cells
+- Cells with representations of multiple firing fields evenly distributed across the environemnt arranged as triangular lattices or tesselated grids. 
+- Found majorly in the MEC but also found in postrhinal cortex, pre and parasubiculum. 
+- Like other spatial representations discussed above, grid representtions are also known to callibrate their firing with respect to external environmental cues but only partially.
+- Similar to head directon representations, grid cell representations are also known to anchor mainly to global distal cues, realigning their representations corresponding to te angular rotations of distal cues. Deformations of the geometry of the environment also deforms the grid represntations correspondingly.
+- Grid repesentations have 3 features, grid scale, ornetation and phase, with different representations present in form of modules instead of a continum of these features. 
+- Grid representations are interconnected forming a torus manifold keeping the firing of all interconnected grid cells coordinated similar to head direction cells. 
+- Grid representaitons are also found to be very stable due to internal interconnectivity possibly relying more on self-motion cues rather than external landmark cues.
+- While the exact function of grid cells is under debate, it is more commonly known to encode a metric that enables self-motion calculation known as path integration.
+
+### Others
+- Boundary vector cells
+- Band cells
+- Speed cells
+- Object vector cells
+- Goal cells
+- Time cell?
 
 ### Place cells and hippocampus
 - Name conceived 400 years ago by Italian anatomist Arantius because human hippocampus looks like a sea horse (genus hippocampus, also a Greek Mythical creature resembling a horse-mermaid).

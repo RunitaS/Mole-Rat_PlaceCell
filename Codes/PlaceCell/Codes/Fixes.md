@@ -1,6 +1,8 @@
 **Place cell characterization**
 # to-do:
 
+- [ ] <Major fix:> **Check if the triangular smoothong procedure over or under smooths the 1D circular track data.** *Compare with raw RM.*
+
 - [ ] <Major fix:> **too many place cells discarded in the speed code, check why the criteria is so stringent. Almost half the cells are throw away.**
 
 - [x] ***`Major fix! Exclude cluster 0 spike in this and all other codes!`*** 
@@ -9,10 +11,17 @@
 
 - [x] ** Check the shuffling analysis. SOmetime it gets 102/102 cells, other time it gets 100/102 cells as true place cells.**
 
-- [ ] **Check the part when triangular kernel smoothing is applied. It sould be after peak and SIR estimation.**
+- [ ] **Check the part when triangular kernel smoothing is applied. It should be after peak and SIR estimation.**
 
-- [ ] **Plot place fields in python code** *Compare trajectory maps with rate maps. Pierre's code had some discrepancies.*
+- [x] ** Plot place fields in python code** *Compare trajectory maps with rate maps. Pierre's code had some discrepancies.*
 
+- [x] ** Adaptive binning of rate map.**
+        Fix: Replaced the fixed-bin histogram + triangular-smoothing rate map in PlaceCellChar_Main_v2_AdaptiveBin.py with adaptive binning, following your MATLAB getAdaptiveBinnedRmap reference:
+        Added _adaptive_binned_ratemap() — a vectorized Python port of the algorithm (per-bin radius expansion until alpha²·n_occ²·rsq·n_spikes2 > 1 or rsq hits 200), using a distance-sort + cumulative-sum instead of the MATLAB while-loop for speed, since occupancy/spikes accumulate monotonically with radius.
+        compute_metrics() now builds this adaptive map and uses it for peak_fr, mean_fr, sir, sparsity, and coherence — replacing the old separate raw/triangular-smoothed maps.
+        _compute_split_half_stability() also uses adaptive binning per half (cheap, single-pass).
+        Per your call: the 1000-iteration SIR/coherence location-shuffling bootstrap stays on the fast fixed-bin estimator — re-running adaptive binning per shuffle would be too slow for batch use — with a comment now documenting that tradeoff.
+        Removed the now-dead triangular-smoothing kernel.
 
 # Speed modulation algo:
 
