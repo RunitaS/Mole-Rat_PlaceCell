@@ -26,7 +26,7 @@ Output:
     occupied arena it covers.
 """
 
-<Major fix: Skewness score to be added to the code>
+#<Major fix: Skewness score to be added to the code>
 
 import os
 import re

@@ -17,6 +17,9 @@ Theta analysis
 11. Compare theta power/frequency in magnetic field vs zero field
 12. Compare theta power between animals in different arenas
 
+Supp: β characteirzation in 1/f^β power law.
+
 Post thesis ananlysis
 1. Characterize 1/f aperiodic signal slope and shape. Indicative of brai state and different in epileptic brains. Alo holds info on excitatory and inhibitory balance.
-   Extract offset, knee, and exponent from aperiodic parameters output of FOOOF
+   Extract offset, knee, and exponent from aperiodic parameters output of FOOOF. 
+   Extract the β value for 1/f^β. Quantify it in mole-rats.
