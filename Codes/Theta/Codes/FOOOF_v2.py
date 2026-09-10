@@ -29,14 +29,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # Add/remove/rename animals ONLY here -- plot colors, filenames, and legends
 # below are all derived automatically from this dict's keys.
 ANIMALS = {
-    #'Fa8477':  r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Fa8477',
+    'Fa8477':  r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Fa8477',
     # 'FaDDE42': r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/LFP/Main/DDE42',
-    'Fa23BD': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/23BDTest',
-    'Fa1059': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/1059Test',
+    #'Fa23BD': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/23BDTest',
+    #'Fa1059': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/1059Test',
 }
 
 
-OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP/thetadeltafilt/v1'  # saved plots go here
+OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP/thetadeltafilt/v2_aperiodicChar_clean'  # saved plots go here
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')            # summary figures
 
 # ---- Acquisition / PSD ----
@@ -532,6 +532,65 @@ def theta_range_from_peak(cf, bw):
     return cf - bw / 2, cf + bw / 2
 
 
+AX_LABEL_FONTSIZE = 10
+
+
+def _style_fooof_fit_ax(ax, fm, xlim=(1, 20), title="Sample FOOOF fit",
+                        theta_band=None):
+    """Plot an already-fit FOOOF model (original spectrum, full model, aperiodic
+    fit) onto `ax` with the shared color/label styling used across the script.
+
+    Also extracts the theta peak (strongest peak within theta_band) from `fm`
+    and shades/labels its [cf - bw/2, cf + bw/2] range on the axis, and
+    annotates the fitted aperiodic parameters (offset, knee, exponent).
+    """
+    fm.plot(ax=ax, add_legend=False)
+
+    line_styles = [
+        ("Original PSD", "#333333", "-",  1.6),
+        ("Full Model",   "#1263E6", "--", 1.4),
+        ("Aperiodic",    "#EA080C", "--", 1.4),
+    ]
+    for line, (label, color, ls, lw) in zip(ax.lines, line_styles):
+        line.set_color(color)
+        line.set_label(label)
+        line.set_linestyle(ls)
+        line.set_linewidth(lw)
+        line.set_alpha(0.9)
+
+    ax.set_xlim(xlim)
+    ax.text(0.5, 1.11, title, transform=ax.transAxes,
+            ha='center', va='bottom', fontsize=10)
+    ax.text(0.5, 1.01, f"R²={fm.r_squared_:.3f}, error={fm.error_:.3f}",
+            transform=ax.transAxes, ha='center', va='bottom', fontsize=8)
+
+    ap = fm.aperiodic_params_
+    if len(ap) == 2:
+        offset, exponent = ap
+        knee = np.nan
+    else:
+        offset, knee, exponent = ap
+    knee_str = f"{knee:.3f}" if not np.isnan(knee) else "n/a"
+    ax.text(0.02, 0.03,
+            f"Offset={offset:.3f}\nKnee={knee_str}\nExponent={exponent:.3f}",
+            transform=ax.transAxes, ha='left', va='bottom', fontsize=7.5,
+            color='#EA080C')
+
+    theta_cf, _theta_pw, theta_bw = extract_theta_peak(fm.peak_params_, theta_band)
+    theta_low, theta_high = theta_range_from_peak(theta_cf, theta_bw)
+    if not np.isnan(theta_low):
+        ax.axvspan(theta_low, theta_high, color='green', alpha=0.15, zorder=0)
+        ax.text(0.5, 0.99, f"Theta range: {theta_low:.2f}-{theta_high:.2f} Hz",
+                transform=ax.transAxes, ha='center', va='top', fontsize=7.5,
+                color='#1a7a1a')
+
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.set_xlabel("Frequency (Hz)", fontsize=AX_LABEL_FONTSIZE)
+    ax.set_ylabel("Power", fontsize=AX_LABEL_FONTSIZE)
+    ax.grid(False)
+    ax.legend(fontsize=8, frameon=False, loc='upper right')
+
+
 def fooof_results_to_df(fooof_results, theta_band):
     """Convert fooof_results list of dicts to a flat dataframe.
 
@@ -593,4 +652,128 @@ def export_low_quality_fits(df, out_path, r2_min=R_SQUARED_MIN, error_max=ERROR_
     print(f"Flagged {len(flagged)}/{len(df)} files "
           f"(r_squared < {r2_min} or error > {error_max}) -> {out_path}")
     return flagged
+
+
+# %% ==================== Aperiodic-parameter histograms ========================
+
+# xlim=None means the histogram range is taken from the data itself (min/max)
+# rather than a fixed window -- used for 'knee', whose scale depends on
+# FOOOF_RANGE and isn't comparable across setups the way offset/exponent are.
+APERIODIC_PROPS = {
+    'offset':   {'xlabel': 'Aperiodic Offset',   'xlim': (-3, 3.0)},
+    'knee':     {'xlabel': 'Aperiodic Knee',     'xlim': None},
+    'exponent': {'xlabel': 'Aperiodic Exponent', 'xlim': (0, 5.0)},
+}
+
+
+def plot_aperiodic_properties(df, props=None, save=True, save_dir=None):
+    """Histograms of aperiodic-fit properties (offset, knee, exponent), one
+    subplot per property, coloured by animal, pooled across every recording
+    file analyzed (one value per file, from `fooof_results_to_df`'s output).
+
+    Saves PNG + SVG to `save_dir` (default FIGURE_DIR) when `save=True`,
+    otherwise shows the figure interactively.
+    """
+    if props is None:
+        selected = list(APERIODIC_PROPS.keys())
+    elif isinstance(props, str):
+        selected = [props]
+    else:
+        selected = list(props)
+
+    unknown = [p for p in selected if p not in APERIODIC_PROPS]
+    if unknown:
+        raise ValueError(f"Unknown property/ies: {unknown}. "
+                         f"Choose from {list(APERIODIC_PROPS.keys())}")
+
+    n_plots = len(selected)
+    n_cols  = min(n_plots, 3)
+    n_rows  = math.ceil(n_plots / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(4.5 * n_cols, 3.5 * n_rows),
+                             squeeze=False)
+    axes_flat = axes.flatten()
+
+    for ax, key in zip(axes_flat, selected):
+        meta     = APERIODIC_PROPS[key]
+        vals_all = df[key].dropna()
+        xlim     = meta['xlim'] or (vals_all.min(), vals_all.max())
+
+        if 'animal' in df.columns:
+            animals_here = sorted(df['animal'].unique())
+            for i, animal in enumerate(animals_here):
+                vals = df.loc[df['animal'] == animal, key].dropna()
+                ax.hist(vals, bins=20, range=xlim,
+                        alpha=0.6, color=ANIMAL_COLORS[i % len(ANIMAL_COLORS)],
+                        edgecolor='white', lw=0.5, label=str(animal))
+            ax.legend(fontsize=7)
+        else:
+            ax.hist(vals_all, bins=20, range=xlim,
+                    color='#AAAAAA', edgecolor='#555555', lw=0.6)
+            ax.axvline(vals_all.median(), color='steelblue', lw=1.5, ls='--',
+                       label=f'median = {vals_all.median():.2f}')
+            ax.legend(fontsize=7)
+
+        ax.set_title(f'n = {vals_all.size}', fontsize=8)
+        ax.set_xlabel(meta['xlabel'])
+        ax.set_xlim(xlim)
+        ax.set_ylabel('No. of recordings')
+        ax.spines[['top', 'right']].set_visible(False)
+
+    for ax in axes_flat[n_plots:]:
+        ax.set_visible(False)
+
+    fig.suptitle('Aperiodic-fit properties (all recordings)', fontsize=11)
+    plt.tight_layout()
+
+    if save:
+        out_dir = save_dir or FIGURE_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        tag = '_'.join(selected)
+        for ext in ('png', 'svg'):
+            fig.savefig(os.path.join(out_dir, f'aperiodic_properties_{tag}.{ext}'),
+                        bbox_inches='tight', dpi=300)
+        print(f"Saved aperiodic-property histograms -> {out_dir}")
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return fig
+
+
+# %% ==================== MAIN PIPELINE (PSD -> FOOOF -> aperiodic plots) =======
+
+if __name__ == '__main__':
+
+    # 1) Generate PSDs for every animal via the reference folder-walk pipeline.
+    results = {}
+    for label, folder in ANIMALS.items():
+        print(f"=== Processing {label} ===")
+        results[label] = process_animal(label, folder)
+
+    # Persist the processed PSDs so downstream steps can be re-run without
+    # redoing the (slow) .ncs -> PSD pass.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(os.path.join(OUTPUT_DIR, 'processed_psds.pkl'), 'wb') as fh:
+        pickle.dump({a: {'freqs': r[0], 'mean': r[1], 'sem': r[2],
+                         'psds': r[4], 'files': r[5]} for a, r in results.items()}, fh)
+
+    # 2) FOOOF on every individual PSD -> flat per-file results.
+    #    Also saves a model-fit figure (original spectrum, full model,
+    #    aperiodic fit) for every file under FIGURE_DIR/individual_fits/<animal>/.
+    fooof_results = build_fooof_results(
+        results, save_fits=True,
+        save_dir=os.path.join(FIGURE_DIR, 'individual_fits'))
+
+    # 3) Expand into per-property dataframe, export it, and flag poor fits.
+    expanded_fooof_df = fooof_results_to_df(fooof_results, theta_band=THETA_BAND)
+    expanded_fooof_df.to_csv(os.path.join(OUTPUT_DIR, 'fooof_aperiodic_results.csv'),
+                             index=False)
+
+    export_low_quality_fits(
+        expanded_fooof_df,
+        os.path.join(OUTPUT_DIR, 'low_quality_fooof_fits.txt'))
+
+    # 4) Aperiodic-parameter histograms (offset, knee, exponent), by animal.
+    plot_aperiodic_properties(expanded_fooof_df, save=True)
 
