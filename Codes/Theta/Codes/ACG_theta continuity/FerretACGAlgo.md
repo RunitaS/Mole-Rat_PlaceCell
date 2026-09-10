@@ -33,7 +33,7 @@ Only epochs that are both artifact-clean and labelled moving/immobile survive to
 This is the mathematical heart of the script, translated from Dunn et al.'s MATLAB.
 
 6a. Build the reference sinusoid bank (once per file, create_sine_ref_xcorrs)
-For each candidate frequency f in 3–7 Hz stepped by 0.1 Hz (41 frequencies) <Should have had 46 frequencies, check why 5 freuqncies are dropped, also which 5 frequencies are dropped?>:
+For each candidate frequency f in 3–7 Hz stepped by 0.1 Hz (41 frequencies):
 
 Synthesize a pure sine sin(2πf·t) sampled at 1 kHz, same length as one data epoch (1000 samples).
 Compute its full autocorrelation (signal.correlate(..., mode='full')), giving 2N-1 lags, and normalise so the zero-lag value (the peak at the center) is 1. This produces a symmetric ACG shape unique to that frequency — a sine wave with a lower frequency has a "slower", more widely spaced ACG, and a higher frequency a "tighter" one.

@@ -1,5 +1,7 @@
 # Theta Mod Prec Fixes
 
+- [ ] <Major fix:> **LFP signal is not detrended. Huge slow drift amp present in signal. Phase values will be wrong irrepective of the transform used.**
+
 - [ ] <Major fix:> **Use wavelet transform instead of interpolation to assign instantaneous phase and power to theta trace.**
 
 - [ ] **<Major fix:> Add only significant theta epochs for phase precession>**
