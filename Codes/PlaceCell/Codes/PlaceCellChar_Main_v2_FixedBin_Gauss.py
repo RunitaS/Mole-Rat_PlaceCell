@@ -189,7 +189,7 @@ _gpu_semaphore = threading.Semaphore(2)
 # bin, smoothed with a Gaussian kernel of sigma = 1.5 bins. Stored here as a
 # physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
 # bin size (target_bin_cm) this script is run with.
-GAUSSIAN_SIGMA_CM = 1.5 * 2.1
+!GAUSSIAN_SIGMA_CM = 1.5 * 2.1
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),

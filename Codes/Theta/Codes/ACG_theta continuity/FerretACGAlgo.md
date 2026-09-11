@@ -111,6 +111,46 @@ If the data has essentially no oscillatory structure (e.g., noise-like, delta-sh
 If the data's ACG is actively out-of-phase / dissimilar in shape from every candidate reference (e.g., an oscillation frequency well outside the reference bank, or a noisy/irregular ACG that anti-correlates with the sinusoid shape over much of the lag range), the distance can exceed 1. A rough geometric estimate (treating a sinusoid's mean-square power as ~0.5) puts the plausible practical ceiling around ~2, though this isn't a hard proven bound — it depends on epoch length, the reference frequency range, and NaN padding.
 Your observed range of 0.0–1.6 is consistent with this — it's within the plausible envelope and not a sign of a bug. There isn't a clean textbook maximum (no "max is 1" or "max is 2" guarantee) — the code's own guidance is correct: plot results_df['ED_min'].hist() on your data and pick ACG_ED_MIN_THRESH based on where the distribution separates "good sinusoidal fits" from "poor fits," rather than assuming a universal cutoff.
 
+## ED_min threshold criteria calc
+
+There's a clean geometric proof for part of this, but not for the exact claim as stated — "no perfect match" does not by itself guarantee ED_min > 1. What can be proven rigorously is a weaker (and more useful) statement. Here's the derivation.
+
+What ED_min actually computes
+From ACG_theta_continuity_TT_ED_min_Simul.py:521-533: for a data epoch's normalized autocorrelogram vector x and a candidate reference sinusoid's normalized autocorrelogram vector r (both are full lag-vectors, peak-normalized to 1 at zero lag),
+
+ED(f) = ‖x − r_f‖₂
+normED(f) = ED(f) / ‖r_f‖₂
+ED_min = min over the bank of normED(f)
+The exact identity
+Write x = ρ‖r‖u, r = ‖r‖v, with u, v unit vectors, ρ = ‖x‖/‖r‖, and c = cos∠(x,r) = ⟨x,r⟩/(‖x‖‖r‖) (i.e. c is the correlation/cosine-similarity between the two autocorrelogram shapes). Then
+
+normED(f)² = ρ² − 2ρc + 1 = (ρ − c)² + (1 − c²)
+
+This is exact — just expanding ‖x−r‖² and using Cauchy–Schwarz (which guarantees 1−c² ≥ 0).
+
+Rearranging the sign of normED² − 1:
+
+normED² − 1 = ρ(ρ − 2c)
+
+Since ρ > 0 always (nonzero signals), sign(normED − 1) = sign(ρ − 2c). Equivalently:
+
+normED(f) < 1  ⟺  ⟨x, r_f⟩ > ‖x‖²/2
+
+What this proves unconditionally
+If c ≤ 0 (the candidate reference is not even positively correlated with the data's autocorrelogram — a "no match" in the strong sense), then ρ − 2c ≥ ρ > 0, so normED > 1 is guaranteed, with no dependence on amplitude scaling. That part is a real theorem, not a heuristic.
+
+If 0 < c < 1 (partial, imperfect match — the realistic case near a true frequency that's slightly off), the sign depends on ρ too. Near a genuine match, ρ ≈ c ≈ 1, and normED² ≈ (ρ−c)² can stay well under 1. So imperfect ≠ guaranteed above 1 — there's a whole neighborhood around the true frequency where the fit is "imperfect" but ED_min still sits comfortably below 1.
+
+Why the crossing point isn't at the bank edge
+This is exactly why find_ed_min_unity_freq in ED_min_FrequencyBank_Simulation.py:318-354 has to numerically root-find the ED_min=1 crossing with brentq instead of reading it off a formula: if "outside the bank ⟹ ED_min>1" were a theorem, the crossing would sit exactly at the bank edge with zero margin. Empirically it doesn't (the code even computes below_margin_hz/above_margin_hz) — <because c(f, f') decays continuously, not as a step function>, as the candidate frequency f' moves away from the true frequency f.
+
+That continuous decay is itself governed by a real, derivable mechanism: the finite-duration (T seconds) autocorrelation of a sinusoid is a cosine at that frequency under a triangular (Fejér-type) envelope. The cosine-similarity c(f, f') between two such vectors reduces, via product-to-sum, to a Fejér-kernel-shaped function of (f−f')·T — it stays near 1 for |f−f'| ≪ 1/T, and falls toward (and slightly below) zero once |f−f'| approaches the epoch's Fourier resolution 1/T. Corollary: far enough outside the bank (roughly once the frequency gap exceeds ~1/T), c drops to ≤0 and ED_min>1 becomes guaranteed by the theorem above — but right at the edge, within about one Fourier resolution bin, there's no such guarantee, which is the "margin" the script measures.
+
+Practical reading
+Since ρ ≈ 1 for essentially any reference in a reasonable band (all reference ACGs are peak-normalized over the same-length epoch, so their overall norms are similar), the condition normED<1 collapses approximately to c > 1/2 — i.e., ED_min<1 roughly whenever the best-matching reference's autocorrelogram is more than ~50% correlated (in the cosine sense) with the data's. That's a reasonable, derivable justification for why 1.0 is a sensible fit-quality cutoff, but it is a geometric convention tied to this particular normalization (comparing against ‖r‖ rather than some noise floor), not a theorem that mismatch automatically exceeds it.
+
+Bottom line: you can prove ED_min > 1 unconditionally only in the "far / uncorrelated" regime (c ≤ 0). <Near the true frequency, ED_min is a smooth function that dips below 1 over a margin of order 1/(epoch duration) around the match> — which is exactly the quantity your simulation script is measuring numerically rather than asserting analytically.
+
 
 # Soraya Dunn MATLAB code:
 

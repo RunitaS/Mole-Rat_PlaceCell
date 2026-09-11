@@ -303,6 +303,66 @@ A unit's total phase-precession slope was expressed in degrees of theta phase sw
 
 **Arena comparison (Circle vs. Linear vs. Open field)**: For sessions organized as `<animal>/<arena>/DayN/<session>`, cells classified as significantly precessing or recessing were pooled across animals within each arena and compared on r², |slope| (deg/pass), and phase range (deg) using a Kruskal–Wallis omnibus test per metric followed by pairwise Mann–Whitney U tests between arenas. The same omnibus/pairwise approach was applied to TMI values from all significantly theta-modulated cells (independent of precession status), pooled by arena, to test whether theta-phase-locking strength itself differed across arena geometries.
 
+#### v2
+
+Methods: Theta Modulation and Phase Precession Analysis
+Based on the full pipeline in ThetaMod_PhasePrecession_withGenPhsAp_v5.py, here is a complete draft methods section, followed by a plain-language explanation of Generalized Phase and Pass Index you can adapt for your thesis narrative.
+
+Methods
+Data acquisition and preprocessing
+Extracellular recordings were acquired with a Neuralynx system. Local field potentials (LFP) were sampled continuously (.ncs files), and spikes from previously isolated single units were extracted from tetrode files (.ntt) following offline spike sorting; unsorted/noise clusters (cluster 0) were excluded. For each session, the first LFP channel (by file order) served as the theta reference. Animal position was tracked via an overhead camera and stored as (x, y) coordinates in centimeters, synchronized to the electrophysiology clock.
+
+Local field potential filtering
+The LFP was bandpass-filtered in the theta band (3–7 Hz) using a fourth-order Butterworth filter implemented in second-order-section form and applied with zero-phase (forward–backward) filtering, to avoid phase distortion from the filter itself.
+
+Generalized Phase estimation of theta
+Instantaneous theta phase was estimated using the Generalized Phase (GP) algorithm (Davis, Muller et al., 2020, Nature 587:432–436; building on Muller et al., 2016, eLife 5:e17267), rather than the phase of the standard Hilbert transform, for reasons detailed below. Briefly, the analytic signal was computed via the Hilbert transform, instantaneous frequency was estimated at each sample, and epochs where instantaneous frequency dropped below the lower edge of the theta passband (3 Hz) — indicating an unreliable, potentially phase-reversed segment — were flagged, extended by a safety margin (3× epoch width), and their phase reconstructed by shape-preserving (PCHIP) interpolation of the unwrapped phase trend from the surrounding reliable samples. This yields a continuous, monotonically-evolving theta phase estimate for the entire session.
+
+Spike–phase assignment and theta phase-locking
+Each spike was assigned the interpolated GP theta phase at its occurrence time (interpolating the sine and cosine of the unwrapped phase separately, to avoid errors at the 0°/360° wraparound). Phase-locking was visualized as a polar histogram of spike counts across theta phase (12° bins), together with the mean resultant vector: mean resultant length (MRL), preferred phase, and significance from the Rayleigh test for circular non-uniformity (α = 0.05).
+
+Theta Modulation Index (TMI) and significance testing
+Theta modulation strength was quantified with the Theta Modulation Index (Frank et al., 2001). Spike phases were tiled across five repeated 360° cycles, binned (36° bins) and Gaussian-smoothed, and the middle two cycles were taken and max-normalized; TMI = 1 − (trough of the normalized histogram), such that TMI approaches 1 for strongly phase-modulated firing and 0 for phase-uniform firing. Units with fewer than 8 spikes were excluded from this analysis.
+
+Significance was assessed with a shuffling procedure following Frank et al. (2001): in each of 1,000 surrogates, every spike was reassigned an independent random phase drawn uniformly from [0°, 360°), except that consecutive spikes occurring < 50 ms apart and falling in the same real-data 36°-phase bin were treated as a single burst and assigned the same shuffled phase together, preserving burst structure while destroying genuine theta-phase alignment. The p-value was the (add-one smoothed) fraction of surrogate TMIs equal to or exceeding the observed TMI; units with p < 0.05 were classified as significantly theta-modulated (TMI_Significant).
+
+Pass Index phase-precession analysis
+For units found to be significantly theta-modulated, spatial phase precession was assessed with the Pass Index method (Climer, Newman & Hasselmo, 2013, European Journal of Neuroscience 38:2526–2541), which generalizes phase precession analysis to two-dimensional, non-linear trajectories (as opposed to requiring a 1-D linearized track).
+
+Rate map and field index. An occupancy-normalized 2-D firing-rate map was computed (spatial bin = 4 cm, Gaussian-smoothed, σ scaled to a 12 cm smoothing width), and normalized to a 0–1 "field index" map (min–max normalization of the rate map, for place cells).
+Field-index trace along the trajectory. The field index was sampled at every tracked position, then resampled at evenly spaced steps along the arc length of the animal's path (rather than in time), so that the resulting signal reflects spatial traversal of the field independent of the animal's instantaneous running speed.
+Spatial filtering. This arc-length trace was bandpass-filtered in a spatial-frequency band automatically derived from the estimated diameter of the firing field (area with rate > 20% of peak).
+Pass Index via Generalized Phase. The same Generalized Phase algorithm used for theta (above) was applied to this filtered spatial signal, yielding a "pass index" ranging continuously from −1 to +1 that represents each moment's normalized position within a single traversal ("pass") through the firing field — entry at −1, field center at 0, exit at +1.
+Circular–linear regression. Each spike's pass index and its GP theta phase were related using the circular–linear regression of Kempter et al. (2012, Journal of Neuroscience Methods 207:113–124): the slope (cycles of theta phase per unit pass index) and correlation coefficient ρ were found by maximizing resultant vector length via a grid search followed by local refinement (needed because the objective function has many aliased local maxima), and significance was assessed from ρ, sample size, and the theta/pass-index dispersion (Kempter et al.'s asymptotic z-test).
+Classification. Slope was converted to degrees of theta phase per full field pass. Cells with a significant fit (p < 0.05) and a negative slope of physiologically plausible magnitude (22°–1440° per pass) were classified as theta-phase precessing; cells meeting the same significance/magnitude criteria with a positive slope were classified as theta-phase recessing rather than discarded, to allow both directions of the phase–position relationship to be reported. Goodness of fit was summarized as r² = ρ², and the total phase range actually swept was computed as |slope| × the observed extent of pass index for that cell's spikes (rather than assuming the cell traversed the full −1 to +1 range). Units with fewer than 50 spikes were excluded from the circular–linear fit.
+Group comparisons across arenas
+For sessions organized by animal and arena type (circle, linear track, open field), significantly precessing/recessing cells were pooled within each arena and compared on r², |slope|, and phase range using the Kruskal–Wallis test, with pairwise Mann–Whitney U tests where the omnibus test was significant. The same non-parametric comparison (Kruskal–Wallis + pairwise Mann–Whitney U) was applied to TMI across arenas for all significantly theta-modulated cells.
+
+Plain-language explanation: Generalized Phase and Pass Index
+Why not just use the Hilbert transform?
+The conventional way to get an instantaneous phase from an oscillatory signal (like theta LFP) is the Hilbert transform: it turns your real-valued signal into a complex "analytic signal," and the angle of that complex number at each time point is the phase. This works well as long as the signal behaves like a clean sine wave — rising and falling smoothly and monotonically through each cycle.
+
+The problem is that real theta oscillations aren't perfect sine waves. They occasionally have brief distortions — a double bump, a flattened trough, a notch — especially when theta is weak or briefly irregular. During those brief moments, the "instantaneous frequency" implied by the Hilbert phase can momentarily drop to zero or even go negative, meaning the phase estimate briefly runs backwards. If you don't correct for this, spikes that happen to fall in these brief glitchy windows get assigned the wrong phase — sometimes off by close to 180°. Over a whole session, this adds noise to phase-locking statistics (TMI, MRL, Rayleigh test) and, worse, can distort the phase precession fit, since a regression is very sensitive to a subset of mislabeled points.
+
+What Generalized Phase does differently
+The Generalized Phase (GP) method (Davis, Muller et al., 2020) starts from the same Hilbert analytic signal, but adds a correction step:
+
+It computes instantaneous frequency at every time point.
+Wherever that instantaneous frequency drops below the low edge of the theta band (i.e., "too slow to be real theta," a signature of a phase-reversal glitch), it flags that stretch of samples as unreliable — and pads a small safety margin around it, since these events are often noisy right at their edges.
+Instead of trusting the raw phase during those flagged stretches, it reconstructs it by smoothly interpolating the phase trend from the reliable data on either side.
+The result is a phase estimate that increases smoothly and consistently through each theta cycle, with the brief "reversed" artifacts removed, rather than fighting the natural (if imperfect) rhythm of the LFP. Practically, this means: cleaner phase-locking histograms, a Theta Modulation Index that reflects genuine rhythmicity rather than glitch-driven scatter, and — most importantly for phase precession — spike phases that are not contaminated by a handful of mislabeled points that would otherwise pull the circular-linear regression off course.
+
+Why Pass Index instead of a linearized position?
+Classic phase precession analyses (e.g., O'Keefe & Recce, 1993) measure "position in the field" by linearizing the animal's path — projecting it onto a single 1-D axis, which works naturally for a rat running back and forth on a straight track. For place cells recorded in open arenas, circular tracks, or any environment where the animal can enter and cross a firing field from many different directions and angles, there is no single natural axis to project onto, and linearization becomes arbitrary or lossy.
+
+The Pass Index (Climer, Newman & Hasselmo, 2013) sidesteps this by not trying to describe where in the room the animal is at all. Instead, it asks a simpler question: as the animal moves through this particular firing field on this particular pass, how far along that traversal is it right now? It does this by:
+
+Building a 1-D signal of "how strongly are we inside the firing field," sampled evenly along the path actually taken (not evenly in time — this removes the effect of running speed).
+Treating that 1-D signal itself as a quasi-oscillatory wave — it rises as the animal enters the field, peaks near the center, and falls as it exits — and applying the exact same Generalized Phase machinery used for theta to extract a smooth "phase" of that traversal.
+That phase is the pass index, running from −1 (field entry) through 0 (field center) to +1 (field exit), regardless of the direction, shape, or curvature of the path taken through the field. This makes phase precession testable on any trajectory shape — circular arenas, open-field foraging, irregular paths — using the same circular–linear regression framework (Kempter et al., 2012) that trip-based linear-track studies use, because "distance into the field" is now itself represented as a clean, continuous, direction-agnostic variable. Using the same GP correction here as for theta phase is what keeps the pass index well-behaved even when a given pass through the field is brief, curved, or has an uneven running speed profile — the exact conditions where a naive Hilbert-style phase would be most likely to glitch.
+
+Let me know if you'd like this adapted to a specific citation style (APA/Nature/etc.), split into separate Theta Modulation / Phase Precession subsections for a two-chapter thesis structure, or trimmed for a paper-length methods section rather than a full thesis chapter.
+
 # Paper methods:
 
 # Theta depth profile; Dunn et.al, 2022
