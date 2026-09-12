@@ -2,6 +2,8 @@
 
 - [ ] **Integration of FOOOF into ACG pipeline is pending. Problems with increasing the fit range from 1-40 Hz to 1-100 Hz.**
 
+- [ ] **Theta vs Speed stats need multiple sample correction. No trend yet shows significance.**
+
 - [x] ** Add Bycycle theta +ve epochs to ACG pipeline** *Not required, instead use ED_min value threshold.
 
 - [x] ** Is the signal cutoff at 100 Hz?** *no noticeable change*

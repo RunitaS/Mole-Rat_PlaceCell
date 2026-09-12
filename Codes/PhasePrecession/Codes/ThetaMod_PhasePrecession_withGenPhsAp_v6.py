@@ -46,13 +46,19 @@ units the timestamp column is actually stored in.
 Output: one row per unit is appended to a single summary table written to
 ROOT_FOLDER/theta_phase.xlsx, covering Step 1's polar-plot statistics
 (MRL, preferred phase, Rayleigh p), Step 2's TMI and its shuffle p-value,
-and Step 3's phase-precession fit (rho, p, slope, is_precessing,
-is_recessing) where it ran. A significant negative-slope fit is labeled
-theta-phase precessing (is_precessing); a significant positive-slope fit
-of the same magnitude range is labeled theta-phase recessing
-(is_recessing) rather than discarded. Per-unit plots (polar plot from
-Step 1, and the 6-panel Pass Index summary from Step 3, when run) are
-saved to <session_folder>/ThetaPhasePrecession_Combined/.
+and Step 3's phase-precession fit (rho, p, slope, p_rho_shuffle,
+p_slope_shuffle, PrecessionClass) where it ran. Step 3's significance is a
+circular time-shift shuffle test (shuffle_precession_significance), not a
+fixed slope-magnitude window: spike times are circularly shifted against
+the position/theta-phase traces many times to build a null distribution of
+rho (and, as a secondary diagnostic, of the slope itself), and p_rho_shuffle
+< ALPHA gates significance. A significant negative slope is labeled
+phase_precessing (is_precessing); a significant positive slope is labeled
+phase_recessing (is_recessing); a non-significant fit on an otherwise
+theta-modulated cell is labeled phase_locked (is_phase_locked) rather than
+discarded. Per-unit plots (polar plot from Step 1, and the 6-panel Pass
+Index summary from Step 3, when run) are saved to
+<session_folder>/ThetaPhasePrecession_Combined/.
 
 If ROOT_FOLDER's cell sessions are laid out as
 <root>/<animal>/<arena>/DayN/<session>, with <arena> one of ARENA_LABELS
@@ -105,6 +111,11 @@ FILTER_BAND = 'auto'          # (low, high) cycles/unit-distance for the spatial
 LFP_FILTER_BAND = (3.0, 7.0) # Hz, theta band used for both the theta-modulation test and LFP phase
 SLOPE_BNDS = None             # optional (low, high) bound on precession slope (cycles/unit)
 MIN_SPIKES_FOR_FIT = 50       # skip circular-linear fit if fewer spikes than this
+N_PRECESSION_SHUFFLES = 500    # circular time-shift shuffles testing the pass-index/theta-phase
+                                # circular-linear fit (rho, slope) against a null of no position-phase
+                                # relationship -- see shuffle_precession_significance
+PRECESSION_MIN_SHIFT_FRAC = 0.1  # minimum circular shift, as a fraction of the overlap window's
+                                  # duration, so no shuffle leaves spikes nearly unshifted
 
 # --- Step 1/2: theta phase-locking / modulation parameters ---
 PHASE_BIN_SIZE_DEG = 36             # degrees per polar-histogram bin (360 must be divisible by this);
@@ -616,11 +627,73 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     return rho, p, s, b
 
 
+def shuffle_precession_significance(spk_ts, ts2, unwrapped_pass_index, lfp_ts, unwrapped_lfp_phase,
+                                     observed_rho, observed_s, rng,
+                                     n_shuffles=N_PRECESSION_SHUFFLES,
+                                     min_shift_frac=PRECESSION_MIN_SHIFT_FRAC, slope_bnds=None):
+    """Null distribution for the pass-index/theta-phase circular-linear fit
+    (Kempter et al. 2012), via a circular time-shift shuffle: spike times are
+    shifted by a random offset -- at least min_shift_frac of the available
+    window, so no shuffle leaves the true alignment nearly intact -- and
+    wrapped within the overlap of the arc-length-resampled position trace
+    and the LFP phase trace; pass index and theta phase are then
+    re-interpolated at the shifted times and refit exactly as for the real
+    data (same anglereg/kempter_lincirc call, so the null also reflects the
+    slope being *estimated*, not assumed known).
+
+    This preserves each spike train's own temporal structure (ISI/bursting)
+    and the natural relationship between position and LFP theta phase,
+    destroying only the cell-specific link between spike timing and where in
+    the field / theta cycle the animal actually was -- analogous to Step 2's
+    TMI shuffle test, and more robust than kempter_lincirc's own asymptotic
+    z-test (which assumes large-n normality of the underlying circular
+    moments) for the bursty, autocorrelated spike trains phase precession is
+    measured from. Used in place of a fixed slope-magnitude window to decide
+    significance, so a real but shallow precession is not discarded just for
+    being outside an arbitrary deg/pass range.
+
+    Returns (p_rho, p_slope, shuffle_rhos, shuffle_slopes). p_rho tests the
+    fitted circular-linear correlation rho (the combined
+    goodness-of-fit-and-slope statistic used for classification below);
+    p_slope tests the fitted slope s alone, reported as a secondary
+    diagnostic.
+    """
+    t_lo = max(ts2.min(), lfp_ts.min())
+    t_hi = min(ts2.max(), lfp_ts.max())
+    duration = t_hi - t_lo
+    min_shift = min_shift_frac * duration
+
+    shuffle_rhos = np.full(n_shuffles, np.nan)
+    shuffle_slopes = np.full(n_shuffles, np.nan)
+    for i in range(n_shuffles):
+        shift = rng.uniform(min_shift, duration - min_shift)
+        shifted_ts = t_lo + np.mod(spk_ts - t_lo + shift, duration)
+
+        shifted_unwrapped = _interp_nearest_extrap(ts2, unwrapped_pass_index, shifted_ts)
+        shifted_pass_index = (np.mod(shifted_unwrapped + np.pi, 2 * np.pi) - np.pi) / np.pi
+        shifted_theta_phase = np.mod(np.interp(shifted_ts, lfp_ts, unwrapped_lfp_phase)
+                                      + np.pi, 2 * np.pi) - np.pi
+
+        rho_i, _p_i, s_i, _b_i = kempter_lincirc(shifted_pass_index, shifted_theta_phase,
+                                                  slope_bnds=slope_bnds)
+        shuffle_rhos[i] = rho_i
+        shuffle_slopes[i] = s_i
+
+    valid = np.isfinite(shuffle_rhos) & np.isfinite(shuffle_slopes)
+    n_valid = int(np.sum(valid))
+    if n_valid == 0 or np.isnan(observed_rho) or np.isnan(observed_s):
+        return np.nan, np.nan, shuffle_rhos, shuffle_slopes
+
+    p_rho = float((np.sum(np.abs(shuffle_rhos[valid]) >= np.abs(observed_rho)) + 1) / (n_valid + 1))
+    p_slope = float((np.sum(np.abs(shuffle_slopes[valid]) >= np.abs(observed_s)) + 1) / (n_valid + 1))
+    return p_rho, p_slope, shuffle_rhos, shuffle_slopes
+
+
 # ============================================================================
 # Step 3: Pass index phase-precession computation for one unit
 # ============================================================================
 
-def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs,
+def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
                         method='place', binside='auto', smth_width='auto',
                         filter_band='auto', lfp_filter_band=(3.0, 7.0),
                         slope_bnds=None):
@@ -662,12 +735,31 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs,
     # under-reporting the true per-pass slope (and the classification bounds
     # below) by a factor of 2.
     slope_deg_per_pass = np.rad2deg(4 * np.pi * s) if not np.isnan(s) else np.nan
-    is_significant_fit = bool((not np.isnan(p)) and p < 0.05)
+
+    # Significance via circular time-shift shuffle (shuffle_precession_significance)
+    # rather than a fixed slope-magnitude window: a real but shallow precession
+    # should not be discarded just for falling outside an arbitrary deg/pass
+    # range, and kempter_lincirc's own asymptotic p (still reported below as
+    # 'p', for QC) assumes large-n normality that real spike trains can violate.
+    p_rho_shuffle, p_slope_shuffle, _shuffle_rhos, _shuffle_slopes = shuffle_precession_significance(
+        spk_ts, ts2, unwrapped, lfp_ts, unwrapped_lfp_phase, rho, s, rng, slope_bnds=slope_bnds)
+
+    is_significant_precession = bool(np.isfinite(p_rho_shuffle) and p_rho_shuffle < ALPHA)
     # Negative slope: theta-phase precessing (spike phase advances to earlier
-    # phase over the field pass). Positive slope with the same significance
-    # and magnitude criteria: theta-phase recessing (phase moves later).
-    is_precessing = bool(is_significant_fit and -1440 < slope_deg_per_pass < -22)
-    is_recessing = bool(is_significant_fit and 22 < slope_deg_per_pass < 1440)
+    # phase over the field pass). Positive slope: theta-phase recessing
+    # (phase moves later). Neither significant: phase locked (theta-modulated,
+    # per Step 2's TMI gate, but with no systematic phase drift across the field).
+    is_precessing = bool(is_significant_precession and s < 0)
+    is_recessing = bool(is_significant_precession and s > 0)
+    is_phase_locked = bool(np.isfinite(p_rho_shuffle) and not is_significant_precession)
+    if not np.isfinite(p_rho_shuffle):
+        precession_class = None
+    elif is_precessing:
+        precession_class = 'phase_precessing'
+    elif is_recessing:
+        precession_class = 'phase_recessing'
+    else:
+        precession_class = 'phase_locked'
 
     # r^2 of the circular-linear fit (rho is Kempter et al.'s circular-linear
     # correlation coefficient, the circular analogue of a linear r).
@@ -703,7 +795,9 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs,
         'rho': rho, 'p': p, 's': s, 'b': b,
         'slope_deg_per_pass': slope_deg_per_pass,
         'r_squared': r_squared, 'phase_range_deg': phase_range_deg,
+        'p_rho_shuffle': p_rho_shuffle, 'p_slope_shuffle': p_slope_shuffle,
         'is_precessing': is_precessing, 'is_recessing': is_recessing,
+        'is_phase_locked': is_phase_locked, 'precession_class': precession_class,
         'density': density, 'pi_edges': pi_edges, 'ph_edges': ph_edges,
         'n_spikes': len(spk_ts),
     }
@@ -988,9 +1082,9 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
     ax.set_ylim(0, 720)
     ax.set_xlabel('Pass index')
     ax.set_ylabel('LFP phase (deg)')
-    ax.set_title(f'rho={results["rho"]:.2f}  p={results["p"]:.3g}\n'
+    ax.set_title(f'rho={results["rho"]:.2f}  p_shuffle={results["p_rho_shuffle"]:.3g}\n'
                  f'slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
-                 f'precessing={results["is_precessing"]}  recessing={results["is_recessing"]}')
+                 f'class={results["precession_class"]}')
 
     ax = axes[1, 1]
     ph_centers = np.rad2deg(0.5 * (results['ph_edges'][:-1] + results['ph_edges'][1:]))
@@ -1007,10 +1101,11 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
     axes[1, 2].axis('off')
     axes[1, 2].text(0.0, 0.9, f"n_spikes = {results['n_spikes']}", fontsize=11)
     axes[1, 2].text(0.0, 0.75, f"rho = {results['rho']:.3f}", fontsize=11)
-    axes[1, 2].text(0.0, 0.6, f"p = {results['p']:.4g}", fontsize=11)
+    axes[1, 2].text(0.0, 0.6, f"p (asymptotic) = {results['p']:.4g}", fontsize=11)
     axes[1, 2].text(0.0, 0.45, f"slope = {results['slope_deg_per_pass']:.2f} deg/pass", fontsize=11)
-    axes[1, 2].text(0.0, 0.3, f"is_precessing = {results['is_precessing']}", fontsize=11)
-    axes[1, 2].text(0.0, 0.15, f"is_recessing = {results['is_recessing']}", fontsize=11)
+    axes[1, 2].text(0.0, 0.3, f"p_rho_shuffle = {results['p_rho_shuffle']:.4g}", fontsize=11)
+    axes[1, 2].text(0.0, 0.15, f"p_slope_shuffle = {results['p_slope_shuffle']:.4g}", fontsize=11)
+    axes[1, 2].text(0.0, 0.0, f"class = {results['precession_class']}", fontsize=11, fontweight='bold')
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
@@ -1221,7 +1316,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                 else:
                     try:
                         results = compute_pass_index(
-                            pos_ts, pos_xy, spk_ts_overlap, lfp_ts, lfp_sig, lfp_fs,
+                            pos_ts, pos_xy, spk_ts_overlap, lfp_ts, lfp_sig, lfp_fs, rng,
                             method=METHOD, binside=BINSIDE, smth_width=SMTH_WIDTH,
                             filter_band=FILTER_BAND, lfp_filter_band=LFP_FILTER_BAND,
                             slope_bnds=SLOPE_BNDS,
@@ -1232,15 +1327,20 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                         row.update({
                             'PassIndex_n_spikes': results['n_spikes'], 'rho': results['rho'],
                             'precession_p': results['p'],
+                            'p_rho_shuffle': results['p_rho_shuffle'],
+                            'p_slope_shuffle': results['p_slope_shuffle'],
                             'slope_deg_per_pass': results['slope_deg_per_pass'],
                             'r_squared': results['r_squared'],
                             'phase_range_deg': results['phase_range_deg'],
                             'is_precessing': results['is_precessing'],
                             'is_recessing': results['is_recessing'],
+                            'is_phase_locked': results['is_phase_locked'],
+                            'PrecessionClass': results['precession_class'],
                         })
                         print(f'  {unit_label}: PRECESSION rho={results["rho"]:.3f}  '
-                              f'p={results["p"]:.3g}  slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
-                              f'precessing={results["is_precessing"]}  recessing={results["is_recessing"]}')
+                              f'p_rho_shuffle={results["p_rho_shuffle"]:.3g}  '
+                              f'slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
+                              f'class={results["precession_class"]}')
                     except Exception as exc:
                         row['PrecessionSkippedReason'] = f'ERROR ({exc})'
                         print(f'  {unit_label}: phase-precession ERROR ({exc})')
@@ -1255,11 +1355,13 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
 
     Each row's Count/Denominator/Percent together cover one pair of
     (number, percentage) items: total cells; SignificantThetaModulation;
-    TMI_Significant (theta-modulated); PrecessionTested; and is_precessing
-    counted two ways -- out of all theta-modulated (TMI_Significant) cells,
-    and out of only the subset that was actually precession-tested (some
-    theta-modulated cells are skipped, e.g. no tracking file or too few
-    overlapping spikes).
+    TMI_Significant (theta-modulated); PrecessionTested; and the three
+    PrecessionClass outcomes (phase_precessing / phase_recessing /
+    phase_locked, from the circular-shuffle test in
+    shuffle_precession_significance) counted two ways -- out of all
+    theta-modulated (TMI_Significant) cells, and out of only the subset that
+    was actually precession-tested (some theta-modulated cells are skipped,
+    e.g. no tracking file or too few overlapping spikes).
     """
     def pct(n, d):
         return (100.0 * n / d) if d > 0 else np.nan
@@ -1269,6 +1371,8 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     n_tmi_sig = int((df['TMI_Significant'] == True).sum())                   # noqa: E712
     n_precession_tested = int((df['PrecessionTested'] == True).sum())        # noqa: E712
     n_precessing = int((df['is_precessing'] == True).sum())                  # noqa: E712
+    n_recessing = int((df['is_recessing'] == True).sum())                    # noqa: E712
+    n_phase_locked = int((df['is_phase_locked'] == True).sum())              # noqa: E712
 
     rows = [
         dict(Metric='SignificantThetaModulation (Rayleigh) cells',
@@ -1280,13 +1384,21 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
         dict(Metric='PrecessionTested cells',
              Count=n_precession_tested, Denominator=total_cells, DenominatorLabel='total cells',
              Percent=pct(n_precession_tested, total_cells)),
-        dict(Metric='is_precessing cells (of theta-modulated cells)',
+        dict(Metric='phase_precessing cells (of theta-modulated cells)',
              Count=n_precessing, Denominator=n_tmi_sig, DenominatorLabel='theta-modulated cells',
              Percent=pct(n_precessing, n_tmi_sig)),
-        dict(Metric='is_precessing cells (of precession-tested cells)',
+        dict(Metric='phase_precessing cells (of precession-tested cells)',
              Count=n_precessing, Denominator=n_precession_tested,
              DenominatorLabel='precession-tested cells',
              Percent=pct(n_precessing, n_precession_tested)),
+        dict(Metric='phase_recessing cells (of precession-tested cells)',
+             Count=n_recessing, Denominator=n_precession_tested,
+             DenominatorLabel='precession-tested cells',
+             Percent=pct(n_recessing, n_precession_tested)),
+        dict(Metric='phase_locked cells (of precession-tested cells)',
+             Count=n_phase_locked, Denominator=n_precession_tested,
+             DenominatorLabel='precession-tested cells',
+             Percent=pct(n_phase_locked, n_precession_tested)),
     ]
     return pd.DataFrame(rows, columns=['Metric', 'Count', 'Denominator', 'DenominatorLabel', 'Percent'])
 
@@ -1314,8 +1426,10 @@ def main():
                'n_spikes_theta', 'MRL', 'PreferredPhase_deg', 'Rayleigh_p',
                'SignificantThetaModulation', 'PhasePeak_deg', 'PhaseValley_deg', 'TMI',
                'TMI_shuffle_p', 'TMI_Significant', 'PrecessionTested', 'PassIndex_n_spikes',
-               'rho', 'r_squared', 'precession_p', 'slope_deg_per_pass', 'phase_range_deg',
-               'is_precessing', 'is_recessing', 'PrecessionSkippedReason']
+               'rho', 'r_squared', 'precession_p', 'p_rho_shuffle', 'p_slope_shuffle',
+               'slope_deg_per_pass', 'phase_range_deg',
+               'is_precessing', 'is_recessing', 'is_phase_locked', 'PrecessionClass',
+               'PrecessionSkippedReason']
     df = pd.DataFrame(all_rows, columns=columns)
     summary_df = build_summary_stats(df)
 
