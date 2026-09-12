@@ -83,6 +83,11 @@ OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_T
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # spatial bin size (cm / along-track cm), fine-map resolution
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
+COVERAGE_FRACTION = 0.80      # a session must have >= min_occ_s occupancy in at least this
+                               # fraction of the arena's total spatial bins (per handler, see
+                               # `total_arena_bins`/`coverage_threshold_bins`), else every file
+                               # (unit) from that session is skipped -- computed dynamically per
+                               # handler rather than hardcoded, so it tracks target_bin_cm/geometry
 MAX_GAP_US     = 50_000       # max spike-position gap (us)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance (reduce for faster runs)
 MAX_WORKERS    = 4
@@ -385,6 +390,12 @@ class OpenFieldHandler:
         r = np.hypot(XX - self.cx, YY - self.cy)
         self.geom_valid = (r <= self.diameter / 2.0).ravel()
 
+        # total bins actually inside the circular arena (excludes the corner bins of the
+        # bounding nx*ny grid that geom_valid already masks out) -- the denominator for the
+        # 80% coverage criterion (COVERAGE_FRACTION)
+        self.total_arena_bins = int(self.geom_valid.sum())
+        self.coverage_threshold_bins = int(np.ceil(COVERAGE_FRACTION * self.total_arena_bins))
+
         self._build_quadrant_fold()
 
     def orient(self, x_cm, y_cm):
@@ -463,6 +474,11 @@ class CircularTrackHandler:
         self.n_bins = max(8, 4 * int(round(circumference / bin_cm / 4.0)))
         self.bin_width_deg = 360.0 / self.n_bins
 
+        # the ring has no out-of-bounds bins (every angular bin is on the track), so all
+        # n_bins count toward the 80% coverage criterion (COVERAGE_FRACTION)
+        self.total_arena_bins = self.n_bins
+        self.coverage_threshold_bins = int(np.ceil(COVERAGE_FRACTION * self.total_arena_bins))
+
         self._build_quadrant_fold()
 
     def orient(self, x_cm, y_cm):
@@ -539,6 +555,11 @@ class LinearTrackHandler:
         self.bin_cm_y = self.width  / self.ny
         self.n_bins = self.nx * self.ny
         self.arena_width_cm = self.length
+
+        # every bin of the nx*ny grid is on the track (no out-of-bounds corners to mask),
+        # so all n_bins count toward the 80% coverage criterion (COVERAGE_FRACTION)
+        self.total_arena_bins = self.n_bins
+        self.coverage_threshold_bins = int(np.ceil(COVERAGE_FRACTION * self.total_arena_bins))
 
         self._build_quadrant_fold()
 
@@ -806,6 +827,18 @@ def process_unit(csv_path: str, ntt_path: str, ntt_file: str, session_name: str,
 
     cell = compute_cell_ratemap(x_cm, y_cm, t, spike_ts, handler)
     if cell is None:
+        return None
+
+    # Coverage criterion: the occupancy map (cell['valid']) depends only on tracking, not on
+    # this unit's spikes, so it is identical for every unit in this session -- this check
+    # therefore skips every file (unit) from a session whose tracking did not cover enough of
+    # the arena (COVERAGE_FRACTION), not just this one unit.
+    covered_bins = int(cell['valid'].sum())
+    if covered_bins < handler.coverage_threshold_bins:
+        print(f'  [SKIP low coverage] {session_name}/{ntt_file}: '
+              f'{covered_bins}/{handler.total_arena_bins} bins covered '
+              f'({covered_bins / handler.total_arena_bins:.0%}), '
+              f'need >= {handler.coverage_threshold_bins} ({COVERAGE_FRACTION:.0%})')
         return None
 
     boot = run_bootstrap_generic(handler, cell, cell['sir'])
