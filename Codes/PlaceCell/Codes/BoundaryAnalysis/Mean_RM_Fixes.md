@@ -1,6 +1,10 @@
 # Mean rate map and population analysis Fixes
 
-- [ ] **1D Circ is converted to angular bins for some god forsaken reason. Convert it back to linear x,y bins.** *Probably why you get single bin
+- [x] <Major fix:> ** Circular track quadrant folds are aligned wrong. Use mirroring method instead of angular rotations.**
+
+- [ ] **Edge vs Center analysis is run on smoothed Rm. Use the same for Mean RM peak map. Don't run on raw RM.** *Check Gaussian smoothing factor. Keep it consistent across all analyses.*
+
+- [x] ** 1D Circ is converted to angular bins for some god forsaken reason. Convert it back to linear x,y bins.** *Probably why you get single bin.*
 
 - [x] ** Change smoothing from triangular kernel to Gaussian kernel.**
 

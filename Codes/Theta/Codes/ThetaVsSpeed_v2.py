@@ -10,6 +10,12 @@ band-passed signal (Davis, Muller et al. 2020, Nature 587:432-436 -- the same
 corrected analytic-signal phase used in Ref_ThetaSpeed.py, ported here
 verbatim), binned against running speed computed from the cleaned tracking
 position.
+
+Before the mixed-model statistics, the per-time-bin (BINSIZE) Frequency/Power
+values are further aggregated into 1 cm/s-wide speed bins per session
+(median Frequency/Power/Speed per bin -- see aggregate_by_speed_bin), so the
+random-intercept LMM is fit on one value per distinct speed actually visited
+per session rather than on thousands of highly autocorrelated time samples.
 """
 
 import os
@@ -73,6 +79,15 @@ FILTER_ORDER = 5
 TRIM_DUR = 0.25
 
 BINSIZE = 0.25
+
+# Speed-binning applied before the mixed model (see aggregate_by_speed_bin):
+# with BINSIZE=0.25 s time bins, a session contributes thousands of
+# Frequency/Power/Speed points, which are not independent samples of the
+# speed relationship and inflate the mixed model's apparent significance.
+# Grouping by SPEED_BIN_WIDTH_CMS-wide speed bins and taking the median
+# Frequency/Power within each (session, bin) group gives one value per
+# actually-distinct speed visited per session.
+SPEED_BIN_WIDTH_CMS = 1.0
 
 # ---- Tracking position cleaning (matches
 # ACG_theta_continuity_TT_Thresholded_EDmin_LFPclean_v3.py's
@@ -508,6 +523,28 @@ def process_root_directory(root_dir):
 
 # %% ==================== Speed vs. theta statistics (mixed linear model) ==========
 
+def aggregate_by_speed_bin(df, speed_bin_width=SPEED_BIN_WIDTH_CMS, group="Session"):
+    """Median Frequency/Power/Speed per (session, speed bin).
+
+    Reduces the raw per-time-bin rows (one every BINSIZE seconds -- thousands
+    per session) to one row per `speed_bin_width` cm/s speed bin actually
+    visited within each session, so the mixed model is fit on a value that
+    summarises a distinct speed rather than on many highly autocorrelated
+    time samples. `Speed` in the output is the median speed of the bin's
+    contributing samples (not the bin edge/center), so it stays a faithful
+    x-value for the fit.
+    """
+    d = df.copy()
+    d["SpeedBin"] = np.floor(d["Speed"] / speed_bin_width)
+    agg = (d.groupby([group, "SpeedBin"])
+            .agg(Frequency=("Frequency", "median"),
+                 Power=("Power", "median"),
+                 Speed=("Speed", "median"),
+                 n=("Speed", "size"))
+            .reset_index(drop=False))
+    return agg.drop(columns="SpeedBin")
+
+
 def fit_mixed_model(df, response, predictor="Speed", group="Session"):
     """
     Random-intercept linear mixed model: response ~ predictor, grouped by
@@ -550,8 +587,12 @@ def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, 
 
 
 def run_speed_vs_theta_stats(df):
-    """Fit and plot mixed linear models of Frequency~Speed and Power~Speed (random intercept per Session)."""
+    """Fit and plot mixed linear models of Frequency~Speed and Power~Speed
+    (random intercept per Session), on speed-binned medians rather than the
+    raw per-time-bin rows -- see aggregate_by_speed_bin."""
     df_stats = df.dropna(subset=["Frequency", "Power", "Speed"])
+    df_stats = aggregate_by_speed_bin(df_stats)
+    df_stats.to_excel(OUTPUT_DIR / "ThetaVsSpeed_binned_medians.xlsx", index=False)
 
     freq_result = fit_mixed_model(df_stats, "Frequency")
     print(freq_result.summary())

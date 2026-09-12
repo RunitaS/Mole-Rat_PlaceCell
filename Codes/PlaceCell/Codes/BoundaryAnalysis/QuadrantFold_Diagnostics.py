@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quadrant-fold matching diagnostics for MeanRateMap_QuadrantAnalysis_v2.py.
+Quadrant-fold matching diagnostics for MeanRateMap_QuadrantAnalysis_v7_CoverageCriteria.py.
 
 Builds the exact same handler objects (pure geometry -- no tracking/spike data
 needed) and visualizes, step by step, how the whole-arena bin grid is split
@@ -34,7 +34,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from MeanRateMap_QuadrantAnalysis_v2 import (  # noqa: E402
+from MeanRateMap_QuadrantAnalysis_v7_CoverageCriteria import (  # noqa: E402
     ARENA_CONFIGS, target_bin_cm, make_handler,
 )
 
@@ -179,7 +179,7 @@ def plot_reflect_fold_diagnostics(handler, arena_name: str, save_path: str,
 
 
 # ============================================================================
-# Roll-fold arena (circular_track)
+# Mirror-fold arena (circular_track)
 # ============================================================================
 
 def plot_ring_fold_diagnostics(handler, save_path: str):
@@ -373,9 +373,10 @@ def plot_full_protocol_reflect(handler, arena_name: str, save_path: str,
 
 
 def plot_full_protocol_ring(handler, save_path: str):
-    """Full cut -> register -> average protocol for the circular track's roll fold:
+    """Full cut -> register -> average protocol for the circular track's mirror fold:
     each of the 4 arcs shown individually at its true physical angular position, then
-    individually rolled onto the reference 0-90 deg arc, then averaged."""
+    individually mirror-registered (alternate arcs reversed) onto the reference 0-90 deg
+    arc, then averaged."""
     n_bins = handler.n_bins
     qn = handler.n_quad_bins
     quad_idx = handler._quad_idx_flat
@@ -439,7 +440,7 @@ def plot_full_protocol_ring(handler, save_path: str):
             spine.set_edgecolor(quad_colors[k]); spine.set_linewidth(3)
         ax.set_title(f'{quad_labels[k]}\nas physically cut', fontsize=9)
 
-    # --- Row 3: each arc rolled onto the reference arc, + their average --------
+    # --- Row 3: each arc mirror-registered onto the reference arc, + their average --
     registered = []
     for idx, k in enumerate((1, 2, 3, 4)):
         ax = fig.add_subplot(gs[2, idx * 4:idx * 4 + 4], projection='polar')
@@ -452,7 +453,7 @@ def plot_full_protocol_ring(handler, save_path: str):
         ax.set_ylim(0, handler.outer_r + 5); ax.set_yticklabels([]); ax.grid(False)
         for spine in ax.spines.values():
             spine.set_edgecolor(quad_colors[k]); spine.set_linewidth(3)
-        ax.set_title(f'{quad_labels[k]}\nregistered (rolled to 0-90 deg)', fontsize=9)
+        ax.set_title(f'{quad_labels[k]}\nregistered (mirrored onto 0-90 deg)', fontsize=9)
 
     ax_avg = fig.add_subplot(gs[2, 16:20], projection='polar')
     avg = np.mean(np.stack(registered, axis=0), axis=0)

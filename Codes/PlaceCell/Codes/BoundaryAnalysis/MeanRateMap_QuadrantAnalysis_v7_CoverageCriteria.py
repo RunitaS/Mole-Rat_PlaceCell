@@ -16,7 +16,8 @@ Reproduces, for place cells pooled across multiple recording days:
               and the 4 registered copies are averaged bin-by-bin, giving one small
               *multi-bin* heatmap (not a single scalar per quadrant):
                 * open_field      : mirror-reflection fold (x and y independently) -> small square heatmap
-                * circular_track  : 90 deg angular roll fold -> small arc heatmap (no distinct walls)
+                * circular_track  : mirror-reflection fold (angular, about the two axes of
+                                    symmetry) -> small arc heatmap (no distinct walls)
                 * linear_track    : mirror-reflection fold (length x width) -> small rectangle heatmap
               Fig 1B pools each cell's one peak location into the folded grid (proportion
               of peaks per bin); Fig 1D folds the single overall (Fig S1H) mean field-index map.
@@ -364,6 +365,31 @@ def _build_reflect_quadrant_fold(nx: int, ny: int) -> tuple:
     return quad_idx.ravel(), n_quad_bins, (half_x, half_y)
 
 
+def _build_reflect_quadrant_fold_ring(n_bins: int) -> tuple:
+    """1D-ring analogue of _build_reflect_quadrant_fold: registers each of the 4 angular
+    quadrants of a circular-track arena onto one reference quadrant by mirror-reflection,
+    the same registration principle used for the open field and linear track, instead of
+    matching quadrants by a fixed rotation offset.
+
+    The ring is cut into 4 equal arcs by two axes of symmetry (0/180 deg and 90/270 deg,
+    the ring's analogue of a rectangle's two wall-pairs). Bins in quadrants 0 and 2 (each
+    starting right after an axis) keep increasing local index with angle; bins in
+    quadrants 1 and 3 have their local index reversed. This mirrors each quadrant about
+    its own nearest axis of symmetry, so a bin's distance from that axis always lands on
+    the same local index as in the reference quadrant -- wall a always maps onto wall a'
+    -- for all 4 quadrants, rather than a plain rotation which would cross-match a bin
+    near one axis in one quadrant against a bin near the opposite axis in another.
+    """
+    qn = n_bins // 4
+    quad_idx = np.empty(n_bins, dtype=int)
+    local_fwd = np.arange(qn)
+    local_rev = local_fwd[::-1]
+    for k in range(4):
+        seg = np.arange(k * qn, (k + 1) * qn)
+        quad_idx[seg] = local_fwd if k % 2 == 0 else local_rev
+    return quad_idx, qn
+
+
 # ============================================================================
 # Arena geometry handlers
 #
@@ -498,16 +524,12 @@ class CircularTrackHandler:
         return _connected_components_ring_flat(qualifies_flat, self.n_bins)
 
     def _build_quadrant_fold(self):
-        """Per the user's choice for arenas without distinct walls: split the ring
-        into 4 equal 90 deg arcs (arbitrary angular quartering) and fold them onto
-        one reference arc, keeping the along-track bins within that arc intact."""
-        qn = self.n_bins // 4
-        quad_idx = np.empty(self.n_bins, dtype=int)
-        for k in range(4):
-            seg = np.arange(k * qn, (k + 1) * qn)
-            quad_idx[seg] = np.arange(qn)
-        self._quad_idx_flat = quad_idx
-        self.n_quad_bins = qn
+        """Splits the ring into 4 equal 90 deg arcs and folds them onto one reference arc
+        via mirror reflection about the ring's two axes of symmetry (see
+        _build_reflect_quadrant_fold_ring), the same registration principle used for the
+        open field and linear track, rather than matching arcs by a fixed rotation
+        offset."""
+        self._quad_idx_flat, self.n_quad_bins = _build_reflect_quadrant_fold_ring(self.n_bins)
 
     def fold_peak_bin(self, bin_idx):
         return _fold_peak_bin(self._quad_idx_flat, bin_idx)

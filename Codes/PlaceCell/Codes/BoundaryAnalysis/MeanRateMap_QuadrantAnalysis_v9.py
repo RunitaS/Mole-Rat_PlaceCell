@@ -16,13 +16,18 @@ Reproduces, for place cells pooled across multiple recording days:
               and the 4 registered copies are averaged bin-by-bin, giving one small
               *multi-bin* heatmap (not a single scalar per quadrant):
                 * open_field      : mirror-reflection fold (x and y independently) -> small square heatmap
-                * circular_track  : 90 deg angular roll fold -> small arc heatmap (no distinct walls)
+                * circular_track  : mirror-reflection fold (arc-length x track-width, about the
+                                    two axes of symmetry) -> small arc x width heatmap
                 * linear_track    : mirror-reflection fold (length x width) -> small rectangle heatmap
               Fig 1B pools each cell's one peak location into the folded grid (proportion
               of peaks per bin); Fig 1D folds the single overall (Fig S1H) mean field-index map.
 
 Arenas (edit ARENA_CONFIGS['root'] below):
-  1. circular_track : 1D circular track, outer dia 80 cm, inner dia 72 cm
+  1. circular_track : annular track, outer dia 80 cm, inner dia 72 cm (4 cm wide) -- binned
+                      genuinely 2D like the other two arenas: arc-length around the ring
+                      (wrap-around) x radial position across the track width, both in the
+                      same 2 x 2 cm bins used elsewhere, rather than a single 1D angular bin
+                      spanning the whole track width.
   2. linear_track    : 80 x 8 cm linear track (vertical sessions auto-rotated 90 deg CCW)
   3. open_field      : circular open field, dia 60 cm
 
@@ -36,8 +41,8 @@ Folder layout expected under each arena's root (same convention as the reference
 
 Every arena's spatial bins are represented as a single flat index (0..n_bins-1); this lets rate-map
 construction, SIR/sparsity, and the bootstrap significance test share one implementation across the
-2D open field, the 1D (wrap-around) ring, and the 1D linear track -- only the coordinate transform,
-smoothing kernel and plotting differ per arena.
+2D open field, the 2D (wrap-around in arc-length only) circular track, and the 2D linear track --
+only the coordinate transform, smoothing kernel and plotting differ per arena.
 """
 
 import os
@@ -78,13 +83,18 @@ ARENA_CONFIGS = {
     ),
 }
 
-OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/MeanRM_Quad_FieldIdx'
+OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/MeanRM_Quad_FieldIdx/Debug'
 
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # spatial bin size (cm / along-track cm), fine-map resolution
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
-COVERAGE_FRACTION = 0.80      # a session must have >= min_occ_s occupancy in at least this
-                               # fraction of the arena's total spatial bins (per handler, see
+COVERAGE_FRACTION = 0.50      # DEBUG: temporarily lowered from 0.80 to test whether the
+                               # rest of the pipeline (bootstrap, place-cell qualification,
+                               # pooling, quadrant fold, plotting) runs end-to-end on
+                               # circular-track sessions that the 80% threshold was excluding
+                               # (e.g. 2NoRot at ~78% bin coverage) -- a session must have
+                               # >= min_occ_s occupancy in at least this fraction of the
+                               # arena's total spatial bins (per handler, see
                                # `total_arena_bins`/`coverage_threshold_bins`), else every file
                                # (unit) from that session is skipped -- computed dynamically per
                                # handler rather than hardcoded, so it tracks target_bin_cm/geometry
@@ -210,33 +220,25 @@ def _smooth_tracking_position(x_cm: np.ndarray, y_cm: np.ndarray, t_us: np.ndarr
 
 
 # ============================================================================
-# Gaussian smoothing kernels (2D for the open field, 1D for ring/linear)
+# Gaussian smoothing kernel (2D for all three arenas -- open field, circular track, linear
+# track -- with wrap-around optionally applied along one axis for the circular track)
 # ============================================================================
 
 def _gaussian_smooth_2d(fr_map: np.ndarray, valid_mask: np.ndarray,
-                         sigma: float = RATEMAP_SMOOTH_SIGMA_BINS) -> np.ndarray:
+                         sigma: float = RATEMAP_SMOOTH_SIGMA_BINS,
+                         wrap_x: bool = False) -> np.ndarray:
+    """2D Gaussian smoothing over a (bx, by) bin grid. wrap_x=True treats axis 0 (bx) as
+    wrap-around (e.g. the circular track's arc-length axis, a closed ring) while axis 1
+    (by) stays bounded -- a cylinder topology -- by passing scipy's per-axis `mode`."""
+    mode = ('wrap' if wrap_x else 'constant', 'constant')
     fr_in   = np.where(valid_mask, fr_map, 0.0)
     mask_in = valid_mask.astype(np.float64)
-    smoothed_fr = gaussian_filter(fr_in,   sigma=sigma, mode='constant', cval=0.0)
-    smoothed_w  = gaussian_filter(mask_in, sigma=sigma, mode='constant', cval=0.0)
+    smoothed_fr = gaussian_filter(fr_in,   sigma=sigma, mode=mode, cval=0.0)
+    smoothed_w  = gaussian_filter(mask_in, sigma=sigma, mode=mode, cval=0.0)
     smoothed = np.zeros_like(smoothed_fr)
     vw = smoothed_w > 0
     smoothed[vw] = smoothed_fr[vw] / smoothed_w[vw]
     smoothed[~valid_mask] = 0.0
-    return smoothed
-
-
-def _gaussian_smooth_1d(fr: np.ndarray, valid: np.ndarray, wrap: bool = False,
-                         sigma: float = RATEMAP_SMOOTH_SIGMA_BINS) -> np.ndarray:
-    mode = 'wrap' if wrap else 'constant'
-    fr_in   = np.where(valid, fr, 0.0)
-    mask_in = valid.astype(np.float64)
-    smoothed_fr = gaussian_filter1d(fr_in,   sigma=sigma, mode=mode, cval=0.0)
-    smoothed_w  = gaussian_filter1d(mask_in, sigma=sigma, mode=mode, cval=0.0)
-    smoothed = np.zeros_like(smoothed_fr)
-    vw = smoothed_w > 0
-    smoothed[vw] = smoothed_fr[vw] / smoothed_w[vw]
-    smoothed[~valid] = 0.0
     return smoothed
 
 
@@ -277,11 +279,14 @@ def _fold_mean_map(quad_idx_flat: np.ndarray, n_quad_bins: int,
     return out, wm
 
 
-def _connected_components_2d_flat(qualifies_flat: np.ndarray, nx: int, ny: int) -> list:
+def _connected_components_2d_flat(qualifies_flat: np.ndarray, nx: int, ny: int,
+                                   wrap_x: bool = False) -> list:
     """8-connected component labelling over a flat (bx*ny+by)-indexed boolean array
-    (open field / linear track grid), returning each component as a list of flat
-    bin indices. Direct analogue of the threshold-method field detector's
-    visited/flood-fill (PlaceFieldDetection_ThresholdMethod_withRM_v5.py)."""
+    (open field / linear track / circular track grid), returning each component as a
+    list of flat bin indices. wrap_x=True additionally connects bx=0 to bx=nx-1 (a
+    cylinder topology, for the circular track's wrap-around arc-length axis). Direct
+    analogue of the threshold-method field detector's visited/flood-fill
+    (PlaceFieldDetection_ThresholdMethod_withRM_v5.py)."""
     qualifies_2d = qualifies_flat.reshape(nx, ny)
     visited = ~qualifies_2d
     components = []
@@ -300,32 +305,12 @@ def _connected_components_2d_flat(qualifies_flat: np.ndarray, nx: int, ny: int) 
                         if ddx == 0 and ddy == 0:
                             continue
                         ni, nj = bx + ddx, by + ddy
+                        if wrap_x:
+                            ni = ni % nx
                         if 0 <= ni < nx and 0 <= nj < ny and not visited[ni, nj]:
                             visited[ni, nj] = True
                             stack.append((ni, nj))
             components.append(region)
-    return components
-
-
-def _connected_components_ring_flat(qualifies_flat: np.ndarray, n_bins: int) -> list:
-    """Connected-component labelling along a 1D wrap-around ring (circular track's
-    angular bin index) -- a bin's only neighbours are +-1 bin, with wraparound."""
-    visited = ~qualifies_flat
-    components = []
-    for i in range(n_bins):
-        if visited[i]:
-            continue
-        region = []
-        stack = [i]
-        visited[i] = True
-        while stack:
-            b = stack.pop()
-            region.append(b)
-            for nb in ((b - 1) % n_bins, (b + 1) % n_bins):
-                if not visited[nb]:
-                    visited[nb] = True
-                    stack.append(nb)
-        components.append(region)
     return components
 
 
@@ -364,13 +349,59 @@ def _build_reflect_quadrant_fold(nx: int, ny: int) -> tuple:
     return quad_idx.ravel(), n_quad_bins, (half_x, half_y)
 
 
+def _build_reflect_quadrant_fold_arc(nx: int) -> tuple:
+    """Arc-length analogue of _build_reflect_quadrant_fold's per-axis reflection: registers
+    each of the 4 angular quadrants of a circular-track arena's arc-length (bx) axis onto
+    one reference quadrant by mirror-reflection, the same registration principle used for
+    the open field and linear track, instead of matching quadrants by a fixed rotation
+    offset.
+
+    The ring is cut into 4 equal arcs by two axes of symmetry (0/180 deg and 90/270 deg,
+    the ring's analogue of a rectangle's two wall-pairs). Bins in quadrants 0 and 2 (each
+    starting right after an axis) keep increasing local index with angle; bins in
+    quadrants 1 and 3 have their local index reversed. This mirrors each quadrant about
+    its own nearest axis of symmetry, so a bin's distance from that axis always lands on
+    the same local index as in the reference quadrant -- wall a always maps onto wall a'
+    -- for all 4 quadrants, rather than a plain rotation which would cross-match a bin
+    near one axis in one quadrant against a bin near the opposite axis in another.
+    """
+    qn = nx // 4
+    quad_idx = np.empty(nx, dtype=int)
+    local_fwd = np.arange(qn)
+    local_rev = local_fwd[::-1]
+    for k in range(4):
+        seg = np.arange(k * qn, (k + 1) * qn)
+        quad_idx[seg] = local_fwd if k % 2 == 0 else local_rev
+    return quad_idx, qn
+
+
+def _build_reflect_quadrant_fold_cylinder(nx: int, ny: int) -> tuple:
+    """2D (arc-length x radial-width) analogue of _build_reflect_quadrant_fold for the
+    circular track: folds the 4 angular quadrants via mirror-reflection about the ring's
+    two axes of symmetry (_build_reflect_quadrant_fold_arc, applied to the bx/arc-length
+    axis), while the by/radial-width axis is carried through unchanged.
+
+    This is not an arbitrary simplification: reflecting a point about a diameter of the
+    ring (a line through the center) preserves its distance from the center exactly, so a
+    bin's radial position (by) is invariant under the very reflection that defines the
+    quadrants -- only its arc-length position (bx) moves. Unlike the open field/linear
+    track (where both axes are reflected/halved), here only bx is folded into a quarter
+    (qn = nx // 4 bins) and the full ny radial bins are kept in the folded map.
+    """
+    arc_quad_idx, qn = _build_reflect_quadrant_fold_arc(nx)
+    bx_idx, by_idx = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
+    quad_idx_2d = arc_quad_idx[bx_idx] * ny + by_idx
+    n_quad_bins = qn * ny
+    return quad_idx_2d.ravel(), n_quad_bins, (qn, ny)
+
+
 # ============================================================================
 # Arena geometry handlers
 #
 # Each handler converts (x_cm, y_cm) into a single flat spatial-bin index per
 # position sample (0..n_bins-1), so the rate-map / SIR / bootstrap machinery
-# below is written once and shared by the 2D open field, the 1D wrap-around
-# ring, and the 1D linear track.
+# below is written once and shared by the 2D open field, the 2D circular track
+# (wrap-around along its arc-length axis only), and the 2D linear track.
 # ============================================================================
 
 class OpenFieldHandler:
@@ -467,15 +498,24 @@ class CircularTrackHandler:
         self.cy = self.outer_r
         self.arena_width_cm = self.outer_d
         self.radial_tol_cm = 4.0
+        self.track_width_cm = self.outer_r - self.inner_r
 
+        # genuine 2D binning, same procedure as the open field / linear track: bins along
+        # the track's arc-length (wrap-around, like the linear track's length axis) AND
+        # bins across its radial width (like the linear track's width axis), both in the
+        # same bin_cm (2 x 2 cm) resolution -- rather than a single 1D angular bin that
+        # spans the whole track width.
         circumference = 2 * np.pi * self.mean_r
         # kept as a multiple of 4 so the quadrant fold below splits into 4 exactly
         # equal-length arcs (see _build_quadrant_fold)
-        self.n_bins = max(8, 4 * int(round(circumference / bin_cm / 4.0)))
-        self.bin_width_deg = 360.0 / self.n_bins
+        self.nx = max(8, 4 * int(round(circumference / bin_cm / 4.0)))   # along arc-length
+        self.ny = max(2, int(round(self.track_width_cm / bin_cm)))       # across radial width
+        self.bin_width_deg = 360.0 / self.nx
+        self.bin_cm_y = self.track_width_cm / self.ny
+        self.n_bins = self.nx * self.ny
 
-        # the ring has no out-of-bounds bins (every angular bin is on the track), so all
-        # n_bins count toward the 80% coverage criterion (COVERAGE_FRACTION)
+        # every bin of the nx*ny grid is on the track (no out-of-bounds corners to mask),
+        # so all n_bins count toward the 80% coverage criterion (COVERAGE_FRACTION)
         self.total_arena_bins = self.n_bins
         self.coverage_threshold_bins = int(np.ceil(COVERAGE_FRACTION * self.total_arena_bins))
 
@@ -487,27 +527,30 @@ class CircularTrackHandler:
     def to_bins(self, x_cm, y_cm):
         r = np.hypot(x_cm - self.cx, y_cm - self.cy)
         theta = np.degrees(np.arctan2(y_cm - self.cy, x_cm - self.cx)) % 360.0
-        bin_idx = np.clip((theta / self.bin_width_deg).astype(int), 0, self.n_bins - 1)
+        bx = np.clip((theta / self.bin_width_deg).astype(int), 0, self.nx - 1)
+        rel_r = np.clip(r - self.inner_r, 0.0, self.track_width_cm)
+        by = np.clip((rel_r / self.bin_cm_y).astype(int), 0, self.ny - 1)
+        flat = bx * self.ny + by
         on_track = (r >= self.inner_r - self.radial_tol_cm) & (r <= self.outer_r + self.radial_tol_cm)
-        return bin_idx, on_track
+        return flat, on_track
 
     def smooth(self, fr_flat, valid_flat):
-        return _gaussian_smooth_1d(fr_flat, valid_flat, wrap=True)
+        fr2 = fr_flat.reshape(self.nx, self.ny)
+        v2  = valid_flat.reshape(self.nx, self.ny)
+        return _gaussian_smooth_2d(fr2, v2, wrap_x=True).ravel()
 
     def connected_components(self, qualifies_flat):
-        return _connected_components_ring_flat(qualifies_flat, self.n_bins)
+        return _connected_components_2d_flat(qualifies_flat, self.nx, self.ny, wrap_x=True)
 
     def _build_quadrant_fold(self):
-        """Per the user's choice for arenas without distinct walls: split the ring
-        into 4 equal 90 deg arcs (arbitrary angular quartering) and fold them onto
-        one reference arc, keeping the along-track bins within that arc intact."""
-        qn = self.n_bins // 4
-        quad_idx = np.empty(self.n_bins, dtype=int)
-        for k in range(4):
-            seg = np.arange(k * qn, (k + 1) * qn)
-            quad_idx[seg] = np.arange(qn)
-        self._quad_idx_flat = quad_idx
-        self.n_quad_bins = qn
+        """Splits the ring's arc-length axis into 4 equal 90 deg arcs and folds them onto
+        one reference arc via mirror reflection about the ring's two axes of symmetry,
+        while carrying the radial-width axis through unchanged (see
+        _build_reflect_quadrant_fold_cylinder) -- the same registration principle used for
+        the open field and linear track, rather than matching arcs by a fixed rotation
+        offset."""
+        self._quad_idx_flat, self.n_quad_bins, self.quad_shape = \
+            _build_reflect_quadrant_fold_cylinder(self.nx, self.ny)
 
     def fold_peak_bin(self, bin_idx):
         return _fold_peak_bin(self._quad_idx_flat, bin_idx)
@@ -516,24 +559,25 @@ class CircularTrackHandler:
         return _fold_mean_map(self._quad_idx_flat, self.n_quad_bins, values_flat, valid_flat)
 
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
-        theta_edges = np.linspace(0, 2 * np.pi, self.n_bins + 1)
-        r_edges = np.array([self.inner_r, self.outer_r])
-        vals = np.where(valid_flat, values_flat, np.nan)[None, :]
+        theta_edges = np.linspace(0, 2 * np.pi, self.nx + 1)
+        r_edges = np.linspace(self.inner_r, self.outer_r, self.ny + 1)
+        grid = np.where(valid_flat, values_flat, np.nan).reshape(self.nx, self.ny)
         ax.set_theta_zero_location('E')
         ax.set_theta_direction(1)
-        pcm = ax.pcolormesh(theta_edges, r_edges, vals, cmap=cmap, norm=norm, shading='auto')
+        pcm = ax.pcolormesh(theta_edges, r_edges, grid.T, cmap=cmap, norm=norm, shading='auto')
         ax.set_ylim(0, self.outer_r + 5)
         ax.set_yticklabels([])
         ax.grid(False)
         return pcm
 
     def plot_quadrant_map(self, ax, values_flat, valid_flat, cmap, norm):
-        theta_edges = np.linspace(0, np.pi / 2, self.n_quad_bins + 1)
-        r_edges = np.array([self.inner_r, self.outer_r])
-        vals = np.where(valid_flat, values_flat, np.nan)[None, :]
+        qn, ny = self.quad_shape
+        theta_edges = np.linspace(0, np.pi / 2, qn + 1)
+        r_edges = np.linspace(self.inner_r, self.outer_r, ny + 1)
+        grid = np.where(valid_flat, values_flat, np.nan).reshape(qn, ny)
         ax.set_theta_zero_location('E')
         ax.set_theta_direction(1)
-        pcm = ax.pcolormesh(theta_edges, r_edges, vals, cmap=cmap, norm=norm, shading='auto')
+        pcm = ax.pcolormesh(theta_edges, r_edges, grid.T, cmap=cmap, norm=norm, shading='auto')
         ax.set_thetamin(0)
         ax.set_thetamax(90)
         ax.set_ylim(0, self.outer_r + 5)
@@ -1106,6 +1150,146 @@ def plot_fig_1BD(arena_handlers: dict, arena_results: dict, save_path: str):
     print(f'[SAVED] {save_path}')
 
 
+def _debug_occupancy_and_rawrate(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarray,
+                                  spike_ts: np.ndarray, handler) -> dict | None:
+    """Same bin-assignment + spike-matching arithmetic as compute_cell_ratemap, but with
+    NO min_occ_s / geom_valid masking -- a bin counts as 'visited' the moment occ_map > 0.
+    This is deliberately more permissive than the real pipeline so raw bin-assignment bugs
+    (gaps, duplicated wrap, off-center ring, wrong radial split) show up even in
+    sparsely-sampled bins that compute_cell_ratemap would mask out as invalid."""
+    x_cm, y_cm = handler.orient(x_cm, y_cm)
+    bin_idx, sample_valid = handler.to_bins(x_cm, y_cm)
+    t = t[sample_valid]
+    bin_idx = bin_idx[sample_valid]
+    if len(t) < 2:
+        return None
+
+    idx   = np.searchsorted(t, spike_ts, side='left')
+    idx_l = np.clip(idx - 1, 0, len(t) - 1)
+    idx_r = np.clip(idx,     0, len(t) - 1)
+    dist_l  = np.abs(spike_ts - t[idx_l])
+    dist_r  = np.abs(spike_ts - t[idx_r])
+    nearest = np.where(dist_l <= dist_r, idx_l, idx_r)
+    min_dist = np.minimum(dist_l, dist_r)
+    valid_spike = min_dist <= MAX_GAP_US
+    spike_frame = nearest[valid_spike]
+
+    n = len(t)
+    dt_frames = np.empty(n, dtype=np.float64)
+    dt_frames[0] = 1.0 / fps
+    dt_frames[1:] = np.minimum(np.diff(t) * 1e-6, 2.0 / fps)
+
+    n_bins = handler.n_bins
+    occ_map   = np.zeros(n_bins, dtype=np.float64)
+    spike_map = np.zeros(n_bins, dtype=np.float64)
+    np.add.at(occ_map,   bin_idx, dt_frames)
+    np.add.at(spike_map, bin_idx[spike_frame], 1.0)
+
+    visited = occ_map > 0
+    fr_raw = np.zeros(n_bins, dtype=np.float64)
+    fr_raw[visited] = spike_map[visited] / occ_map[visited]
+    return dict(occ_map=occ_map, spike_map=spike_map, fr_raw=fr_raw, visited=visited,
+                n_spikes=int(valid_spike.sum()))
+
+
+def debug_plot_circular_track_raw(cfg: dict, out_dir: str) -> None:
+    """Diagnostic for the circular-track bin-assignment bug: for every session, plots the
+    RAW occupancy map (no min_occ_s threshold), and for every unit in it the RAW
+    (unsmoothed) firing-rate map, on the handler's actual (arc-length x radial-width)
+    polar grid -- bypassing the 80% coverage criterion, min_occ_s masking, and
+    place-cell qualification entirely, so every unit gets a saved plot regardless of
+    whether the real pipeline would keep it."""
+    handler = CircularTrackHandler(cfg, target_bin_cm)
+    root = cfg['root']
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(f'[debug] circular_track grid: nx={handler.nx} (arc bins), ny={handler.ny} (radial bins), '
+          f'n_bins={handler.n_bins}, inner_r={handler.inner_r:.2f}, outer_r={handler.outer_r:.2f}, '
+          f'bin_width_deg={handler.bin_width_deg:.3f}, bin_cm_y={handler.bin_cm_y:.3f}')
+
+    for dirpath, _, filenames in os.walk(root):
+        tracking_files_all = [f for f in filenames if f.lower().endswith(('.csv', '.xlsx'))]
+        if COORD_UNITS == 'cm':
+            tracking_files = [f for f in tracking_files_all if f.lower().endswith('_cm.csv')]
+        else:
+            tracking_files = [f for f in tracking_files_all if not f.lower().endswith('_cm.csv')]
+        ntt_files = [f for f in filenames if f.lower().endswith('.ntt')]
+        if len(tracking_files) != 1 or not ntt_files:
+            continue
+
+        session_name = os.path.relpath(dirpath, root)
+        safe_name = session_name.replace(os.sep, '_').replace('/', '_')
+        csv_path = os.path.join(dirpath, tracking_files[0])
+        try:
+            x_cm, y_cm, t = _load_tracking(csv_path, handler.arena_width_cm)
+        except Exception as e:
+            print(f'  ERROR loading tracking [{session_name}]: {e}')
+            continue
+        if len(t) < 2:
+            print(f'  [SKIP no tracking] {session_name}')
+            continue
+        x_cm, y_cm = _smooth_tracking_position(x_cm, y_cm, t)
+
+        bin_idx_all, on_track_all = handler.to_bins(x_cm, y_cm)
+        dt_all = np.empty(len(t), dtype=np.float64)
+        dt_all[0] = 1.0 / fps
+        dt_all[1:] = np.minimum(np.diff(t) * 1e-6, 2.0 / fps)
+        occ_all = np.zeros(handler.n_bins, dtype=np.float64)
+        np.add.at(occ_all, bin_idx_all[on_track_all], dt_all[on_track_all])
+        visited_all = occ_all > 0
+        pct_on_track = float(on_track_all.mean() * 100.0)
+        pct_bins_visited = float(visited_all.sum()) / handler.n_bins * 100.0
+        print(f'  [{session_name}] {len(t)} tracking samples, {pct_on_track:.1f}% on_track, '
+              f'{int(visited_all.sum())}/{handler.n_bins} bins visited ({pct_bins_visited:.1f}%)')
+
+        if visited_all.any():
+            fig = plt.figure(figsize=(6, 6))
+            ax = fig.add_subplot(1, 1, 1, projection='polar')
+            cmap, norm = make_cmap_norm(occ_all[visited_all])
+            pcm = handler.plot_fine(ax, occ_all, visited_all, cmap, norm)
+            ax.set_title(f'{session_name}\nRaw occupancy (s) -- {pct_on_track:.0f}% samples on-track, '
+                         f'{pct_bins_visited:.0f}% bins visited')
+            fig.colorbar(pcm, ax=ax, shrink=0.7, label='Occupancy (s)')
+            fig.tight_layout()
+            occ_path = os.path.join(out_dir, f'Occupancy_{safe_name}.png')
+            fig.savefig(occ_path, dpi=150)
+            plt.close(fig)
+            print(f'    [SAVED] {occ_path}')
+        else:
+            print(f'    [SKIP plot] {session_name}: no bins visited at all')
+
+        for ntt_file in sorted(ntt_files):
+            ntt_path = os.path.join(dirpath, ntt_file)
+            try:
+                spike_data = np.memmap(ntt_path, dtype=ntt_dtype, mode='r', offset=16 * 1024)
+                spike_data = spike_data[spike_data['cell_number'] != 0]
+                spike_ts = np.sort(spike_data['timestamp'].astype(np.float64))
+            except Exception as e:
+                print(f'    ERROR reading {ntt_file}: {e}')
+                continue
+            if len(spike_ts) == 0:
+                continue
+
+            debug_cell = _debug_occupancy_and_rawrate(x_cm, y_cm, t, spike_ts, handler)
+            if debug_cell is None or not debug_cell['visited'].any():
+                print(f'    [SKIP plot] {session_name}/{ntt_file}: no visited bins')
+                continue
+
+            fig = plt.figure(figsize=(6, 6))
+            ax = fig.add_subplot(1, 1, 1, projection='polar')
+            visited = debug_cell['visited']
+            cmap, norm = make_cmap_norm(debug_cell['fr_raw'][visited])
+            pcm = handler.plot_fine(ax, debug_cell['fr_raw'], visited, cmap, norm)
+            ax.set_title(f'{session_name}/{ntt_file}\nRaw rate map (Hz), n_spikes={debug_cell["n_spikes"]}')
+            fig.colorbar(pcm, ax=ax, shrink=0.7, label='Raw rate (Hz)')
+            fig.tight_layout()
+            unit_safe = os.path.splitext(ntt_file)[0]
+            rm_path = os.path.join(out_dir, f'RawRM_{safe_name}_{unit_safe}.png')
+            fig.savefig(rm_path, dpi=150)
+            plt.close(fig)
+            print(f'    [SAVED] {rm_path}')
+
+
 def export_excel(arena_handlers: dict, arena_results: dict, out_path: str):
     rows = []
     for key, results in arena_results.items():
@@ -1126,29 +1310,99 @@ def export_excel(arena_handlers: dict, arena_results: dict, out_path: str):
     print(f'[SAVED] {out_path}')
 
 
+def run_circular_track_pipeline_test(cfg: dict, out_dir: str) -> None:
+    """DEBUG: runs the FULL downstream pipeline (bootstrap, coverage filtering at
+    whatever COVERAGE_FRACTION is currently set to, place-cell qualification, pooling,
+    quadrant fold, plotting, excel export) for the circular_track arena ALONE -- to check
+    that the rest of the analysis actually completes on this data once the coverage
+    threshold is lowered (e.g. sessions like 2NoRot at ~78% bin coverage, excluded by the
+    original 80% threshold), without waiting on the other two arenas."""
+    os.makedirs(out_dir, exist_ok=True)
+    handler, results = collect_arena_results('circular_track', cfg)
+
+    n_processed = len(results)
+    n_place = sum(1 for r in results if r['place_cell'])
+    print(f'[circular_track pipeline test] COVERAGE_FRACTION={COVERAGE_FRACTION:.0%}, '
+          f'{n_processed} units processed, {n_place} place cells.')
+    if n_processed == 0:
+        print('  No units passed the coverage criterion -- nothing to plot.')
+        return
+
+    # Fig S1H equivalent: overall mean field-index map (place cells only)
+    mean_map, valid = pool_fine_map(handler, results)
+    if valid.any():
+        fig = plt.figure(figsize=(5, 5))
+        ax = fig.add_subplot(1, 1, 1, projection='polar')
+        cmap, norm = make_cmap_norm(mean_map[valid])
+        pcm = handler.plot_fine(ax, mean_map, valid, cmap, norm)
+        ax.set_title(f'Circular Track -- mean field index (n={n_place} place cells)')
+        fig.colorbar(pcm, ax=ax, shrink=0.7, label='Field index (a.u.)')
+        fig.tight_layout()
+        p = os.path.join(out_dir, 'CircularTrack_MeanFieldIndex.png')
+        fig.savefig(p, dpi=200)
+        plt.close(fig)
+        print(f'  [SAVED] {p}')
+    else:
+        print('  [SKIP] no valid bins in pooled fine map')
+
+    # Field-only mean rate map
+    mean_map_fo, valid_fo = pool_field_only_map(handler, results)
+    if valid_fo.any():
+        fig = plt.figure(figsize=(5, 5))
+        ax = fig.add_subplot(1, 1, 1, projection='polar')
+        cmap, norm = make_cmap_norm(mean_map_fo[valid_fo])
+        pcm = handler.plot_fine(ax, mean_map_fo, valid_fo, cmap, norm)
+        ax.set_title(f'Circular Track -- field-only mean rate (n={n_place} place cells)')
+        fig.colorbar(pcm, ax=ax, shrink=0.7, label='Mean firing rate (Hz)')
+        fig.tight_layout()
+        p = os.path.join(out_dir, 'CircularTrack_FieldOnlyMeanRate.png')
+        fig.savefig(p, dpi=200)
+        plt.close(fig)
+        print(f'  [SAVED] {p}')
+    else:
+        print('  [SKIP] no valid bins in field-only map')
+
+    # Quadrant fold (Fig 1B/D): peak proportion + mean field index
+    pct, total = pool_quadrant_peak_proportion(handler, results)
+    rate_vals, rate_valid = pool_quadrant_mean_rate(handler, results)
+    fig = plt.figure(figsize=(10, 5))
+    pct_valid = np.isfinite(pct)
+    ax1 = fig.add_subplot(1, 2, 1, projection='polar')
+    cmap1, norm1 = make_cmap_norm(pct[pct_valid])
+    handler.plot_quadrant_map(ax1, np.nan_to_num(pct), pct_valid, cmap1, norm1)
+    ax1.set_title(f'Peak proportion (%), n={total}')
+    ax2 = fig.add_subplot(1, 2, 2, projection='polar')
+    cmap2, norm2 = make_cmap_norm(rate_vals[rate_valid])
+    handler.plot_quadrant_map(ax2, np.nan_to_num(rate_vals), rate_valid, cmap2, norm2)
+    ax2.set_title('Mean field index (a.u.)')
+    fig.suptitle('Circular Track -- quadrant fold (Fig 1B/D)')
+    p = os.path.join(out_dir, 'CircularTrack_QuadrantFold.png')
+    fig.savefig(p, dpi=200)
+    plt.close(fig)
+    print(f'  [SAVED] {p}')
+
+    export_excel({'circular_track': handler}, {'circular_track': results},
+                 os.path.join(out_dir, 'CircularTrack_Summary.xlsx'))
+
+
 # ============================================================================
 # __main__
 # ============================================================================
 
 if __name__ == '__main__':
+    # Debug entry point: runs the full circular_track pipeline (bootstrap, coverage
+    # filtering at COVERAGE_FRACTION above, place-cell qualification, pooling, quadrant
+    # fold, plotting, excel export) alone, to check it completes now that the coverage
+    # threshold has been lowered. The earlier raw-bin-only diagnostic
+    # (debug_plot_circular_track_raw) is still defined above and can be called instead/also
+    # if the bin-assignment question needs revisiting.
     _coord_answer = input("Are the tracking coordinates in pixels or cm? [pixel/cm]: ").strip().lower()
     while _coord_answer not in _PIXEL_ANSWERS | _CM_ANSWERS:
         _coord_answer = input("Please enter 'pixel' or 'cm': ").strip().lower()
     COORD_UNITS = 'pixel' if _coord_answer in _PIXEL_ANSWERS else 'cm'
     print(f"Using '{COORD_UNITS}' tracking coordinates.\n")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    arena_handlers, arena_results = {}, {}
-    for key, cfg in ARENA_CONFIGS.items():
-        print(f'\n=== Processing arena: {key} ===')
-        handler, results = collect_arena_results(key, cfg)
-        arena_handlers[key] = handler
-        arena_results[key]  = results
-
-    plot_fig_S1H(arena_handlers, arena_results, os.path.join(OUTPUT_DIR, 'FigS1H_MeanRateMaps.png'))
-    plot_field_only_mean_maps(arena_handlers, arena_results, os.path.join(OUTPUT_DIR, 'FigS1H_FieldOnly_MeanRateMaps.png'))
-    plot_fig_1BD(arena_handlers, arena_results, os.path.join(OUTPUT_DIR, 'Fig1_BD_QuadrantAnalysis.png'))
-    export_excel(arena_handlers, arena_results, os.path.join(OUTPUT_DIR, 'PlaceCell_MeanRateMap_Summary.xlsx'))
+    pipeline_out_dir = os.path.join(OUTPUT_DIR, 'CircularTrack_PipelineTest')
+    run_circular_track_pipeline_test(ARENA_CONFIGS['circular_track'], pipeline_out_dir)
 
     print('\nDone.')
