@@ -120,6 +120,15 @@ The significance of both averaged and instantaneous speed modulation of firing r
 ### Boundary representation analysis
 
 #### Mean rate map
+All cells classified as place cells in the above mentioned procedure were used to build a mean rate map. Acoverage criteria of 50% was applied and cells recorded in sessions failing to fulfil this criteria were excluded from mean rate maps. Place fields extracted from these cells using the above mentioned procedure were normalzed to obtain a field index using a procedure adapted from Climer et.al.'s pass index method (Climer et.al. 2013). The field index for each bin in a cell's rate map was calculated using the smoothed firing rate map as: (Firing rate in the bin - minimum firing rate)/(peak firing rate-minimum firing rate)
+Field index maps were then averaged bin-by-bin for each animal across all place cells for a specific arena making sure the normalized values were used to construct the mean rate map without including bias due to cell specific firing rate variability. 
+The mean rate maps were calulcated by averaging bins from for overall rate map as well as place field only bins. in addition to this a percentage histogram of peak bin locations was also constructed using the bin location with the peak firing rate. 
+
+##### KDE analysis of mean rate maps
+A kernel density estimate analysis was performed to quantify peaks of field distribution as a function of distance to wall. To quantify place field firing preference relative to distance from the wall, the probability density function (PDF) of the three arenas was plotted with respect to distance from walls as follows: the PDF for the circular track was distributon from outer to inner wall, for linear track it was the distribution from center of the long wall to the ends of long wall ( 0 to 40cm), for the open field it was calculated as the distribution form center of the arena to the walls streching radially outwards (0 to 30cm).
+The distribution over distance to wall was estimated using weighted Gaussian KDE with Scott's bandwidth factor <cross check> . The Gaussian KDE was calculated for all three mean firing distributions, overall mean rate map, place field mean rate map, peak bin histogram. The KDEs obrained from all arenas for the three distributions were compared with an occupancy null map constructed from dwell time as a function of distance to wall to control for sampling artifacts. Significant peaks were detected by comparing the firing map KDE's from each arena with occupancy null maps.
+
+#### Edge vs Center zone analysis
 
 # LFP analysis
 Data preprocessing: LFP data was preprocessed by apply a zero phase IIR notch filter at 50 Hz and it's harmonic frequencies. The signal was linearly detrended to remove slow drift artifacts.

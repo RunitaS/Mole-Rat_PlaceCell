@@ -23,3 +23,5 @@ Post thesis ananlysis
 1. Characterize 1/f aperiodic signal slope and shape. Indicative of brai state and different in epileptic brains. Alo holds info on excitatory and inhibitory balance.
    Extract offset, knee, and exponent from aperiodic parameters output of FOOOF. 
    Extract the β value for 1/f^β. Quantify it in mole-rats.
+
+2. Check Fa23BDs sleep LFP data. Check for presence of theta.

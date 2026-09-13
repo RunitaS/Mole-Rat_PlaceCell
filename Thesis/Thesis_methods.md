@@ -201,6 +201,60 @@ Peak-location proportion (Figure 1B): each place cell's single peak firing bin w
 Quadrant mean field index (Figure 1D): the overall population mean field-index map (as computed above) was itself folded into the reference-quadrant frame by averaging the field-index value of each of the four corresponding bins, yielding a folded map of mean normalized firing as a function of position relative to the boundary.
 All analyses were implemented in Python (NumPy/SciPy for numerical processing, Matplotlib for visualization) and applied identically across the three arena geometries via a shared analysis pipeline that abstracted arena-specific spatial binning, boundary geometry, and quadrant-folding logic behind a common interface.
 
+#### v3
+
+Methods: Mean Rate Map, Quadrant, and Boundary-Preference (KDE) Analysis
+Based on MeanRateMap_QuadrantAnalysis_v10.py, following Muessig et al.'s approach for pooling place-field maps across cells.
+
+1. Tracking preprocessing
+Position tracking (30 Hz) was loaded per session and converted from pixel to cm coordinates using the known arena width as a scale reference. Samples flagged by the tracking software as lost (coded as ±1) were removed, and residual frame-to-frame velocity outliers (>0.006 px/µs before scaling) were excluded. Remaining tracking was cleaned of short-range jumps by an iterative procedure: any step implying instantaneous speed >80 cm/s was marked as an artifact, gaps were linearly interpolated across neighboring valid samples, and the cleaned x/y trace was then smoothed with a 1D Gaussian kernel (σ = 1 sample) independently on each axis.
+
+2. Spatial binning per arena
+All three arenas (open field, circular track, linear track) were binned into 2 × 2 cm bins and represented internally as a single flat bin index, so that rate-map construction, spatial information, and the shuffle test are implemented once and shared across geometries:
+
+Open field (60 cm diameter): binned in Cartesian x/y; bins whose center fell outside the circular boundary were excluded from the valid mask.
+Circular track (80 cm outer / 72 cm inner diameter, 4 cm wide): binned in polar coordinates as arc-length (wrap-around) × radial position across the track width — i.e., genuinely two-dimensional rather than a single angular bin spanning the full track width.
+Linear track (80 × 8 cm): binned along length × width; vertically-oriented sessions were rotated 90° so all sessions pooled onto a common length axis.
+Occupancy and spike counts were accumulated per bin (50 ms max spike–position matching gap), and bins with <1 s total occupancy were excluded. A session was only included if tracking covered ≥50% of the arena's total valid bins; otherwise every unit recorded in that session was dropped, since the occupancy mask is a property of the session's tracking, not of any individual cell.
+
+Raw rate maps (spikes / occupancy per bin) were smoothed with a 2D Gaussian kernel (σ = 1 bin), occupancy-weighted so that low-sampling bins do not disproportionately pull down their neighbors; for the circular track this smoothing wrapped across the arc-length axis to preserve continuity around the ring.
+
+3. Place-cell qualification
+For each unit, spatial information rate (SIR, bits/spike) and sparsity were computed from the smoothed, occupancy-weighted rate map. Statistical significance of spatial tuning was assessed with a circular-shift shuffle test (Fenton method): spike times were shifted by a random offset (excluding a 20 s margin at each end) and reassigned to the fixed occupancy trace, repeated 1000 times to build a null SIR distribution; a cell's real SIR had to exceed the 95th percentile of this null distribution. A unit was classified as a place cell if it met all of: >50 spikes, peak firing rate between 1–25 Hz, SIR > 0.5, sparsity < 0.75, and shuffle significance.
+
+4. Place-field extraction
+Place fields were extracted per cell using a threshold criterion adapted from the pass-index place filter band (auto_filter_band): a bin qualified if its raw (unsmoothed) firing rate exceeded both the cell's overall mean firing rate and 20% of the raw map's peak rate. Connected runs of qualifying bins (8-connected, with wrap-around on the circular track's arc-length axis) were retained as a field only if they spanned ≥7 contiguous bins.
+
+5. Field-index normalization and mean rate maps
+To pool cells with heterogeneous peak firing rates and field locations without over- or under-weighting any individual cell, each cell's smoothed rate map was linearly rescaled to its own 0–1 range using its own minimum and peak firing rate ("field index"). Two pooled maps were computed per arena:
+
+Overall mean field-index map (Fig. S1H equivalent): the per-bin mean of all place cells' field-index maps, restricted to bins each cell occupied validly.
+Field-only mean map: the mean field index restricted to each cell's own extracted place-field bins only, weighted by occupancy (seconds sampled per bin) so bins that some cells happened to oversample did not bias the pooled estimate.
+6. Quadrant analysis (Fig. 1B/D)
+Following Muessig et al.'s Figure 1A method, each arena's binned map was divided into four regions related by reflective symmetry and registered onto one reference region so that a "wall a" always mapped onto "wall a′" and "wall b" onto "wall b′" for all four regions (a plain 90° rotation was explicitly avoided, since it cross-matches the two wall axes for two of the four quadrants). For the open field and linear track this was mirror-reflection of each axis independently about its own midpoint; for the circular track it was mirror-reflection of the arc-length axis about the ring's two symmetry axes, with the radial axis carried through unchanged (reflection about a diameter preserves radial distance).
+
+Two quantities were folded into this reference region and averaged bin-by-bin across the four registered copies:
+
+Fig. 1B — the proportion of place-cell peak-firing locations falling in each folded bin (a single peak location per cell, not itself averaged).
+Fig. 1D — the overall mean field-index map (§5), folded and averaged across the four regions to give one small heatmap per arena.
+7. Boundary-preference analysis via kernel density estimation
+This analysis tests, per arena, whether firing is concentrated at particular distances from the boundary/wall in a way that cannot be explained simply by how much time the animal spent at each distance.
+
+Distance-to-wall metric. For every spatial bin, the geometric distance from its center to the nearest boundary was precomputed: for the open field, distance to the circular perimeter; for the circular track, distance to the nearer of the inner or outer rim (independent of arc position, since it depends only on radial position); for the linear track, distance to the nearest of the four walls (length-ends or width-sides), whichever was closer.
+
+KDE inputs. Three complementary pooled quantities were each treated as a distribution over distance-to-wall and estimated with a Gaussian kernel density estimate (scipy.stats.gaussian_kde, weighted, bandwidth chosen automatically by Scott's rule from the effective sample size):
+
+Overall — every valid bin of the pooled overall mean field-index map (§5), weighted by its pooled field-index value.
+Field — every valid bin of the pooled field-only mean map (§5), similarly weighted.
+Peak — each place cell's single peak-firing bin, contributing one unweighted point per cell (an unfolded point process over distance-to-wall, distinct from the quadrant-folded peak proportions of Fig. 1B).
+Because gaussian_kde always normalizes its output to a proper probability density regardless of the input weights' units (field-index a.u. for "overall"/"field", or unweighted counts for "peak"), all three curves and their corresponding null distributions are directly comparable on the same density scale.
+
+Occupancy null. To distinguish genuine boundary-locked firing from a trivial artifact of how much of each distance band the animal happened to sample, a null KDE was built from the same population's pooled dwell time (occupancy, in seconds) as a function of distance-to-wall — i.e., the density expected if firing rate were spatially uniform given the animal's actual sampling. This null used the same bin restriction as its corresponding firing curve (all valid bins for "overall"/"peak"; place-field bins only for "field").
+
+Sampling uncertainty and significance. A cell-identity bootstrap (1000 resamples of place cells with replacement, rebuilding the pooled map/peak set and its KDE from scratch each time) generated the median curve and a 95% confidence band (2.5th–97.5th percentile) for the observed KDE at each of 200 evenly spaced grid points spanning 0 to the arena's maximum possible distance-to-wall. A distance was flagged as showing significant boundary preference where the entire bootstrap confidence interval — specifically its lower (2.5th percentile) bound — exceeded the occupancy null curve (two-sided α = 0.05, but tested as a one-directional excess since the question is whether firing is enriched, not depleted, near a given distance). Contiguous runs of flagged grid points spanning at least 3 grid points were reported as discrete significant boundary peaks, each characterized by its start/end distance, the peak location (grid point of maximum median density within the run), and the corresponding observed vs. null density values.
+
+This procedure was run independently for each of the 3 arenas × 3 map types (overall, peak, field-only), yielding 9 boundary-preference curves in total, each annotated with its significant peak(s) if any were detected.
+
 ### Edge vs Center zone
 
 To test whether place cells preferentially represented the boundary or the interior of an arena, every qualifying place cell (see Place cell characterization above) was assigned to an "edge" or "centre" zone from the location of its own peak-firing bin, and firing/spatial-coding properties were then compared between the resulting groups. Classification used the same occupancy-weighted, triangularly smoothed 2×2 cm rate map built for the place-cell characterization above (bins with <1 s occupancy excluded), run independently for the open field and linear track.
@@ -301,6 +355,7 @@ Continuity of hippocampal theta oscillations in the mole-rat LFP was quantified 
 **Fit-quality gating**: Epochs for which no reference sinusoid matched well (ED_min > 1.0) were excluded from quantitative comparison of peak range and frequency, since a poor fit indicates the epoch's autocorrelogram shape is not well characterised by any candidate sinusoid; these epochs were retained in the underlying dataset with a flag so that rejection rates could be reported and inspected separately.
 
 **Aggregation**: Normalised peak range was compared between moving and immobile epochs within each channel and animal to test for the persistence of theta-band oscillatory structure during immobility, and matched-sinusoid frequency estimates were summarised per animal to characterise the dominant hippocampal theta frequency, following the analysis and figure conventions of Dunn et al. (2022, Fig. 4).
+
 
 #### Theta depth profile
 

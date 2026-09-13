@@ -97,7 +97,7 @@ MAX_GAP_US     = 50_000       # max spike-position gap in µs (50 ms)
 
 MIN_FIELD_SIZE_FRAC = 0.04    # a field must span >= 4% of all occupied bins
 
-METHOD2_RATE_THRESHOLD_FRAC = 0.10    # "threshold method": bins must be >= 10% of the cell's peak rate
+METHOD2_RATE_THRESHOLD_FRAC = 0.20    # "threshold method": bins must be >= 10% of the cell's peak rate
                                        # (mirrors pTreshold in the MATLAB placefield reference); bins must
                                        # also be above the cell's mean firing rate (see detect_place_fields_threshold)
 

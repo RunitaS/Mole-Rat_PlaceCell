@@ -51,7 +51,8 @@ import concurrent.futures
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.ndimage import gaussian_filter, gaussian_filter1d, label
+from scipy.stats import gaussian_kde
 
 import matplotlib
 matplotlib.use('Agg')
@@ -421,6 +422,11 @@ class OpenFieldHandler:
         r = np.hypot(XX - self.cx, YY - self.cy)
         self.geom_valid = (r <= self.diameter / 2.0).ravel()
 
+        # distance from each bin centre to the arena's (single, circular) wall, for the
+        # boundary-preference KDE analysis (analyze_wall_distance_kde)
+        self.dist_to_wall_flat = np.clip(self.diameter / 2.0 - r, 0.0, None).ravel()
+        self.max_dist_to_wall = self.diameter / 2.0
+
         # total bins actually inside the circular arena (excludes the corner bins of the
         # bounding nx*ny grid that geom_valid already masks out) -- the denominator for the
         # 80% coverage criterion (COVERAGE_FRACTION)
@@ -514,6 +520,17 @@ class CircularTrackHandler:
         self.bin_cm_y = self.track_width_cm / self.ny
         self.n_bins = self.nx * self.ny
 
+        # distance from each bin's radial position to the nearest of the track's two
+        # edges (inner or outer rim), for the boundary-preference KDE analysis
+        # (analyze_wall_distance_kde). Independent of arc position (bx): reflecting a
+        # point about a diameter of the ring preserves its radial distance, so only by
+        # (radial bin) matters here, mirroring _build_reflect_quadrant_fold_cylinder's
+        # observation that by is invariant under the quadrant-fold reflection.
+        by_centers_cm = (np.arange(self.ny) + 0.5) * self.bin_cm_y
+        dist_by = np.minimum(by_centers_cm, self.track_width_cm - by_centers_cm)
+        self.dist_to_wall_flat = np.tile(dist_by, self.nx)
+        self.max_dist_to_wall = self.track_width_cm / 2.0
+
         # every bin of the nx*ny grid is on the track (no out-of-bounds corners to mask),
         # so all n_bins count toward the 80% coverage criterion (COVERAGE_FRACTION)
         self.total_arena_bins = self.n_bins
@@ -599,6 +616,18 @@ class LinearTrackHandler:
         self.bin_cm_y = self.width  / self.ny
         self.n_bins = self.nx * self.ny
         self.arena_width_cm = self.length
+
+        # distance from each bin centre to the nearest of the rectangle's 4 walls (2
+        # length-ends + 2 width-sides), for the boundary-preference KDE analysis
+        # (analyze_wall_distance_kde) -- same "nearest wall, either axis" convention as
+        # classify_edge_centre's dist_from_wall_cm in BoundaryAnalysis_Pipeline_v2.py.
+        bx_centers_cm = (np.arange(self.nx) + 0.5) * self.bin_cm_x
+        by_centers_cm = (np.arange(self.ny) + 0.5) * self.bin_cm_y
+        dist_x = np.minimum(bx_centers_cm, self.length - bx_centers_cm)
+        dist_y = np.minimum(by_centers_cm, self.width - by_centers_cm)
+        DX, DY = np.meshgrid(dist_x, dist_y, indexing='ij')
+        self.dist_to_wall_flat = np.minimum(DX, DY).ravel()
+        self.max_dist_to_wall = min(self.length, self.width) / 2.0
 
         # every bin of the nx*ny grid is on the track (no out-of-bounds corners to mask),
         # so all n_bins count toward the 80% coverage criterion (COVERAGE_FRACTION)
@@ -1032,6 +1061,247 @@ def pool_quadrant_mean_rate(handler, results: list) -> tuple:
 
 
 # ============================================================================
+# Boundary-preference KDE analysis
+#
+# For each arena and each of 3 pooled maps, estimates a (weighted) kernel density of
+# firing as a function of distance-to-wall (handler.dist_to_wall_flat), and tests
+# whether the resulting curve shows any peak that is not simply explained by how much
+# time/area the animal sampled at each distance:
+#   'overall' : the Fig S1H mean field-index map (pool_fine_map) -- one weighted sample
+#               per valid bin, weight = pooled field-index value.
+#   'field'   : the place-field-only mean map (pool_field_only_map) -- same, restricted
+#               to each cell's own extracted place-field bins.
+#   'peak'    : each place cell's single peak-firing bin, one unweighted sample per cell
+#               (a point process over distance-to-wall, unfolded -- unlike Fig 1B's
+#               quadrant-folded peak proportions).
+#
+# Significance: the null is an occupancy-derived KDE (same distance samples, weighted by
+# pooled dwell-time instead of firing) -- i.e. the distance-to-wall density expected if
+# firing were spatially uniform given how much the animal actually sampled each distance.
+# A cell-identity bootstrap (resampling place cells with replacement) gives the observed
+# KDE's sampling uncertainty; a distance is flagged when the ENTIRE bootstrap CI (its
+# 2.5th percentile) lies above the null, and contiguous flagged runs are reported as
+# significant boundary peaks. gaussian_kde normalizes its output to a probability density
+# regardless of the input weights' units (Hz vs. seconds), so the observed and null
+# curves are directly comparable on the same scale.
+# ============================================================================
+
+N_KDE_GRID_POINTS = 200
+N_KDE_BOOTSTRAP   = 1000
+KDE_ALPHA         = 0.05   # two-sided: flag where the observed KDE's 2.5th percentile exceeds the null
+
+
+def _weighted_kde(samples: np.ndarray, weights: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """Weighted Gaussian KDE of `samples` (weights >= 0) evaluated at `grid`. Returns an
+    all-zero curve when there are fewer than 2 distinctly-valued weighted samples --
+    gaussian_kde needs a non-singular covariance to pick a bandwidth."""
+    samples = np.asarray(samples, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    m = np.isfinite(samples) & np.isfinite(weights) & (weights > 0)
+    samples, weights = samples[m], weights[m]
+    if len(samples) < 2 or np.ptp(samples) == 0:
+        return np.zeros_like(grid)
+    try:
+        kde = gaussian_kde(samples, weights=weights)
+    except Exception:
+        return np.zeros_like(grid)
+    return kde(grid)
+
+
+def _kde_inputs_overall(handler, results: list) -> tuple:
+    mean_map, valid = pool_fine_map(handler, results)
+    return handler.dist_to_wall_flat[valid], mean_map[valid]
+
+
+def _kde_inputs_field(handler, results: list) -> tuple:
+    mean_map, valid = pool_field_only_map(handler, results)
+    return handler.dist_to_wall_flat[valid], mean_map[valid]
+
+
+def _kde_inputs_peak(handler, results: list) -> tuple:
+    place = [r for r in results if r['place_cell'] and r.get('peak_bin') is not None]
+    samples = np.array([handler.dist_to_wall_flat[r['peak_bin']] for r in place], dtype=np.float64)
+    return samples, np.ones_like(samples)
+
+
+def _null_kde_inputs_overall(handler, results: list) -> tuple:
+    """Occupancy null shared by 'overall' and 'peak': pooled dwell-time (s) per bin
+    across the same place-cell population, i.e. the distance-to-wall density expected
+    under spatially-uniform firing given how the animal actually sampled the arena."""
+    place = [r for r in results if r['place_cell']]
+    occ_sum   = np.zeros(handler.n_bins, dtype=np.float64)
+    valid_any = np.zeros(handler.n_bins, dtype=bool)
+    for r in place:
+        occ_sum[r['valid']] += r['occ_map'][r['valid']]
+        valid_any |= r['valid']
+    return handler.dist_to_wall_flat[valid_any], occ_sum[valid_any]
+
+
+def _null_kde_inputs_field(handler, results: list) -> tuple:
+    """Occupancy null for 'field': dwell-time pooled ONLY over each cell's own extracted
+    place-field bins, mirroring pool_field_only_map's restriction."""
+    place = [r for r in results if r['place_cell']]
+    occ_sum   = np.zeros(handler.n_bins, dtype=np.float64)
+    valid_any = np.zeros(handler.n_bins, dtype=bool)
+    for r in place:
+        m = r['field_mask'] & r['valid']
+        occ_sum[m] += r['occ_map'][m]
+        valid_any |= m
+    return handler.dist_to_wall_flat[valid_any], occ_sum[valid_any]
+
+
+_MAP_ORDER  = ['overall', 'peak', 'field']
+_MAP_TITLES = {'overall': 'Overall mean rate map', 'peak': 'Peak mean rate map',
+               'field': 'Place-field mean rate map'}
+_MAP_KDE_INPUT_FN  = {'overall': _kde_inputs_overall, 'peak': _kde_inputs_peak, 'field': _kde_inputs_field}
+_MAP_NULL_INPUT_FN = {'overall': _null_kde_inputs_overall, 'peak': _null_kde_inputs_overall,
+                       'field': _null_kde_inputs_field}
+
+
+def _bootstrap_kde_band(handler, place_cells: list, map_type: str, grid: np.ndarray,
+                         n_boot: int, rng: np.random.Generator) -> tuple:
+    """Cell-identity bootstrap (resample place cells with replacement, rebuild the pooled
+    map/peak set and its KDE each time) -- the observed KDE's sampling uncertainty."""
+    n = len(place_cells)
+    curves = np.zeros((n_boot, len(grid)))
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        boot_cells = [place_cells[i] for i in idx]
+        samples, weights = _MAP_KDE_INPUT_FN[map_type](handler, boot_cells)
+        curves[b] = _weighted_kde(samples, weights, grid)
+    lo  = np.percentile(curves, 100 * KDE_ALPHA / 2.0, axis=0)
+    hi  = np.percentile(curves, 100 * (1.0 - KDE_ALPHA / 2.0), axis=0)
+    med = np.percentile(curves, 50, axis=0)
+    return med, lo, hi
+
+
+def _find_significant_kde_peaks(grid: np.ndarray, med: np.ndarray, lo: np.ndarray,
+                                 null_curve: np.ndarray, min_run_points: int = 3) -> list:
+    """Contiguous grid runs where the observed KDE's bootstrap lower bound exceeds the
+    occupancy null; each run's peak = the observed-KDE local maximum within it."""
+    sig = lo > null_curve
+    labeled, n_labels = label(sig)
+    peaks = []
+    for lbl in range(1, n_labels + 1):
+        idx = np.where(labeled == lbl)[0]
+        if len(idx) < min_run_points:
+            continue
+        peak_i = idx[np.argmax(med[idx])]
+        peaks.append(dict(
+            start_cm=round(float(grid[idx[0]]), 2),
+            end_cm=round(float(grid[idx[-1]]), 2),
+            peak_dist_cm=round(float(grid[peak_i]), 2),
+            peak_density=round(float(med[peak_i]), 6),
+            null_density=round(float(null_curve[peak_i]), 6),
+        ))
+    return peaks
+
+
+def analyze_wall_distance_kde(handler, results: list, map_type: str,
+                               n_boot: int = N_KDE_BOOTSTRAP, n_grid: int = N_KDE_GRID_POINTS,
+                               rng: np.random.Generator | None = None) -> dict:
+    """Boundary-preference analysis for one arena x one pooled map: see module-level
+    comment above for the KDE / null / bootstrap / peak-detection design."""
+    place_cells = [r for r in results if r['place_cell']]
+    grid = np.linspace(0.0, handler.max_dist_to_wall, n_grid)
+
+    out = dict(map_type=map_type, grid=grid, n_place_cells=len(place_cells), n_samples=0,
+               real_med=np.zeros(n_grid), real_lo=np.zeros(n_grid), real_hi=np.zeros(n_grid),
+               null_curve=np.zeros(n_grid), peaks=[])
+    if not place_cells:
+        return out
+
+    samples, _ = _MAP_KDE_INPUT_FN[map_type](handler, place_cells)
+    out['n_samples'] = int(len(samples))
+    if len(samples) < 2 or np.ptp(samples) == 0:
+        return out
+
+    null_samples, null_weights = _MAP_NULL_INPUT_FN[map_type](handler, place_cells)
+    out['null_curve'] = _weighted_kde(null_samples, null_weights, grid)
+
+    rng = rng if rng is not None else np.random.default_rng(0)
+    out['real_med'], out['real_lo'], out['real_hi'] = \
+        _bootstrap_kde_band(handler, place_cells, map_type, grid, n_boot=n_boot, rng=rng)
+
+    out['peaks'] = _find_significant_kde_peaks(grid, out['real_med'], out['real_lo'], out['null_curve'])
+    return out
+
+
+def plot_wall_distance_kde(kde_results: dict, save_path: str):
+    fig, axes = plt.subplots(len(_MAP_ORDER), len(_ARENA_ORDER), figsize=(15, 12), squeeze=False)
+    for col, arena_key in enumerate(_ARENA_ORDER):
+        for row, map_type in enumerate(_MAP_ORDER):
+            ax = axes[row][col]
+            res = kde_results[arena_key][map_type]
+            grid = res['grid']
+
+            ax.plot(grid, res['null_curve'], color='0.4', ls='--', lw=1.5, label='Occupancy null')
+            ax.plot(grid, res['real_med'], color='#C0392B', lw=2, label='Observed')
+            ax.fill_between(grid, res['real_lo'], res['real_hi'], color='#C0392B', alpha=0.2)
+
+            for pk in res['peaks']:
+                ax.axvspan(pk['start_cm'], pk['end_cm'], color='gold', alpha=0.35)
+                ax.axvline(pk['peak_dist_cm'], color='#B8860B', lw=1, ls=':')
+
+            n_sig = len(res['peaks'])
+            ax.set_title(f"{_ARENA_TITLES[arena_key]} -- {_MAP_TITLES[map_type]}\n"
+                         f"(n={res['n_place_cells']} cells, {n_sig} sig. peak{'s' if n_sig != 1 else ''})",
+                         fontsize=9)
+            ax.set_xlabel('Distance to wall (cm)', fontsize=8)
+            ax.set_ylabel('Density', fontsize=8)
+            if row == 0 and col == 0:
+                ax.legend(fontsize=7, loc='upper right')
+
+    fig.suptitle('Boundary-preference KDE: firing density vs. distance to wall\n'
+                 '(gold band = distance range where the observed KDE significantly exceeds the occupancy null)')
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
+
+
+def export_wall_distance_kde_summary(kde_results: dict, out_path: str):
+    rows = []
+    for arena_key, by_map in kde_results.items():
+        for map_type, res in by_map.items():
+            if not res['peaks']:
+                rows.append(dict(arena=arena_key, map_type=map_type, n_place_cells=res['n_place_cells'],
+                                  n_samples=res['n_samples'], peak_rank=None, start_cm=None, end_cm=None,
+                                  peak_dist_cm=None, peak_density=None, null_density=None))
+                continue
+            for i, pk in enumerate(res['peaks'], start=1):
+                rows.append(dict(arena=arena_key, map_type=map_type, n_place_cells=res['n_place_cells'],
+                                  n_samples=res['n_samples'], peak_rank=i, **pk))
+    df = pd.DataFrame(rows)
+    df.to_excel(out_path, index=False)
+    print(f'[SAVED] {out_path}')
+
+
+def run_wall_distance_kde_analysis(arena_handlers: dict, arena_results: dict, out_dir: str,
+                                    n_boot: int = N_KDE_BOOTSTRAP) -> dict:
+    kde_results = {
+        arena_key: {
+            map_type: analyze_wall_distance_kde(arena_handlers[arena_key], arena_results[arena_key],
+                                                 map_type, n_boot=n_boot)
+            for map_type in _MAP_ORDER
+        }
+        for arena_key in _ARENA_ORDER
+    }
+
+    plot_wall_distance_kde(kde_results, os.path.join(out_dir, 'WallDistance_KDE.png'))
+    export_wall_distance_kde_summary(kde_results, os.path.join(out_dir, 'WallDistance_KDE_Peaks.xlsx'))
+
+    for arena_key in _ARENA_ORDER:
+        for map_type in _MAP_ORDER:
+            res = kde_results[arena_key][map_type]
+            n_sig = len(res['peaks'])
+            peak_str = ', '.join(f"{p['peak_dist_cm']:.1f} cm" for p in res['peaks'])
+            print(f'[{arena_key}/{map_type}] n={res["n_place_cells"]} place cells, '
+                  f'{n_sig} significant boundary peak(s)' + (f': {peak_str}' if n_sig else ''))
+    return kde_results
+
+
+# ============================================================================
 # Plotting
 # ============================================================================
 
@@ -1409,6 +1679,7 @@ def run_full_pipeline(out_dir: str) -> None:
                  os.path.join(out_dir, 'Fig1BD_QuadrantFold.png'))
     export_excel(arena_handlers, arena_results,
                  os.path.join(out_dir, 'AllArenas_Summary.xlsx'))
+    run_wall_distance_kde_analysis(arena_handlers, arena_results, out_dir)
 
 
 if __name__ == '__main__':

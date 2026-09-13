@@ -23,3 +23,7 @@ Place cell single unit analysis
 19. Field centroid distance from center
 20. How to quantify blobiness of a place field? Whatever analysis that is.
 21. Remapping between session (place and rate remapping)
+
+Post thesis analysis
+1. Population code analysis from mean RM. Andre Fenton's population vector analysis.
+2. Quadrant sepaparation wrt to magnetic opeintation. N-E-S-W-
