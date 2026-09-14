@@ -49,27 +49,14 @@ variable-speed tracking, and are called out where they occur below:
      it is simply called without spkts (its default None short-circuits
      that branch safely).
 
-No p-value/significance test is available from AditiPrecessionUtils itself
-for either calcTMI or circRegress/kempCorr as written (circRegress's own
+No p-value/significance test is available from AditiPrecessionUtils for
+either calcTMI or circRegress/kempCorr as written (circRegress's own
 'psim' field is only ever populated with NaN, in its <3-spike short-circuit
-branch -- the main code path never computes it). calcTMI's TMI is still
-reported descriptively here, with no significance test.
-
-circRegress's fit (slope, corr), however, IS tested for significance in
-this script, via shuffle_precession_significance -- a circular time-shift
-shuffle ported from ThetaMod_PhasePrecession_withGenPhsAp_v7.py's function
-of the same name (Climer, Newman & Hasselmo 2013-style shuffle test):
-spike times are circularly shifted against the tracking/LFP traces many
-times (N_PRECESSION_SHUFFLES), apu.spk_pos_x/apu.getPhase/apu.circRegress
-are re-run on each shuffle exactly as on the real data (same fixed field
-boundaries, same renormalization), and the fraction of shuffle |corr| >=
-the observed |corr| gives p_corr_shuffle (p_slope_shuffle is the same test
-computed on the slope alone, as a secondary diagnostic). A cell is
-classified 'phase_precessing' if p_corr_shuffle < ALPHA and the slope is
-negative, 'phase_recessing' if p_corr_shuffle < ALPHA and the slope is
-positive, and 'phase_locked' if the fit was not significant (rather than
-being discarded) -- stored in is_precessing / is_recessing /
-is_phase_locked / PrecessionClass.
+branch -- the main code path never computes it). This script reports the
+module's own statistics (TMI, circular-linear slope, kempCorr correlation)
+without inventing a significance test that isn't part of the cited
+algorithm; treat them descriptively; add your own shuffle/permutation test
+if a formal significance decision is needed.
 
 Requires: numpy, scipy, pandas, matplotlib, openpyxl, plus
 AditiPrecessionUtils.py's own dependencies (scikit-learn, shapely, joblib)
@@ -98,7 +85,7 @@ import AditiPrecessionUtils as apu
 # Configuration -- EDIT THESE
 # ============================================================================
 
-ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True")
+ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa8477")
 OUTPUT_EXCEL_NAME = 'AditiPhasePrecession_Analyzed.xlsx'   # written to ROOT_FOLDER
 
 TRACKING_TIME_UNIT = 'us'          # 'us', 'ms', or 's' -- units of the tracking timestamp column
@@ -117,16 +104,6 @@ PPDIR = 0                          # apu.circRegress's ppdir: 0 = unconstrained 
                                     # (classic precessing) slopes only, 1 = positive (recessing) only
 MAXSLOPE = 'default'               # apu.circRegress's maxslope: 'default' allows <=720 deg of phase
                                     # change across the field; see its own comment
-
-ALPHA = 0.05                       # significance threshold for the circular time-shift shuffle test
-N_PRECESSION_SHUFFLES = 500        # circular time-shift shuffles testing the circRegress fit (corr,
-                                    # slope) against a null of no position-phase relationship -- see
-                                    # shuffle_precession_significance, ported from
-                                    # ThetaMod_PhasePrecession_withGenPhsAp_v7.py's function of the
-                                    # same name
-PRECESSION_MIN_SHIFT_FRAC = 0.1    # minimum circular shift, as a fraction of the tracking/LFP overlap
-                                    # window's duration, so no shuffle leaves spikes nearly unshifted
-RANDOM_SEED = 0                    # seed for the shuffle test's RNG, for reproducibility
 
 RUN_INTRINSIC_FREQ_ANALYSIS = False   # apu.TempAutocorr / apu.precessionFreq / apu.thetaskipAmp are
                                        # O(n_spikes^2) double loops in this module (unmodified here);
@@ -316,85 +293,12 @@ def estimate_vel_and_numpasses(pos_ts, pos_x, min_speed_cm_s=MIN_SPEED_CM_S,
     return vel, max(numpasses, 1)
 
 
-def shuffle_precession_significance(spk_ts, pos_ts, pos_x, filtered_theta, lfp_ts, fldstart, fldend,
-                                     observed_corr, observed_slope_deg, ppdir, maxslope, rng,
-                                     n_shuffles=N_PRECESSION_SHUFFLES,
-                                     min_shift_frac=PRECESSION_MIN_SHIFT_FRAC):
-    """Null distribution for the apu.circRegress circular-linear fit, via a
-    circular time-shift shuffle -- ported from
-    ThetaMod_PhasePrecession_withGenPhsAp_v7.py's shuffle_precession_significance
-    (Kempter et al. 2012 fit, Climer/Newman/Hasselmo-style shuffle test).
-
-    Spike times are shifted by a random offset -- at least min_shift_frac of
-    the tracking/LFP overlap window, so no shuffle leaves the true alignment
-    nearly intact -- and wrapped within that window. Position (apu.spk_pos_x)
-    and theta phase (apu.getPhase, re-run on the shifted times exactly as it
-    runs on the real spike times) are then re-evaluated at the shifted times,
-    restricted to the same fixed field boundaries (fldstart/fldend -- these
-    describe where the place field is, so are NOT recomputed per shuffle,
-    only the spike-timing/theta relationship within it is being tested),
-    renormalized exactly as apu.fieldDetect does its own field-restricted
-    positions, and refit with apu.circRegress -- so the null also reflects
-    the slope/correlation being *estimated*, not assumed known.
-
-    This preserves the spike train's own temporal structure (ISI/bursting)
-    and the natural relationship between position and LFP theta phase,
-    destroying only the cell-specific link between spike timing and where in
-    the field/theta cycle the animal actually was.
-
-    Returns (p_corr, p_slope, shuffle_corrs, shuffle_slopes). p_corr tests
-    circRegress's own 'corr' (the combined goodness-of-fit-and-slope
-    statistic used for classification below); p_slope tests the fitted
-    slope alone, reported as a secondary diagnostic.
-    """
-    t_lo = max(pos_ts.min(), lfp_ts.min())
-    t_hi = min(pos_ts.max(), lfp_ts.max())
-    duration = t_hi - t_lo
-    min_shift = min_shift_frac * duration
-
-    shuffle_corrs = np.full(n_shuffles, np.nan)
-    shuffle_slopes = np.full(n_shuffles, np.nan)
-    for i in range(n_shuffles):
-        shift = rng.uniform(min_shift, duration - min_shift)
-        shifted_ts = t_lo + np.mod(spk_ts - t_lo + shift, duration)
-
-        shifted_pos = spk_pos_x(pos_ts, pos_x, shifted_ts)
-        shifted_phase_deg = apu.getPhase(shifted_ts, filtered_theta, lfp_ts)
-
-        infield = (shifted_pos >= fldstart) & (shifted_pos <= fldend) & ~np.isnan(shifted_phase_deg)
-        x = shifted_pos[infield]
-        if len(x) < MIN_SPIKES_INFIELD_FOR_FIT:
-            continue
-        x_norm = x - x.min()
-        x_span = x_norm.max()
-        if x_span <= 0:
-            continue
-        x_norm = x_norm / x_span
-        y_rad = np.mod(np.deg2rad(shifted_phase_deg[infield]), 2 * np.pi)
-
-        try:
-            reg_i = apu.circRegress(x_norm, y_rad, None, ppdir, maxslope=maxslope)
-        except Exception:
-            continue
-        shuffle_corrs[i] = reg_i['corr']
-        shuffle_slopes[i] = np.rad2deg(reg_i['slope_opt'])
-
-    valid = np.isfinite(shuffle_corrs) & np.isfinite(shuffle_slopes)
-    n_valid = int(np.sum(valid))
-    if n_valid == 0 or np.isnan(observed_corr) or np.isnan(observed_slope_deg):
-        return np.nan, np.nan, shuffle_corrs, shuffle_slopes
-
-    p_corr = float((np.sum(np.abs(shuffle_corrs[valid]) >= np.abs(observed_corr)) + 1) / (n_valid + 1))
-    p_slope = float((np.sum(np.abs(shuffle_slopes[valid]) >= np.abs(observed_slope_deg)) + 1) / (n_valid + 1))
-    return p_corr, p_slope, shuffle_corrs, shuffle_slopes
-
-
 # ============================================================================
 # Per-unit analysis, calling AditiPrecessionUtils's own functions throughout
 # ============================================================================
 
 def analyze_unit(spk_ts, pos_ts, pos_x, filtered_theta, lfp_ts, posbins, vel, numpasses,
-                  unit_label, output_dir: Path, rng):
+                  unit_label, output_dir: Path):
     """Run the full AditiPrecessionUtils battery for one unit. Returns a
     result dict for the summary table; writes one combined summary figure."""
     row = dict(n_spikes_total=len(spk_ts))
@@ -421,9 +325,7 @@ def analyze_unit(spk_ts, pos_ts, pos_x, filtered_theta, lfp_ts, posbins, vel, nu
     row.update(PrecessionTested=False, PrecessionSkippedReason='', FieldStart_cm=np.nan,
                FieldEnd_cm=np.nan, FieldCentre_cm=np.nan, n_spikes_infield=0,
                CircCorr=np.nan, Slope_deg_per_field=np.nan, PhaseOffset_deg=np.nan,
-               PhaseValley_deg=np.nan, p_corr_shuffle=np.nan, p_slope_shuffle=np.nan,
-               is_precessing=False, is_recessing=False, is_phase_locked=False,
-               PrecessionClass=None)
+               SlopeDirection='', PhaseValley_deg=np.nan)
 
     if row['n_spikes_phase'] < MIN_SPIKES_INFIELD_FOR_FIT:
         row['PrecessionSkippedReason'] = (
@@ -469,34 +371,8 @@ def analyze_unit(spk_ts, pos_ts, pos_x, filtered_theta, lfp_ts, posbins, vel, nu
     row['CircCorr'] = float(regData['corr'])
     row['Slope_deg_per_field'] = slope_deg
     row['PhaseOffset_deg'] = float(np.rad2deg(regData['phase_opt']) % 360)
+    row['SlopeDirection'] = 'precessing' if slope_deg < 0 else ('recessing' if slope_deg > 0 else 'flat')
     row['PhaseValley_deg'] = float(apu.findPhaseValley(phs_deg, ncopies=2))
-
-    # ---- significance of the fit via circular time-shift shuffle (see
-    # shuffle_precession_significance above) -- gates the precessing/
-    # recessing/phase_locked classification instead of the fitted slope's
-    # raw sign alone ----
-    p_corr_shuffle, p_slope_shuffle, _shuffle_corrs, _shuffle_slopes = shuffle_precession_significance(
-        spk_ts, pos_ts, pos_x, filtered_theta, lfp_ts, row['FieldStart_cm'], row['FieldEnd_cm'],
-        row['CircCorr'], slope_deg, PPDIR, MAXSLOPE, rng)
-    row['p_corr_shuffle'] = p_corr_shuffle
-    row['p_slope_shuffle'] = p_slope_shuffle
-
-    is_significant_precession = bool(np.isfinite(p_corr_shuffle) and p_corr_shuffle < ALPHA)
-    # Negative slope: theta-phase precessing (spike phase advances to earlier
-    # phase over the field). Positive slope: theta-phase recessing (phase
-    # moves later). Neither significant: phase locked (theta-modulated
-    # firing with no systematic phase drift across the field).
-    row['is_precessing'] = bool(is_significant_precession and slope_deg < 0)
-    row['is_recessing'] = bool(is_significant_precession and slope_deg > 0)
-    row['is_phase_locked'] = bool(np.isfinite(p_corr_shuffle) and not is_significant_precession)
-    if not np.isfinite(p_corr_shuffle):
-        row['PrecessionClass'] = None
-    elif row['is_precessing']:
-        row['PrecessionClass'] = 'phase_precessing'
-    elif row['is_recessing']:
-        row['PrecessionClass'] = 'phase_recessing'
-    else:
-        row['PrecessionClass'] = 'phase_locked'
 
     # ---- optional intrinsic-frequency block (apu.TempAutocorr / precessionFreq / thetaskipAmp) ----
     row['IntrinsicFreq_Hz'] = np.nan
@@ -533,8 +409,8 @@ def _plot_unit_summary(phs_deg, normx, all_valid_phase_deg, fielddata, regData,
     axes[0, 1].plot(xg, phi_deg, 'r', lw=2)
     axes[0, 1].plot(xg, phi_deg + 360, 'r', lw=2)
     axes[0, 1].set_xlabel('normalized field position')
-    axes[0, 1].set_title(f'rho={row["CircCorr"]:.2f}  p_shuffle={row["p_corr_shuffle"]:.3g}  '
-                          f'slope={slope_deg:.1f} deg/field ({row["PrecessionClass"]})', fontsize=10)
+    axes[0, 1].set_title(f'rho={row["CircCorr"]:.2f}  slope={slope_deg:.1f} deg/field '
+                          f'({row["SlopeDirection"]})', fontsize=10)
 
     plt.sca(axes[1, 0])
     x_field_two = np.concatenate([fielddata['spkpos'], fielddata['spkpos']])
@@ -557,7 +433,7 @@ def _plot_unit_summary(phs_deg, normx, all_valid_phase_deg, fielddata, regData,
 # Batch main
 # ============================================================================
 
-def process_session(data_folder: Path, rng) -> list[dict]:
+def process_session(data_folder: Path) -> list[dict]:
     output_dir = data_folder / 'AditiPhasePrecession'
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -597,13 +473,13 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                        ntt_file=ntt_path.name, cell_number=cell_number)
             try:
                 unit_row = analyze_unit(spk_ts, pos_ts, pos_x, filtered_theta, lfp_ts, posbins,
-                                         vel, numpasses, unit_label, output_dir, rng)
+                                         vel, numpasses, unit_label, output_dir)
                 row.update(unit_row)
                 if unit_row.get('PrecessionTested'):
                     print(f'    {unit_label}: TMI={unit_row["TMI"]:.2f}  '
-                          f'corr={unit_row["CircCorr"]:.2f}  p_shuffle={unit_row["p_corr_shuffle"]:.3g}  '
+                          f'corr={unit_row["CircCorr"]:.2f}  '
                           f'slope={unit_row["Slope_deg_per_field"]:.1f} deg/field '
-                          f'({unit_row["PrecessionClass"]})')
+                          f'({unit_row["SlopeDirection"]})')
                 else:
                     print(f'    {unit_label}: precession not tested '
                           f'({unit_row["PrecessionSkippedReason"]})')
@@ -618,8 +494,6 @@ def process_session(data_folder: Path, rng) -> list[dict]:
 def main():
     warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-    rng = np.random.default_rng(RANDOM_SEED)
-
     session_folders = find_session_folders(ROOT_FOLDER)
     if not session_folders:
         raise FileNotFoundError(f'No folders with both .ncs and .ntt files found under {ROOT_FOLDER}')
@@ -628,7 +502,7 @@ def main():
     for data_folder in session_folders:
         print(f'\n=== Session: {data_folder} ===')
         try:
-            all_rows.extend(process_session(data_folder, rng))
+            all_rows.extend(process_session(data_folder))
         except Exception as exc:
             print(f'ERROR processing {data_folder}: {exc}')
             continue
@@ -636,9 +510,8 @@ def main():
     columns = ['Session', 'FolderPath', 'Unit', 'ntt_file', 'cell_number', 'n_spikes_total',
                'n_spikes_phase', 'ISI_CV', 'TMI', 'PrecessionTested', 'FieldStart_cm',
                'FieldEnd_cm', 'FieldCentre_cm', 'n_spikes_infield', 'CircCorr',
-               'Slope_deg_per_field', 'p_corr_shuffle', 'p_slope_shuffle', 'is_precessing',
-               'is_recessing', 'is_phase_locked', 'PrecessionClass', 'PhaseOffset_deg',
-               'PhaseValley_deg', 'IntrinsicFreq_Hz', 'ThetaSkipAmp', 'PrecessionSkippedReason']
+               'Slope_deg_per_field', 'PhaseOffset_deg', 'SlopeDirection', 'PhaseValley_deg',
+               'IntrinsicFreq_Hz', 'ThetaSkipAmp', 'PrecessionSkippedReason']
     df = pd.DataFrame(all_rows, columns=columns)
     excel_path = ROOT_FOLDER / OUTPUT_EXCEL_NAME
     df.to_excel(excel_path, sheet_name='AditiPhasePrecession', index=False)

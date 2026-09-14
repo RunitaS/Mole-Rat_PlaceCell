@@ -199,23 +199,18 @@ def getFRphaseplane(spktspc,spktsin,winlen=0.2):
 def getPhase(spkTimes,sinInput,time):
     idx,_ = find_peaks(sinInput)
     pkTimes = time[idx]#*second
-    spkTimes = np.asarray(spkTimes)
+    spkPhase = np.zeros(len(spkTimes))
 
-    # Vectorized equivalent of the original per-spike loop (which did
-    # pkTsBefore = max(pkTimes[pkTimes<=t]); pkTsAfter = min(pkTimes[pkTimes>=t])
-    # by linearly rescanning the full pkTimes array for every spike -- O(n_spikes*n_peaks)).
-    # searchsorted brackets each spike in O(log n_peaks) instead, since pkTimes is sorted.
-    before_idx = np.clip(np.searchsorted(pkTimes, spkTimes, side='right') - 1, 0, len(pkTimes)-1)
-    after_idx = np.clip(np.searchsorted(pkTimes, spkTimes, side='left'), 0, len(pkTimes)-1)
-    pkTsBefore = pkTimes[before_idx]
-    pkTsAfter = pkTimes[after_idx]
-    interpkInt = pkTsAfter-pkTsBefore
-
-    with np.errstate(invalid='ignore', divide='ignore'):
-        spkPhase = ((spkTimes-pkTsBefore)/interpkInt)*360
-
-    inrange = (spkTimes>=pkTimes[0]) & (spkTimes<=pkTimes[-1])
-    spkPhase = np.where(inrange, spkPhase, np.nan)
+    for i in range(len(spkTimes)):
+        if spkTimes[i]>=pkTimes[0] and spkTimes[i]<=pkTimes[-1]:
+            pkTsBefore = max(pkTimes[pkTimes<=spkTimes[i]])
+            pkTsAfter = min(pkTimes[pkTimes>=spkTimes[i]])
+            interpkInt = pkTsAfter-pkTsBefore
+            #can include an additional here to check if the inter peak interval is within theta range.
+            # it is not necessary here since our inputs are in the theta range only
+            spkPhase[i]=((spkTimes[i]-pkTsBefore)/interpkInt)*360
+        else:
+            spkPhase[i]=np.nan
 
     return spkPhase
 

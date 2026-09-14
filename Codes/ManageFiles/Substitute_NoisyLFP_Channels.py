@@ -14,25 +14,25 @@ import shutil
 # ==== USER CONFIGURATION =====================================================
 # Hardcode the root folder to search. All subfolders and sub-subfolders will
 # be scanned for session folders containing the clean-channel .ncs files below.
-ROOT_DIR = r"X:/NMR_group_data/Runita/Analysis/Thesis/Data/Fa5834"  # <-- EDIT THIS PATH
+ROOT_DIR = r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Debug"  # <-- EDIT THIS PATH
 
 # Mapping of {destination filename (noisy channel to fill in): source filename
 # (clean channel to copy from)}, applied within every session folder.
-COPY_MAP = {
-     "CSC5ch2.ncs": "CSC8ch2.ncs",
-     "CSC6ch2.ncs": "CSC8ch2.ncs",
-     "CSC4ch2.ncs": "CSC1ch2.ncs",
-     "CSC3ch2.ncs": "CSC2ch2.ncs",
-     "CSC7ch2.ncs": "CSC2ch2.ncs",
- }
-
 # COPY_MAP = {
-#     "CSC5ch2.ncs": "CSC8ch2.ncs",
-#     "CSC6ch2.ncs": "CSC8ch2.ncs",
-#     "CSC4ch2.ncs": "CSC8ch2.ncs",
-#     "CSC3ch2.ncs": "CSC8ch2.ncs",
-#     "CSC7ch2.ncs": "CSC8ch2.ncs",
-# }
+#      "CSC5ch2.ncs": "CSC8ch2.ncs",
+#      "CSC6ch2.ncs": "CSC8ch2.ncs",
+#      "CSC4ch2.ncs": "CSC1ch2.ncs",
+#      "CSC3ch2.ncs": "CSC2ch2.ncs",
+#      "CSC7ch2.ncs": "CSC2ch2.ncs",
+#  }
+
+COPY_MAP = {
+    "CSC5ch2.ncs": "CSC8ch2.ncs",
+    "CSC6ch2.ncs": "CSC8ch2.ncs",
+    "CSC4ch2.ncs": "CSC8ch2.ncs",
+    "CSC3ch2.ncs": "CSC8ch2.ncs",
+    "CSC7ch2.ncs": "CSC8ch2.ncs",
+}
 
 DRY_RUN = False  # Set to False to actually copy files after checking the preview output
 OVERWRITE_EXISTING = True  # Set to False to skip destinations that already exist

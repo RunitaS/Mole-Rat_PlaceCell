@@ -28,8 +28,11 @@ unit (one .ntt file = one already-isolated unit):
 ROOT_FOLDER is searched recursively; every folder that directly contains at
 least one .ncs and at least one .ntt file is treated as a session. Data
 layout expected per session folder:
-    *.ncs   Neuralynx continuous (LFP) file. The first one (natural sort of
-            filename) is used as the theta reference channel.
+    *.ncs   Neuralynx continuous (LFP) file, one per tetrode/channel. Each
+            .ntt file is matched to the .ncs file sharing its embedded
+            channel number (e.g. TT1.ntt -> CSC1.ncs, TT12.ntt -> CSC12.ncs)
+            via match_ncs_to_ntt(), rather than every unit in the session
+            being referenced to a single session-wide LFP channel.
     *.ntt   Neuralynx tetrode spike files, one file per already-isolated
             unit. Every .ntt file in the folder is processed.
     tracking .csv file, auto-detected as the first .csv in the folder (only
@@ -78,6 +81,9 @@ ROOT_FOLDER/ArenaComparison_TMI.png with 'ArenaComparison_TMI_Omnibus' /
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 """
 
+!Correct phase slope testing! Most precessing/recessing cells classified as phase locked. 
+!Criteria is too strict.
+
 from __future__ import annotations
 
 import re
@@ -98,8 +104,8 @@ from scipy.special import erf
 # Configuration -- EDIT THESE
 # ============================================================================
 
-ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True")
-OUTPUT_EXCEL_NAME = 'theta_phase_GPA.xlsx'   # written to ROOT_FOLDER
+ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Debug")
+OUTPUT_EXCEL_NAME = 'theta_phase_GPA_debug.xlsx'   # written to ROOT_FOLDER
 
 TRACKING_TIME_UNIT = 'us'     # 'us', 'ms', or 's' -- units of the tracking timestamp column
 
@@ -453,8 +459,22 @@ def generalized_phase_vector(x, fs, lp, nwin=3):
 
     Returns
     -------
-    xgp : complex analytic signal with the corrected ("generalized") phase.
-    wt  : instantaneous frequency estimate (same rate units as fs).
+    xgp     : complex analytic signal with the corrected ("generalized") phase.
+    wt_pre  : instantaneous frequency of the RAW, pre-correction Hilbert
+         phase (same rate units as fs) -- used internally to detect
+         phase-slip epochs (idx = wt_pre < lp) and returned for debugging/
+         comparison. Expected to dip below `lp` (and swing outside the
+         passband generally) exactly in those epochs, since that is the
+         artifact this function corrects.
+    idx     : boolean mask, True where the sample fell inside a phase-slip
+         epoch and its phase in `xgp` was therefore *reconstructed*
+         (pchip-filled across a gap whose true cumulative cycle count is
+         not preserved) rather than measured. Safe to read xgp's *wrapped*
+         phase (np.angle(xgp)) at these samples; NOT safe to use them (or
+         their immediate neighbours) for anything depending on the rate of
+         change of phase, such as instantaneous frequency -- see
+         gp_instantaneous_frequency below, which excludes them for exactly
+         this reason.
     """
     x = np.asarray(x, dtype=np.float64)
     npts = x.shape[0]
@@ -470,23 +490,23 @@ def generalized_phase_vector(x, fs, lp, nwin=3):
     xo = signal.hilbert(x)
     ph = np.angle(xo)
     md = np.abs(xo)
-    wt = _inst_freq(xo)
+    wt_raw = _inst_freq(xo)
 
     # rectify rotation direction so instantaneous frequency is positive
-    finite_wt = wt[np.isfinite(wt)]
+    finite_wt = wt_raw[np.isfinite(wt_raw)]
     sign_if = np.sign(np.mean(finite_wt)) if finite_wt.size else 1.0
     if sign_if == -1:
         xo = md * np.exp(1j * (sign_if * ph))
         ph = np.angle(xo)
         md = np.abs(xo)
-        wt = _inst_freq(xo)
+        wt_raw = _inst_freq(xo)
 
     if np.all(np.isnan(ph)):
-        return np.full(npts, np.nan, dtype=np.complex128), wt
+        return np.full(npts, np.nan, dtype=np.complex128), wt_raw, np.ones(npts, dtype=bool)
 
     # find negative-/low-frequency ("phase slip") epochs and extend each by
     # nwin x its own width
-    idx = wt < lp
+    idx = wt_raw < lp
     idx[0] = False
     labeled, n_groups = label(idx)
     for kk in range(1, n_groups + 1):
@@ -495,40 +515,77 @@ def generalized_phase_vector(x, fs, lp, nwin=3):
         extended_stop = min(start + (stop - start) * nwin, npts - 1)
         idx[start:extended_stop + 1] = True
 
-    # "stitch over" those epochs: unwrap the full, still-finite raw phase
-    # trace first (matching generalized_phase_vector.m's own order --
-    # unwrap() runs there before the flagged epoch is ever set to NaN, so the
-    # global cycle count threading through each flagged epoch comes from the
-    # true continuous raw phase, not from treating the surviving samples as
-    # if they'd been sampled back-to-back). Only *after* unwrapping do we
-    # blank the flagged samples and reconstruct them by shape-preserving
-    # (pchip) interpolation from the surrounding reliable unwrapped trend,
-    # then rewrap.
+    # unwrap only the trustworthy (unflagged) samples, then reconstruct the
+    # flagged samples by shape-preserving (pchip) interpolation of that
+    # trustworthy unwrapped trend, and rewrap.
     #
-    # (An earlier version of this port unwrapped only the unflagged samples,
-    # concatenated as if contiguous. That discards whatever true phase
-    # advance occurred during each excised epoch beyond the nearest-2*pi
-    # wrap, which is wrong whenever an epoch's real phase advance exceeds pi
-    # (plausible once the nwin=3 safety extension is applied at a low theta
-    # cutoff) -- causing whole-cycle errors that accumulate across a
-    # multi-minute recording with many recurring flagged epochs, i.e. making
-    # the phase/frequency estimates worse instead of correcting them.)
+    # (A previous version of this port instead unwrapped the FULL raw phase
+    # trace first -- including through the flagged phase-slip epochs -- before
+    # blanking and pchip-filling them, on the theory that this better preserves
+    # the true cycle count spanned by each excised epoch. In practice this made
+    # the instantaneous-frequency estimates *worse*, not better: the raw
+    # Hilbert phase genuinely wobbles/reverses inside a phase-slip epoch (that
+    # is the artifact being corrected), so integrating through it with
+    # np.unwrap bakes a fractional-cycle drift into the very anchor points the
+    # pchip reconstruction relies on -- unlike a clean whole-cycle ambiguity,
+    # this drift does not cancel under rewrapping and corrupts both the
+    # reconstructed span and everything downstream. Confirmed against
+    # ThetaVsSpeed_v3_binning.py, whose GP instantaneous-frequency estimates
+    # (same algorithm, unwrap-valid-only) matched expected theta frequencies
+    # while this file's full-trace-unwrap version did not; reverted to
+    # unwrap-valid-only here to match.)
     valid = ~idx
     if np.count_nonzero(valid) < 2:
-        return np.full(npts, np.nan, dtype=np.complex128), wt
+        return np.full(npts, np.nan, dtype=np.complex128), wt_raw, np.ones(npts, dtype=bool)
 
-    p = np.unwrap(ph)
-    p[idx] = np.nan
     valid_positions = np.flatnonzero(valid)
+    p_valid_unwrapped = np.unwrap(ph[valid])
+
+    p = np.empty(npts, dtype=np.float64)
+    p[valid] = p_valid_unwrapped
     invalid_positions = np.flatnonzero(idx)
     if invalid_positions.size:
-        filler = PchipInterpolator(valid_positions, p[valid_positions], extrapolate=True)
+        filler = PchipInterpolator(valid_positions, p_valid_unwrapped, extrapolate=True)
         p[invalid_positions] = filler(invalid_positions)
 
     p = _gp_rewrap(p)
 
     xgp = md * np.exp(1j * p)
-    return xgp, wt
+    return xgp, wt_raw, idx
+
+
+def gp_instantaneous_frequency(xgp, idx, fs, lowcut, highcut):
+    """Per-sample instantaneous frequency (Hz) from a Generalized-Phase
+    analytic signal `xgp`/`idx` (generalized_phase_vector's own return),
+    for debugging/QC plots (e.g. plot_gp_instantaneous_frequency) -- NOT a
+    naive derivative of xgp's phase at every sample, which would include
+    epochs where that phase was fabricated rather than measured.
+
+    Two classes of sample are excluded rather than reported as if they were
+    real measurements (ported from ThetaVsSpeed_v3_binning.py's
+    estimate_instantaneous_frequency_power, frequency half only):
+
+      - reconstructed samples (idx): xgp's phase there was pchip-filled
+        across a phase-slip gap to give a plausible *wrapped* value, not a
+        plausible *rate of change* -- see generalized_phase_vector's own
+        docstring. A frequency estimate spans two samples (i, i+1), so
+        either endpoint being reconstructed invalidates it.
+      - any surviving estimate outside the bandpass filter's own
+        [lowcut, highcut] range: even a "trustworthy" sample can't produce
+        a frequency outside the band that was filtered into xgp in the
+        first place; a value out there means the analytic-signal estimate
+        itself is unreliable there (e.g. right at the filter's transition
+        band, or straddling a reconstructed/valid boundary).
+    """
+    dt = 1.0 / fs
+    freq = np.full(len(xgp), np.nan)
+    freq[:-1] = np.angle(xgp[1:] * np.conj(xgp[:-1])) / (2 * np.pi * dt)
+    reconstructed = idx[:-1] | idx[1:]
+    freq[:-1][reconstructed] = np.nan
+    with np.errstate(invalid='ignore'):
+        out_of_band = (freq < lowcut) | (freq > highcut)
+    freq[out_of_band] = np.nan
+    return freq
 
 
 # ============================================================================
@@ -710,14 +767,14 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     fs_arc = 1.0 / np.mean(np.diff(cc))
     filtered_field_index = bandpass_filter(resampled, filter_band[0], filter_band[1], fs_arc)
 
-    xgp_field_index, _ = generalized_phase_vector(filtered_field_index, fs_arc, filter_band[0])
+    xgp_field_index, _, _ = generalized_phase_vector(filtered_field_index, fs_arc, filter_band[0])
     pass_index_trace = np.angle(xgp_field_index) / np.pi
     unwrapped = np.unwrap(pass_index_trace * np.pi)
     spk_unwrapped = _interp_nearest_extrap(ts2, unwrapped, spk_ts)
     spk_pass_index = (np.mod(spk_unwrapped + np.pi, 2 * np.pi) - np.pi) / np.pi
 
     filtered_lfp = bandpass_filter(lfp_sig, lfp_filter_band[0], lfp_filter_band[1], lfp_fs)
-    xgp_lfp, _ = generalized_phase_vector(filtered_lfp, lfp_fs, lfp_filter_band[0])
+    xgp_lfp, _, _ = generalized_phase_vector(filtered_lfp, lfp_fs, lfp_filter_band[0])
     lfp_phase = np.angle(xgp_lfp)
     unwrapped_lfp_phase = np.unwrap(lfp_phase)
     spk_theta_phase = np.mod(np.interp(spk_ts, lfp_ts, unwrapped_lfp_phase) + np.pi, 2 * np.pi) - np.pi
@@ -1032,6 +1089,60 @@ def plot_phase_histogram(phase_deg, is_sig, title, out_path: Path,
     plt.close(fig)
 
 
+def plot_gp_instantaneous_frequency(wt_pre, wt_post, filter_band, title, out_path: Path,
+                                     display_margin_hz=10.0):
+    """Debug plot (per LFP file): instantaneous-frequency distribution
+    BEFORE Generalized Phase correction (wt_pre -- generalized_phase_
+    vector's internal raw-Hilbert-phase estimate, used only to detect
+    phase-slip epochs) side by side with AFTER correction (wt_post --
+    gp_instantaneous_frequency's masked estimate from the phase-slip-
+    stitched analytic signal, with reconstructed/out-of-band samples
+    excluded rather than plotted as real measurements -- see its own
+    docstring), on the same figure so the effect of the correction is
+    directly comparable.
+
+    Both panels share one x-axis window (filter band +/- display_margin_hz)
+    so the two histograms are visually comparable; the fraction of samples
+    landing outside that window is reported in the panel title instead of
+    stretching the axis to chase outliers (a single near-zero-envelope
+    sample can otherwise blow up the raw Hilbert phase to a huge spurious
+    instantaneous frequency and swamp the whole plot).
+    """
+    lo_edge = filter_band[0] - display_margin_hz
+    hi_edge = filter_band[1] + display_margin_hz
+    bins = np.linspace(lo_edge, hi_edge, 200)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True, sharey=True)
+    panels = [(axes[0], wt_pre, 'PRE-GP correction (raw Hilbert phase)'),
+              (axes[1], wt_post, 'POST-GP correction')]
+
+    for ax, wt, label in panels:
+        finite_wt = wt[np.isfinite(wt)]
+        ax.hist(finite_wt, bins=bins, color='#4C72B0', edgecolor='none')
+        ax.axvline(filter_band[0], color='red', linestyle='--', linewidth=1,
+                   label=f'filter band [{filter_band[0]:g}, {filter_band[1]:g}] Hz')
+        ax.axvline(filter_band[1], color='red', linestyle='--', linewidth=1)
+        ax.set_xlabel('Instantaneous frequency (Hz)')
+
+        if finite_wt.size:
+            pctiles = np.percentile(finite_wt, [1, 50, 99])
+            pct_outside = 100.0 * np.mean((finite_wt < lo_edge) | (finite_wt > hi_edge))
+            range_str = (f'true range=[{finite_wt.min():.2f}, {finite_wt.max():.2f}] Hz\n'
+                         f'median={pctiles[1]:.2f} Hz | 1st-99th pct=[{pctiles[0]:.2f}, {pctiles[2]:.2f}] Hz | '
+                         f'{pct_outside:.2f}% outside plotted window')
+        else:
+            range_str = 'no finite instantaneous-frequency samples'
+        ax.set_title(f'{label}\n{range_str}', fontsize=8.5)
+        ax.legend(fontsize=8)
+
+    axes[0].set_ylabel('Sample count')
+    fig.suptitle(title, fontsize=11, fontweight='bold')
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_unit_summary(pos_xy, results, title, out_path: Path):
     """Step 3: 6-panel Pass Index phase-precession summary figure."""
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
@@ -1115,6 +1226,27 @@ def find_session_folders(root: Path) -> list[Path]:
     """Recursively find folders directly containing both .ncs and .ntt files."""
     ncs_parents = {p.parent for p in root.rglob('*.ncs')}
     return sorted(folder for folder in ncs_parents if any(folder.glob('*.ntt')))
+
+
+def _extract_channel_number(path: Path):
+    """Numeric channel/tetrode id embedded in a filename, e.g. 'TT3.ntt' -> 3,
+    'CSC12.ncs' -> 12. Returns None if the stem has no digits."""
+    m = re.search(r'(\d+)', path.stem)
+    return int(m.group(1)) if m else None
+
+
+def match_ncs_to_ntt(ntt_path: Path, ncs_files: list[Path]) -> Path:
+    """Find the .ncs file whose embedded number matches the .ntt file's
+    (e.g. TT1.ntt -> CSC1.ncs), so each tetrode's spikes are referenced to
+    their own LFP channel instead of a single session-wide channel."""
+    tt_num = _extract_channel_number(ntt_path)
+    if tt_num is not None:
+        for ncs_path in ncs_files:
+            if _extract_channel_number(ncs_path) == tt_num:
+                return ncs_path
+    raise FileNotFoundError(
+        f'No .ncs file matching {ntt_path.name} (tetrode number {tt_num}) found among: '
+        f'{[p.name for p in ncs_files]}')
 
 
 def detect_arena(folder_path: Path) -> str | None:
@@ -1243,37 +1375,70 @@ def process_session(data_folder: Path, rng) -> list[dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncs_files = sorted(data_folder.glob('*.ncs'), key=_natural_key)
-    theta_ncs = ncs_files[0]
-    print(f'Using LFP file: {theta_ncs.name}')
-    lfp_sig, lfp_ts, lfp_fs = load_ncs(theta_ncs)
-    filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
-    xgp_lfp, _ = generalized_phase_vector(filtered_lfp, lfp_fs, LFP_FILTER_BAND[0])
-    lfp_phase_unwrapped = np.unwrap(np.angle(xgp_lfp))
 
     # Tracking is only needed for Step 3; a missing tracking file should not
     # block Steps 1-2 for this session.
     pos_ts = pos_xy = None
-    t_start = t_stop = None
     try:
         tracking_path = _find_tracking_file(data_folder)
         print(f'Using tracking file: {tracking_path.name}')
         pos_ts, pos_xy = load_tracking(tracking_path, TRACKING_TIME_UNIT)
-        t_start = max(pos_ts.min(), lfp_ts.min())
-        t_stop = min(pos_ts.max(), lfp_ts.max())
     except FileNotFoundError as exc:
         print(f'  {exc} -- Step 3 (phase precession) will be skipped for this session.')
 
     session_label = '_'.join(data_folder.parts[-3:])
     ntt_files = sorted(data_folder.glob('*.ntt'), key=_natural_key)
 
+    # Cache per matched .ncs file (channel-loading, GP filtering, and the
+    # per-LFP-file instantaneous-frequency debug plot) so tetrodes that
+    # happen to share one don't reload/refilter/re-plot it more than once.
+    lfp_cache: dict[Path, dict] = {}
+
     rows = []
     for ntt_path in ntt_files:
         print(f'Processing: {ntt_path.name}')
+
+        try:
+            theta_ncs = match_ncs_to_ntt(ntt_path, ncs_files)
+        except FileNotFoundError as exc:
+            print(f'  {exc} -- skipping this tetrode.')
+            continue
+
+        if theta_ncs not in lfp_cache:
+            print(f'  Using LFP file: {theta_ncs.name}')
+            lfp_sig, lfp_ts, lfp_fs = load_ncs(theta_ncs)
+            filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
+            xgp_lfp, lfp_inst_freq_pre, lfp_gp_idx = generalized_phase_vector(
+                filtered_lfp, lfp_fs, LFP_FILTER_BAND[0])
+            lfp_inst_freq_post = gp_instantaneous_frequency(
+                xgp_lfp, lfp_gp_idx, lfp_fs, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1])
+            lfp_phase_unwrapped = np.unwrap(np.angle(xgp_lfp))
+
+            freq_plot_path = output_dir / f'{theta_ncs.stem}_GPA_InstFreqRange.png'
+            plot_gp_instantaneous_frequency(lfp_inst_freq_pre, lfp_inst_freq_post, LFP_FILTER_BAND,
+                                             theta_ncs.name, freq_plot_path)
+            print(f'  GPA instantaneous-frequency range plot saved to {freq_plot_path}')
+
+            t_start = t_stop = None
+            if pos_ts is not None:
+                t_start = max(pos_ts.min(), lfp_ts.min())
+                t_stop = min(pos_ts.max(), lfp_ts.max())
+
+            lfp_cache[theta_ncs] = dict(lfp_sig=lfp_sig, lfp_ts=lfp_ts, lfp_fs=lfp_fs,
+                                         lfp_phase_unwrapped=lfp_phase_unwrapped,
+                                         t_start=t_start, t_stop=t_stop)
+
+        lfp_data = lfp_cache[theta_ncs]
+        lfp_sig, lfp_ts, lfp_fs = lfp_data['lfp_sig'], lfp_data['lfp_ts'], lfp_data['lfp_fs']
+        lfp_phase_unwrapped = lfp_data['lfp_phase_unwrapped']
+        t_start, t_stop = lfp_data['t_start'], lfp_data['t_stop']
+
         units = load_ntt_spike_times(ntt_path)
         for cell_number, spk_ts in units.items():
             unit_label = f'{ntt_path.stem}_cell{cell_number}' if len(units) > 1 else ntt_path.stem
             row = dict(Session=session_label, FolderPath=str(data_folder), Unit=unit_label,
-                       ntt_file=ntt_path.name, cell_number=cell_number, n_spikes_total=len(spk_ts))
+                       ntt_file=ntt_path.name, lfp_file=theta_ncs.name, cell_number=cell_number,
+                       n_spikes_total=len(spk_ts))
 
             # ---- Steps 1 & 2: theta phase-locking polar plot + TMI shuffle test ----
             metrics, phase_deg = compute_theta_modulation(spk_ts, lfp_ts, lfp_phase_unwrapped, rng)
@@ -1417,7 +1582,7 @@ def main():
             print(f'ERROR processing {data_folder}: {exc}')
             continue
 
-    columns = ['Session', 'FolderPath', 'Unit', 'ntt_file', 'cell_number', 'n_spikes_total',
+    columns = ['Session', 'FolderPath', 'Unit', 'ntt_file', 'lfp_file', 'cell_number', 'n_spikes_total',
                'n_spikes_theta', 'MRL', 'PreferredPhase_deg', 'Rayleigh_p',
                'SignificantThetaModulation', 'PhasePeak_deg', 'PhaseValley_deg', 'TMI',
                'TMI_shuffle_p', 'TMI_Significant', 'PrecessionTested', 'PassIndex_n_spikes',

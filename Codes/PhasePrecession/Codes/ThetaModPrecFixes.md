@@ -1,10 +1,12 @@
 # Theta Mod Prec Fixes
 
+- [ ] **Try using higher order of Butterworth.**
+
 - [ ] <Major fix:> **LFP signal is not detrended. Huge slow drift amp present in signal. Phase values will be wrong irrepective of the transform used.**
 
-- [ ] <Major fix:> **Use wavelet transform instead of interpolation to assign instantaneous phase and power to theta trace.**
+- [x] ** Use wavelet transform instead of interpolation to assign instantaneous phase and power to theta trace.** *Used GPA intead.*
 
-- [ ] **<Major fix:> Add only significant theta epochs for phase precession>**
+- [ ] **<Major fix:> Add only significant theta epochs for phase precession>** *not necessarily if you prove theta is continuos durin awake state irrespective of locomotion state. Try runnig phase rpecession with different high pass velocity filters intread (no high pass, high pass = 1cm/sec, high pass = 4cm/sec).*
 
 - [x] < Major fix:> ** Stats are wrong. Steeper slopes show no signif phase precession. flat ones do. Mostly dpendent on spike numbers.**
 

@@ -10,13 +10,15 @@ Input:
 
 Algorithm (per .ntt file) – "threshold method", adapted from a MATLAB
 `placefield`/`getLegals` reference implementation:
-    1. Keep only occupied bins whose smoothed firing rate is both
-       >= METHOD2_RATE_THRESHOLD_FRAC of the cell's peak rate AND above
-       the cell's mean firing rate.
+    1. Keep only occupied bins whose adaptively-binned firing rate (Skaggs &
+       McNaughton 1998 criterion, ported from Roddy Grieves' rate_mapper.m
+       'adaptive' method) is both >= METHOD2_RATE_THRESHOLD_FRAC of the
+       cell's peak rate AND above the cell's mean firing rate.
     2. 8-connected-component label the surviving bins.
-    3. Components spanning >= MIN_FIELD_SIZE_FRAC of the occupied bins
-       are reported as place fields (peak bin + firing-rate-weighted
-       centre of mass, mirroring the MATLAB reference's `fieldPos`).
+    3. Components spanning >= MIN_FIELD_SIZE_BINS contiguous (8-connected,
+       no discontinuity) bins are reported as place fields (peak bin +
+       firing-rate-weighted centre of mass, mirroring the MATLAB
+       reference's `fieldPos`).
     This is a single non-iterative sweep (no suppression / re-bootstrapping).
 
 Output:
@@ -30,39 +32,18 @@ Output:
 
 import os
 import re
-import time
 import threading
 import concurrent.futures
 import types
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import convolve
+from scipy.ndimage import distance_transform_edt
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-# ── GPU availability ──────────────────────────────────────────────────────────
-
-try:
-    import cupy as cp                                          # type: ignore[import-untyped]
-    from cupyx.scipy.ndimage import convolve as cp_convolve    # type: ignore[import-untyped]
-    _t = cp.zeros((3, 3), dtype=cp.float64)
-    _k = cp.ones((3, 3), dtype=cp.float64) / 9.0
-    cp_convolve(_t, _k, mode='constant')
-    del _t, _k
-    _GPU = True
-    print("CuPy detected – GPU (CUDA) acceleration enabled.")
-except ImportError:
-    cp          = types.SimpleNamespace()                      # type: ignore[assignment]
-    cp_convolve = lambda *args, **kwargs: None                 # type: ignore[assignment]
-    _GPU = False
-    print("CuPy not found – running on CPU (install cupy-cuda12x to enable GPU).")
-except Exception as _gpu_err:
-    cp          = types.SimpleNamespace()                      # type: ignore[assignment]
-    cp_convolve = lambda *args, **kwargs: None                 # type: ignore[assignment]
-    _GPU = False
-    print(f"CuPy found but GPU JIT unavailable ({_gpu_err}) – falling back to CPU.")
+# ── GPU status (informational only – adaptive binning runs on CPU) ────────────
 
 try:
     import pynvml                                              # type: ignore[import-untyped]
@@ -94,26 +75,28 @@ target_bin_cm  = 2.0          # bin size in cm
 arena_width_cm = 80.0         # physical arena width in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike-position gap in µs (50 ms)
+MAX_SPEED_CM_S = 90           # frame-to-frame speed above this is treated as a tracking-jump artifact and dropped
 
-MIN_FIELD_SIZE_FRAC = 0.04    # a field must span >= 4% of all occupied bins
+MIN_FIELD_SIZE_BINS = 9       # a field must span >= 9 contiguous (8-connected) bins
 
 METHOD2_RATE_THRESHOLD_FRAC = 0.20    # "threshold method": bins must be >= 10% of the cell's peak rate
                                        # (mirrors pTreshold in the MATLAB placefield reference); bins must
                                        # also be above the cell's mean firing rate (see detect_place_fields_threshold)
 
-MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
 
 # 'pixel' or 'cm' – set interactively at startup (see __main__ below).
 COORD_UNITS = 'pixel'
 
-_gpu_semaphore = threading.Semaphore(2)
-
-# Hockeimer et al. 2025 (eLife 85599): ratemaps binned at 10 px (2.1 cm) per
-# bin, smoothed with a Gaussian kernel of sigma = 1.5 bins. Stored here as a
-# physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
-# bin size (target_bin_cm) this script is run with.
-GAUSSIAN_SIGMA_CM = 1.5 * 2.1
+# Adaptive binning (Skaggs & McNaughton 1998, eq. 11), ported from Roddy
+# Grieves' rate_mapper.m 'adaptive' method (github.com/RoddyMGrieves/rate_mapper).
+ADAPTIVE_ALPHA_BASE = 0.0001  # "a" in r >= a / (n * sqrt(s)); applied to raw
+                               # occupancy SAMPLE COUNTS (n), not occupancy time
+ADAPTIVE_MINDIST_CM = 4.0     # checkpoint radius (cm): if the occupancy TIME
+                               # enclosed within this fixed radius doesn't reach
+                               # min_occ_s, the bin is invalid outright
+ADAPTIVE_MAXDIST_CM = 64.0    # max search radius (cm) before an adaptively
+                               # binned bin gives up expanding
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),
@@ -126,56 +109,105 @@ ntt_dtype = np.dtype([
 _print_lock = threading.Lock()
 
 
-# ── Smoothing ──────────────────────────────────────────────────────────────────
+# ── Adaptive binning ───────────────────────────────────────────────────────────
 
-def _wait_for_gpu_slot(poll_interval: float = 0.5):
-    if not _GPU or not _NVML:
-        return
-    while _gpu_util_pct() >= MAX_GPU_UTIL_PCT:
-        time.sleep(poll_interval)
+def _adaptive_binned_ratemap(occ_map: np.ndarray, spike_map: np.ndarray,
+                              occ_count_map: np.ndarray,
+                              min_occ_s: float, fps: float, target_bin_cm: float,
+                              alpha_base: float = ADAPTIVE_ALPHA_BASE,
+                              mindist_cm: float = ADAPTIVE_MINDIST_CM,
+                              maxdist_cm: float = ADAPTIVE_MAXDIST_CM) -> tuple[np.ndarray, np.ndarray]:
+    """Adaptive binning firing rate map, ported from Roddy Grieves' rate_mapper.m
+    'adaptive' method (Skaggs & McNaughton 1998, eq. 11; see
+    https://github.com/RoddyMGrieves/rate_mapper). For every bin, a circular
+    neighbourhood (radius r, in bin units) is grown outward until
 
+        r >= a / (n * sqrt(s))
 
-def _gaussian_kernel(sigma_bins: float) -> np.ndarray:
-    """2D Gaussian kernel, sigma given in bins, truncated at 3 sigma."""
-    radius = max(1, int(np.ceil(3 * sigma_bins)))
-    ax = np.arange(-radius, radius + 1)
-    xx, yy = np.meshgrid(ax, ax, indexing='ij')
-    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma_bins ** 2))
-    kernel /= kernel.sum()
-    return kernel
+    where a = alpha_base, n is the occupancy SAMPLE COUNT enclosed so far
+    (occ_count_map -- a raw count of position samples, not seconds), and s is
+    the spike count enclosed so far. Equivalently, squaring both sides:
+    rsq * n^2 * s >= a^-2, which is what's evaluated below. Once the radius
+    is chosen, the bin's rate is spikes / occupancy-TIME (occ_map, in
+    seconds) enclosed within it.
 
+    A bin with zero spikes in its neighbourhood never gets substituted with
+    "1 spike" to dodge a zero threshold -- the criterion simply never
+    triggers while s=0, so the neighbourhood keeps growing until a spike is
+    found or maxdist is hit.
 
-def _gaussian_smooth(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
-    sigma_bins = GAUSSIAN_SIGMA_CM / bin_cm
-    kernel = _gaussian_kernel(sigma_bins)
+    Two validity gates, both taken directly from rate_mapper.m:
+      - mindist checkpoint: if the occupancy TIME enclosed within a small
+        fixed `mindist_cm` radius doesn't reach min_occ_s, the bin is invalid
+        outright, regardless of how far expansion would otherwise go.
+      - maxdist cap: the search stops at `maxdist_cm`; if the criterion was
+        never satisfied by then, the bin uses whatever radius accumulated up
+        to that cap.
 
-    fr_in   = np.where(valid_mask, fr_map, 0.0)
-    mask_in = valid_mask.astype(np.float64)
+    Every bin within reach of some visited bin is evaluated (an unvisited
+    bin can still borrow a valid estimate from nearby visited bins). Bins
+    with no visited bin within maxdist are skipped outright via a distance
+    transform on the occupancy mask.
+    """
+    n_i, n_j = occ_map.shape
+    mindist_rsq = (mindist_cm / target_bin_cm) ** 2
+    maxdist_rsq = (maxdist_cm / target_bin_cm) ** 2
+    max_rsq_int = max(int(np.ceil(maxdist_rsq)), 1)
 
-    if _GPU:
-        fr_gpu   = cp.asarray(fr_in, dtype=cp.float64)
-        mask_gpu = cp.asarray(mask_in, dtype=cp.float64)
-        kern_gpu = cp.asarray(kernel, dtype=cp.float64)
-        _wait_for_gpu_slot()
-        _gpu_semaphore.acquire()
-        try:
-            smoothed_fr = cp.asnumpy(
-                cp_convolve(fr_gpu, kern_gpu, mode='constant', cval=0.0)
-            )
-            smoothed_weights = cp.asnumpy(
-                cp_convolve(mask_gpu, kern_gpu, mode='constant', cval=0.0)
-            )
-        finally:
-            _gpu_semaphore.release()
-    else:
-        smoothed_fr      = convolve(fr_in,   kernel, mode='constant', cval=0.0)
-        smoothed_weights = convolve(mask_in, kernel, mode='constant', cval=0.0)
+    fr_map     = np.zeros_like(occ_map)
+    valid_mask = np.zeros(occ_map.shape, dtype=bool)
 
-    smoothed = np.zeros_like(smoothed_fr)
-    valid_weights = smoothed_weights > 0
-    smoothed[valid_weights] = smoothed_fr[valid_weights] / smoothed_weights[valid_weights]
-    smoothed[~valid_mask] = 0.0
-    return smoothed
+    if spike_map.sum() <= 0 or occ_count_map.sum() <= 0:
+        return fr_map, valid_mask
+
+    occ_flat       = occ_map.ravel()          # occupancy TIME (s) per bin
+    occ_count_flat = occ_count_map.ravel()    # occupancy SAMPLE COUNT per bin
+    spike_flat     = spike_map.ravel()
+
+    I, J = np.meshgrid(np.arange(n_i), np.arange(n_j), indexing='ij')
+    I = I.ravel(); J = J.ravel()
+
+    # Candidate squared radii, ascending, starting at 1 bin^2 -- Grieves'
+    # smallest tested radius is a full bin width (r=1), not r=0.
+    rsq_values   = np.arange(1, max_rsq_int + 1, dtype=np.float64)
+    thresh_sq    = (1.0 / alpha_base) ** 2
+
+    visited      = occ_count_map > 0
+    dist_visited = distance_transform_edt(~visited)   # 0 at visited bins
+    reachable    = dist_visited <= np.sqrt(maxdist_rsq)
+
+    for i0, j0 in np.argwhere(reachable):
+        d2 = (I - i0) ** 2 + (J - j0) ** 2
+        order         = np.argsort(d2, kind='stable')
+        d2_sorted     = d2[order]
+        occ_cum       = np.cumsum(occ_flat[order])
+        occ_count_cum = np.cumsum(occ_count_flat[order])
+        spike_cum     = np.cumsum(spike_flat[order])
+
+        # mindist checkpoint gate: fixed radius, independent of the
+        # adaptively-chosen radius found below
+        chk = int(np.searchsorted(d2_sorted, mindist_rsq, side='right'))
+        chk = min(max(chk, 1), len(d2_sorted))
+        if occ_cum[chk - 1] < min_occ_s:
+            continue   # invalid regardless of how far expansion would go
+
+        idx = np.searchsorted(d2_sorted, rsq_values, side='right')
+        idx = np.clip(idx, 1, len(d2_sorted))
+        occ_time_at_rsq  = occ_cum[idx - 1]
+        occ_count_at_rsq = occ_count_cum[idx - 1]
+        spike_at_rsq     = spike_cum[idx - 1]
+
+        satisfied = rsq_values * (occ_count_at_rsq ** 2) * spike_at_rsq >= thresh_sq
+        k = int(np.argmax(satisfied)) if satisfied.any() else max_rsq_int - 1
+
+        n_occ_final    = occ_time_at_rsq[k]
+        n_spikes_final = spike_at_rsq[k]
+
+        if n_occ_final >= min_occ_s:
+            fr_map[i0, j0]     = n_spikes_final / n_occ_final
+            valid_mask[i0, j0] = True
+
+    return fr_map, valid_mask
 
 
 # ── Rate-map metrics (SIR / sparsity / coherence / peak / mean) ────────────────
@@ -208,35 +240,51 @@ def _metrics_from_ratemap(fr_map: np.ndarray, occ_map: np.ndarray, valid_mask: n
 def build_ratemap(csv_path: str, ntt_path: str,
                    arena_width_cm: float, target_bin_cm: float) -> tuple:
     """Loads tracking + spikes and returns (metrics, ctx) where ctx carries
-    everything needed for field detection: fr_raw, fr_smooth, occ_map,
+    everything needed for field detection: fr_adaptive, occ_map,
     valid_mask, spike_frame indices, t, beh_bx, beh_by, n_bins_x/y."""
 
     data = (pd.read_excel(csv_path) if csv_path.lower().endswith('.xlsx')
             else pd.read_csv(csv_path))
 
     if COORD_UNITS == 'cm':
-        t = np.asarray(data.iloc[:, 0], dtype=float)
-        x = np.asarray(data.iloc[:, 3], dtype=float)
-        y = np.asarray(data.iloc[:, 4], dtype=float)
+        t    = np.asarray(data.iloc[:, 0], dtype=float)
+        x    = np.asarray(data.iloc[:, 3], dtype=float)
+        y    = np.asarray(data.iloc[:, 4], dtype=float)
+        x_px = np.asarray(data['x'], dtype=float)   # raw pixel column, used only to spot the lost-tracking sentinel below
     else:
         x = np.asarray(data['x'],    dtype=float)
         y = np.asarray(data['y'],    dtype=float)
         t = np.asarray(data['time'], dtype=float)
+        x_px = x
 
-    mask = ~np.isin(x, [1, -1])
+    # Lost-tracking sentinel (1 / -1) is a pixel-space convention; check it on the
+    # pixel column even in 'cm' mode, since the cm-converted column almost never
+    # lands on exactly 1 or -1 and the filter would otherwise be a no-op.
+    mask = ~np.isin(x_px, [1, -1])
     x, y, t = x[mask], y[mask], t[mask]
 
-    dx = np.append(np.diff(x), 0)
-    dy = np.append(np.diff(y), 0)
-    dt = np.append(np.diff(t), 1)
+    # Jump-artifact filter, evaluated in real cm/s. `t` is a raw microsecond
+    # timestamp and x/y can be pixels or cm depending on COORD_UNITS, so both
+    # need to be put on a common physical scale before comparing to a speed
+    # threshold (a rough, unfiltered pixel-to-cm scale is fine here, same as
+    # pixel_to_cm_conversion_v4.py's remove_speed_jumps: real jumps are large
+    # enough to still be caught).
+    dt_sec   = np.append(np.diff(t), 1) * 1e-6
+    valid_dt = dt_sec > 0
 
-    dxy = np.hypot(dx, dy)
-    valid_dt = dt > 0
+    if COORD_UNITS == 'cm':
+        x_cm_rough, y_cm_rough = x, y
+    else:
+        rough_px_per_cm = max(x.max() - x.min(), y.max() - y.min()) / arena_width_cm
+        x_cm_rough = x / rough_px_per_cm
+        y_cm_rough = y / rough_px_per_cm
 
-    speed = np.zeros_like(dxy)
-    speed[valid_dt] = dxy[valid_dt] / dt[valid_dt]
+    dxy_cm = np.hypot(np.append(np.diff(x_cm_rough), 0), np.append(np.diff(y_cm_rough), 0))
 
-    keep = np.where(valid_dt & (speed < 0.006))[0]
+    speed_cm_s = np.zeros_like(dxy_cm)
+    speed_cm_s[valid_dt] = dxy_cm[valid_dt] / dt_sec[valid_dt]
+
+    keep = np.where(valid_dt & (speed_cm_s < MAX_SPEED_CM_S))[0]
     x, y, t = x[keep], y[keep], t[keep]
 
     order = np.argsort(t)
@@ -286,29 +334,32 @@ def build_ratemap(csv_path: str, ntt_path: str,
     max_frame_s   = 2.0 / fps
     dt_frames[1:] = np.minimum(raw_dt, max_frame_s)
 
-    occ_map   = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
-    spike_map = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    occ_map       = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    occ_count_map = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    spike_map     = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
 
-    np.add.at(occ_map,   (beh_bx, beh_by), dt_frames)
-    np.add.at(spike_map, (sp_bx,  sp_by),  1.0)
+    np.add.at(occ_map,       (beh_bx, beh_by), dt_frames)
+    np.add.at(occ_count_map, (beh_bx, beh_by), 1.0)
+    np.add.at(spike_map,     (sp_bx,  sp_by),  1.0)
 
-    valid_mask = occ_map >= min_occ_s
-
-    fr_raw = np.zeros_like(occ_map)
-    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
-    fr_smooth = _gaussian_smooth(fr_raw, valid_mask, target_bin_cm)
+    # Adaptive-binned firing rate map (replaces the fixed-bin + Gaussian-
+    # smoothing pipeline): each bin's neighbourhood radius grows until it
+    # encloses enough occupancy and spikes to satisfy the Skaggs & McNaughton
+    # (1998) adaptive-binning criterion -- see _adaptive_binned_ratemap.
+    fr_adaptive, valid_mask = _adaptive_binned_ratemap(
+        occ_map, spike_map, occ_count_map, min_occ_s, fps, target_bin_cm)
 
     ctx = dict(spike_ts=spike_ts[valid_spike], spike_frame=spike_frame, t=t,
                beh_bx=beh_bx, beh_by=beh_by,
                occ_map=occ_map, valid_mask=valid_mask,
-               fr_raw=fr_raw, fr_smooth=fr_smooth,
+               fr_adaptive=fr_adaptive,
                n_bins_x=n_bins_x, n_bins_y=n_bins_y)
 
     if not valid_mask.any():
         return ({'n_spikes': n_spikes, 'n_discarded': n_discarded,
                   'peak_fr': 0.0, 'mean_fr': 0.0, 'sir': 0.0, 'sparsity': 0.0}, ctx)
 
-    base = _metrics_from_ratemap(fr_smooth, occ_map, valid_mask)
+    base = _metrics_from_ratemap(fr_adaptive, occ_map, valid_mask)
     base['n_spikes']    = n_spikes
     base['n_discarded'] = n_discarded
     return base, ctx
@@ -346,13 +397,13 @@ def _connected_components_8(qualifies: np.ndarray, n_bins_x: int, n_bins_y: int)
 def detect_place_fields_threshold(base_metrics: dict, ctx: dict, target_bin_cm: float) -> list[dict]:
     """"Threshold method": a single-pass connected-component detector adapted
     from the MATLAB `placefield`/`getLegals` reference. A bin only qualifies
-    for a field if its smoothed rate is >= METHOD2_RATE_THRESHOLD_FRAC of the
+    for a field if its adaptively-binned rate is >= METHOD2_RATE_THRESHOLD_FRAC of the
     cell's peak rate AND above the cell's mean firing rate; 8-connected
-    components of qualifying bins spanning >= MIN_FIELD_SIZE_FRAC of the
-    occupied bins are reported as fields (peak bin + rate-weighted centre of
-    mass, mirroring the reference's `fieldPos`/`centreFieldSize`)."""
+    components of qualifying bins spanning >= MIN_FIELD_SIZE_BINS contiguous
+    bins (no discontinuity) are reported as fields (peak bin + rate-weighted
+    centre of mass, mirroring the reference's `fieldPos`/`centreFieldSize`)."""
     valid_mask = ctx['valid_mask']
-    fr_smooth  = ctx['fr_smooth']
+    fr_adaptive  = ctx['fr_adaptive']
     n_bins_x   = ctx['n_bins_x']
     n_bins_y   = ctx['n_bins_y']
 
@@ -360,12 +411,12 @@ def detect_place_fields_threshold(base_metrics: dict, ctx: dict, target_bin_cm: 
     if total_valid_bins == 0:
         return []
 
-    peak_fr = float(fr_smooth[valid_mask].max())
+    peak_fr = float(fr_adaptive[valid_mask].max())
     mean_fr = float(base_metrics.get('mean_fr', 0.0))
     rate_threshold = METHOD2_RATE_THRESHOLD_FRAC * peak_fr
-    min_size_bins  = max(1, int(np.ceil(MIN_FIELD_SIZE_FRAC * total_valid_bins)))
+    min_size_bins  = MIN_FIELD_SIZE_BINS
 
-    qualifies = valid_mask & (fr_smooth >= rate_threshold) & (fr_smooth > mean_fr)
+    qualifies = valid_mask & (fr_adaptive >= rate_threshold) & (fr_adaptive > mean_fr)
 
     centre_bin = (n_bins_x / 2.0, n_bins_y / 2.0)
     best_centre_dist  = np.inf
@@ -378,7 +429,7 @@ def detect_place_fields_threshold(base_metrics: dict, ctx: dict, target_bin_cm: 
 
         bxs   = np.array([b[0] for b in region])
         bys   = np.array([b[1] for b in region])
-        rates = fr_smooth[bxs, bys]
+        rates = fr_adaptive[bxs, bys]
 
         peak_local_idx = int(np.argmax(rates))
         peak_bin = (int(bxs[peak_local_idx]), int(bys[peak_local_idx]))
@@ -444,9 +495,9 @@ def _field_mask_from_bin_coords(bin_coords: str, n_bins_x: int, n_bins_y: int) -
     return mask
 
 
-def _plot_ratemap_with_field_boundaries(ax, fr_smooth: np.ndarray, valid_mask: np.ndarray,
+def _plot_ratemap_with_field_boundaries(ax, fr_adaptive: np.ndarray, valid_mask: np.ndarray,
                                          fields: list[dict], n_bins_x: int, n_bins_y: int, title: str):
-    display_map = np.ma.masked_where(~valid_mask, fr_smooth)
+    display_map = np.ma.masked_where(~valid_mask, fr_adaptive)
     im = ax.imshow(display_map.T, origin='lower', cmap='jet', interpolation='nearest')
 
     for field in fields:
@@ -464,7 +515,7 @@ def _plot_ratemap_with_field_boundaries(ax, fr_smooth: np.ndarray, valid_mask: n
 def _save_field_ratemap_plot(ctx: dict, fields_threshold: list[dict], ntt_path: str):
     """Saves one PNG per .ntt file: rate map with detected-field boundaries
     (black outlines) from the threshold method."""
-    fr_smooth  = ctx['fr_smooth']
+    fr_adaptive  = ctx['fr_adaptive']
     valid_mask = ctx['valid_mask']
     n_bins_x   = ctx['n_bins_x']
     n_bins_y   = ctx['n_bins_y']
@@ -473,7 +524,7 @@ def _save_field_ratemap_plot(ctx: dict, fields_threshold: list[dict], ntt_path: 
     canvas = FigureCanvasAgg(fig)
     ax = fig.add_subplot(111)
 
-    im = _plot_ratemap_with_field_boundaries(ax, fr_smooth, valid_mask, fields_threshold,
+    im = _plot_ratemap_with_field_boundaries(ax, fr_adaptive, valid_mask, fields_threshold,
                                               n_bins_x, n_bins_y,
                                               f'Threshold method ({len(fields_threshold)} field(s))')
     fig.colorbar(im, ax=ax, label='Hz')
