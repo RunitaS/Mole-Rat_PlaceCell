@@ -25,3 +25,8 @@ Post thesis ananlysis
    Extract the β value for 1/f^β. Quantify it in mole-rats.
 
 2. Check Fa23BDs sleep LFP data. Check for presence of theta.
+
+3. Use GPA to extract phase reset epochs. Correlate them with behavior.
+
+4. Fast gamma arises out of MEC inputs to CA1. Significant gamma peak in all recordings may be due to constant inputs from MEC to CA1. Check the exact freq. peak. 
+Also check for theta gamma coupling and check for specific theta phase preferred by gamma. Proves the MEC-CA1 connectivity causing the hippocampal fast gamma and spatial memory processing in MR hippocampus.

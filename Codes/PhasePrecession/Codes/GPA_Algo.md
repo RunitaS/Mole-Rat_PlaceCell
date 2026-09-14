@@ -63,31 +63,63 @@ This is exactly the artifact GPA was designed to correct.
 This is generalized_phase_vector. Given the filtered signal <x(t), sampling rate fs, the filter's low cutoff lp> (e.g. 3 Hz), and a <safety-margin multiplier nwin (default 3>, from the original MATLAB generalized_phase_vector.m):
 
     1. Compute the raw analytic signal and raw instantaneous frequency.
-
     xo = hilbert(x), φ_raw(t) = angle(xo), A(t) = |xo|.
     Raw instantaneous frequency wt_raw(t) = phase advance per sample, converted to Hz (see Step 5's formula) — this is the "PRE-GP" signal, the one full of spikes/negative values.
+
     2. Rectify the rotation direction.
-
     Check the average sign of the finite raw instantaneous frequencies. If it's negative overall (the analytic signal happens to be winding clockwise rather than counter-clockwise — a convention/sign ambiguity, not an error), flip the sign of the phase and rebuild xo, φ, A, wt_raw from the flipped version. This just guarantees "forward in time = phase increasing," a bookkeeping convention, before any artifact-detection happens.
+
     3. Flag "phase-slip" epochs.
-
     Mark every sample where wt_raw(t) < lp (the filter's own low-frequency edge) as untrustworthy. Note this single threshold catches both the physically-impossible negative frequencies and any positive-but-too-low frequency — anything below the band you filtered to isolate cannot be real.
-    4. Extend each flagged run by a safety margin.
 
+    4. Extend each flagged run by a safety margin.
     For each contiguous run of flagged samples (found by connected-component labeling), extend it forward to nwin (=3) times its own original width.
     Why: the artifact doesn't cleanly start and stop exactly where the frequency crosses the threshold — the distortion "bleeds" into neighboring samples that still look superficially fine but are contaminated by the same collapsed-envelope event. Padding generously avoids leaving corrupted samples just outside the flagged zone.
-    5. Unwrap the phase using only the trustworthy (unflagged) samples.
 
+    5. Unwrap the phase using only the trustworthy (unflagged) samples.
     np.unwrap is applied only to the valid subset of φ_raw, producing a continuously increasing (not wrapped to ±π) phase trend for the good stretches.
     Critically, the flagged samples are not included in this unwrap step — the code's own comment explains that unwrapping straight through a phase-slip epoch bakes a spurious fractional-cycle drift into the trend (because the raw phase genuinely wobbles there), which then corrupts the reconstruction. Skipping the bad samples entirely and reconstructing them afterward (next step) was empirically found to give correct results, while unwrapping through them did not.
-    6. Reconstruct the flagged (bad) samples by shape-preserving interpolation.
+        What np.unwrap assumes
+        np.unwrap has one job: turn a wrapped phase sequence (jumping between −π and +π every cycle) into a continuously increasing trace. It does this with a very simple rule, applied sample-to-sample:
 
+        if the raw jump between two consecutive samples is bigger than π in magnitude, assume that's a wraparound artifact (not a real jump), and add/subtract the right multiple of 2π to cancel it.
+
+        This rule only works because it assumes the true phase moves a small, predictable amount each sample — so any jump bigger than π must be a wrap, not a real signal change. That assumption is what a phase-slip epoch violates.
+
+        What happens inside a phase-slip epoch
+        During a slip, the signal's envelope collapses near zero, so atan2(Im, Re) is dividing noise by noise — the raw angle doesn't advance smoothly, it jitters and reverses unpredictably. So instead of one clean oversized jump (a genuine wrap), you get a string of erratic small-and-large jumps in random directions.
+
+        np.unwrap still applies its "jump > π → add 2π" rule at every one of those erratic steps, blindly. Because the jumps don't behave like a real, slowly-varying phase, the corrections it applies don't sum to the right number of whole cycles. You end up with a fractional multiple of 2π worth of error, e.g. the trace exits the slip epoch shifted by 2π×1.37 instead of 2π×1 or 2π×2.
+
+        Why "fractional" is the key word — this is where it gets "baked in"
+        If the error had been a clean whole cycle (2π×1 instead of 2π×2, say), it would be harmless: at the end of the pipeline you rewrap with mod 2π, and
+
+
+        (true_phase + 2π·n) mod 2π == true_phase   # for any integer n
+        The whole-cycle offset vanishes — no visible effect.
+
+        But a fractional-cycle offset does not cancel under that same operation:
+
+
+        (true_phase + 2π·1.37) mod 2π == true_phase + 0.37·2π   ≠ true_phase
+        That leftover 0.37 cycles (~133°) is a permanent, wrong shift. And because np.unwrap is a running cumulative sum, every sample after the slip epoch inherits that same offset — it's not confined to the bad stretch. So the old (now-reverted) approach — unwrap the entire raw trace first, including through the slip, then blank and PCHIP-fill the flagged samples — was feeding the interpolator's anchor points (the "good" samples right after the gap) values that were already silently shifted by this bogus fractional amount. The interpolation faithfully reconstructs a smooth ramp — just a smooth ramp between the wrong endpoints.
+
+        The fix (what the code does now)
+        generalized_phase_vector (in Debug_GPA_PhaseValues_ThetaMod_PhasePrec_SpikeLFP_Matched_v9.py) sidesteps this entirely: it calls np.unwrap only on the valid samples, concatenated together with the flagged ones simply dropped out — np.unwrap(ph[valid]). np.unwrap never sees the erratic jitter inside the slip at all, only the clean readings before and after it. Since a flagged run is normally a small fraction of a cycle, the jump across the (now-adjacent-in-the-array) valid neighbors is small and gets unwrapped correctly. PCHIP then just draws a monotonic ramp between those two now-trustworthy anchors to fill the gap, and the whole thing is rewrapped at the end.
+
+        So the essence of the line you selected: unwrapping through the bad samples lets their noise corrupt the arithmetic that produces every later sample's value; skipping them avoids ever exposing np.unwrap's "big jump = wraparound" assumption to data where that assumption is false.
+
+        Summary: unwrapping through the noisy slip lets np.unwrap's "big jump = one wraparound" assumption fail, so the correction it applies ends up off by a fractional (not whole) multiple of 2π, and that fractional offset doesn't cancel when you later rewrap with mod 2π, so it permanently shifts every sample after it.
+<Check if unwrap is distorting the signal. That is the most probable cause of th bug. It shifts the whole signal after phase slip.>
+
+    6. Reconstruct the flagged (bad) samples by shape-preserving interpolation.
     Using PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) — a shape-preserving interpolant that won't overshoot or oscillate the way a plain cubic spline might — fit a curve through the valid unwrapped-phase points, then evaluate that curve at the flagged (invalid) sample positions.
     This effectively draws a smooth, monotonically increasing phase ramp bridging the gap, using the trend on either side, instead of trusting the raw (and wrong) arctangent inside the gap.
     No samples are ever deleted: every timestamp — flagged or not — ends up with a phase value.
-    7. Rewrap the reconstructed phase back into (−π, π].
 
+    7. Rewrap the reconstructed phase back into (−π, π].
     Standard modulo-2π wrapping, _gp_rewrap, converting the unwrapped (Step 5–6) trace back to a normal angle.
+
     8. Rebuild the corrected analytic signal.
 
     xgp(t) = A(t) · exp(i · φ_corrected(t)) — same envelope A(t) as before (amplitude was never in question — only phase was corrupted), now paired with the corrected phase.
@@ -120,6 +152,10 @@ For quality control, this codebase then goes a step further and blanks out (NaNs
 spans a reconstructed sample (i.e., either of the two adjacent samples used in the difference was interpolated in Step 6) — because a pchip fill gives a believable angle but not a believable rate of change, so any frequency computed across that boundary is discarded rather than reported;
 falls outside the original filter's own passband (e.g., outside 3–7 Hz) even among "trustworthy" samples — since a signal that was bandlimited to 3–7 Hz cannot truthfully have an instantaneous frequency of, say, 10 Hz; a value like that means the estimate itself (not necessarily the underlying data) is unreliable, often right at the filter's transition band.
 This masked frequency is only a debugging/QC signal ("did GPA produce physically sensible frequencies?") — it is not the same thing as the corrected phase itself, which remains defined and usable at every sample, reconstructed or not.
+<BUG: Out of bound freq values converted to NaN. Drops too many epochs.>
+<Fix: Either interpolate from valid samples np.diff(p) * fs / (2*np.pi) 
+or
+Use some shape preserving interpolator> 
 
 Instantaneous power
 Power is simply the squared envelope of the analytic signal:

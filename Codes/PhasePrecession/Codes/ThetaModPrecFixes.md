@@ -1,6 +1,8 @@
 # Theta Mod Prec Fixes
 
-- [ ] **Try using higher order of Butterworth.**
+- [x] < Major fix:> ** Slope stats are way too strict. CHeck what Aditi used in her paper.** *Used Wang et.al.'s Pearson method.*
+
+- [x] ** Try using higher order of Butterworth.** *NotReq. Already sosfiltfilt is doubling the order from 4th to 8th.*
 
 - [ ] <Major fix:> **LFP signal is not detrended. Huge slow drift amp present in signal. Phase values will be wrong irrepective of the transform used.**
 

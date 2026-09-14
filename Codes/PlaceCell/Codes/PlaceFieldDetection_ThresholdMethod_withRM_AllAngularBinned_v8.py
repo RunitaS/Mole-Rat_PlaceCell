@@ -8,46 +8,33 @@ Input:
     i.e. C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True
     (each sub-folder holds the confirmed-place-cell .ntt file(s) plus their tracking file).
 
-Three arena types are supported, auto-detected from the session folder path
-(the path must contain 'Open', 'Linear', or 'Circle' -- case-insensitive --
-see _detect_arena_type):
-    - 'Open'   : open field, 60 cm diameter.
-    - 'Linear' : linear track, 80 x 8 cm.
-    - 'Circle' : circular alley track, 80 cm outer diameter / 72 cm inner
-                 diameter.
-
-Open field and Linear track use a conventional 2-D Cartesian occupancy grid
-(target_bin_cm x target_bin_cm bins), smoothed with an occupancy-weighted
-2-D Gaussian kernel (see _gaussian_smooth_2d). No adaptive binning is used.
-
-Circle uses 1-D angular binning instead of the 2-D grid. The animal's
-position on a ring track is fundamentally 1-D (its running direction, theta,
-around the ring), not 2-D. Binning (x, y) on a square Cartesian grid and
-running an 8-connected-component search on it does not respect that
-topology -- the ring's curvature means a square grid samples the track
-unevenly, so a single true field can get sliced into several disconnected
-2-D components (spurious "multifield" cells) purely from binning artifacts,
-independent of any real firing discontinuity. To fix this, the ratemap is
-built in angular bins: every tracking sample and spike is assigned to a bin
-by its bearing (theta) around the track's fitted centre only (its radial
-distance from centre is discarded), collapsing the ratemap to a single 1-D
-array around the ring, smoothed with a wrap-around 1-D Gaussian kernel (see
-_gaussian_smooth_circular). Field detection then finds contiguous runs of
-qualifying bins on that 1-D circular array, wrapping around the theta=0/2*pi
-seam, which is a topologically correct match for a closed loop and cannot
-fragment a field the way the 2-D grid did.
+The track is a circular alley: the animal's position is fundamentally
+1-D (its running direction, theta, around the ring), not 2-D. Binning
+(x, y) on a square Cartesian grid and running an 8-connected-component
+search on it does not respect that topology -- the ring's curvature
+means a square grid samples the track unevenly, so a single true field
+can get sliced into several disconnected 2-D components (spurious
+"multifield" cells) purely from binning artifacts, independent of any
+real firing discontinuity. To fix this, the entire rate map is built in
+angular bins: every tracking sample and spike is assigned to a bin by
+its bearing (theta) around the track's fitted centre only (its radial
+distance from centre is discarded), collapsing the ratemap to a single
+1-D array around the ring. Field detection then finds contiguous runs of
+qualifying bins on that 1-D circular array, wrapping around the
+theta=0/2*pi seam, which is a topologically correct match for a closed
+loop and cannot fragment a field the way the 2-D grid did.
 
 Algorithm (per .ntt file) – "threshold method", adapted from a MATLAB
 `placefield`/`getLegals` reference implementation:
-    1. Keep only occupied bins whose Gaussian-smoothed firing rate is both
+    1. Keep only occupied angular bins whose smoothed firing rate is both
        >= METHOD2_RATE_THRESHOLD_FRAC of the cell's peak rate AND above
        the cell's mean firing rate.
-    2. Open/Linear: 8-connected-component label the surviving bins on the
-       2-D grid. Circle: label contiguous runs of the surviving bins on the
-       circular (wrap-around) angular axis.
-    3. Components/runs spanning >= MIN_FIELD_SIZE_BINS contiguous bins (no
-       discontinuity) are reported as place fields (peak bin + firing-rate-
-       weighted centre of mass, mirroring the MATLAB reference's `fieldPos`).
+    2. Label contiguous runs of the surviving bins on the circular
+       (wrap-around) angular axis.
+    3. Runs spanning >= MIN_FIELD_SIZE_BINS contiguous bins (no
+       discontinuity, wrapping around the seam) are reported as place
+       fields (peak bin + firing-rate-weighted circular centre of mass,
+       mirroring the MATLAB reference's `fieldPos`).
     This is a single non-iterative sweep (no suppression / re-bootstrapping).
 
 Output:
@@ -117,35 +104,21 @@ def _gpu_util_pct() -> int:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-root_folder  = r'X:\NMR_group_data\Runita\Temp\PlaceCell_True\TestRun'
-output_excel = r'X:\NMR_group_data\Runita\Temp\PlaceCell_True\TestRun\PlaceFields.xlsx'
-
-# root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
-# output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/PlaceFields.xlsx'
+root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/PlaceFields.xlsx'
 
 fps            = 30           # tracking frame rate (Hz)
-target_bin_cm  = 2.0          # bin size in cm (both 2-D grid bins and angular arc-length bins)
+target_bin_cm  = 2.0          # bin size in cm
+arena_width_cm = 80.0         # physical arena width in cm
 min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike-position gap in µs (50 ms)
 MAX_SPEED_CM_S = 90           # frame-to-frame speed above this is treated as a tracking-jump artifact and dropped
 
-# Arena type is auto-detected per session from the folder path (see
-# _detect_arena_type). ARENA_WIDTH_CM is the physical width (cm) used only to
-# convert tracking pixel coordinates to cm: the open field's diameter, the
-# linear track's long axis, and the circular track's outer diameter.
-ARENA_TYPES = ('Open', 'Linear', 'Circle')
-ARENA_WIDTH_CM = {
-    'Open':   60.0,    # 60 cm diameter open field
-    'Linear': 80.0,    # 80 x 8 cm linear track (long axis)
-    'Circle': 80.0,    # 80 cm outer diameter circular track
-}
+MIN_FIELD_SIZE_BINS = 9       # a field must span >= 9 contiguous angular bins (wrap-around)
 
-MIN_FIELD_SIZE_BINS = 9       # a field must span >= 9 contiguous bins (8-connected on the
-                               # 2-D grid for Open/Linear, or wrap-around angular bins for Circle)
-
-METHOD2_RATE_THRESHOLD_FRAC = 0.20    # "threshold method": bins must be >= 20% of the cell's peak rate
+METHOD2_RATE_THRESHOLD_FRAC = 0.20    # "threshold method": bins must be >= 10% of the cell's peak rate
                                        # (mirrors pTreshold in the MATLAB placefield reference); bins must
-                                       # also be above the cell's mean firing rate (see detect_place_fields_threshold_*)
+                                       # also be above the cell's mean firing rate (see detect_place_fields_threshold)
 
 MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
@@ -158,8 +131,7 @@ _gpu_semaphore = threading.Semaphore(2)
 # Hockeimer et al. 2025 (eLife 85599): ratemaps binned at 10 px (2.1 cm) per
 # bin, smoothed with a Gaussian kernel of sigma = 1.5 bins. Stored here as a
 # physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
-# bin size (target_bin_cm) this script is run with. Used for both the 2-D
-# (Open/Linear) and angular (Circle) rate maps.
+# bin size (target_bin_cm) this script is run with.
 GAUSSIAN_SIGMA_CM = 5 #1.5 * 2.1
 
 ntt_dtype = np.dtype([
@@ -171,22 +143,6 @@ ntt_dtype = np.dtype([
 ])
 
 _print_lock = threading.Lock()
-
-
-# ── Arena-type detection ─────────────────────────────────────────────────────
-
-def _detect_arena_type(path: str) -> str:
-    """Identifies the arena type from a session folder path. The path must
-    contain exactly one of 'Open', 'Linear', or 'Circle' (case-insensitive)
-    somewhere in it -- raises ValueError otherwise, so a mis-named folder
-    fails loudly instead of silently picking the wrong binning procedure."""
-    lower = path.lower()
-    hits = [name for name in ARENA_TYPES if name.lower() in lower]
-    if len(hits) != 1:
-        raise ValueError(
-            f"Could not uniquely determine arena type from path {path!r} "
-            f"(expected exactly one of {ARENA_TYPES} to appear in the path, found {hits})")
-    return hits[0]
 
 
 # ── Smoothing ──────────────────────────────────────────────────────────────────
@@ -255,42 +211,6 @@ def _gaussian_smooth_circular(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm
     return smoothed
 
 
-def _gaussian_smooth_2d(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
-    """Occupancy-weighted 2D Gaussian smoothing for the Open-field / Linear-
-    track rate maps (used instead of adaptive binning). Rate is recovered as
-    smoothed-spikes / smoothed-occupancy-weight, so unvisited bins near the
-    arena edge don't bias the smoothed rate downward. Edges are zero-padded
-    (no wrap-around -- unlike the circular ring track, these arenas are not
-    a closed loop)."""
-    sigma_bins = GAUSSIAN_SIGMA_CM / bin_cm
-    kernel_1d = _gaussian_kernel_1d(sigma_bins)
-    kernel_2d = np.outer(kernel_1d, kernel_1d)
-
-    fr_in   = np.where(valid_mask, fr_map, 0.0)
-    mask_in = valid_mask.astype(np.float64)
-
-    if _GPU:
-        fr_gpu   = cp.asarray(fr_in,   dtype=cp.float64)
-        mask_gpu = cp.asarray(mask_in, dtype=cp.float64)
-        kern_gpu = cp.asarray(kernel_2d, dtype=cp.float64)
-        _wait_for_gpu_slot()
-        _gpu_semaphore.acquire()
-        try:
-            smoothed_fr      = cp.asnumpy(cp_convolve(fr_gpu,   kern_gpu, mode='constant', cval=0.0))
-            smoothed_weights = cp.asnumpy(cp_convolve(mask_gpu, kern_gpu, mode='constant', cval=0.0))
-        finally:
-            _gpu_semaphore.release()
-    else:
-        smoothed_fr      = convolve(fr_in,   kernel_2d, mode='constant', cval=0.0)
-        smoothed_weights = convolve(mask_in, kernel_2d, mode='constant', cval=0.0)
-
-    smoothed = np.zeros_like(smoothed_fr)
-    valid_weights = smoothed_weights > 0
-    smoothed[valid_weights] = smoothed_fr[valid_weights] / smoothed_weights[valid_weights]
-    smoothed[~valid_mask] = 0.0
-    return smoothed
-
-
 # ── Rate-map metrics (SIR / sparsity / coherence / peak / mean) ────────────────
 
 def _metrics_from_ratemap(fr_map: np.ndarray, occ_map: np.ndarray, valid_mask: np.ndarray) -> dict:
@@ -316,7 +236,7 @@ def _metrics_from_ratemap(fr_map: np.ndarray, occ_map: np.ndarray, valid_mask: n
             'sir': round(sir, 4), 'sparsity': round(sparsity, 4)}
 
 
-# ── Ring-track geometry (angular binning, Circle arena only) ────────────────────
+# ── Ring-track geometry (angular binning) ───────────────────────────────────────
 
 RADIAL_RANGE_CLIP_PCTILE = 0.5   # trim this many percentiles off each end of the
                                   # radial-distance distribution before estimating
@@ -342,81 +262,17 @@ def _circular_mean_rad(angles_rad: np.ndarray, weights: np.ndarray) -> float:
     return float(np.arctan2(s, c)) % (2.0 * np.pi)
 
 
-# ── Rate-map construction, per arena type ───────────────────────────────────────
+# ── Tracking + spike loading / rate-map construction ────────────────────────────
 
-def _build_ratemap_circular(x_cm: np.ndarray, y_cm: np.ndarray, spike_frame: np.ndarray,
-                             dt_frames: np.ndarray, target_bin_cm: float) -> dict:
-    """1-D angular ratemap for the Circle (ring) track -- see module
-    docstring. Every sample's bearing (theta) around the track's fitted
-    centre is binned; radial distance from centre is discarded."""
-    cx, cy = _fit_ring_centre(x_cm, y_cm)
-    r_cm        = np.hypot(x_cm - cx, y_cm - cy)
-    theta_rad   = np.arctan2(y_cm - cy, x_cm - cx)             # (-pi, pi]
-    theta_0_2pi = np.mod(theta_rad, 2.0 * np.pi)               # [0, 2*pi)
-
-    r_min = float(np.percentile(r_cm, RADIAL_RANGE_CLIP_PCTILE))
-    r_max = float(np.percentile(r_cm, 100.0 - RADIAL_RANGE_CLIP_PCTILE))
-    track_width_cm = max(r_max - r_min, 0.0)
-
-    r_mean = float(np.median(r_cm))
-    bin_width_rad = target_bin_cm / r_mean                     # arc length ~= target_bin_cm
-    n_bins_theta = max(1, int(round(2.0 * np.pi / bin_width_rad)))
-    bin_width_rad = 2.0 * np.pi / n_bins_theta                 # re-close evenly around the ring
-
-    beh_bt = np.clip((theta_0_2pi / bin_width_rad).astype(int), 0, n_bins_theta - 1)
-    sp_bt  = beh_bt[spike_frame]
-
-    occ_map   = np.zeros(n_bins_theta, dtype=np.float64)
-    spike_map = np.zeros(n_bins_theta, dtype=np.float64)
-    np.add.at(occ_map,   beh_bt, dt_frames)
-    np.add.at(spike_map, sp_bt,  1.0)
-
-    valid_mask = occ_map >= min_occ_s
-    fr_raw = np.zeros_like(occ_map)
-    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
-    fr_smooth = _gaussian_smooth_circular(fr_raw, valid_mask, target_bin_cm)
-
-    return dict(beh_bt=beh_bt, occ_map=occ_map, valid_mask=valid_mask,
-                fr_raw=fr_raw, fr_smooth=fr_smooth,
-                n_bins_theta=n_bins_theta, bin_width_rad=bin_width_rad,
-                cx=cx, cy=cy, r_min=r_min, r_max=r_max, track_width_cm=track_width_cm)
-
-
-def _build_ratemap_2d(x_cm: np.ndarray, y_cm: np.ndarray, spike_frame: np.ndarray,
-                       dt_frames: np.ndarray, target_bin_cm: float) -> dict:
-    """Conventional 2-D Cartesian ratemap (target_bin_cm x target_bin_cm
-    bins) for the Open-field and Linear-track arenas, Gaussian-smoothed
-    (no adaptive binning)."""
-    n_bins_x = int(np.ceil(x_cm.max() / target_bin_cm))
-    n_bins_y = int(np.ceil(y_cm.max() / target_bin_cm))
-
-    beh_bx = np.clip((x_cm / target_bin_cm).astype(int), 0, n_bins_x - 1)
-    beh_by = np.clip((y_cm / target_bin_cm).astype(int), 0, n_bins_y - 1)
-    sp_bx  = beh_bx[spike_frame]
-    sp_by  = beh_by[spike_frame]
-
-    occ_map   = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
-    spike_map = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
-    np.add.at(occ_map,   (beh_bx, beh_by), dt_frames)
-    np.add.at(spike_map, (sp_bx,  sp_by),  1.0)
-
-    valid_mask = occ_map >= min_occ_s
-    fr_raw = np.zeros_like(occ_map)
-    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
-    fr_smooth = _gaussian_smooth_2d(fr_raw, valid_mask, target_bin_cm)
-
-    return dict(beh_bx=beh_bx, beh_by=beh_by, occ_map=occ_map, valid_mask=valid_mask,
-                fr_raw=fr_raw, fr_smooth=fr_smooth,
-                n_bins_x=n_bins_x, n_bins_y=n_bins_y)
-
-
-# ── Tracking + spike loading / rate-map dispatch ────────────────────────────────
-
-def build_ratemap(csv_path: str, ntt_path: str, arena_width_cm: float,
-                   target_bin_cm: float, arena_type: str) -> tuple:
-    """Loads tracking + spikes and returns (metrics, ctx). Dispatches to the
-    1-D angular ratemap (Circle) or the 2-D Cartesian ratemap (Open, Linear)
-    depending on arena_type -- see module docstring."""
+def build_ratemap(csv_path: str, ntt_path: str,
+                   arena_width_cm: float, target_bin_cm: float) -> tuple:
+    """Loads tracking + spikes and returns (metrics, ctx) where ctx carries
+    everything needed for field detection: fr_raw, fr_smooth, occ_map,
+    valid_mask, spike_frame indices, t, beh_bt, n_bins_theta. The ratemap is
+    built purely from each sample's bearing (theta) around the track's
+    fitted centre -- its radial distance from centre is discarded -- so the
+    whole ratemap collapses to a 1-D array around the ring (see module
+    docstring)."""
 
     data = (pd.read_excel(csv_path) if csv_path.lower().endswith('.xlsx')
             else pd.read_csv(csv_path))
@@ -478,6 +334,22 @@ def build_ratemap(csv_path: str, ntt_path: str, arena_width_cm: float,
         x_cm = (x - x.min()) / px_per_cm
         y_cm = (y - y.min()) / px_per_cm
 
+    cx, cy = _fit_ring_centre(x_cm, y_cm)
+    r_cm        = np.hypot(x_cm - cx, y_cm - cy)
+    theta_rad   = np.arctan2(y_cm - cy, x_cm - cx)            # (-pi, pi]
+    theta_0_2pi = np.mod(theta_rad, 2.0 * np.pi)              # [0, 2*pi)
+
+    r_min = float(np.percentile(r_cm, RADIAL_RANGE_CLIP_PCTILE))
+    r_max = float(np.percentile(r_cm, 100.0 - RADIAL_RANGE_CLIP_PCTILE))
+    track_width_cm = max(r_max - r_min, 0.0)
+
+    r_mean = float(np.median(r_cm))
+    bin_width_rad = target_bin_cm / r_mean                    # arc length ~= target_bin_cm
+    n_bins_theta = max(1, int(round(2.0 * np.pi / bin_width_rad)))
+    bin_width_rad = 2.0 * np.pi / n_bins_theta                # re-close evenly around the ring
+
+    beh_bt = np.clip((theta_0_2pi / bin_width_rad).astype(int), 0, n_bins_theta - 1)
+
     spike_data = np.memmap(ntt_path, dtype=ntt_dtype, mode='r', offset=16 * 1024)
     spike_ts   = np.sort(spike_data['timestamp'].astype(np.float64))
 
@@ -494,22 +366,32 @@ def build_ratemap(csv_path: str, ntt_path: str, arena_width_cm: float,
     n_spikes    = int(valid_spike.sum())
     n_discarded = int((~valid_spike).sum())
 
+    sp_bt = beh_bt[spike_frame]
+
     dt_frames     = np.empty(len(t), dtype=np.float64)
     dt_frames[0]  = 1.0 / fps
     raw_dt        = np.diff(t) * 1e-6
     max_frame_s   = 2.0 / fps
     dt_frames[1:] = np.minimum(raw_dt, max_frame_s)
 
-    if arena_type == 'Circle':
-        ctx_extra = _build_ratemap_circular(x_cm, y_cm, spike_frame, dt_frames, target_bin_cm)
-    else:
-        ctx_extra = _build_ratemap_2d(x_cm, y_cm, spike_frame, dt_frames, target_bin_cm)
+    occ_map   = np.zeros(n_bins_theta, dtype=np.float64)
+    spike_map = np.zeros(n_bins_theta, dtype=np.float64)
 
-    occ_map    = ctx_extra['occ_map']
-    valid_mask = ctx_extra['valid_mask']
-    fr_smooth  = ctx_extra['fr_smooth']
+    np.add.at(occ_map,   beh_bt, dt_frames)
+    np.add.at(spike_map, sp_bt,  1.0)
 
-    ctx = dict(spike_ts=spike_ts[valid_spike], spike_frame=spike_frame, t=t, **ctx_extra)
+    valid_mask = occ_map >= min_occ_s
+
+    fr_raw = np.zeros_like(occ_map)
+    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
+    fr_smooth = _gaussian_smooth_circular(fr_raw, valid_mask, target_bin_cm)
+
+    ctx = dict(spike_ts=spike_ts[valid_spike], spike_frame=spike_frame, t=t,
+               beh_bt=beh_bt,
+               occ_map=occ_map, valid_mask=valid_mask,
+               fr_raw=fr_raw, fr_smooth=fr_smooth,
+               n_bins_theta=n_bins_theta, bin_width_rad=bin_width_rad,
+               cx=cx, cy=cy, r_min=r_min, r_max=r_max, track_width_cm=track_width_cm)
 
     if not valid_mask.any():
         return ({'n_spikes': n_spikes, 'n_discarded': n_discarded,
@@ -521,133 +403,15 @@ def build_ratemap(csv_path: str, ntt_path: str, arena_width_cm: float,
     return base, ctx
 
 
-# ── Field isolation – "threshold method", 2-D grid (Open field / Linear track) ──
-
-def _connected_components_8(qualifies: np.ndarray, n_bins_x: int, n_bins_y: int) -> list:
-    """8-connected component labelling of the bins where `qualifies` is True.
-    Direct analogue of the MATLAB reference's visited/getLegals flood fill."""
-    visited = ~qualifies
-    components = []
-    for i in range(n_bins_x):
-        for j in range(n_bins_y):
-            if visited[i, j]:
-                continue
-            region = []
-            stack = [(i, j)]
-            visited[i, j] = True
-            while stack:
-                bx, by = stack.pop()
-                region.append((bx, by))
-                for ddx in (-1, 0, 1):
-                    for ddy in (-1, 0, 1):
-                        if ddx == 0 and ddy == 0:
-                            continue
-                        nx, ny = bx + ddx, by + ddy
-                        if 0 <= nx < n_bins_x and 0 <= ny < n_bins_y and not visited[nx, ny]:
-                            visited[nx, ny] = True
-                            stack.append((nx, ny))
-            components.append(region)
-    return components
-
-
-def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_cm: float) -> list[dict]:
-    """"Threshold method" for the 2-D grid (Open field / Linear track): a bin
-    only qualifies for a field if its Gaussian-smoothed rate is >=
-    METHOD2_RATE_THRESHOLD_FRAC of the cell's peak rate AND above the cell's
-    mean firing rate; 8-connected components of qualifying bins spanning >=
-    MIN_FIELD_SIZE_BINS contiguous bins (no discontinuity) are reported as
-    fields (peak bin + rate-weighted centre of mass, mirroring the MATLAB
-    reference's `fieldPos`/`centreFieldSize`)."""
-    valid_mask  = ctx['valid_mask']
-    fr_smooth   = ctx['fr_smooth']
-    n_bins_x    = ctx['n_bins_x']
-    n_bins_y    = ctx['n_bins_y']
-
-    total_valid_bins = int(valid_mask.sum())
-    if total_valid_bins == 0:
-        return []
-
-    peak_fr = float(fr_smooth[valid_mask].max())
-    mean_fr = float(base_metrics.get('mean_fr', 0.0))
-    rate_threshold = METHOD2_RATE_THRESHOLD_FRAC * peak_fr
-    min_size_bins  = MIN_FIELD_SIZE_BINS
-
-    qualifies = valid_mask & (fr_smooth >= rate_threshold) & (fr_smooth > mean_fr)
-
-    centre_bin = (n_bins_x / 2.0, n_bins_y / 2.0)
-    best_centre_dist  = np.inf
-    centre_field_idx  = None
-    fields = []
-
-    for region in _connected_components_8(qualifies, n_bins_x, n_bins_y):
-        if len(region) < min_size_bins:
-            continue
-
-        bxs   = np.array([b[0] for b in region])
-        bys   = np.array([b[1] for b in region])
-        rates = fr_smooth[bxs, bys]
-
-        peak_local_idx = int(np.argmax(rates))
-        peak_bin = (int(bxs[peak_local_idx]), int(bys[peak_local_idx]))
-        peak_val = float(rates[peak_local_idx])
-
-        total_rate = float(rates.sum())
-        com_x = float(np.sum(rates * bxs) / total_rate)
-        com_y = float(np.sum(rates * bys) / total_rate)
-
-        n_bins_field = len(region)
-        area_cm2     = n_bins_field * (target_bin_cm ** 2)
-        pct_area     = 100.0 * n_bins_field / total_valid_bins
-        bin_coords_str = ';'.join(f'{bx}-{by}' for bx, by in sorted(region))
-
-        dist_to_centre = float(np.hypot(com_x - centre_bin[0], com_y - centre_bin[1]))
-        if dist_to_centre < best_centre_dist:
-            best_centre_dist = dist_to_centre
-            centre_field_idx = len(fields)
-
-        fields.append({
-            'field_number':          len(fields) + 1,
-            'peak_bin_x':            peak_bin[0],
-            'peak_bin_y':            peak_bin[1],
-            'peak_fr_hz':            round(peak_val, 4),
-            'com_bin_x':             round(com_x, 3),
-            'com_bin_y':             round(com_y, 3),
-            'com_cm_x':              round(com_x * target_bin_cm, 2),
-            'com_cm_y':              round(com_y * target_bin_cm, 2),
-            'n_bins':                n_bins_field,
-            'area_cm2':              round(area_cm2, 2),
-            'pct_of_occupied_area':  round(pct_area, 2),
-            'bbox_x_min':            int(bxs.min()),
-            'bbox_x_max':            int(bxs.max()),
-            'bbox_y_min':            int(bys.min()),
-            'bbox_y_max':            int(bys.max()),
-            'bbox_cm_x_min':         round(bxs.min() * target_bin_cm, 2),
-            'bbox_cm_x_max':         round((bxs.max() + 1) * target_bin_cm, 2),
-            'bbox_cm_y_min':         round(bys.min() * target_bin_cm, 2),
-            'bbox_cm_y_max':         round((bys.max() + 1) * target_bin_cm, 2),
-            'bin_coords':            bin_coords_str,
-            'total_occupied_bins':   total_valid_bins,
-            'min_field_size_bins':   min_size_bins,
-            'rate_threshold_hz':     round(rate_threshold, 4),
-            'mean_fr_threshold_hz':  round(mean_fr, 4),
-            'is_centre_field':       False,
-        })
-
-    if centre_field_idx is not None:
-        fields[centre_field_idx]['is_centre_field'] = True
-
-    return fields
-
-
-# ── Field isolation – "threshold method", angular (Circle track) ────────────────
+# ── Field isolation – "threshold method" (MATLAB placefield reference) ─────────
 
 def _circular_runs(qualifies: np.ndarray, n_bins_theta: int) -> list:
     """Contiguous-run labelling of the angular bins where `qualifies` is
     True, wrapping around the theta=0/2*pi seam (bin 0 borders bin
     n_bins_theta-1) since the track is a closed loop. A field is never
     artificially split just because it straddles that arbitrary seam --
-    the circular analogue of the 2-D 8-connected-component search, adapted
-    from the MATLAB reference's visited/getLegals flood fill."""
+    the circular analogue of the old 2-D 8-connected-component search,
+    adapted from the MATLAB reference's visited/getLegals flood fill."""
     if not qualifies.any():
         return []
     if qualifies.all():
@@ -672,15 +436,15 @@ def _circular_runs(qualifies: np.ndarray, n_bins_theta: int) -> list:
     return runs
 
 
-def detect_place_fields_threshold_circular(base_metrics: dict, ctx: dict, target_bin_cm: float) -> list[dict]:
-    """"Threshold method" for the Circle (ring) track: a single-pass
-    contiguous-run detector adapted from the MATLAB `placefield`/`getLegals`
-    reference. A bin only qualifies for a field if its smoothed rate is >=
-    METHOD2_RATE_THRESHOLD_FRAC of the cell's peak rate AND above the cell's
-    mean firing rate; contiguous runs of qualifying angular bins spanning >=
-    MIN_FIELD_SIZE_BINS bins (no discontinuity, wrapping around the theta
-    seam) are reported as fields (peak bin + rate-weighted circular centre
-    of mass, mirroring the reference's `fieldPos`/`centreFieldSize`)."""
+def detect_place_fields_threshold(base_metrics: dict, ctx: dict, target_bin_cm: float) -> list[dict]:
+    """"Threshold method": a single-pass contiguous-run detector adapted
+    from the MATLAB `placefield`/`getLegals` reference. A bin only qualifies
+    for a field if its smoothed rate is >= METHOD2_RATE_THRESHOLD_FRAC of the
+    cell's peak rate AND above the cell's mean firing rate; contiguous runs
+    of qualifying angular bins spanning >= MIN_FIELD_SIZE_BINS bins (no
+    discontinuity, wrapping around the theta seam) are reported as fields
+    (peak bin + rate-weighted circular centre of mass, mirroring the
+    reference's `fieldPos`/`centreFieldSize`)."""
     valid_mask    = ctx['valid_mask']
     fr_smooth     = ctx['fr_smooth']
     n_bins_theta  = ctx['n_bins_theta']
@@ -771,69 +535,15 @@ def detect_place_fields_threshold_circular(base_metrics: dict, ctx: dict, target
     return fields
 
 
-# ── Rate-map + field-boundary plotting – 2-D grid (Open field / Linear track) ───
-
-def _field_mask_from_bin_coords(bin_coords: str, n_bins_x: int, n_bins_y: int) -> np.ndarray:
-    mask = np.zeros((n_bins_x, n_bins_y), dtype=bool)
-    if not bin_coords:
-        return mask
-    for pair in bin_coords.split(';'):
-        bx_str, by_str = pair.split('-')
-        mask[int(bx_str), int(by_str)] = True
-    return mask
-
-
-def _plot_ratemap_with_field_boundaries_2d(ax, fr_smooth: np.ndarray, valid_mask: np.ndarray,
-                                            fields: list[dict], n_bins_x: int, n_bins_y: int, title: str):
-    display_map = np.ma.masked_where(~valid_mask, fr_smooth)
-    im = ax.imshow(display_map.T, origin='lower', cmap='jet', interpolation='nearest')
-
-    for field in fields:
-        field_mask = _field_mask_from_bin_coords(field.get('bin_coords', ''), n_bins_x, n_bins_y)
-        if not field_mask.any():
-            continue
-        ax.contour(field_mask.T.astype(float), levels=[0.5], colors='black', linewidths=1.5)
-
-    ax.set_title(title)
-    ax.set_xlabel('x bin')
-    ax.set_ylabel('y bin')
-    return im
-
-
-def _save_field_ratemap_plot_2d(ctx: dict, fields_threshold: list[dict], ntt_path: str):
-    """Saves one PNG per .ntt file: rate map with detected-field boundaries
-    (black outlines) from the threshold method."""
-    fr_smooth  = ctx['fr_smooth']
-    valid_mask = ctx['valid_mask']
-    n_bins_x   = ctx['n_bins_x']
-    n_bins_y   = ctx['n_bins_y']
-
-    fig = Figure(figsize=(6, 6))
-    canvas = FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
-
-    im = _plot_ratemap_with_field_boundaries_2d(ax, fr_smooth, valid_mask, fields_threshold,
-                                                 n_bins_x, n_bins_y,
-                                                 f'Threshold method ({len(fields_threshold)} field(s))')
-    fig.colorbar(im, ax=ax, label='Hz')
-    fig.tight_layout()
-
-    ntt_name  = os.path.splitext(os.path.basename(ntt_path))[0]
-    save_dir  = os.path.join(os.path.dirname(ntt_path), 'ratemap_field_plots')
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'{ntt_name}_ratemap_fields.png')
-    fig.savefig(save_path, dpi=150)
-
-
-# ── Rate-map + field-boundary plotting – angular (Circle track) ─────────────────
+# ── Rate-map + field-boundary plotting ──────────────────────────────────────────
 
 _FIELD_COLORS = ['tab:red', 'tab:green', 'tab:purple', 'tab:orange',
                   'tab:brown', 'tab:pink', 'tab:cyan', 'tab:olive']
 
 
-def _plot_ratemap_polar(ax, fr_smooth: np.ndarray, valid_mask: np.ndarray,
-                         fields: list[dict], n_bins_theta: int,
-                         bin_width_rad: float, title: str):
+def _plot_ratemap_with_field_boundaries(ax, fr_smooth: np.ndarray, valid_mask: np.ndarray,
+                                         fields: list[dict], n_bins_theta: int,
+                                         bin_width_rad: float, title: str):
     """Plots the 1-D angular rate map as a polar tuning curve, so the ring
     track renders as an actual ring: theta=0 and theta=2*pi coincide in
     physical space, so a field that straddles that seam still appears as one
@@ -863,74 +573,21 @@ def _plot_ratemap_polar(ax, fr_smooth: np.ndarray, valid_mask: np.ndarray,
         ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1), fontsize=7)
 
 
-def _plot_ratemap_ring(ax, fr_smooth: np.ndarray, valid_mask: np.ndarray,
-                        fields: list[dict], n_bins_theta: int, bin_width_rad: float,
-                        r_min: float, r_max: float, title: str):
-    """Plots the 1-D angular rate map as a binned heatmap in an actual ring
-    shape (an annulus spanning the track's fitted radial extent, r_min to
-    r_max), the angular analogue of the 2-D grid's imshow rate map. Each
-    angular bin is one wedge of the ring, colour-coded by its smoothed rate;
-    the polar r-axis is forced to start at 0 so the empty disc inside r_min
-    renders as the ring's hole. Detected fields are outlined in black, the
-    same way field boundaries are contoured on the 2-D grid."""
-    theta_edges = np.arange(n_bins_theta + 1) * bin_width_rad
-    r_edges = np.array([r_min, r_max])
-    theta_mesh, r_mesh = np.meshgrid(theta_edges, r_edges)
-
-    rates = np.ma.masked_where(~valid_mask, fr_smooth).reshape(1, n_bins_theta)
-    mesh = ax.pcolormesh(theta_mesh, r_mesh, rates, cmap='jet', shading='flat')
-
-    theta_centers = (np.arange(n_bins_theta) + 0.5) * bin_width_rad
-    theta_ext = np.concatenate([theta_centers, theta_centers[:1] + 2.0 * np.pi])
-    track_width = max(r_max - r_min, 1e-6)
-    pad = min(0.15 * track_width, r_min) if r_min > 0 else 0.15 * track_width
-    r_centers = np.array([r_min - pad, r_min, r_max, r_max + pad])
-
-    for field in fields:
-        bin_coords = field.get('bin_coords', '')
-        if not bin_coords:
-            continue
-        bts = [int(b) for b in bin_coords.split(';')]
-        field_row = np.zeros(n_bins_theta)
-        field_row[bts] = 1.0
-        mask_2d = np.vstack([np.zeros(n_bins_theta), field_row, field_row, np.zeros(n_bins_theta)])
-        mask_ext = np.concatenate([mask_2d, mask_2d[:, :1]], axis=1)
-        theta_c, r_c = np.meshgrid(theta_ext, r_centers)
-        ax.contour(theta_c, r_c, mask_ext, levels=[0.5], colors='black', linewidths=1.5)
-
-    ax.set_title(title)
-    ax.set_theta_zero_location('E')
-    ax.set_theta_direction(1)
-    ax.set_ylim(0, r_max * 1.1)
-    ax.set_yticklabels([])
-    return mesh
-
-
-def _save_field_ratemap_plot_circular(ctx: dict, fields_threshold: list[dict], ntt_path: str):
-    """Saves one PNG per .ntt file: the polar angular tuning curve with
-    detected-field markers, alongside the binned rate map rendered as an
-    actual ring (angular bins, field boundaries outlined) -- the angular
-    analogue of the imshow rate map used for the Open field / Linear track."""
+def _save_field_ratemap_plot(ctx: dict, fields_threshold: list[dict], ntt_path: str):
+    """Saves one PNG per .ntt file: polar angular rate map with detected-field
+    markers from the threshold method."""
     fr_smooth     = ctx['fr_smooth']
     valid_mask    = ctx['valid_mask']
     n_bins_theta  = ctx['n_bins_theta']
     bin_width_rad = ctx['bin_width_rad']
-    r_min         = ctx['r_min']
-    r_max         = ctx['r_max']
 
-    fig = Figure(figsize=(12, 6.5))
+    fig = Figure(figsize=(6.5, 6.5))
     canvas = FigureCanvasAgg(fig)
-    ax_line = fig.add_subplot(121, projection='polar')
-    ax_ring = fig.add_subplot(122, projection='polar')
+    ax = fig.add_subplot(111, projection='polar')
 
-    _plot_ratemap_polar(ax_line, fr_smooth, valid_mask, fields_threshold,
-                         n_bins_theta, bin_width_rad,
-                         f'Threshold method ({len(fields_threshold)} field(s))')
-    im = _plot_ratemap_ring(ax_ring, fr_smooth, valid_mask, fields_threshold,
-                             n_bins_theta, bin_width_rad, r_min, r_max,
-                             'Binned rate map (ring)')
-    fig.colorbar(im, ax=ax_ring, label='Hz', fraction=0.046, pad=0.1)
-
+    _plot_ratemap_with_field_boundaries(ax, fr_smooth, valid_mask, fields_threshold,
+                                         n_bins_theta, bin_width_rad,
+                                         f'Threshold method ({len(fields_threshold)} field(s))')
     fig.tight_layout()
 
     ntt_name  = os.path.splitext(os.path.basename(ntt_path))[0]
@@ -964,43 +621,28 @@ def _run_job(args):
     ntt_path     = os.path.join(dirpath, ntt_file)
     pct          = 100 * unit_idx / total_units
 
-    try:
-        arena_type = _detect_arena_type(dirpath)
-    except ValueError as e:
-        with _print_lock:
-            print(f'  ERROR determining arena type for {ntt_file}: {e}')
-        return session_name, ntt_file, 'Unknown', [], {'error': str(e)}
-
-    arena_width_cm = ARENA_WIDTH_CM[arena_type]
-
     with _print_lock:
-        print(f'[{unit_idx}/{total_units}  {pct:.1f}%]  {session_name}  |  {ntt_file}  |  arena={arena_type}  (GPU {_gpu_util_pct()}%)')
+        print(f'[{unit_idx}/{total_units}  {pct:.1f}%]  {session_name}  |  {ntt_file}  (GPU {_gpu_util_pct()}%)')
 
     try:
-        base_metrics, ctx = build_ratemap(csv_path, ntt_path, arena_width_cm, target_bin_cm, arena_type)
+        base_metrics, ctx = build_ratemap(csv_path, ntt_path, arena_width_cm, target_bin_cm)
     except Exception as e:
         with _print_lock:
             print(f'  ERROR building rate map for {ntt_file}: {e}')
-        return session_name, ntt_file, arena_type, [], {'error': str(e)}
+        return session_name, ntt_file, [], {'error': str(e)}
 
     if not ctx or not ctx.get('valid_mask', np.array([])).any():
-        return session_name, ntt_file, arena_type, [], {'error': 'no valid occupancy / tracking data'}
+        return session_name, ntt_file, [], {'error': 'no valid occupancy / tracking data'}
 
     try:
-        if arena_type == 'Circle':
-            fields_threshold = detect_place_fields_threshold_circular(base_metrics, ctx, target_bin_cm)
-        else:
-            fields_threshold = detect_place_fields_threshold_2d(base_metrics, ctx, target_bin_cm)
+        fields_threshold = detect_place_fields_threshold(base_metrics, ctx, target_bin_cm)
     except Exception as e:
         with _print_lock:
             print(f'  ERROR detecting fields (threshold method) in {ntt_file}: {e}')
-        return session_name, ntt_file, arena_type, [], {'error': str(e)}
+        return session_name, ntt_file, [], {'error': str(e)}
 
     try:
-        if arena_type == 'Circle':
-            _save_field_ratemap_plot_circular(ctx, fields_threshold, ntt_path)
-        else:
-            _save_field_ratemap_plot_2d(ctx, fields_threshold, ntt_path)
+        _save_field_ratemap_plot(ctx, fields_threshold, ntt_path)
     except Exception as e:
         with _print_lock:
             print(f'  ERROR saving rate-map/field plot for {ntt_file}: {e}')
@@ -1012,7 +654,7 @@ def _run_job(args):
         'base_peak_fr':  base_metrics.get('peak_fr'),
         'base_mean_fr':  base_metrics.get('mean_fr'),
     }
-    return session_name, ntt_file, arena_type, fields_threshold, summary
+    return session_name, ntt_file, fields_threshold, summary
 
 
 # ── Batch scan ────────────────────────────────────────────────────────────────
@@ -1057,17 +699,7 @@ if __name__ == "__main__":
 
     # ── Write Excel ────────────────────────────────────────────────────────────
 
-    field_columns_2d = [
-        'field_number', 'peak_bin_x', 'peak_bin_y', 'peak_fr_hz',
-        'com_bin_x', 'com_bin_y', 'com_cm_x', 'com_cm_y',
-        'n_bins', 'area_cm2', 'pct_of_occupied_area',
-        'bbox_x_min', 'bbox_x_max', 'bbox_y_min', 'bbox_y_max',
-        'bbox_cm_x_min', 'bbox_cm_x_max', 'bbox_cm_y_min', 'bbox_cm_y_max',
-        'bin_coords', 'total_occupied_bins', 'min_field_size_bins',
-        'rate_threshold_hz', 'mean_fr_threshold_hz', 'is_centre_field',
-    ]
-
-    field_columns_circular = [
+    field_columns_threshold = [
         'field_number', 'peak_bin_theta', 'peak_theta_deg', 'peak_fr_hz',
         'com_theta_deg', 'n_bins', 'arc_length_cm', 'track_width_cm',
         'area_cm2', 'pct_of_occupied_area', 'pct_of_track_circumference',
@@ -1084,7 +716,7 @@ if __name__ == "__main__":
     summary_rows = []
     sorted_results = sorted(results, key=lambda r: (r[0], r[1]))
 
-    for session_name, ntt_file, arena_type, fields_threshold, summary in sorted_results:
+    for session_name, ntt_file, fields_threshold, summary in sorted_results:
         sheet_name = _safe_sheet_name(os.path.splitext(ntt_file)[0], used_sheet_names)
 
         areas_thr = [f['area_cm2'] for f in fields_threshold]
@@ -1093,7 +725,6 @@ if __name__ == "__main__":
         summary_rows.append({
             'session': session_name,
             'unit': ntt_file,
-            'arena_type': arena_type,
             'sheet_name': sheet_name,
             'n_fields_detected': len(fields_threshold),
             'field_areas_cm2':  '; '.join(f'{a:.2f}' for a in areas_thr),
@@ -1109,7 +740,7 @@ if __name__ == "__main__":
         })
 
     summary_columns = [
-        'session', 'unit', 'arena_type', 'sheet_name', 'n_fields_detected',
+        'session', 'unit', 'sheet_name', 'n_fields_detected',
         'field_areas_cm2', 'field_pct_areas',
         'total_field_area_cm2', 'total_pct_area_occupied',
         'n_spikes', 'base_sir', 'base_sparsity', 'base_peak_fr', 'base_mean_fr', 'error',
@@ -1119,13 +750,12 @@ if __name__ == "__main__":
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         df_summary.to_excel(writer, sheet_name='Summary', index=False)
 
-        for (session_name, ntt_file, arena_type, fields_threshold, summary), row in zip(sorted_results, summary_rows):
+        for (session_name, ntt_file, fields_threshold, summary), row in zip(sorted_results, summary_rows):
             sheet_name = row['sheet_name']
-            columns = field_columns_circular if arena_type == 'Circle' else field_columns_2d
             if fields_threshold:
-                df_thr = pd.DataFrame(fields_threshold, columns=columns)
+                df_thr = pd.DataFrame(fields_threshold, columns=field_columns_threshold)
             else:
-                df_thr = pd.DataFrame(columns=columns)
+                df_thr = pd.DataFrame(columns=field_columns_threshold)
             df_thr.to_excel(writer, sheet_name=sheet_name, index=False)
 
     print(f'\nDone. Results saved to {output_excel}')
