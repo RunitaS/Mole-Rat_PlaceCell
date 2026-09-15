@@ -107,6 +107,7 @@
 ##### Theta osccillations in the hippocampus
 - Generation of theta from MS-DBB and MEC inputs
 - Instrinsic theta due to recurrent network
+- MS cholinergic septal inputs to hippocampal interneurons (predominantly GABAergic)
 
 ##### Spike-LFP coupling in hippocampus
 - Inputs from areas such as the MEC and MS along with intrinsic synchronus population activity within the CA1 region is known to give rise ot a promiment oscillation in peaking at 8Hz during periods of mobility known as the theta rhythm.

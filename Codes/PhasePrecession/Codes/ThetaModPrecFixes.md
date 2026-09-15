@@ -1,14 +1,25 @@
 # Theta Mod Prec Fixes
 
-- [x] < Major fix:> ** Slope stats are way too strict. CHeck what Aditi used in her paper.** *Used Wang et.al.'s Pearson method.*
-
-- [x] ** Try using higher order of Butterworth.** *NotReq. Already sosfiltfilt is doubling the order from 4th to 8th.*
+- [ ] <Major fix:> **Slope stats are way too strict. CHeck what Aditi used in her paper.** *Used Wang et.al.'s Pearson method. Didn't solve the problem. Too many phase locked place cells. Something changed after modification were applied to GPA.*
 
 - [ ] <Major fix:> **LFP signal is not detrended. Huge slow drift amp present in signal. Phase values will be wrong irrepective of the transform used.**
 
-- [x] ** Use wavelet transform instead of interpolation to assign instantaneous phase and power to theta trace.** *Used GPA intead.*
-
 - [ ] **<Major fix:> Add only significant theta epochs for phase precession>** *not necessarily if you prove theta is continuos durin awake state irrespective of locomotion state. Try runnig phase rpecession with different high pass velocity filters intread (no high pass, high pass = 1cm/sec, high pass = 4cm/sec).*
+
+- [ ] **Detect TMI peaks for all theta modulated cells. Compare phase across pooled place cells.** *Make sure you run it on LFO matched spike files.*
+
+- [ ] **Cross check if pass index code is executed according to Climer's code. Description in MEC paper does not match python code. Could be because of method used for grid cells,**
+
+- [ ] **Currently there are considerable number of phase processing cells. Check for forward vs backward phase precession to remove the possibility of these being entry through butt.** *Not doable until Nauman is done with his analysis.*
+
+- [ ] **Neurons could be theta phase rolling instead of processing.** *Net phase relationship is different from instantaneous relationship.*
+<Cross check with Aditi's phase precession code>
+
+- [x] ** Go through the condition for significant slope**
+
+- [x] ** Try using higher order of Butterworth.** *NotReq. Already sosfiltfilt is doubling the order from 4th to 8th.*
+
+- [x] ** Use wavelet transform instead of interpolation to assign instantaneous phase and power to theta trace.** *Used GPA intead.*
 
 - [x] < Major fix:> ** Stats are wrong. Steeper slopes show no signif phase precession. flat ones do. Mostly dpendent on spike numbers.**
 
@@ -24,17 +35,6 @@ Bug 3 (secondary, per your go-ahead): slope_deg_per_pass used rad2deg(2π·s), w
 *Verified the fix against simulated spikes with known ground-truth slopes: slope recovery went from essentially random to accurate, and significance now tracks true signal strength/spike count instead of being inverted. This will change which cells your pipeline calls significantly precessing/recessing (previously-flagged "flat but significant" cells will likely lose significance, and genuinely steep cells should gain it) — you'll want to re-run the pipeline to regenerate theta_phase.xlsx before drawing conclusions from it. I left ThetaModPrecFixes.md's corresponding TODO item unchecked since I didn't touch that file — let me know if you'd like me to check it off.*
 
 - [x] < Major fix:> ** Change field threshold from 10% to 20%.**
-
-- [ ] **Cross check if pass index code is executed according to Climer's code. Description in MEC paper does not match python code. Could be because of method used for grid cells,**
-
-- [ ] **Currently there are considerable number of phase processing cells. Check for forward vs backward phase precession to remove the possibility of these being entry through butt.** *Not doable until Nauman is done with his analysis.*
-
-- [ ] **Neurons could be theta phase rolling instead of processing.** *Net phase relationship is different from instantaneous relationship.*
-<Cross check with Aditi's phase precession code>
-
-- [ ] **Cross check procesion code with Hemanya's code.**
-
-- [ ] **Go through the condition for significant slope**
 
 
 
