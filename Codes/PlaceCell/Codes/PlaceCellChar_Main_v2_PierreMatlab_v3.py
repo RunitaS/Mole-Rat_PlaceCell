@@ -13,14 +13,12 @@ min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
 
-MAX_GPU_UTIL_PCT = 60          # if GPU is available, wait until GPU utilization drops below this percentage before starting each bootstrap to prevent overload (set to 0 to disable waiting)
 MAX_WORKERS      = 4
 """
 
 import os
 import shutil
 import threading
-import time
 import concurrent.futures
 import types
 import random
@@ -28,8 +26,12 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import convolve, gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr, t as _t_dist
+
+# np.trapz was removed in NumPy 2.0 in favour of np.trapezoid (deprecated
+# alias before that); support either version of numpy.
+_trapz = getattr(np, 'trapezoid', None) or np.trapz
 
 # Thread-safe Matplotlib imports for parallel rendering
 from matplotlib.figure import Figure
@@ -83,35 +85,10 @@ class _Metrics(TypedDict, total=False):
     unit:            str
     job_order:       int
 
-# ── GPU availability ──────────────────────────────────────────────────────────
+# ── GPU status (for progress printing only) ────────────────────────────────────
 
 if TYPE_CHECKING:
-    import cupy as cp                                          # type: ignore
-    from cupyx.scipy.ndimage import convolve as cp_convolve    # type: ignore
     import pynvml                                              # type: ignore
-
-try:
-    import cupy as cp                                          # type: ignore[import-untyped]
-    from cupyx.scipy.ndimage import convolve as cp_convolve    # type: ignore[import-untyped]
-    # Validate that CUDA JIT (nvrtc) actually works before committing to GPU mode
-    _t = cp.zeros((3, 3), dtype=cp.float64)
-    _k = cp.ones((3, 3), dtype=cp.float64) / 9.0
-    cp_convolve(_t, _k, mode='constant')
-    del _t, _k
-    _GPU = True
-    print("CuPy detected – GPU (CUDA) acceleration enabled.")
-except ImportError:
-    cp          = types.SimpleNamespace()                      # type: ignore[assignment]
-    # Assign dummy lambda to prevent "None cannot be called" Pylance errors
-    cp_convolve = lambda *args, **kwargs: None                 # type: ignore[assignment]
-    _GPU = False
-    print("CuPy not found – running on CPU (install cupy-cuda12x to enable GPU).")
-except Exception as _gpu_err:
-    # CuPy imported but CUDA JIT unavailable (e.g. missing nvrtc*.dll)
-    cp          = types.SimpleNamespace()                      # type: ignore[assignment]
-    cp_convolve = lambda *args, **kwargs: None                 # type: ignore[assignment]
-    _GPU = False
-    print(f"CuPy found but GPU JIT unavailable ({_gpu_err}) – falling back to CPU.")
 
 try:
     import pynvml                                              # type: ignore[import-untyped]
@@ -136,7 +113,7 @@ def _gpu_util_pct() -> int:
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 root_folder  = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059/FixedBin'
-output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059/FixedBin/Test_FixedBin.xlsx'
+output_excel = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True_v2/Fa1059/FixedBin/Test_KDE.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
@@ -174,7 +151,6 @@ SPEED_MOD_DOWNSAMPLE_FACTOR = 1   # downsample tracking for speed-modulation ana
                                    # frame base (rest of the pipeline, e.g. SIR/ratemap, is
                                    # unaffected and still uses the native-rate tracking).
 
-MAX_GPU_UTIL_PCT = 60
 MAX_WORKERS      = 4
 
 # 'pixel' or 'cm' – set interactively at startup (see __main__ below).
@@ -183,13 +159,13 @@ MAX_WORKERS      = 4
 #           y (cm) in column E – used directly, no pixel→cm conversion.
 COORD_UNITS = 'cm'
 
-_gpu_semaphore = threading.Semaphore(2)
-
-# Hockeimer et al. 2025 (eLife 85599): ratemaps binned at 10 px (2.1 cm) per
-# bin, smoothed with a Gaussian kernel of sigma = 1.5 bins. Stored here as a
-# physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
-# bin size (target_bin_cm) this script is run with.
-GAUSSIAN_SIGMA_CM = 4 #1.5 * 2.1
+# MATLAB Fig1a_RateMaps_mat/ratemap_gaussian.m + rate_estimator.m (CBM
+# toolbox, June 2011): ratemap is a continuous, edge-corrected Gaussian KDE
+# evaluated at each grid point, not a binned histogram + post-hoc blur.
+# Bandwidth h = KDE_SMOOTH_FACTOR * bin_cm, matching MATLAB's literal
+# `h = smooth_factor*binWidth` (smooth_factor = 5 in the calling script,
+# TestScriptNeuraMat_runita.m) applied to this script's own bin size.
+KDE_SMOOTH_FACTOR = 5
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),
@@ -215,60 +191,83 @@ def _animal_relpath(dirpath: str) -> str | None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _wait_for_gpu_slot(poll_interval: float = 0.5):
-    if not _GPU or not _NVML:
-        return
-    while _gpu_util_pct() >= MAX_GPU_UTIL_PCT:
-        time.sleep(poll_interval)
-
-
-def _gaussian_kernel(sigma_bins: float) -> np.ndarray:
-    """2D Gaussian kernel, sigma given in bins, truncated at 3 sigma."""
-    radius = max(1, int(np.ceil(3 * sigma_bins)))
-    ax = np.arange(-radius, radius + 1)
-    xx, yy = np.meshgrid(ax, ax, indexing='ij')
-    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma_bins ** 2))
-    kernel /= kernel.sum()
-    return kernel
-
-
-def _gaussian_smooth(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
+def _gaussian_kernel_2d(dx: np.ndarray, dy: np.ndarray) -> np.ndarray:
+    """Isotropic bivariate Gaussian kernel (MATLAB CBM toolbox's
+    gaussian_kernel.m -- not itself checked into the repo, but standard for
+    this toolbox). Callers pre-scale dx, dy by 1/h (invh), so h carries the
+    kernel's std in the original (cm) units; the overall normalising
+    constant cancels in the conv_sum/edge_corrector ratio below regardless.
     """
-    Apply Gaussian smoothing restricted to valid bins.
-    Edge effects corrected by dividing the convolved rates by the convolved mask.
+    return (1.0 / (2.0 * np.pi)) * np.exp(-0.5 * (dx * dx + dy * dy))
+
+
+def _kde_edge_corrector(bin_centers_x: np.ndarray, bin_centers_y: np.ndarray,
+                         pos_x: np.ndarray, pos_y: np.ndarray, pos_t_ms: np.ndarray,
+                         invh: float) -> np.ndarray:
+    """Time-integral of the Gaussian kernel over the whole occupancy trace, at
+    every ratemap grid point -- ports MATLAB rate_estimator.m's
+    `edge_corrector = trapz(posts, gaussian_kernel(...))`.
+
+    Depends only on the position trajectory, never on spikes, so
+    _run_bootstrap computes this once per cell and reuses it for every
+    location-shuffle instead of recomputing it N_BOOTSTRAP times.
     """
-    sigma_bins = GAUSSIAN_SIGMA_CM / bin_cm
-    kernel = _gaussian_kernel(sigma_bins)
+    n_x, n_y = len(bin_centers_x), len(bin_centers_y)
+    edge = np.empty((n_x, n_y), dtype=np.float64)
+    dy_all = (pos_y[None, :] - bin_centers_y[:, None]) * invh   # (n_y, n_pos)
+    for ix, gx in enumerate(bin_centers_x):
+        dx = (pos_x - gx) * invh                                 # (n_pos,)
+        kernel = _gaussian_kernel_2d(dx[None, :], dy_all)        # (n_y, n_pos)
+        edge[ix, :] = _trapz(kernel, pos_t_ms, axis=1)
+    return edge
 
-    fr_in   = np.where(valid_mask, fr_map, 0.0)
-    mask_in = valid_mask.astype(np.float64)
 
-    if _GPU:
-        fr_gpu   = cp.asarray(fr_in, dtype=cp.float64)
-        mask_gpu = cp.asarray(mask_in, dtype=cp.float64)
-        kern_gpu = cp.asarray(kernel, dtype=cp.float64)
-        _wait_for_gpu_slot()
-        _gpu_semaphore.acquire()
-        try:
-            smoothed_fr = cp.asnumpy(
-                cp_convolve(fr_gpu, kern_gpu, mode='constant', cval=0.0)
-            )
-            smoothed_weights = cp.asnumpy(
-                cp_convolve(mask_gpu, kern_gpu, mode='constant', cval=0.0)
-            )
-        finally:
-            _gpu_semaphore.release()
-    else:
-        smoothed_fr      = convolve(fr_in,   kernel, mode='constant', cval=0.0)
-        smoothed_weights = convolve(mask_in, kernel, mode='constant', cval=0.0)
+def _kde_conv_sum(bin_centers_x: np.ndarray, bin_centers_y: np.ndarray,
+                   spk_x: np.ndarray, spk_y: np.ndarray, invh: float) -> np.ndarray:
+    """Sum of Gaussian kernel weights at the spike locations, at every
+    ratemap grid point -- ports MATLAB rate_estimator.m's `conv_sum`.
+    """
+    n_x, n_y = len(bin_centers_x), len(bin_centers_y)
+    conv = np.empty((n_x, n_y), dtype=np.float64)
+    dy_all = (spk_y[None, :] - bin_centers_y[:, None]) * invh   # (n_y, n_spikes)
+    for ix, gx in enumerate(bin_centers_x):
+        dx = (spk_x - gx) * invh                                 # (n_spikes,)
+        kernel = _gaussian_kernel_2d(dx[None, :], dy_all)        # (n_y, n_spikes)
+        conv[ix, :] = kernel.sum(axis=1)
+    return conv
 
-    # Correct edge effects by normalizing by gathered weights
-    smoothed = np.zeros_like(smoothed_fr)
-    valid_weights = smoothed_weights > 0
-    smoothed[valid_weights] = smoothed_fr[valid_weights] / smoothed_weights[valid_weights]
 
-    smoothed[~valid_mask] = 0.0
-    return smoothed
+def _kde_ratemap(spk_x: np.ndarray, spk_y: np.ndarray,
+                  pos_x: np.ndarray, pos_y: np.ndarray,
+                  pos_t_us: 'np.ndarray | None',
+                  bin_centers_x: np.ndarray, bin_centers_y: np.ndarray, h: float,
+                  edge_corrector: 'np.ndarray | None' = None) -> np.ndarray:
+    """Continuous, edge-corrected Gaussian KDE firing-rate map. Ports MATLAB
+    Fig1a_RateMaps_mat/ratemap_gaussian.m + rate_estimator.m (CBM toolbox,
+    June 2011) directly -- rather than binning spikes into a histogram and
+    applying a post-hoc Gaussian blur -- the rate at each grid point (x,y) is
+
+        r(x,y) = conv_sum(x,y) / (edge_corrector(x,y) + 1e-4) + 1e-4
+
+    where conv_sum is the sum of a Gaussian kernel of bandwidth h (cm)
+    evaluated at every spike location, and edge_corrector is that same
+    kernel's time-integral over the whole position trace (trapz), correcting
+    for uneven/edge occupancy. Internally mirrors MATLAB's millisecond time
+    convention (posts in ms, final rate then x1000) so the 1e-4 regulariser
+    matches the original constant; the map returned here is already in Hz.
+
+    `edge_corrector`, if supplied, is reused as-is instead of being
+    recomputed from pos_x/pos_y/pos_t_us -- see _kde_edge_corrector's
+    docstring (used by the location-shuffling bootstrap).
+    """
+    invh = 1.0 / h
+    if edge_corrector is None:
+        pos_t_ms = pos_t_us * 1e-3
+        edge_corrector = _kde_edge_corrector(bin_centers_x, bin_centers_y,
+                                              pos_x, pos_y, pos_t_ms, invh)
+    conv_sum = _kde_conv_sum(bin_centers_x, bin_centers_y, spk_x, spk_y, invh)
+    rate_per_ms = conv_sum / (edge_corrector + 1e-4) + 1e-4
+    return rate_per_ms * 1000.0
 
 
 # ── Theta modulation ──────────────────────────────────────────────────────────
@@ -980,17 +979,21 @@ def _compute_speed_modulation(
 
 def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd: int,
                               beh_bx: np.ndarray, beh_by: np.ndarray,
+                              x_cm: np.ndarray, y_cm: np.ndarray,
                               occ_map: np.ndarray, valid_mask: np.ndarray,
-                              n_bins_x: int, n_bins_y: int) -> tuple[float, float]:
+                              n_bins_x: int, n_bins_y: int,
+                              bin_centers_x: np.ndarray, bin_centers_y: np.ndarray,
+                              kde_h: float, edge_corrector: np.ndarray) -> tuple[float, float]:
     """Compute SIR and spatial coherence from the same location-shuffled spike
     train after circularly shifting the position time series by `rnd` frames.
     Spike-to-frame assignments are kept fixed; only the location at each frame
     changes. Equivalent to MATLAB: locs_rand = [locs(rnd:end); locs(1:rnd-1)]
 
-    Both metrics are derived from the single shuffled rate map built here
-    (fr_raw feeds both SIR and coherence directly) so that each bootstrap
-    iteration only needs one shuffled spike train, matching the real-data
-    pipeline where both SIR and coherence use the non-smoothed map.
+    SIR uses the raw (unsmoothed) binned histogram ratio, matching the
+    real-data SIR. Coherence uses the continuous KDE ratemap (_kde_ratemap),
+    matching the real-data coherence; `edge_corrector` is precomputed once by
+    the caller (_run_bootstrap) since it depends only on the (unshuffled)
+    occupancy trace, not on which frame each spike is attributed to.
     """
     n_frames   = len(beh_bx)
     shuf_frame = (spike_frame_indices + rnd) % n_frames
@@ -1013,7 +1016,11 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
         ratio   = ri_flat[nonzero] / r_mean
         sir     = float(np.sum(pi_flat[nonzero] * ratio * np.log2(ratio)))
 
-    coherence = _compute_coherence(fr_raw, valid_mask, n_bins_x, n_bins_y)
+    fr_smooth = _kde_ratemap(x_cm[shuf_frame], y_cm[shuf_frame], x_cm, y_cm, None,
+                              bin_centers_x, bin_centers_y, kde_h,
+                              edge_corrector=edge_corrector)
+    fr_smooth[~valid_mask] = 0.0
+    coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
 
     return sir, coherence
 
@@ -1025,8 +1032,10 @@ _NULL_COHERENCE_BOOTSTRAP = {'coherence_bootstrap_mean': float('nan'),
 
 def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
                    beh_bx: np.ndarray, beh_by: np.ndarray,
+                   x_cm: np.ndarray, y_cm: np.ndarray,
                    occ_map: np.ndarray, valid_mask: np.ndarray,
                    n_bins_x: int, n_bins_y: int,
+                   bin_centers_x: np.ndarray, bin_centers_y: np.ndarray, kde_h: float,
                    real_sir: float, real_coherence: float, ntt_path: str,
                    label: str = '') -> dict:
     """Location-shuffling bootstrap (matches MATLAB calcSI_v3_locshuf).
@@ -1039,7 +1048,9 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     SIR and spatial coherence share the same N_BOOTSTRAP shuffled spike trains
     (one shuffle per iteration feeds both metrics via
     `_sir_and_coherence_from_spikes_locshuf`) rather than running two separate
-    bootstraps, halving the shuffle-generation cost.
+    bootstraps, halving the shuffle-generation cost. Coherence's KDE
+    edge_corrector depends only on the (unshuffled) occupancy trace, so it is
+    computed once here, outside the loop, and reused for every shuffle.
     """
     if len(spike_frame_indices) == 0:
         return {'bootstrap_mean': float('nan'),
@@ -1056,15 +1067,19 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
                 'bootstrap_sig':  None,
                 **_NULL_COHERENCE_BOOTSTRAP}
 
+    edge_corrector = _kde_edge_corrector(bin_centers_x, bin_centers_y,
+                                          x_cm, y_cm, t * 1e-3, 1.0 / kde_h)
+
     sir_i = np.zeros(N_BOOTSTRAP, dtype=np.float64)
     coh_i = np.zeros(N_BOOTSTRAP, dtype=np.float64)
     for i in range(N_BOOTSTRAP):
         rnd  = random.randint(MARGIN_FRAMES, n_frames - MARGIN_FRAMES)
         sir_i[i], coh_i[i] = _sir_and_coherence_from_spikes_locshuf(
             spike_frame_indices, rnd,
-            beh_bx, beh_by,
+            beh_bx, beh_by, x_cm, y_cm,
             occ_map, valid_mask,
-            n_bins_x, n_bins_y)
+            n_bins_x, n_bins_y,
+            bin_centers_x, bin_centers_y, kde_h, edge_corrector)
 
     bootstrap_mean = float(np.mean(sir_i))
     bootstrap_p95  = float(np.percentile(sir_i, 95))
@@ -1367,9 +1382,9 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, valid_mask: np.ndarray,
     print(f'  [SAVED] {save_path}')
 
 
-def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
+def _compute_coherence(fr_map: np.ndarray, valid_mask: np.ndarray,
                        n_bins_x: int, n_bins_y: int) -> float:
-    """Spatial coherence: correlation of each bin's non-smoothed rate with the
+    """Spatial coherence: correlation of each bin's rate (from `fr_map`) with the
     mean rate of its (up to 8) occupied neighbours, Fisher Z-transformed.
     """
     valid_idx    = np.argwhere(valid_mask)
@@ -1377,7 +1392,7 @@ def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
     fr_nbr_means = []
     for bx, by in valid_idx:
         nbr_vals = [
-            fr_raw[bx + dx, by + dy]
+            fr_map[bx + dx, by + dy]
             for dx in (-1, 0, 1) for dy in (-1, 0, 1)
             if not (dx == 0 and dy == 0)
             and 0 <= bx + dx < n_bins_x
@@ -1385,7 +1400,7 @@ def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
             and valid_mask[bx + dx, by + dy]
         ]
         if nbr_vals:
-            fr_bin_vals.append(fr_raw[bx, by])
+            fr_bin_vals.append(fr_map[bx, by])
             fr_nbr_means.append(float(np.mean(nbr_vals)))
 
     if len(fr_bin_vals) > 2:
@@ -1542,7 +1557,15 @@ def compute_metrics(csv_path: str, ntt_path: str,
     fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
 
     # ── 7. Smoothed firing rate map ───────────────────────────────────────────
-    fr_smooth = _gaussian_smooth(fr_raw, valid_mask, target_bin_cm)
+    # Continuous, edge-corrected Gaussian KDE (ports MATLAB ratemap_gaussian.m
+    # + rate_estimator.m) evaluated at this grid's bin centres, rather than a
+    # binned histogram followed by a post-hoc Gaussian blur.
+    bin_centers_x = (np.arange(n_bins_x) + 0.5) * target_bin_cm
+    bin_centers_y = (np.arange(n_bins_y) + 0.5) * target_bin_cm
+    kde_h = KDE_SMOOTH_FACTOR * target_bin_cm
+    fr_smooth = _kde_ratemap(x_cm[spike_frame], y_cm[spike_frame], x_cm, y_cm, t,
+                              bin_centers_x, bin_centers_y, kde_h)
+    fr_smooth[~valid_mask] = 0.0
 
     # ── 8. Compute metrics ────────────────────────────────────────────────────
     ctx = dict(spike_ts=spike_ts[valid_spike], spike_frame=spike_frame, t=t,
@@ -1550,7 +1573,8 @@ def compute_metrics(csv_path: str, ntt_path: str,
                beh_bx=beh_bx, beh_by=beh_by,
                occ_map=occ_map, valid_mask=valid_mask,
                dt_frames=dt_frames,
-               n_bins_x=n_bins_x, n_bins_y=n_bins_y)
+               n_bins_x=n_bins_x, n_bins_y=n_bins_y,
+               bin_centers_x=bin_centers_x, bin_centers_y=bin_centers_y)
 
     if not valid_mask.any():
         return ({'n_spikes': n_spikes, 'n_discarded': n_discarded,
@@ -1578,8 +1602,8 @@ def compute_metrics(csv_path: str, ntt_path: str,
     spar_den = float(np.sum(pi_flat * ri_flat ** 2))
     sparsity = float((spar_num ** 2) / spar_den) if spar_den > 0 else 0.0
 
-    # Spatial coherence: non-smoothed map vs 8-neighbour mean (Fisher Z)
-    coherence = _compute_coherence(fr_raw, valid_mask, n_bins_x, n_bins_y)
+    # Spatial coherence: smoothed map vs 8-neighbour mean (Fisher Z)
+    coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
 
     metrics = {
         'n_spikes':    n_spikes,
@@ -1659,7 +1683,9 @@ def _run_job(args):
             try:
                 bootst = _run_bootstrap(
                     ctx['spike_frame'], ctx['t'], ctx['beh_bx'], ctx['beh_by'],
+                    ctx['x_cm'], ctx['y_cm'],
                     ctx['occ_map'], ctx['valid_mask'], ctx['n_bins_x'], ctx['n_bins_y'],
+                    ctx['bin_centers_x'], ctx['bin_centers_y'], KDE_SMOOTH_FACTOR * target_bin_cm,
                     metrics.get('sir', 0.0), metrics.get('coherence', float('nan')),  # type: ignore
                     ntt_path, label=label,
                 )
@@ -1797,9 +1823,9 @@ def _run_job(args):
                 float(peak_fr)   >  1.0  and
                 float(peak_fr)   < 25.0  and
                 float(sir)       >  0.5  and
-                float(sparsity)  <  0.5  and
-                boot_sig is True         and
-                coh_boot_sig is True
+                #float(sparsity)  <  0.9  and
+                boot_sig is True         #and
+                #coh_boot_sig is True
             )
         else:
             metrics['place_cell'] = None

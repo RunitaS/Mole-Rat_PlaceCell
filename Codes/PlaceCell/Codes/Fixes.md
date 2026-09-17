@@ -1,9 +1,9 @@
 **Place cell characterization**
 # to-do:
 
-- [ ] <Major fix:> **Change all triangular smoothing kernels to Gaussian smoothing kernels. Triangular smoothing is not ideal for place cells.**
+- [x] < Major fix:> ** Change all triangular smoothing kernels to Gaussian smoothing kernels. Triangular smoothing is not ideal for place cells.**
 
-- [ ] <Major fix:> **Check if the triangular smoothong procedure over or under smooths the 1D circular track data.** *Compare with raw RM.*
+- [x] < Major fix:> ** Check if the triangular smoothong procedure over or under smooths the 1D circular track data.** *Compare with raw RM.*
 
 - [ ] <Major fix:> **too many place cells discarded in the speed code, check why the criteria is so stringent. Almost half the cells are throw away.**
 
@@ -13,7 +13,7 @@
 
 - [x] ** Check the shuffling analysis. SOmetime it gets 102/102 cells, other time it gets 100/102 cells as true place cells.**
 
-- [ ] **Check the part when triangular kernel smoothing is applied. It should be after peak and SIR estimation.**
+- [x] ** Check the part when triangular kernel smoothing is applied. It should be after peak and SIR estimation.**
 
 - [x] ** Plot place fields in python code** *Compare trajectory maps with rate maps. Pierre's code had some discrepancies.*
 
@@ -168,7 +168,7 @@ The surviving bin centres/means are fit with linregress to get speed_beta (slope
 - [x] ** Resolution in Mcnaughton 1983 is pretty low. Replicate their resolution and check for speed modulation.**  
 *The animals's position was continuously sampled by the computer at a rate of 10 Hz. The resolution in the position measure was estimated at about 0.5 cm. Since instantaneous velocity was calculated from the distanced moved between sampling points its resolution was therefore about 5 cm/sec.*
 
-- [ ] **Change n,n+1 to n,n-1. Pad i=1 speed.** ***Retrospective speed coding and prostpecive speed coding is a thing!*** *n,n+1 will give retrospective speed, while n,n-1 will give prospective speed*
+- [ ] **Change n,n+1 to n,n-1. Pad i=1 speed.** ***Retrospective speed coding and prospective speed coding is a thing!*** *n,n+1 will give retrospective speed, while n,n-1 will give prospective speed*
 
 - [x] ** Gaussian smoothing of speed is missing ** * Is it pre smoothed in compute_metrics? * *There was no speed or position smoothing anywhere in the code. Added position smoothing. Does the speed need further smoothing?*
 

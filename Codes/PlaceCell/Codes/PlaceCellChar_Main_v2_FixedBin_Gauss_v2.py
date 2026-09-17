@@ -9,7 +9,7 @@ output_excel = r'F:/Check/1059_Nest_Day10/sir_shuff.xlsx'
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
 arena_width_cm = 60.0         # physical arena width in cm
-min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
+min_occ_s      = 0.5          # exclude bins with < 0.5 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
 
@@ -24,6 +24,7 @@ import time
 import concurrent.futures
 import types
 import random
+from datetime import datetime
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import numpy as np
@@ -144,7 +145,7 @@ Output_PlaceTrue = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Place
 fps            = 30           # tracking frame rate (Hz)
 target_bin_cm  = 2.0          # bin size in cm
 arena_width_cm = 80.0         # physical arena width in cm
-min_occ_s      = 1.0          # exclude bins with < 1 s occupancy
+min_occ_s      = 1            # exclude bins with < 1 s occupancy
 MAX_GAP_US     = 50_000       # max spike–position gap in µs (50 ms)
 N_BOOTSTRAP    = 1000         # circular-shift shuffles for SIR significance
 
@@ -190,6 +191,69 @@ _gpu_semaphore = threading.Semaphore(2)
 # physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
 # bin size (target_bin_cm) this script is run with.
 GAUSSIAN_SIGMA_CM = 4 #1.5 * 2.1
+
+# Place-cell classification thresholds, applied to metrics['place_cell'] below.
+# Kept as named constants (rather than inline literals) so a single source of
+# truth drives both the classification and the run-metadata record of it.
+PLACE_CELL_MIN_SPIKES  = 50    # n_spikes must exceed this
+PLACE_CELL_MIN_PEAK_FR = 1.0   # peak_fr (Hz) lower bound
+PLACE_CELL_MAX_PEAK_FR = 25.0  # peak_fr (Hz) upper bound
+PLACE_CELL_MIN_SIR     = 0.5   # spatial information rate lower bound
+PLACE_CELL_MAX_SPARSITY = 0.9  # sparsity upper bound (currently disabled, see below)
+
+# Criteria actually ANDed together in metrics['place_cell'] (see _build_row).
+# Update this alongside the boolean expression if a criterion is toggled on/off.
+PLACE_CELL_CRITERIA_ACTIVE = (
+    'n_spikes > PLACE_CELL_MIN_SPIKES',
+    'PLACE_CELL_MIN_PEAK_FR < peak_fr < PLACE_CELL_MAX_PEAK_FR',
+    'sir > PLACE_CELL_MIN_SIR',
+    'bootstrap_sig is True',
+)
+# Criteria present in the code but currently commented out (not applied).
+PLACE_CELL_CRITERIA_DISABLED = (
+    'sparsity < PLACE_CELL_MAX_SPARSITY',
+    'coherence_bootstrap_sig is True',
+)
+
+# Names of every hardcoded analysis setting above, in the order they should
+# appear in the run-metadata CSV. Add new config variables here as they're
+# introduced so they get captured automatically.
+RUN_CONFIG_VARS = [
+    'root_folder', 'output_excel', 'Output_PlaceTrue',
+    'fps', 'target_bin_cm', 'arena_width_cm', 'min_occ_s',
+    'MAX_GAP_US', 'N_BOOTSTRAP',
+    'STABILITY_MIN_BINS',
+    'AUTOCORR_WINDOW_MS', 'AUTOCORR_BIN_MS', 'THETA_POWER_THRESH',
+    'SPEED_MIN_CMS', 'SPEED_MAX_CMS', 'SPEED_BIN_CMS', 'SPEED_SMOOTH_S',
+    'SPEED_MIN_BIN_FRAC', 'SPEED_N_SHUFFLE', 'SPEED_SHUFFLE_MARGIN_S',
+    'POS_JUMP_THRESH_CMS', 'POS_SMOOTH_SIGMA_SMP',
+    'SPEED_MOD_DOWNSAMPLE_FACTOR',
+    'MAX_GPU_UTIL_PCT', 'MAX_WORKERS',
+    'COORD_UNITS',
+    'GAUSSIAN_SIGMA_CM',
+    'PLACE_CELL_MIN_SPIKES', 'PLACE_CELL_MIN_PEAK_FR', 'PLACE_CELL_MAX_PEAK_FR',
+    'PLACE_CELL_MIN_SIR', 'PLACE_CELL_MAX_SPARSITY',
+    'PLACE_CELL_CRITERIA_ACTIVE', 'PLACE_CELL_CRITERIA_DISABLED',
+]
+
+
+def _save_run_metadata(output_path: str) -> str:
+    """Write every hardcoded setting in RUN_CONFIG_VARS, plus which script
+    generated the run and when, to a CSV next to `output_path`. Called once
+    at the start of a batch run so any figure/result produced downstream can
+    be traced back to the exact settings that made it.
+    """
+    rows = [
+        {'parameter': 'script_name', 'value': os.path.basename(__file__)},
+        {'parameter': 'run_timestamp', 'value': datetime.now().isoformat(timespec='seconds')},
+    ]
+    rows += [{'parameter': name, 'value': globals()[name]} for name in RUN_CONFIG_VARS]
+
+    meta_path = os.path.splitext(output_path)[0] + '_run_metadata.csv'
+    pd.DataFrame(rows).to_csv(meta_path, index=False)
+    print(f'[SAVED] Run metadata: {meta_path}')
+    return meta_path
+
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),
@@ -981,16 +1045,16 @@ def _compute_speed_modulation(
 def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd: int,
                               beh_bx: np.ndarray, beh_by: np.ndarray,
                               occ_map: np.ndarray, valid_mask: np.ndarray,
-                              n_bins_x: int, n_bins_y: int) -> tuple[float, float]:
+                              n_bins_x: int, n_bins_y: int, bin_cm: float) -> tuple[float, float]:
     """Compute SIR and spatial coherence from the same location-shuffled spike
     train after circularly shifting the position time series by `rnd` frames.
     Spike-to-frame assignments are kept fixed; only the location at each frame
     changes. Equivalent to MATLAB: locs_rand = [locs(rnd:end); locs(1:rnd-1)]
 
-    Both metrics are derived from the single shuffled rate map built here
-    (fr_raw feeds both SIR and coherence directly) so that each bootstrap
-    iteration only needs one shuffled spike train, matching the real-data
-    pipeline where both SIR and coherence use the non-smoothed map.
+    Both metrics are derived from the single shuffled rate map built here so
+    that each bootstrap iteration only needs one shuffled spike train: SIR uses
+    the raw shuffled map (matching the real-data SIR), while coherence uses the
+    same map after Gaussian smoothing (matching the real-data coherence).
     """
     n_frames   = len(beh_bx)
     shuf_frame = (spike_frame_indices + rnd) % n_frames
@@ -1013,7 +1077,8 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
         ratio   = ri_flat[nonzero] / r_mean
         sir     = float(np.sum(pi_flat[nonzero] * ratio * np.log2(ratio)))
 
-    coherence = _compute_coherence(fr_raw, valid_mask, n_bins_x, n_bins_y)
+    fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
+    coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
 
     return sir, coherence
 
@@ -1026,7 +1091,7 @@ _NULL_COHERENCE_BOOTSTRAP = {'coherence_bootstrap_mean': float('nan'),
 def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
                    beh_bx: np.ndarray, beh_by: np.ndarray,
                    occ_map: np.ndarray, valid_mask: np.ndarray,
-                   n_bins_x: int, n_bins_y: int,
+                   n_bins_x: int, n_bins_y: int, bin_cm: float,
                    real_sir: float, real_coherence: float, ntt_path: str,
                    label: str = '') -> dict:
     """Location-shuffling bootstrap (matches MATLAB calcSI_v3_locshuf).
@@ -1064,7 +1129,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
             spike_frame_indices, rnd,
             beh_bx, beh_by,
             occ_map, valid_mask,
-            n_bins_x, n_bins_y)
+            n_bins_x, n_bins_y, bin_cm)
 
     bootstrap_mean = float(np.mean(sir_i))
     bootstrap_p95  = float(np.percentile(sir_i, 95))
@@ -1091,7 +1156,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     counts: np.ndarray = np.asarray(hist_result[0])
     max_count = float(counts.max()) if counts.max() > 0 else 1.0
 
-    box_plot = ax.boxplot(sir_i, whis=[5, 95], vert=False, showfliers=False, # type: ignore
+    box_plot = ax.boxplot(sir_i, whis=[5, 95], orientation='horizontal', showfliers=False, # type: ignore
                           positions=[-max_count / 10], widths=max_count / 15)
     ax.plot([real_sir, real_sir], [0, max_count], 'r-.')
 
@@ -1117,7 +1182,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
         counts2: np.ndarray = np.asarray(hist_result2[0])
         max_count2 = float(counts2.max()) if counts2.max() > 0 else 1.0
 
-        box_plot2 = ax2.boxplot(coh_valid, whis=[5, 95], vert=False, showfliers=False, # type: ignore
+        box_plot2 = ax2.boxplot(coh_valid, whis=[5, 95], orientation='horizontal', showfliers=False, # type: ignore
                                 positions=[-max_count2 / 10], widths=max_count2 / 15)
         if np.isfinite(real_coherence):
             ax2.plot([real_coherence, real_coherence], [0, max_count2], 'r-.')
@@ -1367,9 +1432,9 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, valid_mask: np.ndarray,
     print(f'  [SAVED] {save_path}')
 
 
-def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
+def _compute_coherence(fr_map: np.ndarray, valid_mask: np.ndarray,
                        n_bins_x: int, n_bins_y: int) -> float:
-    """Spatial coherence: correlation of each bin's non-smoothed rate with the
+    """Spatial coherence: correlation of each bin's rate (from `fr_map`) with the
     mean rate of its (up to 8) occupied neighbours, Fisher Z-transformed.
     """
     valid_idx    = np.argwhere(valid_mask)
@@ -1377,7 +1442,7 @@ def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
     fr_nbr_means = []
     for bx, by in valid_idx:
         nbr_vals = [
-            fr_raw[bx + dx, by + dy]
+            fr_map[bx + dx, by + dy]
             for dx in (-1, 0, 1) for dy in (-1, 0, 1)
             if not (dx == 0 and dy == 0)
             and 0 <= bx + dx < n_bins_x
@@ -1385,7 +1450,7 @@ def _compute_coherence(fr_raw: np.ndarray, valid_mask: np.ndarray,
             and valid_mask[bx + dx, by + dy]
         ]
         if nbr_vals:
-            fr_bin_vals.append(fr_raw[bx, by])
+            fr_bin_vals.append(fr_map[bx, by])
             fr_nbr_means.append(float(np.mean(nbr_vals)))
 
     if len(fr_bin_vals) > 2:
@@ -1578,8 +1643,8 @@ def compute_metrics(csv_path: str, ntt_path: str,
     spar_den = float(np.sum(pi_flat * ri_flat ** 2))
     sparsity = float((spar_num ** 2) / spar_den) if spar_den > 0 else 0.0
 
-    # Spatial coherence: non-smoothed map vs 8-neighbour mean (Fisher Z)
-    coherence = _compute_coherence(fr_raw, valid_mask, n_bins_x, n_bins_y)
+    # Spatial coherence: smoothed map vs 8-neighbour mean (Fisher Z)
+    coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
 
     metrics = {
         'n_spikes':    n_spikes,
@@ -1660,6 +1725,7 @@ def _run_job(args):
                 bootst = _run_bootstrap(
                     ctx['spike_frame'], ctx['t'], ctx['beh_bx'], ctx['beh_by'],
                     ctx['occ_map'], ctx['valid_mask'], ctx['n_bins_x'], ctx['n_bins_y'],
+                    target_bin_cm,
                     metrics.get('sir', 0.0), metrics.get('coherence', float('nan')),  # type: ignore
                     ntt_path, label=label,
                 )
@@ -1793,13 +1859,13 @@ def _run_job(args):
         if ((n_spikes is not None) and (sir is not None) and (peak_fr is not None)
                 and (sparsity is not None) and (boot_sig is not None) and (coh_boot_sig is not None)):
             metrics['place_cell'] = (
-                int(n_spikes)    >  50   and
-                float(peak_fr)   >  1.0  and
-                float(peak_fr)   < 25.0  and
-                float(sir)       >  0.5  and
-                float(sparsity)  <  0.5  and
-                boot_sig is True         and
-                coh_boot_sig is True
+                int(n_spikes)    >  PLACE_CELL_MIN_SPIKES   and
+                float(peak_fr)   >  PLACE_CELL_MIN_PEAK_FR  and
+                float(peak_fr)   <  PLACE_CELL_MAX_PEAK_FR  and
+                float(sir)       >  PLACE_CELL_MIN_SIR      and
+                #float(sparsity)  <  PLACE_CELL_MAX_SPARSITY  and
+                boot_sig is True                            #and
+                #coh_boot_sig is True
             )
         else:
             metrics['place_cell'] = None
@@ -1845,6 +1911,8 @@ if __name__ == "__main__":
         _coord_answer = input("Please enter 'pixel' or 'cm': ").strip().lower()
     COORD_UNITS = 'pixel' if _coord_answer in _PIXEL_ANSWERS else 'cm'
     print(f"Using '{COORD_UNITS}' tracking coordinates.\n")
+
+    _save_run_metadata(output_excel)
 
     all_jobs   = []
     dir_to_csv = {}
