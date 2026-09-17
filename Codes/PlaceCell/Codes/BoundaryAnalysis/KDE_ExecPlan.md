@@ -1,0 +1,43 @@
+Rebuild boundary-preference analysis as an averaged-rate-vs-position curve
+Context
+analyze_wall_distance_kde (MeanRateMap_QuadrantAnalysis_v10.py:1063-1301) currently treats every spatial bin as one raw sample, weighted by its firing rate, and fits scipy.stats.gaussian_kde (a weighted density estimate) over those samples.
+
+For each bin, get its centroid position along a single geometric axis specific to the arena.
+Average the firing rate (or % of peaks) of all bins sharing that position into one number per position.
+Smooth that averaged curve with a kernel.
+Compare it to a null curve built the same way from pooled occupancy, using the existing bootstrap-CI-vs-null significance logic.
+This is a genuinely different pipeline (average-then-smooth, not density-of-weighted-samples), and the geometric axis itself changes per arena per the user's spec. Below is the concrete design, including two assumptions I'm flagging explicitly for review (weighting convention when averaging bins into a position-group; and how the circular track's two-curve output is shown), since getting the axis definitions and units wrong here would produce a plausible-looking but scientifically incorrect plot.
+
+Per-arena geometric axis (new handler attributes)
+OpenFieldHandler (L408-428): add dist_from_center_flat = r.ravel() (0 at center → diameter/2 = 30 cm at wall) and max_dist_from_center = diameter/2. This is the opposite direction from the current dist_to_wall_flat (which is 0 at the wall) — matches "0 to 30 cm, center to wall."
+LinearTrackHandler (L606-630): add dist_from_mid_flat = |bx_center - length/2| computed from the length axis only (width axis dropped entirely, unlike the current min(DX, DY)), broadcast across all by via np.repeat(..., ny) to match the flat = bx*ny+by convention. Range 0 (midpoint of the 80 cm wall) to 40 cm (either end). Both ends of the track fold onto the same distance value, same as today.
+CircularTrackHandler (L496-532): add arc_pos_cm_flat = arc-length position of each bin's bx (0 to circumference, stored as new attribute circumference_cm), broadcast across by; add inner_side_flat = by < ny//2 (for the actual config, ny=2, so this is exactly inner ring bin vs outer ring bin). Per your confirmed answer, the circular track will not use radial distance as its KDE x-axis (only 2 bins there) — instead it produces two separate arc-position curves (inner-ring-only, outer-ring-only), each smoothed and compared to its own occupancy null, mirroring how the linear track uses its length axis.
+Curve construction (replaces _weighted_kde)
+New shared helper, used by all three arenas:
+
+_distance_bin_average(pos_flat, value_flat, weight_flat, valid_mask, bin_edges)
+    -> (bin_centers, avg_value_per_bin, total_weight_per_bin)
+Groups bins by which bin_edges interval their position falls in (2 cm resolution, matching target_bin_cm, i.e. reusing the existing spatial bin size rather than inventing a new constant) and computes a weighted mean of value_flat per group.
+
+Weighting convention (assumption to confirm): for the 'overall' map type I'll use an unweighted mean across bins-in-group (mirrors pool_fine_map's own unweighted-across-cells convention); for 'field' I'll use an occupancy-weighted mean (mirrors pool_field_only_map's own occupancy-weighted convention). Same weighting is applied to that map type's null curve so observed and null stay comparable.
+For 'peak', there's no continuous value to average — it stays a point process (one sample per place cell = its peak bin's position). The curve becomes a % of place-cell peaks per position-bin (histogram normalized to 100%), smoothed the same way. Its null is % of pooled occupancy per position-bin, so both are on a directly comparable "% of total" scale.
+New _gaussian_smooth_1d_nan(values, valid, sigma_bins, wrap=False) (mirrors the existing NaN-safe trick in _gaussian_smooth_2d, L228-243: smooth value*mask and mask separately via gaussian_filter1d, divide) smooths the per-position-bin averages, with sigma_bins=RATEMAP_SMOOTH_SIGMA_BINS (reuse the existing constant, 1.0 bin) and wrap=True only for the circular track's arc-position axis (it's a closed ring, same as wrap_x=True used elsewhere for that arena).
+Null curve, bootstrap, and significance testing
+Kept conceptually as-is per your instructions ("compare to null occupancy distribution"), just re-fed by the new curve construction instead of _weighted_kde:
+
+Null curve = same _distance_bin_average + smoothing pipeline applied to pooled occupancy (r['occ_map']) instead of firing rate, using the existing _null_kde_inputs_overall / _null_kde_inputs_field pooling logic (L1127-1150) unchanged, just routed through the new curve builder.
+Bootstrap band: same cell-identity resampling as _bootstrap_kde_band (L1161-1175) — resample place cells with replacement, rebuild the averaged+smoothed curve each iteration, take 2.5/50/97.5th percentiles across 1000 bootstraps.
+Peak flagging: unchanged logic from _find_significant_kde_peaks (L1178-1197) — contiguous position-bin runs where the bootstrap lower bound exceeds the null curve.
+Worth noting in a code comment (not blocking): since averaging (rather than density-weighting) no longer lets arena geometry/bin-count bias the curve's mean, the occupancy null's role here is more about flagging poorly-sampled/noisy regions and behavioral sampling bias than correcting a geometric mean-bias — kept because you asked for it explicitly, but the comment will document why its statistical necessity is weaker than in the old density-based design.
+Top-level restructure
+analyze_wall_distance_kde → branches by arena: open_field/linear_track produce one (grid, real_med, real_lo, real_hi, null_curve, peaks) per map type, same shape as today. circular_track produces two such results per map type, keyed 'inner'/'outer'.
+plot_wall_distance_kde: axis labels become arena-specific ("Distance from center (cm)" / "Distance from track midpoint (cm)" / "Position along track (cm)"; y-axis "Avg. field-index rate" for overall/field, "% of place-cell peaks" for peak). For the circular track's column, overlay both inner-ring and outer-ring observed+null curves in the same subplot (solid vs. dashed) rather than adding extra rows, so the figure grid stays 3 (map_type) × 3 (arena).
+export_wall_distance_kde_summary: add a side column (None for open_field/linear_track, 'inner'/'outer' for circular_track) to the exported peaks table.
+Files touched
+Only BoundaryAnalysis/MeanRateMap_QuadrantAnalysis_v10.py: the three handler __init__ methods (add attributes), and the entire "Boundary-preference KDE analysis" section (L1063-1301), which gets rewritten in place. No other files reference dist_to_wall_flat/max_dist_to_wall/this section, so this is self-contained.
+
+Verification
+No test suite for this pipeline (it's a data-analysis script over recording sessions). I'll verify by:
+
+Running the new curve-construction helpers (_distance_bin_average, _gaussian_smooth_1d_nan) on small synthetic arrays to confirm shapes/edge cases (empty groups, all-NaN groups, wrap-around).
+Running run_wall_distance_kde_analysis end-to-end against the existing pooled arena_results (same entry point already used at L1682) and visually inspecting the saved WallDistance_KDE.png / WallDistance_KDE_Peaks.xlsx outputs for sane axis ranges, curve shapes, and peak flags per arena.
