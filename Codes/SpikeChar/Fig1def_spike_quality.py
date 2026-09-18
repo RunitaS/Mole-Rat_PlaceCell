@@ -18,6 +18,18 @@ Metrics computed
   CSI                  – complex spike index: % of all ISIs in [3, 20] ms
                          where the 2nd spike amplitude < 1st (Bhatt et al. 2020)
 
+Acceptance criteria (unit is "accepted" only if ALL three hold)
+─────────────────────────────────────────────────────────────
+  ISI violation %       < 1 %
+  SNR                   > 2.5
+  Template correlation  > 0.5
+
+Accepted units' .ntt files, plus every .csv and .ncs file found alongside them,
+are copied into a sibling '<ROOT_FOLDER>_Accepted' tree that mirrors the
+session subfolder structure. In every histogram below, rejected units are
+drawn as a gray segment stacked at the bottom of each bin, with accepted
+units in color on top.
+
 References
 ──────────
 Lee D et al. (2018) Exp Neurobiol 27:593-604.
@@ -26,6 +38,7 @@ Bhatt DL et al. / Bhatt et al. 2020 — Cell 2000 (S0092-8674(00)81828-0)
 """
 
 import os
+import shutil
 import numpy as np # type: ignore
 import pandas as pd # type: ignore
 import matplotlib # type: ignore
@@ -38,8 +51,15 @@ from openpyxl.drawing.image import Image as XLImage # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
-OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
+ROOT_FOLDER  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2'
+OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2\QUALITY_METRICS.xlsx'
+
+# Sibling folder that receives accepted units' .ntt files plus every .csv/.ncs
+# file found in the same session folder (mirrors ROOT_FOLDER's subfolder tree).
+ACCEPTED_ROOT_FOLDER = ROOT_FOLDER.rstrip('\\/') + '_Accepted'
+
+# ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
+# OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
 
 N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
 WAVEFORM_DURATION_MS = 5.0       # total duration spanned by the 32-sample waveform snippet
@@ -59,6 +79,11 @@ SNR_HIGH_GOOD = 4.0
 # ── ISI violation thresholds (%) ──────────────────────────────────────────────
 ISI_GOOD_PCT   = 1.0   # < 1 %  → GREEN
 ISI_MARGIN_PCT = 5.0   # 1–5 %  → YELLOW, > 5 % → RED
+
+# ── Unit acceptance thresholds (ISI + SNR + template correlation) ─────────────
+TEMPLATE_CORR_ACCEPT_MIN = 0.5   # template correlation must exceed this
+ACCEPTED_COLOR = '#4A90D9'       # color used for accepted units in stacked plots
+REJECTED_COLOR = '#B0B0B0'       # gray used for rejected units in stacked plots
 
 # ── Spike duration onset/offset threshold ──────────────────────────────────────
 # Onset (depolarization begin) / offset (hyperpolarization end) are taken as the
@@ -117,7 +142,7 @@ ALL_METRIC_KEYS = [
     'csi',
 ]
 
-COLUMN_ORDER = ['session', 'unit'] + ALL_METRIC_KEYS
+COLUMN_ORDER = ['session', 'unit'] + ALL_METRIC_KEYS + ['accepted']
 
 
 # ── Helpers: file I/O ──────────────────────────────────────────────────────────
@@ -141,11 +166,22 @@ def _parse_adbitvolts(path: str) -> float:
     return DEFAULT_ADBITVOLTS
 
 
-def load_ntt_waveforms(ntt_path: str):
+def load_ntt_waveforms(ntt_path: str, exclude_cluster0: bool = True):
+    """
+    Load waveforms/timestamps from an .ntt file.
+
+    exclude_cluster0 : if True (default), spikes with cell_number == 0
+        (unclustered / noise cluster) are dropped, so metrics are computed
+        only on the sorted main cluster.
+    """
     adbitvolts = _parse_adbitvolts(ntt_path)
     uv_scale   = adbitvolts * 1e6
     spike_data = np.memmap(ntt_path, dtype=NTT_DTYPE, mode='r',
                            offset=NTT_HEADER_BYTES)
+    cell_number = spike_data['cell_number']  # type: ignore[index]
+    if exclude_cluster0:
+        keep = cell_number != 0
+        spike_data = spike_data[keep]
     waveforms  = spike_data['waveforms'].astype(np.float64) * uv_scale  # type: ignore[operator]
     timestamps = spike_data['timestamp'].astype(np.float64)
     return waveforms, timestamps, adbitvolts
@@ -211,6 +247,15 @@ def isi_quality(pct) -> tuple:
     if pct < ISI_MARGIN_PCT:
         return ('Marginal', FILL_YELLOW)
     return ('High', FILL_RED)
+
+
+def is_unit_accepted(isi_pct, snr_val, template_corr) -> bool:
+    """A unit is accepted only if ISI violation < 1 %, SNR > 2.5, and
+    template correlation > 0.5 all hold (NaN/None in any metric → rejected)."""
+    for v in (isi_pct, snr_val, template_corr):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return False
+    return (isi_pct < ISI_GOOD_PCT) and (snr_val > SNR_LOW_OK) and (template_corr > TEMPLATE_CORR_ACCEPT_MIN)
 
 
 # ── Individual quality-metric functions ───────────────────────────────────────
@@ -457,17 +502,39 @@ os.makedirs(WAVEFORM_PLOT_DIR, exist_ok=True)
 
 records = []
 waveform_plot_entries = []   # [(label, png_path), ...] for Excel embedding
+n_units_copied = 0
+n_support_files_copied = 0
 for dirpath, _, filenames in os.walk(ROOT_FOLDER):
     ntt_files = sorted(f for f in filenames if f.lower().endswith('.ntt'))
     if not ntt_files:
         continue
+
+    session_name = os.path.relpath(dirpath, ROOT_FOLDER)
+    dest_dir     = os.path.join(ACCEPTED_ROOT_FOLDER, session_name)
+
+    # Copy every .csv and .ncs file in this session folder, regardless of
+    # any individual unit's acceptance (they describe the recording session,
+    # not a single cluster).
+    support_files = sorted(f for f in filenames if f.lower().endswith(('.csv', '.ncs')))
+    if support_files:
+        os.makedirs(dest_dir, exist_ok=True)
+        for support_file in support_files:
+            shutil.copy2(os.path.join(dirpath, support_file), os.path.join(dest_dir, support_file))
+            n_support_files_copied += 1
+
     for ntt_file in ntt_files:
-        ntt_path     = os.path.join(dirpath, ntt_file)
-        session_name = os.path.relpath(dirpath, ROOT_FOLDER)
+        ntt_path = os.path.join(dirpath, ntt_file)
         print(f'Processing: {session_name}  |  {ntt_file}')
         try:
-            metrics = compute_metrics(ntt_path)
-            pt_plot = metrics.pop('_pt_plot', None)
+            metrics  = compute_metrics(ntt_path)
+            pt_plot  = metrics.pop('_pt_plot', None)
+            accepted = is_unit_accepted(metrics.get('isi_violation_pct'),
+                                        metrics.get('snr'),
+                                        metrics.get('template_correlation'))
+            if accepted:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copy2(ntt_path, os.path.join(dest_dir, ntt_file))
+                n_units_copied += 1
             if pt_plot is not None:
                 unit_label = f'{session_name}_{os.path.splitext(ntt_file)[0]}'.replace(os.sep, '_')
                 png_path   = os.path.join(WAVEFORM_PLOT_DIR, f'{unit_label}_waveform.png')
@@ -476,10 +543,15 @@ for dirpath, _, filenames in os.walk(ROOT_FOLDER):
                 waveform_plot_entries.append((f'{session_name} | {ntt_file}', png_path))
         except Exception as exc:
             print(f'  ERROR: {exc}')
-            metrics = {k: None for k in ALL_METRIC_KEYS}
-        metrics['session'] = session_name # type: ignore
-        metrics['unit']    = ntt_file # type: ignore
+            metrics  = {k: None for k in ALL_METRIC_KEYS}
+            accepted = False
+        metrics['session']  = session_name # type: ignore
+        metrics['unit']     = ntt_file # type: ignore
+        metrics['accepted'] = accepted # type: ignore
         records.append(metrics)
+
+print(f'\nAccepted units copied: {n_units_copied}  |  Support files (.csv/.ncs) copied: {n_support_files_copied}')
+print(f'Accepted-unit tree: {ACCEPTED_ROOT_FOLDER}')
 
 # ── Build DataFrame ───────────────────────────────────────────────────────────
 
@@ -589,18 +661,38 @@ print('Excel data saved.')
 
 # ── Histogram helper ──────────────────────────────────────────────────────────
 
-def make_histogram(values, title, xlabel,
+def make_histogram(values, accepted, title, xlabel,
                    thresholds=(), threshold_colors=(), threshold_labels=(),
                    bar_color='#4A90D9', n_bins=30):
-    vals = np.array([v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))])
+    """
+    Stacked histogram: for each bin, rejected units (accepted == False) are
+    drawn as a gray segment at the bottom, accepted units in `bar_color` on
+    top, so discarded cells are visually separated from the accepted ones
+    within the same bin.
+    """
+    values   = np.asarray(values,   dtype=float)
+    accepted = np.asarray([bool(a) if a is not None else False for a in accepted], dtype=bool)
+    valid    = ~np.isnan(values)
+    vals     = values[valid]
+    acc      = accepted[valid] if len(accepted) == len(values) else np.zeros(vals.shape, dtype=bool)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.patch.set_facecolor('#F7F9FC')
     ax.set_facecolor('#F7F9FC')
 
     if len(vals) > 0:
-        ax.hist(vals, bins=n_bins, color=bar_color,
-                edgecolor='white', linewidth=0.6, zorder=3)
+        bin_edges    = np.histogram_bin_edges(vals, bins=n_bins)
+        bin_widths   = np.diff(bin_edges)
+        bin_centers  = bin_edges[:-1] + bin_widths / 2
+        n_rejected, _ = np.histogram(vals[~acc], bins=bin_edges)
+        n_accepted, _ = np.histogram(vals[acc],  bins=bin_edges)
+
+        ax.bar(bin_centers, n_rejected, width=bin_widths, color=REJECTED_COLOR,
+               edgecolor='white', linewidth=0.6, zorder=3,
+               label=f'Discarded (n={int(n_rejected.sum())})')
+        ax.bar(bin_centers, n_accepted, width=bin_widths, bottom=n_rejected,
+               color=bar_color, edgecolor='white', linewidth=0.6, zorder=3,
+               label=f'Accepted (n={int(n_accepted.sum())})')
 
         for xv, col, lbl in zip(thresholds, threshold_colors, threshold_labels):
             ax.axvline(xv, color=col, linewidth=1.5, linestyle='--', zorder=4, label=lbl)
@@ -651,9 +743,10 @@ histogram_specs = [
 ]
 
 png_paths = {}
+accepted_flags = df['accepted'].values if 'accepted' in df.columns else np.zeros(len(df), dtype=bool)
 for sheet_name, suffix, col, title, xlabel, thresholds, thr_colors, thr_labels, bar_color in histogram_specs:
     vals = df[col].values if col in df.columns else []
-    fig  = make_histogram(vals, title, xlabel,
+    fig  = make_histogram(vals, accepted_flags, title, xlabel,
                           thresholds=thresholds,
                           threshold_colors=thr_colors,
                           threshold_labels=thr_labels,
