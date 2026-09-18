@@ -810,3 +810,11 @@ for col in ['isi_violation_pct', 'template_correlation', 'pt_time_ms',
     vals = df[col].dropna()
     if len(vals):
         print(f'\n{col}: mean={vals.mean():.4f}  median={vals.median():.4f}  SD={vals.std():.4f}  n={len(vals)}')
+
+# ── Final accepted/rejected tally (printed last, once everything else is done) ─
+n_accepted = int(df['accepted'].sum())
+n_rejected = int((~df['accepted']).sum())
+print(f'\n{"="*50}')
+print(f'Cells accepted (ISI<1%, SNR>2.5, TmplCorr>0.5): {n_accepted}')
+print(f'Cells rejected: {n_rejected}')
+print(f'{"="*50}')
