@@ -93,6 +93,12 @@ MAD_THRESH = 5.0
 DELTA_BAND = (1.0, 3.0)  # Hz
 THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 
+# ---- Theta-band epoch power (power-vs-speed analysis) ----
+# Order of the zero-phase Butterworth band-pass (filtfilt) applied to the
+# whole cleaned trace before epoching for 'epoch_power_uv2' -- see
+# bandpass_filter / process_ncs_for_acg.
+THETA_BANDPASS_ORDER = 4
+
 # ---- Velocity / running-speed epoch gating ----
 # Every .ncs file's session folder is expected to hold one tracking .csv with
 # a UNIX timestamp (us, column A) on the same clock as the .ncs timestamps,
@@ -179,6 +185,15 @@ def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
     of the theta-band content the ACG matching cares about)."""
     nyq = fs_hz / 2.0
     b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
+    return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
+
+
+def bandpass_filter(x, fs_hz, band, order=4):
+    """Zero-phase Butterworth band-pass filter (filtfilt, so no phase
+    distortion), used to isolate theta-band (3-7 Hz) power ahead of epoching
+    for the power-vs-speed analysis."""
+    nyq = fs_hz / 2.0
+    b, a = signal.butter(order, [band[0] / nyq, band[1] / nyq], btype='band')
     return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
 
 
@@ -669,19 +684,25 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
 
     Returns a DataFrame (one row per epoch) with the quantify_xcorr_epochs
     columns plus 'movement', 'median_speed_cms', 'epoch_index', and
-    'epoch_power_uv2' (mean squared amplitude of the epoch's cleaned LFP
-    waveform, in uV^2 -- see the ADBitVolts note on 'epoch_power_uv2' below).
+    'epoch_power_uv2' (mean squared amplitude of the epoch's theta-band
+    (THETA_BAND, 3-7 Hz) filtered LFP waveform, in uV^2 -- see the
+    ADBitVolts note on 'epoch_power_uv2' below).
     """
     # load_ncs converts the raw ADC counts to microvolts via ADBitVolts
     # (samples * ADBitVolts * 1e6); every step below (resample/notch/detrend/
-    # lowpass) is amplitude-preserving, so `lfp` -- and therefore the epoch
-    # power computed from it -- stays correctly scaled in uV / uV^2 rather
-    # than raw ADC counts.
+    # lowpass/bandpass) is amplitude-preserving, so `lfp` -- and therefore the
+    # epoch power computed from it -- stays correctly scaled in uV / uV^2
+    # rather than raw ADC counts.
     lfp, lfp_start_us = load_ncs(fpath)
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
     lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+    # Theta-band (3-7 Hz) version of the same cleaned trace, used only for the
+    # epoch power computed below -- keeps the power comparable to speed on the
+    # same theta rhythm the ACG frequency analysis targets, rather than
+    # broadband (<=LOWPASS_CUTOFF_HZ) power.
+    lfp_theta = bandpass_filter(lfp, fs_acg, THETA_BAND, order=THETA_BANDPASS_ORDER)
 
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
@@ -707,10 +728,13 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
                                         ed_min_thresh=ed_min_thresh)
     result['movement'] = label[keep]
     result['median_speed_cms'] = med_speed[keep]
-    # mean squared amplitude of each kept epoch's cleaned (uV-scaled) LFP
-    # waveform -- a broadband (<=LOWPASS_CUTOFF_HZ) power estimate for the
-    # exact same epochs used for the ACG frequency (freq_est) analysis above
-    result['epoch_power_uv2'] = np.mean(data_epochs ** 2, axis=0)
+    # mean squared amplitude of each kept epoch's theta-band (3-7 Hz)
+    # filtered, cleaned (uV-scaled) LFP waveform -- same epoch boundaries as
+    # the broadband epochs used for the ACG frequency (freq_est) analysis
+    # above, so freq_est/movement/speed/power all line up row-for-row.
+    theta_epochs, _ = build_epochs(lfp_theta, nperseg)
+    theta_data_epochs = theta_epochs[keep].T
+    result['epoch_power_uv2'] = np.mean(theta_data_epochs ** 2, axis=0)
     result['epoch_index'] = np.where(keep)[0]
     # absolute path -- lets get_epoch_waveform() re-fetch this exact epoch's
     # raw waveform later (e.g. for plot_example_epoch), regardless of cwd
@@ -1140,9 +1164,10 @@ def plot_freq_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), colo
 
 def plot_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), color='#55A868'):
     """Theta-positive epochs only (non-skipped): scatter of per-epoch
-    broadband LFP power ('epoch_power_uv2', mean squared amplitude of the
-    cleaned, ADBitVolts-scaled uV waveform -- see process_ncs_for_acg) vs.
-    per-epoch median running speed ('median_speed_cms'), with a
+    theta-band (3-7 Hz) LFP power ('epoch_power_uv2', mean squared amplitude
+    of the cleaned, ADBitVolts-scaled, theta-bandpass-filtered uV waveform --
+    see process_ncs_for_acg) vs. per-epoch median running speed
+    ('median_speed_cms'), with a
     random-intercept mixed-model fit (grouped by animal) overlaid as the
     fixed-effect line and its 95% CI band. Same
     fit_mixed_model/plot_mixed_model_fit stats as ThetaVsSpeed_v2.py and
@@ -1189,8 +1214,8 @@ def plot_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), col
     ax.fill_between(x_range, y_ci_low, y_ci_high, color='grey', alpha=0.4,
                     label='95% CI', zorder=3)
     ax.set_xlabel('Median epoch speed (cm/s)')
-    ax.set_ylabel('Epoch LFP power (uV$^2$)')
-    title = 'Theta-positive epochs: epoch power vs. speed (mixed model, grouped by animal)'
+    ax.set_ylabel('Epoch theta-band power (uV$^2$)')
+    title = 'Theta-positive epochs: theta-band power vs. speed (mixed model, grouped by animal)'
     ax.set_title(f'{animal}: {title}' if animal else title, fontsize=10)
     ax.legend(fontsize=7, frameon=False)
 
@@ -1670,7 +1695,7 @@ if __name__ == '__main__':
     print(f"  freq_est ~ speed slope = {freqspeed_result.params['median_speed_cms']:.4f} Hz per cm/s "
           f"(p = {freqspeed_result.pvalues['median_speed_cms']:.2e})")
 
-    # Same theta-positive epochs, now their broadband LFP power
+    # Same theta-positive epochs, now their theta-band (3-7 Hz) LFP power
     # ('epoch_power_uv2', ADBitVolts-scaled uV^2) vs. median epoch speed
     fig_powerspeed, _ax_powerspeed, powerspeed_result = plot_power_vs_speed_mixedmodel(results_df)
     powerspeed_path = os.path.join(FIGURE_DIR, 'power_vs_speed_mixedmodel.png')
@@ -1680,7 +1705,8 @@ if __name__ == '__main__':
     powerspeed_stats_path = os.path.join(OUTPUT_DIR, 'power_vs_speed_mixedmodel_stats.xlsx')
     save_mixedlm_stats_excel(
         powerspeed_result, powerspeed_stats_path,
-        model_desc='epoch_power_uv2 ~ median_speed_cms, groups=animal (theta-positive epochs only)')
+        model_desc='epoch_power_uv2 (theta-band, 3-7 Hz) ~ median_speed_cms, '
+                   'groups=animal (theta-positive epochs only)')
     print(f'Saved mixed-model stats -> {powerspeed_stats_path}')
     print(f"  epoch_power_uv2 ~ speed slope = {powerspeed_result.params['median_speed_cms']:.4f} uV^2 per cm/s "
           f"(p = {powerspeed_result.pvalues['median_speed_cms']:.2e})")

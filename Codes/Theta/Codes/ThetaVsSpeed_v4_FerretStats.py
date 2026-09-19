@@ -5,11 +5,11 @@ Recursively finds every Neuralynx .ncs LFP file under ROOT_DIR, pairs it with
 the tracking .csv in its own folder, cleans the LFP the same way as
 ACG_theta_continuity_TT_Thresholded_EDmin_LFPclean_v3.py (resample -> notch ->
 detrend -> low-pass), then band-pass filters to theta and estimates
-instantaneous frequency/amplitude using the peak-trough interpolation method
-of Dunn et al. 2022 (Nature Communications 13:5905, the ferret theta paper) --
-a verbatim port of the paper's own implementation
+instantaneous frequency/power using the peak-trough interpolation method of
+Dunn et al. 2022 (Nature Communications 13:5905, the ferret theta paper) --
+a port of the paper's own implementation
 (calculate_peak_trough_signal_parameters.m / findMinMax.m /
-clean_peaks_and_troughs.m, Toolbox/Signal-processing/, in
+clean_peaks_and_troughs.m, Toolbox/Signal-processing/,
 https://github.com/slsdunn/theta-paper-code), binned against running speed
 computed from the cleaned tracking position.
 
@@ -28,9 +28,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import signal
-from scipy.ndimage import gaussian_filter1d, label
-from scipy.interpolate import PchipInterpolator
-from scipy.stats import norm
+from scipy.ndimage import gaussian_filter1d
+from scipy.stats import norm, linregress
 import matplotlib.pyplot as plt
 import statsmodels.formula.api as smf
 import openpyxl
@@ -79,6 +78,12 @@ FS_LFP = 250
 BANDPASS_CUTOFF = (3.0, 7.0)
 FILTER_ORDER = 5
 
+# ---- Peak/trough detection for the instantaneous frequency/power estimate
+# (see estimate_instantaneous_frequency_power) -- findMinMax.m's hysteresis
+# threshold, as a fraction of the band-passed signal's median absolute
+# amplitude. Dunn et al.'s own value ("chosen empirically"). ----
+PEAK_THRESH_PC = 0.25
+
 # ---- Edge trimming (seconds) -- drops filtfilt edge artifacts from the
 # start/end of each cleaned trace ----
 TRIM_DUR = 0.25
@@ -89,7 +94,7 @@ BINSIZE = 0.25
 # (BINSIZE) aggregation in bin_data and the per-speed-bin aggregation in
 # aggregate_by_speed_bin (the values the mixed model is fit on). 'median' or
 # 'mean'.
-BIN_AGG_METHOD = 'mean'
+BIN_AGG_METHOD = 'median'
 
 # Speed-binning applied before the mixed model (see aggregate_by_speed_bin):
 # with BINSIZE=0.25 s time bins, a session contributes thousands of
@@ -269,153 +274,203 @@ def trim_signal(sig, fs, trim_dur):
 
 
 # ============================================================================
-# Generalized Phase (Davis, Muller et al. 2020, Nature 587:432-436; Muller et
-# al. 2016, eLife 5:e17267) -- corrected replacement for the plain Hilbert-
-# transform phase. Ported verbatim from Ref_ThetaSpeed.py's
-# generalized_phase_vector (itself ported from generalized_phase_vector.m,
-# https://github.com/mullerlab/generalized-phase), which corrects the plain
-# analytic-signal phase for epochs where instantaneous frequency collapses or
-# reverses sign, instead of the peak-to-peak/trough-to-trough interpolation
-# previously used here to assign instantaneous frequency between cycles.
+# Peak-trough interpolation (Dunn et al. 2022, Nature Communications
+# 13:5905, the ferret theta paper) -- instantaneous frequency/power from
+# linear interpolation of peak-to-peak and trough-to-trough intervals of the
+# band-passed signal, rather than an analytic-signal (Hilbert/Generalized
+# Phase) estimate. Ported verbatim from
+# calculate_peak_trough_signal_parameters.m / findMinMax.m /
+# clean_peaks_and_troughs.m (Toolbox/Signal-processing/,
+# https://github.com/slsdunn/theta-paper-code).
 # ============================================================================
 
-def _gp_rewrap(xp):
-    """rewrap.m: fold an unwrapped phase trace back into (-pi, pi]."""
-    return xp - 2 * np.pi * np.floor((xp - np.pi) / (2 * np.pi)) - 2 * np.pi
-
-
-def generalized_phase_vector(x, fs, lp, nwin=3):
-    """Generalized Phase of a single real-valued time series
-    (generalized_phase_vector.m). Drop-in replacement for
-    np.angle(signal.hilbert(x)) via np.angle(xgp): corrects the analytic
-    signal's phase for epochs where the instantaneous frequency falls below
-    `lp`, which otherwise corrupt the plain Hilbert phase with spurious
-    reversed-phase assignments.
-
-    Parameters
-    ----------
-    x  : 1D real array, already bandpass-filtered over the band of interest
-         (the same band whose low edge is passed as `lp`).
-    fs : sampling rate of x, Hz.
-    lp : low-frequency cutoff -- the lower edge of the bandpass filter that
-         produced x. Instantaneous frequency below this value marks a
-         phase-slip epoch to be corrected.
-    nwin : safety-window multiplier extending each detected phase-slip
-         epoch (generalized_phase_vector.m default: 3).
+def _find_min_max(sig, thresh_pc):
+    """findMinMax.m: hysteresis-based local peak/trough detector -- a new
+    peak is only confirmed once the signal has since fallen at least
+    `thresh_pc` * median(|sig|) below it (and symmetrically for troughs), so
+    small ripples on the way to the real extremum don't register as spurious
+    extrema of their own.
 
     Returns
     -------
-    xgp : complex analytic signal with the corrected ("generalized") phase.
-    wt  : instantaneous frequency estimate (Hz).
-    idx : boolean mask, True where the sample fell inside a phase-slip
-          epoch and its phase in `xgp` was therefore *reconstructed*
-          (pchip-filled across a gap whose true cumulative cycle count is
-          not preserved -- see the note above _detect_phase_slip below)
-          rather than measured. Safe to read xgp's *wrapped* phase
-          (np.angle(xgp)) at these samples; not safe to use them for
-          anything depending on cumulative/unwrapped phase, such as
-          instantaneous frequency.
+    max_point, min_point : (n, 2) arrays of [sample_index, value], in
+        detection order.
+    min_change : the amplitude range (thresh_pc * median(|sig|)) used.
     """
-    x = np.asarray(x, dtype=np.float64)
-    npts = x.shape[0]
-    dt = 1.0 / fs
+    n = len(sig)
+    valid = ~np.isnan(sig)
+    if not valid.any():
+        return np.empty((0, 2)), np.empty((0, 2)), np.nan
 
-    def _inst_freq(xo):
-        wt = np.zeros(npts)
-        wt[:-1] = np.angle(xo[1:] * np.conj(xo[:-1])) / (2 * np.pi * dt)
-        return wt
+    min_change = np.nanmedian(np.abs(sig)) * thresh_pc
 
-    xo = signal.hilbert(x)
-    ph = np.angle(xo)
-    md = np.abs(xo)
-    wt = _inst_freq(xo)
+    first_valid = np.flatnonzero(valid)[0]
+    next_max_y = sig[first_valid] + min_change
+    next_min_y = sig[first_valid] - min_change
 
-    # rectify rotation direction so instantaneous frequency is positive
-    finite_wt = wt[np.isfinite(wt)]
-    sign_if = np.sign(np.mean(finite_wt)) if finite_wt.size else 1.0
-    if sign_if == -1:
-        xo = md * np.exp(1j * (sign_if * ph))
-        ph = np.angle(xo)
-        md = np.abs(xo)
-        wt = _inst_freq(xo)
+    looking_for = 1  # 1 = next confirmation will be a trough (tracking a running local max) -- 0 = next confirmation will be a peak
+    local_max_y = local_max_yx = None
+    local_min_y = local_min_yx = None
+    max_point, min_point = [], []
 
-    if np.all(np.isnan(ph)):
-        return np.full(npts, np.nan, dtype=np.complex128), wt, np.ones(npts, dtype=bool)
+    for x in range(n):
+        y = sig[x]
+        if np.isnan(y):
+            continue
 
-    # find negative-/low-frequency ("phase slip") epochs and extend each by
-    # nwin x its own width
-    idx = wt < lp
-    idx[0] = False
-    labeled, n_groups = label(idx)
-    for kk in range(1, n_groups + 1):
-        idxs = np.flatnonzero(labeled == kk)
-        start, stop = idxs[0], idxs[-1]
-        extended_stop = min(start + (stop - start) * nwin, npts - 1)
-        idx[start:extended_stop + 1] = True
+        if y > next_max_y:
+            if looking_for == 1:
+                if local_min_yx is None:
+                    looking_for = 0
+                    continue
+                min_point.append((local_min_yx, local_min_y))
+            next_min_y = y - min_change
+            next_max_y = y + min_change
+            looking_for = 0
+            local_max_y, local_max_yx = y, x
 
-    # unwrap only the trustworthy (unflagged) samples, then reconstruct the
-    # flagged samples by shape-preserving (pchip) interpolation of that
-    # trustworthy unwrapped trend, and rewrap.
-    valid = ~idx
-    if np.count_nonzero(valid) < 2:
-        return np.full(npts, np.nan, dtype=np.complex128), wt, np.ones(npts, dtype=bool)
+        if local_max_yx is not None and local_max_y <= y:
+            local_max_y, local_max_yx = y, x
 
-    valid_positions = np.flatnonzero(valid)
-    p_valid_unwrapped = np.unwrap(ph[valid])
+        if y < next_min_y:
+            if looking_for == 0:
+                if local_max_yx is None:
+                    looking_for = 1
+                    continue
+                max_point.append((local_max_yx, local_max_y))
+            next_max_y = y + min_change
+            next_min_y = y - min_change
+            looking_for = 1
+            local_min_y, local_min_yx = y, x
 
-    p = np.empty(npts, dtype=np.float64)
-    p[valid] = p_valid_unwrapped
-    invalid_positions = np.flatnonzero(idx)
-    if invalid_positions.size:
-        filler = PchipInterpolator(valid_positions, p_valid_unwrapped, extrapolate=True)
-        p[invalid_positions] = filler(invalid_positions)
+        if local_min_yx is not None and local_min_y >= y:
+            local_min_y, local_min_yx = y, x
 
-    p = _gp_rewrap(p)
-
-    xgp = md * np.exp(1j * p)
-    return xgp, wt, idx
+    max_arr = np.array(max_point, dtype=np.float64).reshape(-1, 2)
+    min_arr = np.array(min_point, dtype=np.float64).reshape(-1, 2)
+    return max_arr, min_arr, min_change
 
 
-def estimate_instantaneous_frequency_power(theta, fs, lowcut, highcut):
-    """Per-sample instantaneous theta frequency (Hz) and power (uV^2) from
-    the Generalized Phase of the band-passed signal `theta` -- the corrected
-    analytic-signal phase itself, not an interpolation of peak-to-peak /
-    trough-to-trough intervals.
+def _clean_peaks_troughs(sig, peaks, troughs):
+    """clean_peaks_and_troughs.m: merge peaks+troughs into one time-ordered
+    extrema list, drop peaks below zero and troughs above zero (detection
+    artifacts), then resolve any two consecutive same-type extrema -- either
+    a spurious double-detection (the weaker of the pair is dropped) or a
+    genuine missed opposite-type extremum in between (inserted, at the
+    sample where the signal peaks/troughs within that span).
 
-    Frequency is the *consecutive-sample* phase advance of the corrected
-    signal (the same bounded estimator generalized_phase_vector uses
-    internally for its own `wt`, applied here to `xgp`), not the derivative
-    of the fully unwrapped phase -- differentiating a globally unwrapped
-    phase would compound errors across the whole trace.
+    Returns
+    -------
+    extrema : (n, 3) array of [sample_index, value, kind], sorted by sample
+        index; kind is 1 for a peak, -1 for a trough.
+    """
+    kind = np.concatenate([np.ones(len(peaks)), -np.ones(len(troughs))])
+    extrema = np.column_stack([
+        np.concatenate([peaks[:, 0], troughs[:, 0]]),
+        np.concatenate([peaks[:, 1], troughs[:, 1]]),
+        kind,
+    ])
 
-    Critically, samples that generalized_phase_vector had to *reconstruct*
-    (its `idx` mask: a phase-slip epoch, pchip-filled across a gap whose
-    true cumulative cycle count is not preserved -- see its own docstring)
-    are excluded here entirely, not merely sign-clipped: xgp's phase there
-    was fabricated to give a plausible *wrapped* value, not a plausible
-    *rate of change*, so a per-sample frequency computed from it (of either
-    sign, and of any magnitude -- including values that land back inside
-    the passband by chance) is not physically meaningful. A frequency
-    estimate spans two samples (i, i+1), so either endpoint being
-    reconstructed invalidates it. As a final sanity net, any surviving
-    estimate outside the bandpass filter's own [lowcut, highcut] range is
-    also dropped -- even a "trustworthy" sample can't produce a frequency
-    outside the band that was filtered into `theta` in the first place; a
-    value out there means the analytic-signal estimate itself is
-    unreliable (e.g. right at the filter's transition band). Power is the
-    squared GP amplitude envelope, defined at every sample of `theta` with
-    no interpolation needed."""
-    xgp, _wt, idx = generalized_phase_vector(theta, fs, lowcut)
-    dt = 1.0 / fs
-    instantaneous_freq = np.full(len(xgp), np.nan)
-    instantaneous_freq[:-1] = np.angle(xgp[1:] * np.conj(xgp[:-1])) / (2 * np.pi * dt)
-    reconstructed = idx[:-1] | idx[1:]
-    instantaneous_freq[:-1][reconstructed] = np.nan
+    remove_negative_peaks = (extrema[:, 1] < 0) & (extrema[:, 2] == 1)
+    remove_positive_troughs = (extrema[:, 1] > 0) & (extrema[:, 2] == -1)
+    extrema = extrema[~(remove_negative_peaks | remove_positive_troughs)]
+    extrema = extrema[np.argsort(extrema[:, 0], kind='stable')]
+
+    while True:
+        same_kind = np.flatnonzero(np.diff(extrema[:, 2]) == 0)
+        if same_kind.size == 0:
+            break
+        i = int(same_kind[0])
+        i0, i1 = int(extrema[i, 0]), int(extrema[i + 1, 0])
+        seg = sig[i0:i1 + 1]
+
+        if extrema[i, 2] == 1:  # two consecutive peaks
+            missed_val = np.min(seg)
+            missed_idx = i0 + int(np.argmin(seg))
+            missed_kind = -1
+            if missed_val > 0:  # no real trough between them -- spurious double peak
+                drop = i if extrema[i, 1] < extrema[i + 1, 1] else i + 1
+                extrema = np.delete(extrema, drop, axis=0)
+                continue
+        else:  # two consecutive troughs
+            missed_val = np.max(seg)
+            missed_idx = i0 + int(np.argmax(seg))
+            missed_kind = 1
+            if missed_val < 0:  # no real peak between them -- spurious double trough
+                drop = i if extrema[i, 1] > extrema[i + 1, 1] else i + 1
+                extrema = np.delete(extrema, drop, axis=0)
+                continue
+
+        extrema = np.insert(extrema, i + 1, [missed_idx, missed_val, missed_kind], axis=0)
+
+    return extrema
+
+
+def _interp1_extrap_nan(xp, fp, x):
+    """MATLAB interp1 default (linear, no extrapolation): NaN outside
+    [xp[0], xp[-1]]."""
+    if len(xp) < 2:
+        return np.full(len(x), np.nan)
+    return np.interp(x, xp, fp, left=np.nan, right=np.nan)
+
+
+def _calc_peak_trough_params(extrema, t, nan_mask):
+    """calc_peak_trough_params (nested in
+    calculate_peak_trough_signal_parameters.m): instantaneous frequency and
+    power from peak-to-peak / trough-to-trough interpolation.
+
+    Each peak-to-peak (and, independently, trough-to-trough) interval gives
+    one frequency estimate (1 / interval duration), assigned at the sample
+    midway between the two peaks (avoiding the lag a peak-locked estimate
+    would otherwise have); linearly interpolating that across every sample
+    of `t`, doing the same for troughs, and averaging the two gives the
+    instantaneous frequency trace. Power is the squared amplitude envelope,
+    where the envelope at each sample is the mean of the (linearly
+    interpolated) peak and trough amplitude traces.
+    """
+    peaks = extrema[extrema[:, 2] == 1]
+    troughs = extrema[extrema[:, 2] == -1]
+
+    peak_idx, trough_idx = peaks[:, 0].astype(int), troughs[:, 0].astype(int)
+    peak_t, trough_t = t[peak_idx], t[trough_idx]
+    peak_f = 1.0 / np.diff(peak_t)
+    trough_f = 1.0 / np.diff(trough_t)
+
+    # midpoint sample between consecutive peaks/troughs, used as the time
+    # coordinate for that interval's frequency estimate
+    peak_mid_idx = np.round(peak_idx[:-1] + 0.5 * np.diff(peak_idx)).astype(int)
+    trough_mid_idx = np.round(trough_idx[:-1] + 0.5 * np.diff(trough_idx)).astype(int)
+
+    peak_f_t = _interp1_extrap_nan(t[peak_mid_idx], peak_f, t)
+    trough_f_t = _interp1_extrap_nan(t[trough_mid_idx], trough_f, t)
     with np.errstate(invalid='ignore'):
-        out_of_band = (instantaneous_freq < lowcut) | (instantaneous_freq > highcut)
-    instantaneous_freq[out_of_band] = np.nan
-    instantaneous_power = np.abs(xgp) ** 2
+        instantaneous_freq = np.nanmean(np.column_stack([peak_f_t, trough_f_t]), axis=1)
+
+    peak_amp_t = _interp1_extrap_nan(peak_t, peaks[:, 1], t)
+    trough_amp_t = _interp1_extrap_nan(trough_t, troughs[:, 1], t)
+    peak_amp_t[nan_mask] = np.nan
+    trough_amp_t[nan_mask] = np.nan
+    with np.errstate(invalid='ignore'):
+        envelope = np.nanmean(np.column_stack([np.abs(peak_amp_t), np.abs(trough_amp_t)]), axis=1)
+    instantaneous_power = envelope ** 2
+
+    instantaneous_freq[nan_mask] = np.nan
     return instantaneous_freq, instantaneous_power
+
+
+def estimate_instantaneous_frequency_power(theta, t, thresh_pc=PEAK_THRESH_PC):
+    """Per-sample instantaneous theta frequency (Hz) and power (uV^2) of the
+    band-passed signal `theta`, via the peak-trough interpolation method of
+    Dunn et al. 2022 (see module header): local peaks/troughs are detected
+    with a hysteresis threshold (`thresh_pc` * median(|theta|)), cleaned so
+    they strictly alternate, and the frequency/amplitude of each peak-to-peak
+    and trough-to-trough interval is linearly interpolated across every
+    sample -- rather than read off an analytic-signal phase.
+    """
+    nan_mask = np.isnan(theta)
+    max_point, min_point, _min_change = _find_min_max(theta, thresh_pc)
+    extrema = _clean_peaks_troughs(theta, max_point, min_point)
+    return _calc_peak_trough_params(extrema, t, nan_mask)
 
 
 _BIN_AGG_FUNCS = {'median': np.nanmedian, 'mean': np.nanmean}
@@ -484,8 +539,7 @@ def process_ncs_session(fpath):
     inst_speed = speed[in_window]
     speed_ts = speed_ts[in_window]
 
-    inst_freq, inst_power = estimate_instantaneous_frequency_power(
-        theta, FS_LFP, BANDPASS_CUTOFF[0], BANDPASS_CUTOFF[1])
+    inst_freq, inst_power = estimate_instantaneous_frequency_power(theta, lfp_ts, PEAK_THRESH_PC)
 
     bin_start = lfp_ts.min().round()
     bin_stop = lfp_ts.max().round()
@@ -642,6 +696,102 @@ def run_speed_vs_theta_stats(df):
     return freq_result, power_result
 
 
+# %% ==================== Speed vs. theta statistics: per-session OLS (Dunn et al. Fig. 3 method) ==========
+#
+# Dunn et al. 2022 (Nat Commun 13:5905) did NOT use a mixed-effects model
+# (lme4/stargazer) for the theta-frequency/power vs. speed relationship shown in
+# their Fig. 3c,d,i,j and the "Speed vs freq./pow." columns of Fig. 3f,l. That LMM
+# machinery (Stats/figure4_LMM.R, figure5_LMM.R, figure6_LMM.R in
+# https://github.com/slsdunn/theta-paper-code) was used for a *different* analysis:
+# their autocorrelation-based "peak range" theta-regularity metric vs. movement
+# state / atropine / trial epoch (their Figs. 4-6). For the continuous
+# speed-vs-frequency/power relationship, the Methods/legend text describes a plain
+# per-session (per-channel) ordinary least-squares regression fit to speed-binned
+# median frequency/power values ("Regression line fitted to median values ... in
+# each speed bin"), summarised across sessions/channels as mean +/- SD of the fitted
+# slope (beta_1) -- e.g. "rat: 0.026 +/- 0.007, ferret: 0.010 +/- 0.003" (main text)
+# -- with individual channels/sessions called significant via a Bonferroni-corrected
+# p-value (their Fig. 3 legend: p < 0.0016 = 0.05/32 channels).
+#
+# The MATLAB helper that actually performs this fit
+# (linear_fit_of_table_or_struct_vars.m) is referenced by their plotting code
+# (Paper-figure-plotting/supfigure2_depth_profiles.m) but is not included in the
+# public repository -- only the calling/plotting code is. The implementation below
+# follows the Methods text and figure legends directly, as a paper-faithful
+# alternative to run_speed_vs_theta_stats's mixed model above (that mixed model
+# pools all sessions into one fit with session as a random intercept and a single
+# shared slope -- a different, not wrong, question from the paper's per-session
+# slope distribution).
+
+FIG3_SPEED_BIN_WIDTH_CMS = 5.0  # matches the paper's Fig. 3 speed binning ("5 cms-1 bins")
+FIG3_SPEED_UPPER_PCTILE = 90.0  # paper excluded speeds above the 90th percentile per session
+
+
+def fit_per_session_ols(df, response, predictor="Speed", group="Session"):
+    """Per-session ordinary least-squares regression of `response` on `predictor`,
+    one independent fit per session (no pooling), matching Dunn et al.'s Fig. 3
+    approach. Returns one row per session with slope (beta1), intercept, R^2,
+    p-value and the number of speed bins the fit used.
+    """
+    rows = []
+    for ses_id, g in df.groupby(group):
+        g = g.dropna(subset=[predictor, response])
+        if len(g) < 3:
+            continue
+        slope, intercept, r_value, p_value, _std_err = linregress(g[predictor], g[response])
+        rows.append({
+            group: ses_id,
+            "beta1": slope,
+            "intercept": intercept,
+            "r2": r_value ** 2,
+            "pvalue": p_value,
+            "n_bins": len(g),
+        })
+    return pd.DataFrame(rows)
+
+
+def run_speed_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
+    """Reproduce Dunn et al.'s Fig. 3 speed-theta statistics: bin each session's
+    data into FIG3_SPEED_BIN_WIDTH_CMS-wide speed bins (median Frequency/Power per
+    bin, after dropping speeds above the FIG3_SPEED_UPPER_PCTILE percentile within
+    that session, as in the paper), fit one OLS regression per session (not a mixed
+    model), and summarise the fitted slopes as mean +/- SD across sessions -- the
+    number the paper actually reports in text -- plus the count/proportion of
+    sessions individually significant at a Bonferroni-corrected threshold
+    (0.05 / n_channels_for_bonferroni; the paper used 32, its probe's channel
+    count -- leave this at 1 if you're not correcting across multiple
+    simultaneously-recorded channels per session).
+    """
+    df_clean = df.dropna(subset=["Frequency", "Power", "Speed"]).copy()
+
+    def _trim_top_pctile(g):
+        thresh = np.percentile(g["Speed"], FIG3_SPEED_UPPER_PCTILE)
+        return g[g["Speed"] <= thresh]
+    df_clean = df_clean.groupby("Session", group_keys=False).apply(_trim_top_pctile)
+
+    df_binned = aggregate_by_speed_bin(df_clean, speed_bin_width=FIG3_SPEED_BIN_WIDTH_CMS)
+    df_binned.to_excel(OUTPUT_DIR / "Fig3_speed_binned_medians.xlsx", index=False)
+
+    alpha_bonf = 0.05 / n_channels_for_bonferroni
+
+    summary_lines = []
+    for response in ("Frequency", "Power"):
+        fits = fit_per_session_ols(df_binned, response)
+        fits.to_excel(OUTPUT_DIR / f"Fig3_persession_OLS_{response}.xlsx", index=False)
+
+        n_sig = int((fits["pvalue"] < alpha_bonf).sum())
+        line = (f"{response} vs Speed (per-session OLS, n={len(fits)} sessions): "
+                f"beta1 = {fits['beta1'].mean():.4g} +/- {fits['beta1'].std():.4g} (mean +/- SD), "
+                f"{n_sig}/{len(fits)} sessions significant at Bonferroni p < {alpha_bonf:.4g}")
+        print(line)
+        summary_lines.append(line)
+
+    with open(OUTPUT_DIR / "Fig3_persession_OLS_summary.txt", "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+
+    return df_binned
+
+
 # %% ==================== Driver =====================================================
 
 if __name__ == "__main__":
@@ -652,6 +802,7 @@ if __name__ == "__main__":
     print(f'Saved {len(df)} rows -> {OUTPUT_PARQUET}')
 
     if df["Session"].nunique() > 0:
-        run_speed_vs_theta_stats(df)
+        run_speed_vs_theta_stats(df)                    # mixed model (session as random intercept)
+        run_speed_vs_theta_persession_stats(df)          # Dunn et al. Fig. 3's per-session OLS
     else:
         print('No sessions processed successfully -- skipping speed vs. theta statistics.')

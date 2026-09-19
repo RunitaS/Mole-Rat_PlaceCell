@@ -5,13 +5,11 @@ Recursively finds every Neuralynx .ncs LFP file under ROOT_DIR, pairs it with
 the tracking .csv in its own folder, cleans the LFP the same way as
 ACG_theta_continuity_TT_Thresholded_EDmin_LFPclean_v3.py (resample -> notch ->
 detrend -> low-pass), then band-pass filters to theta and estimates
-instantaneous frequency/amplitude using the peak-trough interpolation method
-of Dunn et al. 2022 (Nature Communications 13:5905, the ferret theta paper) --
-a verbatim port of the paper's own implementation
-(calculate_peak_trough_signal_parameters.m / findMinMax.m /
-clean_peaks_and_troughs.m, Toolbox/Signal-processing/, in
-https://github.com/slsdunn/theta-paper-code), binned against running speed
-computed from the cleaned tracking position.
+instantaneous frequency/power from the Generalized Phase (GP) of the
+band-passed signal (Davis, Muller et al. 2020, Nature 587:432-436 -- the same
+corrected analytic-signal phase used in Ref_ThetaSpeed.py, ported here
+verbatim), binned against running speed computed from the cleaned tracking
+position.
 
 Before the mixed-model statistics, the per-time-bin (BINSIZE) Frequency/Power
 values are further aggregated into 1 cm/s-wide speed bins per session
@@ -43,7 +41,7 @@ import openpyxl
 # single tracking .csv that lives in the same folder.
 ROOT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
 
-OUTPUT_PARQUET = os.path.join(ROOT_DIR, 'ThetaVsSpeed_out.parquet')
+OUTPUT_XLSX = os.path.join(ROOT_DIR, 'ThetaVsSpeed_out.xlsx')
 
 # Speed vs. theta stats (mixed-model plots + summary) are written here.
 OUTPUT_DIR = Path(ROOT_DIR) / 'Output_ThetaVsSpeed'
@@ -648,8 +646,8 @@ if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     df = process_root_directory(ROOT_DIR)
-    df.to_parquet(OUTPUT_PARQUET, index=False)
-    print(f'Saved {len(df)} rows -> {OUTPUT_PARQUET}')
+    df.to_excel(OUTPUT_XLSX, index=False)
+    print(f'Saved {len(df)} rows -> {OUTPUT_XLSX}')
 
     if df["Session"].nunique() > 0:
         run_speed_vs_theta_stats(df)
