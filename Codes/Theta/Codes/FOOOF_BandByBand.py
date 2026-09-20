@@ -696,6 +696,54 @@ def build_band_by_band_df(results, fooof_results, bands=None):
     return df
 
 
+def print_peak_frequency_summary(df_bands, mean_fms, bands=None,
+                                 highlight=('theta', 'fast gamma')):
+    """Print the FOOOF peak frequency (centre freq) for every band in which a
+    peak was detected -- per animal, as a per-file summary (n detected, mean,
+    SD, median, range) and for the animal's mean-PSD fit. Bands in `highlight`
+    (theta, fast gamma) additionally list the peak frequency of every file."""
+    bands = bands or BANDS
+    print("\n" + "=" * 78)
+    print("PEAK FREQUENCY SUMMARY (FOOOF centre frequency, Hz)")
+    print("=" * 78)
+
+    for animal in sorted(df_bands['animal'].unique()):
+        print(f"\n[{animal}]")
+        fm = mean_fms.get(animal)
+        for band_name, band_def in bands:
+            sub = df_bands[(df_bands['animal'] == animal) & (df_bands['band'] == band_name)]
+            det = sub[sub['has_peak']]
+            star = '*' if band_name in highlight else ' '
+
+            if fm is not None:
+                mean_cf = get_band_peak_fm(fm, band_def)[0]
+                mean_txt = 'no peak' if np.isnan(mean_cf) else f'{mean_cf:.2f} Hz'
+            else:
+                mean_txt = 'n/a'
+
+            if len(det) == 0:
+                print(f" {star}{band_name:<11} ({band_def[0]:g}-{band_def[1]:g} Hz): "
+                      f"0/{len(sub)} files with a peak | mean-PSD peak: {mean_txt}")
+                continue
+            cf = det['peak_cf']
+            print(f" {star}{band_name:<11} ({band_def[0]:g}-{band_def[1]:g} Hz): "
+                  f"{len(det)}/{len(sub)} files with a peak | "
+                  f"CF mean={cf.mean():.2f} +/- {cf.std():.2f} (SD), "
+                  f"median={cf.median():.2f}, range={cf.min():.2f}-{cf.max():.2f} | "
+                  f"mean-PSD peak: {mean_txt}")
+
+    for band_name in highlight:
+        det = df_bands[(df_bands['band'] == band_name) & df_bands['has_peak']]
+        print(f"\n--- {band_name.upper()}: peak frequency per file ---")
+        if det.empty:
+            print("  no peaks detected")
+            continue
+        for _, row in det.sort_values(['animal', 'file']).iterrows():
+            print(f"  {row['animal']:<8} {row['file']}: {row['peak_cf']:.2f} Hz "
+                  f"(PW={row['band_power_peak']:.3f}, BW={row['peak_bw']:.2f})")
+    print("=" * 78)
+
+
 def plot_band_shaded_spectra(freqs, master_psds_dict, animals_list, bands=None,
                              freq_range=(1, 90), save=False, save_path=None):
     """Mean PSD per animal with each canonical band shaded (fooof.plts'
@@ -1393,3 +1441,8 @@ df_group_diffs.to_csv(os.path.join(OUTPUT_DIR, 'band_by_band_group_diffs.csv'), 
 export_band_by_band_excel(
     df_band_by_band, df_group_diffs,
     os.path.join(OUTPUT_DIR, 'band_by_band.xlsx'), bands=BANDS)
+
+# 8) Peak frequency summary: for every band, the FOOOF peak centre frequency
+#    wherever a peak was detected. Theta and fast gamma are printed in detail.
+print_peak_frequency_summary(df_band_by_band, mean_fms, bands=BANDS,
+                            highlight=('theta', 'fast gamma'))

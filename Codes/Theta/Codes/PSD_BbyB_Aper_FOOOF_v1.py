@@ -24,9 +24,6 @@ from fooof.plts.spectra import plot_spectra_shading
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
-# seaborn 0.13.2 (latest) still passes `vert=` to ax.bxp internally; matplotlib 3.11 warns
-warnings.filterwarnings("ignore", message=".*vert: bool was.*deprecated", category=DeprecationWarning)
-warnings.filterwarnings("ignore", message=".*vert: bool was.*deprecated", module="seaborn")
 
 
 # %% ==================== Configuration (from reference code) ====================
@@ -37,7 +34,7 @@ ROOT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP'
 
 # Common output folder: every CSV/XLSX/PKL/TXT result and all figures
 # (band-by-band, theta range, aperiodic properties) are saved under here.
-OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP/BandByBand/v2_Simul'
+OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP/BandByBand/v1'
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')            # all figures
 
 # Which animals (by ID / subfolder name under ROOT_DIR) to include. Comment/
@@ -48,7 +45,6 @@ ANIMALS_TO_INCLUDE = [
     '23BDTest',
     #'Fa5834',
     '8477Test',
-    #'FaSimul',   # 10 simulated random-frequency + Poisson-noise LFPs (Simulate_LFP_FaSimul.py)
 ]
 
 # {animal_id: folder_path} -- auto-built from ANIMALS_TO_INCLUDE + ROOT_DIR.
@@ -70,7 +66,7 @@ NORM_BAND  = (1.0, 100.0) # band used for relative-power normalization
 # filtering: an epoch is rejected if its LOW_BAND (delta, 1-3 Hz) power
 # exceeds its THETA_BAND (3-7 Hz, defined below) power. THETA_BAND is
 # resolved at call time, so its definition later in this file still applies.
-APPLY_DELTA_THETA_FILTER = False
+APPLY_DELTA_THETA_FILTER = True
 
 # ---- Velocity / running-speed epoch gating ----
 # Every .ncs file's session folder holds one tracking .csv with a UNIX
@@ -121,8 +117,8 @@ BANDS = Bands({
     'theta': [3, 7],
     'alpha': [8, 13],
     'beta':  [13, 30],
-    'slow gamma': [30, 60],
-    'fast gamma': [60, 90],
+    'slow gamma': [30, 50],
+    'fast gamma': [50, 90],
 })
 
 # Neuralynx .ncs record format (512 int16 samples per record, 16 kB header skipped)
@@ -1375,9 +1371,6 @@ def get_sample_psd(results, animal=None, index=0):
     return freqs, psds_norm[index]
 
 
-# (low, high) Hz from theta_range_summary()'s grand average; set in the main pipeline
-THETA_RANGE_EST = None
-
 AX_LABEL_FONTSIZE   = 10
 TICK_LABEL_FONTSIZE = 10
 
@@ -1403,10 +1396,7 @@ def plot_mean_psds_all_animals_on_ax(ax, freqs, master_psds_dict, animals_list,
     ax.set_title("A  Mean Power Spectra", y=1.03, fontsize=10, pad=8)
     ax.spines[['top', 'right']].set_visible(False)
     ax.legend(fontsize=8, frameon=False)
-    # theta highlight: bounds from the theta-range estimation (grand mean of
-    # per-animal [low, high]); falls back to THETA_BAND if not yet estimated
-    lo, hi = THETA_RANGE_EST if THETA_RANGE_EST is not None else THETA_BAND
-    ax.axvspan(lo, hi, color='gray', alpha=0.12, zorder=0)
+    ax.axvspan(3, 7, color='gray', alpha=0.12, zorder=0)  # theta band highlight
     _fmt(ax)
 
 
@@ -1573,92 +1563,6 @@ def plot_master_summary(results, master_psds_dict, expanded_fooof_df,
     return fig, axes
 
 
-# %% ==================== Run metadata ===========================================
-
-def _script_name():
-    """File name of this script (falls back when run cell-by-cell/interactively)."""
-    try:
-        return os.path.basename(__file__)
-    except NameError:
-        return 'Fig4a_PSD_v2_Simul.py'
-
-
-def save_run_metadata(out_path):
-    """Write every analysis setting (config block + hard-coded values used later
-    in the file) plus the generating script's name and run time to a 2-column
-    (parameter, value) CSV next to the results."""
-    import datetime
-    meta = {
-        # ---- provenance ----
-        'script_name':            _script_name(),
-        'run_datetime':           datetime.datetime.now().isoformat(timespec='seconds'),
-        # ---- paths / animals ----
-        'ROOT_DIR':               ROOT_DIR,
-        'OUTPUT_DIR':             OUTPUT_DIR,
-        'FIGURE_DIR':             FIGURE_DIR,
-        'ANIMALS_TO_INCLUDE':     ANIMALS_TO_INCLUDE,
-        # ---- acquisition / PSD ----
-        'fs':                     fs,
-        'fs_down':                fs_down,
-        'nperseg':                nperseg,
-        'ADBitVolts':             ADBitVolts,
-        'MAD_THRESH':             MAD_THRESH,
-        'LOW_BAND':               LOW_BAND,
-        'NORM_BAND':              NORM_BAND,
-        'APPLY_DELTA_THETA_FILTER': APPLY_DELTA_THETA_FILTER,
-        # ---- velocity gating ----
-        'SPEED_MIN_CMS':          SPEED_MIN_CMS,
-        'SPEED_MAX_CMS':          SPEED_MAX_CMS,
-        'SPEED_SMOOTH_WINDOW':    SPEED_SMOOTH_WINDOW,
-        'SPEED_SMOOTH_POLY':      SPEED_SMOOTH_POLY,
-        # ---- line noise ----
-        'LINE_FREQ':              LINE_FREQ,
-        'LINE_HARMONICS':         LINE_HARMONICS,
-        'APPLY_TIME_NOTCH':       APPLY_TIME_NOTCH,
-        'NOTCH_Q':                NOTCH_Q,
-        'APPLY_SPECTRAL_INTERP':  APPLY_SPECTRAL_INTERP,
-        'INTERP_HALFWIDTH':       INTERP_HALFWIDTH,
-        # ---- detrending ----
-        'APPLY_TIME_DETREND':     APPLY_TIME_DETREND,
-        'DETREND_TYPE':           DETREND_TYPE,
-        # ---- FOOOF ----
-        'FOOOF_RANGE':            FOOOF_RANGE,
-        'FOOOF_SETTINGS':         FOOOF_SETTINGS,
-        'THETA_BAND':             THETA_BAND,
-        'BANDS':                  dict(BANDS.definitions),
-        # ---- hard-coded after the config block ----
-        'ncs_dtype':              str(ncs_dtype),
-        'welch_window':           'hann',
-        'welch_noverlap':         0,
-        'welch_detrend':          'constant',
-        'MAD_robust_z_constant':  0.6745,
-        'R_SQUARED_MIN':          R_SQUARED_MIN,
-        'ERROR_MAX':              ERROR_MAX,
-        'THETA_FIT_R2_MIN':       THETA_FIT_R2_MIN,
-        'THETA_FIT_ERR_MAX':      THETA_FIT_ERR_MAX,
-        'THETA_LOW_COLOR':        THETA_LOW_COLOR,
-        'THETA_HIGH_COLOR':       THETA_HIGH_COLOR,
-        'APERIODIC_PROPS':        APERIODIC_PROPS,
-        'THETA_PROPS':            THETA_PROPS,
-        'THETA_SPECIFIC':         sorted(THETA_SPECIFIC),
-        'AX_LABEL_FONTSIZE':      AX_LABEL_FONTSIZE,
-        'TICK_LABEL_FONTSIZE':    TICK_LABEL_FONTSIZE,
-        'histogram_bins':         20,
-        'individual_fit_plot_xlim': (1, 20),
-        'sample_fit_xlim':        (1, 20),
-        'mean_psd_plot_xlim':     (2, 20),
-        'band_shaded_spectra_freq_range': (1, 90),
-        'fit_quality_ylim_summary_R2':    (0.9, 1.0),
-        'fit_quality_ylim_summary_error': (0, 0.1),
-        'plot_palette':           _PALETTE,
-    }
-    df_meta = pd.DataFrame({'parameter': list(meta.keys()),
-                            'value':     [str(v) for v in meta.values()]})
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    df_meta.to_csv(out_path, index=False)
-    print(f"Run metadata -> {out_path}")
-
-
 # %% ==================== MAIN PIPELINE (PSD -> FOOOF -> plots) ==================
 
 # 1) Generate PSDs for every animal via the reference folder-walk pipeline.
@@ -1674,10 +1578,20 @@ file_counts      = {a: r[3] for a, r in results.items()}           # {animal: n_
 
 # Optionally persist the processed PSDs.
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-save_run_metadata(os.path.join(OUTPUT_DIR, 'run_metadata.csv'))
 with open(os.path.join(OUTPUT_DIR, 'processed_psds.pkl'), 'wb') as fh:
     pickle.dump({a: {'freqs': r[0], 'mean': r[1], 'sem': r[2],
                      'psds': r[4], 'files': r[5]} for a, r in results.items()}, fh)
+
+# 2) Multi-animal mean +/- SEM PSD plot.
+fig, ax = plt.subplots(figsize=(6, 5))
+plot_mean_psds_all_animals_on_ax(ax, freqs_store, master_psds_dict, animals,
+                                 file_counts=file_counts)
+os.makedirs(FIGURE_DIR, exist_ok=True)
+fig.savefig(os.path.join(FIGURE_DIR, "mean_psds_all_animals.png"),
+            dpi=300, bbox_inches="tight")
+fig.savefig(os.path.join(FIGURE_DIR, "mean_psds_all_animals.svg"),
+            dpi=300, bbox_inches="tight")
+plt.show()
 
 # 3) FOOOF summary on each animal's averaged PSD (quick report).
 #    mean_fms is reused below by the band-by-band group comparison (step 7).
@@ -1720,22 +1634,6 @@ theta_summary_df = theta_range_summary(expanded_fooof_df)
 theta_summary_df.to_csv(os.path.join(OUTPUT_DIR, 'theta_range_summary.csv'),
                         index=False)
 plot_theta_range_boxplot(expanded_fooof_df, summary=theta_summary_df, save=True)
-
-# Grand-average estimated theta range -> grey highlight on the mean-PSD plots
-_grand = theta_summary_df[theta_summary_df['animal'] == 'ALL'].iloc[0]
-THETA_RANGE_EST = (_grand['theta_low_mean'], _grand['theta_high_mean'])
-print(f"Theta highlight range: {THETA_RANGE_EST[0]:.2f}-{THETA_RANGE_EST[1]:.2f} Hz")
-
-# Multi-animal mean +/- SEM PSD plot.
-fig, ax = plt.subplots(figsize=(6, 5))
-plot_mean_psds_all_animals_on_ax(ax, freqs_store, master_psds_dict, animals,
-                                 file_counts=file_counts)
-os.makedirs(FIGURE_DIR, exist_ok=True)
-fig.savefig(os.path.join(FIGURE_DIR, "mean_psds_all_animals.png"),
-            dpi=300, bbox_inches="tight")
-fig.savefig(os.path.join(FIGURE_DIR, "mean_psds_all_animals.svg"),
-            dpi=300, bbox_inches="tight")
-plt.show()
 
 # 6) Sample fit + composite summary figure.
 fig, ax = plt.subplots(figsize=(5, 3))
