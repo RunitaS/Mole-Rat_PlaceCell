@@ -30,9 +30,9 @@ import numpy as np
 import pandas as pd
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
-ROOT_DIR = r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode'  # root folder containing subfolders with .nev + .csv files
+ROOT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Data_v2'  # root folder containing subfolders with .nev + .csv files
 
-MATCH_TOLERANCE_MS = 500  # max allowed difference between a .nev timestamp and its matched csv row
+MATCH_TOLERANCE_MS = 50000  # max allowed difference between a .nev timestamp and its matched csv row
 # (camera start/stop typically lags the .nev event by up to a few hundred ms
 # even on a synced clock, so 50 ms was too tight and skipped valid folders)
 
@@ -86,7 +86,7 @@ def trim_csv_to_nev_window(csv_path, nev_path, tolerance_ms, csv_to_us_factor):
     start_stop = read_nev_start_stop(nev_path)
     if start_stop is None:
         print(f"    No event records in {os.path.basename(nev_path)}, skipping.")
-        return
+        return "skipped"
     start_ts, stop_ts = start_stop
 
     df = pd.read_csv(csv_path)
@@ -102,7 +102,7 @@ def trim_csv_to_nev_window(csv_path, nev_path, tolerance_ms, csv_to_us_factor):
         print(f"    No csv row within {tolerance_ms} ms of nev start/stop "
               f"(closest diffs: start={start_diff / 1000:.2f} ms, "
               f"stop={stop_diff / 1000:.2f} ms), skipping.")
-        return
+        return "skipped"
 
     lo, hi = sorted((start_idx, stop_idx))
     trimmed = df.loc[lo:hi].reset_index(drop=True)
@@ -113,28 +113,53 @@ def trim_csv_to_nev_window(csv_path, nev_path, tolerance_ms, csv_to_us_factor):
     print(f"    matched csv rows: start_idx={start_idx} (diff={start_diff / 1000:.2f} ms), "
           f"stop_idx={stop_idx} (diff={stop_diff / 1000:.2f} ms)")
     print(f"    kept {len(trimmed)}/{len(df)} rows -> overwrote {csv_path}")
+    return "trimmed"
 
 
 def main():
+    # Pass 1: find every folder holding both a .nev and a .csv
+    jobs = []  # (folder, nev_files, csv_files)
+    n_folders = 0
     for folder, _dirnames, filenames in os.walk(ROOT_DIR):
+        n_folders += 1
         nev_files = sorted(f for f in filenames if f.lower().endswith('.nev'))
         csv_files = sorted(f for f in filenames if f.lower().endswith('.csv'))
+        if nev_files and csv_files:
+            jobs.append((folder, nev_files, csv_files))
 
-        if not nev_files or not csv_files:
-            continue
+    n_csv_total = sum(len(c) for _, _, c in jobs)
+    print(f"Scanned {n_folders} folders under {ROOT_DIR}")
+    print(f"Found {len(jobs)} folders with .nev + .csv ({n_csv_total} csv files to process)\n")
 
+    # Pass 2: trim
+    done = n_trimmed = n_skipped = n_failed = 0
+    for f_num, (folder, nev_files, csv_files) in enumerate(jobs, start=1):
+        print(f"[folder {f_num}/{len(jobs)}] {folder}")
         if len(nev_files) > 1:
-            print(f"[{folder}] Multiple .nev files found, using the first: {nev_files[0]}")
-        if len(csv_files) > 1:
-            print(f"[{folder}] Multiple .csv files found, using the first: {csv_files[0]}")
+            print(f"    Multiple .nev files found, using the first: {nev_files[0]}")
 
-        print(f"[{folder}] Trimming {csv_files[0]} to {nev_files[0]} window")
-        trim_csv_to_nev_window(
-            os.path.join(folder, csv_files[0]),
-            os.path.join(folder, nev_files[0]),
-            MATCH_TOLERANCE_MS,
-            CSV_TIMESTAMP_TO_US_FACTOR,
-        )
+        for csv_file in csv_files:
+            done += 1
+            print(f"  [csv {done}/{n_csv_total}] Trimming {csv_file} to {nev_files[0]} window")
+            try:
+                status = trim_csv_to_nev_window(
+                    os.path.join(folder, csv_file),
+                    os.path.join(folder, nev_files[0]),
+                    MATCH_TOLERANCE_MS,
+                    CSV_TIMESTAMP_TO_US_FACTOR,
+                )
+            except Exception as e:
+                print(f"    ERROR: {e}")
+                status = "failed"
+            if status == "trimmed":
+                n_trimmed += 1
+            elif status == "skipped":
+                n_skipped += 1
+            else:
+                n_failed += 1
+
+    print(f"\nDone. {n_trimmed} trimmed, {n_skipped} skipped, {n_failed} failed "
+          f"(of {n_csv_total} csv files in {len(jobs)} folders).")
 
 
 if __name__ == '__main__':

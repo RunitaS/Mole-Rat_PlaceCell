@@ -107,8 +107,9 @@ from scipy.special import erf
 # ============================================================================
 # Configuration -- EDIT THESE
 # ============================================================================
+#ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
 
-ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
+ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Debug") 
 OUTPUT_EXCEL_NAME = 'theta_phase_Interp.xlsx'   # written to ROOT_FOLDER
 # PrecessionClass -> folder (in ROOT_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 CLASS_PLOT_FOLDERS = {
@@ -681,7 +682,7 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
 
 """
 The bug is in the kempter_lincirc function, specifically in how the circular means (phi_bar and theta_bar) 
-are calculated.When a cell exhibits strong phase precession, its spikes sweep across a wide range of theta 
+are calculated. When a cell exhibits strong phase precession, its spikes sweep across a wide range of theta 
 phases—often a full $360^\circ$ cycle. The circular mean of a distribution spanning a full cycle is mathematically 
 undefined because its mean resultant vector length approaches zero. As a result, np.angle(np.sum(np.exp(1j * phi)) / n) 
 evaluates to a highly unstable, arbitrary noise angle.This arbitrary angle shifts the phase in np.sin(phi - phi_bar) 

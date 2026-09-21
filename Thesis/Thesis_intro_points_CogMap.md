@@ -105,14 +105,32 @@
 #### Theta and Phase code of place cells
 
 ##### Theta osccillations in the hippocampus
+
+- Along with encoding information at the level of single neurons, the population of neurons firing in a synchronus pattern which is recorded as rhythmic activity in form of local field potentials also encodes significant information and is required to communicate between brain regiosn as well as within the same brain region. 
+- Oscillations in rodent hippocampus have been well characerized and known to play a very significant role in processing of complex information with inhibition of these oscillations causes impairments in higher order functions.
+- Rodent hippocampus is known to have a prominent theta rhythm which plays a role in sptatial information processing. 
+- However, recent evidence from LFP recordings in multiple species has raised questions regarding the role it plays in processing information.
+- These oscillations are known to act as a common clock syncing information and controlling the temporal patterns of firing within and between brain regions. This enables a cascade of information flow from uostream brain regions to downstream higher order brain regions.
+- The functions attributed to rodent hippocampal theta are locomotion, memory and spatial navigation. But recordings from multiple species highlight that theta may play a role in gating whatever type os information would be relevant each species. BAts for examples, have very rate bouts of theta but the occurence is known to correlate with epochs of echolocation, primates also have fewer bouts although relatively higher than bats and their theta correlates more ofen with processing of visual information.
+
+###### Type I and type II theta
+- THe mechanism of theta generation is complex with several inputs from multiple differnet types of inhibitory and excitatory cells giving rise to a slow oscillatory pattern in the hippocampus. The plethora of players seem to contirbute to two different types of theta in the CA1 brain region. Atropine sensitive, mobility dependent type I theta and immobility independent tpye II theta. 
+- Type I theta is known to be continuously present as long as the animal is locomoting and is mainly associated with processing of spatial information. However, type II theta occurs only in bouts with at a lower amplitude with known functions in processing both spatial and non-spatial information/
+
+###### Theta genesis
 - Generation of theta from MS-DBB and MEC inputs
 - Instrinsic theta due to recurrent network
 - MS cholinergic septal inputs to hippocampal interneurons (predominantly GABAergic)
+- Additionally, intrinsic network of GABAergic interneurons maintains theta rhyhtms internally inside the CA1 region. 
+
+###### Theta reset and entrainment
 
 ##### Spike-LFP coupling in hippocampus
 - Inputs from areas such as the MEC and MS along with intrinsic synchronus population activity within the CA1 region is known to give rise ot a promiment oscillation in peaking at 8Hz during periods of mobility known as the theta rhythm.
 - In conjunction to the rate-code, the place cells of hippocampus make use of theta cycles as a clock by firing at specific phase of rhythmic theta. Hence, also called the temporal code of hippocampal place cells as it regulates the timing of spiking activity.
 - Specifically, a place cell fires at a later phase of a given theta cycle on entry of the animal into its respective field. This preferred phase shifts to an earlier phase of theta each theta cycle. The phase preference at the center of the place field with peak firing rate usually reaches the trough of theta cycle, mid way between the begining and ending of a theta cycle. The spikes occur around the begining of the theta cycle by the time the animal exits the field. Hence, the specific phase of theta cycle where the place cell fires encodes information on the position relative to the begining, peak, and end of the place field.
+
+###### Theta's role in trajectory planning and theta sweeps
 
 ## Comparision between species
 
