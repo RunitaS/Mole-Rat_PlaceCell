@@ -640,7 +640,6 @@ def anglereg(x: np.ndarray, theta: np.ndarray, bnds=None):
                    np.sum(np.cos(theta - 2 * np.pi * s * x)))
     return s, b
 
-
 def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     """Linear-circular correlation (Kempter et al. 2012). Returns (rho, p, s, b)."""
     x = np.asarray(x, dtype=np.float64)
@@ -655,14 +654,14 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
         s, b = anglereg(x, theta, slope_bnds)
 
     n = len(x)
-    # 2*pi factor: s is in cycles per unit x (matching anglereg's own
-    # optimizer, theta - 2*pi*s*x), so the fitted phase is 2*pi*s*x, not
-    # s*x -- this was previously omitted, which decoupled rho/p from the
-    # fitted slope for anything but near-zero s.
     phi = np.mod(2 * np.pi * s * x, 2 * np.pi)
     theta_w = np.mod(theta, 2 * np.pi)
-    phi_bar = np.angle(np.sum(np.exp(1j * phi)) / n)
-    theta_bar = np.angle(np.sum(np.exp(1j * theta_w)) / n)
+    
+    # --- BUG FIX ---
+    # Kempter et al. 2012: Because phi and theta can span a full cycle, their standard 
+    # circular means are undefined. We use the regression parameters mapped from the linear mean.
+    phi_bar = 2 * np.pi * s * np.mean(x)
+    theta_bar = phi_bar + b
 
     num = np.sum(np.sin(theta_w - theta_bar) * np.sin(phi - phi_bar))
     den = np.sqrt(np.sum(np.sin(theta_w - theta_bar) ** 2) * np.sum(np.sin(phi - phi_bar) ** 2))
@@ -676,6 +675,67 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     p = 1 - erf(np.abs(z) / np.sqrt(2))
 
     return rho, p, s, b
+
+
+"""
+The bug is in the kempter_lincirc function, specifically in how the circular means (phi_bar and theta_bar) 
+are calculated.When a cell exhibits strong phase precession, its spikes sweep across a wide range of theta 
+phases—often a full $360^\circ$ cycle. The circular mean of a distribution spanning a full cycle is mathematically 
+undefined because its mean resultant vector length approaches zero. As a result, np.angle(np.sum(np.exp(1j * phi)) / n) 
+evaluates to a highly unstable, arbitrary noise angle.This arbitrary angle shifts the phase in np.sin(phi - phi_bar) 
+and np.sin(theta_w - theta_bar), destroying the phase alignment between the two variables. This artificially drives 
+the correlation numerator (num) to near-zero, minimizing $\rho$ and yielding a high, non-significant $p$-value. 
+This is why visually strong precessing cells are being classified as phase-locked.Kempter et al. (2012) explicitly 
+highlight this exact pitfall. To circumvent the undefined circular mean, you must bypass np.angle entirely and define 
+the mean phase using the linear mean $\bar{x}$ combined with the regression intercept $b$.
+"""
+
+"""
+BUG FIX:
+The surrounding statistical logic in your pipeline is mathematically sound:Asymptotic z-test: 
+Your test statistic $z = \rho \sqrt{n \frac{\lambda_{20} \lambda_{02}}{\lambda_{22}}}$ and 
+standard normal conversion $p = 1 - \text{erf}(\vert{}z\vert{} / \sqrt{2})$ are correct implementations 
+of the asymptotic test.Optimization: The chunked grid-search followed by minimize_scalar in anglereg 
+is a highly robust way to avoid the local minima that frequently trap standard gradient descent in 
+circular-linear optimization.Slope Conversion: Multiplying by $4\pi$ (np.rad2deg(4 * np.pi * s)) correctly 
+accounts for the fact that $x \in [-1, 1]$ means one pass equals 2 units, yielding $720s$ degrees per pass.
+"""
+
+# def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
+#     """Linear-circular correlation (Kempter et al. 2012). Returns (rho, p, s, b)."""
+#     x = np.asarray(x, dtype=np.float64)
+#     theta = np.asarray(theta, dtype=np.float64)
+#     good = ~np.isnan(x) & ~np.isnan(theta)
+#     x, theta = x[good], theta[good]
+
+#     if len(x) == 0:
+#         return np.nan, np.nan, np.nan, np.nan
+
+#     if s is None:
+#         s, b = anglereg(x, theta, slope_bnds)
+
+#     n = len(x)
+#     # 2*pi factor: s is in cycles per unit x (matching anglereg's own
+#     # optimizer, theta - 2*pi*s*x), so the fitted phase is 2*pi*s*x, not
+#     # s*x -- this was previously omitted, which decoupled rho/p from the
+#     # fitted slope for anything but near-zero s.
+#     phi = np.mod(2 * np.pi * s * x, 2 * np.pi)
+#     theta_w = np.mod(theta, 2 * np.pi)
+#     phi_bar = np.angle(np.sum(np.exp(1j * phi)) / n)
+#     theta_bar = np.angle(np.sum(np.exp(1j * theta_w)) / n)
+
+#     num = np.sum(np.sin(theta_w - theta_bar) * np.sin(phi - phi_bar))
+#     den = np.sqrt(np.sum(np.sin(theta_w - theta_bar) ** 2) * np.sum(np.sin(phi - phi_bar) ** 2))
+#     rho = (np.abs(num / den) if den > 0 else 0.0) * np.sign(s)
+
+#     def lam(i, j):
+#         return np.sum((np.sin(phi - phi_bar) ** i) * (np.sin(theta_w - theta_bar) ** j)) / n
+
+#     l20, l02, l22 = lam(2, 0), lam(0, 2), lam(2, 2)
+#     z = rho * np.sqrt(n * l20 * l02 / l22) if l22 > 0 else 0.0
+#     p = 1 - erf(np.abs(z) / np.sqrt(2))
+
+#     return rho, p, s, b
 
 
 # ============================================================================

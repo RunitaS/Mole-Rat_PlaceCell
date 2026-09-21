@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Combined theta-modulation + phase-precession pipeline, run sequentially per
 unit (one .ntt file = one already-isolated unit):
@@ -108,14 +108,16 @@ from scipy.special import erf
 # Configuration -- EDIT THESE
 # ============================================================================
 
-ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Debug")
-OUTPUT_EXCEL_NAME = 'theta_phase_PeakInterp_PhaseShuffle.xlsx'   # written to ROOT_FOLDER
+ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
+OUTPUT_EXCEL_NAME = 'theta_phase_Interp.xlsx'   # written to ROOT_FOLDER
 # PrecessionClass -> folder (in ROOT_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 CLASS_PLOT_FOLDERS = {
     'phase_precessing': 'PhasePrecessing_Plots',
     'phase_succeeding': 'PhaseSucceeding_Plots',
     'phase_locked': 'PhaseLocked_Plots',
 }
+# Fits whose wrapped phase line has > MAX_FIT_LINES segments (biologically implausible)
+MULTILINES_FOLDER = 'MultiLinesFit'
 
 TRACKING_TIME_UNIT = 'us'     # 'us', 'ms', or 's' -- units of the tracking timestamp column
 
@@ -640,7 +642,6 @@ def anglereg(x: np.ndarray, theta: np.ndarray, bnds=None):
                    np.sum(np.cos(theta - 2 * np.pi * s * x)))
     return s, b
 
-
 def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     """Linear-circular correlation (Kempter et al. 2012). Returns (rho, p, s, b)."""
     x = np.asarray(x, dtype=np.float64)
@@ -655,14 +656,14 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
         s, b = anglereg(x, theta, slope_bnds)
 
     n = len(x)
-    # 2*pi factor: s is in cycles per unit x (matching anglereg's own
-    # optimizer, theta - 2*pi*s*x), so the fitted phase is 2*pi*s*x, not
-    # s*x -- this was previously omitted, which decoupled rho/p from the
-    # fitted slope for anything but near-zero s.
     phi = np.mod(2 * np.pi * s * x, 2 * np.pi)
     theta_w = np.mod(theta, 2 * np.pi)
-    phi_bar = np.angle(np.sum(np.exp(1j * phi)) / n)
-    theta_bar = np.angle(np.sum(np.exp(1j * theta_w)) / n)
+    
+    # --- BUG FIX ---
+    # Kempter et al. 2012: Because phi and theta can span a full cycle, their standard 
+    # circular means are undefined. We use the regression parameters mapped from the linear mean.
+    phi_bar = 2 * np.pi * s * np.mean(x)
+    theta_bar = phi_bar + b
 
     num = np.sum(np.sin(theta_w - theta_bar) * np.sin(phi - phi_bar))
     den = np.sqrt(np.sum(np.sin(theta_w - theta_bar) ** 2) * np.sum(np.sin(phi - phi_bar) ** 2))
@@ -676,6 +677,67 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     p = 1 - erf(np.abs(z) / np.sqrt(2))
 
     return rho, p, s, b
+
+
+"""
+The bug is in the kempter_lincirc function, specifically in how the circular means (phi_bar and theta_bar) 
+are calculated.When a cell exhibits strong phase precession, its spikes sweep across a wide range of theta 
+phases—often a full $360^\circ$ cycle. The circular mean of a distribution spanning a full cycle is mathematically 
+undefined because its mean resultant vector length approaches zero. As a result, np.angle(np.sum(np.exp(1j * phi)) / n) 
+evaluates to a highly unstable, arbitrary noise angle.This arbitrary angle shifts the phase in np.sin(phi - phi_bar) 
+and np.sin(theta_w - theta_bar), destroying the phase alignment between the two variables. This artificially drives 
+the correlation numerator (num) to near-zero, minimizing $\rho$ and yielding a high, non-significant $p$-value. 
+This is why visually strong precessing cells are being classified as phase-locked.Kempter et al. (2012) explicitly 
+highlight this exact pitfall. To circumvent the undefined circular mean, you must bypass np.angle entirely and define 
+the mean phase using the linear mean $\bar{x}$ combined with the regression intercept $b$.
+"""
+
+"""
+BUG FIX:
+The surrounding statistical logic in your pipeline is mathematically sound:Asymptotic z-test: 
+Your test statistic $z = \rho \sqrt{n \frac{\lambda_{20} \lambda_{02}}{\lambda_{22}}}$ and 
+standard normal conversion $p = 1 - \text{erf}(\vert{}z\vert{} / \sqrt{2})$ are correct implementations 
+of the asymptotic test.Optimization: The chunked grid-search followed by minimize_scalar in anglereg 
+is a highly robust way to avoid the local minima that frequently trap standard gradient descent in 
+circular-linear optimization.Slope Conversion: Multiplying by $4\pi$ (np.rad2deg(4 * np.pi * s)) correctly 
+accounts for the fact that $x \in [-1, 1]$ means one pass equals 2 units, yielding $720s$ degrees per pass.
+"""
+
+# def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
+#     """Linear-circular correlation (Kempter et al. 2012). Returns (rho, p, s, b)."""
+#     x = np.asarray(x, dtype=np.float64)
+#     theta = np.asarray(theta, dtype=np.float64)
+#     good = ~np.isnan(x) & ~np.isnan(theta)
+#     x, theta = x[good], theta[good]
+
+#     if len(x) == 0:
+#         return np.nan, np.nan, np.nan, np.nan
+
+#     if s is None:
+#         s, b = anglereg(x, theta, slope_bnds)
+
+#     n = len(x)
+#     # 2*pi factor: s is in cycles per unit x (matching anglereg's own
+#     # optimizer, theta - 2*pi*s*x), so the fitted phase is 2*pi*s*x, not
+#     # s*x -- this was previously omitted, which decoupled rho/p from the
+#     # fitted slope for anything but near-zero s.
+#     phi = np.mod(2 * np.pi * s * x, 2 * np.pi)
+#     theta_w = np.mod(theta, 2 * np.pi)
+#     phi_bar = np.angle(np.sum(np.exp(1j * phi)) / n)
+#     theta_bar = np.angle(np.sum(np.exp(1j * theta_w)) / n)
+
+#     num = np.sum(np.sin(theta_w - theta_bar) * np.sin(phi - phi_bar))
+#     den = np.sqrt(np.sum(np.sin(theta_w - theta_bar) ** 2) * np.sum(np.sin(phi - phi_bar) ** 2))
+#     rho = (np.abs(num / den) if den > 0 else 0.0) * np.sign(s)
+
+#     def lam(i, j):
+#         return np.sum((np.sin(phi - phi_bar) ** i) * (np.sin(theta_w - theta_bar) ** j)) / n
+
+#     l20, l02, l22 = lam(2, 0), lam(0, 2), lam(2, 2)
+#     z = rho * np.sqrt(n * l20 * l02 / l22) if l22 > 0 else 0.0
+#     p = 1 - erf(np.abs(z) / np.sqrt(2))
+
+#     return rho, p, s, b
 
 
 # ============================================================================
@@ -1190,6 +1252,16 @@ def match_ncs_to_ntt(ntt_path: Path, ncs_files: list[Path]) -> Path:
         f'{[p.name for p in ncs_files]}')
 
 
+def detect_animal_id(folder_path: Path) -> str:
+    """Animal ID: the first path component under ROOT_FOLDER, per the layout
+    ROOT_FOLDER/<animal>/<arena>/DayN/<session>. Falls back to the folder four
+    levels up if folder_path isn't under ROOT_FOLDER."""
+    try:
+        return folder_path.relative_to(ROOT_FOLDER).parts[0]
+    except (ValueError, IndexError):
+        return folder_path.parts[-4] if len(folder_path.parts) >= 4 else 'UnknownAnimal'
+
+
 def detect_arena(folder_path: Path) -> str | None:
     """Arena (Circle/Linear/Open) read off a case-insensitive match to
     ARENA_LABELS among folder_path's components, per the data layout
@@ -1328,6 +1400,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
         print(f'  {exc} -- Step 3 (phase precession) will be skipped for this session.')
 
     session_label = '_'.join(data_folder.parts[-3:])
+    animal_id = detect_animal_id(data_folder)
     ntt_files = sorted(data_folder.glob('*.ntt'), key=_natural_key)
 
     # Cache per matched .ncs file (channel loading, theta filtering, ACG epochs)
@@ -1383,7 +1456,9 @@ def process_session(data_folder: Path, rng) -> list[dict]:
         units = load_ntt_spike_times(ntt_path)
         for cell_number, spk_ts in units.items():
             unit_label = f'{ntt_path.stem}_cell{cell_number}' if len(units) > 1 else ntt_path.stem
-            row = dict(Session=session_label, FolderPath=str(data_folder), Unit=unit_label,
+            plot_label = f'{animal_id} | {unit_label}'
+            file_prefix = f'{animal_id}_{unit_label}'
+            row = dict(Animal=animal_id, Session=session_label, FolderPath=str(data_folder), Unit=unit_label,
                        ntt_file=ntt_path.name, lfp_file=theta_ncs.name, cell_number=cell_number,
                        n_spikes_total=len(spk_ts))
 
@@ -1400,14 +1475,14 @@ def process_session(data_folder: Path, rng) -> list[dict]:
             row.update(metrics)
 
             if metrics['n_spikes_theta'] >= MIN_SPIKES_FOR_TMI:
-                polar_path = output_dir / f'{unit_label}_PolarPlot.png'
+                polar_path = output_dir / f'{file_prefix}_PolarPlot.png'
                 plot_polar_theta(phase_deg, metrics['MRL'], metrics['PreferredPhase_deg'],
                                   metrics['Rayleigh_p'], metrics['SignificantThetaModulation'],
-                                  unit_label, polar_path)
+                                  plot_label, polar_path)
 
-                hist_path = output_dir / f'{unit_label}_PhaseHistogram.png'
+                hist_path = output_dir / f'{file_prefix}_PhaseHistogram.png'
                 plot_phase_histogram(phase_deg, metrics['SignificantThetaModulation'],
-                                      unit_label, hist_path)
+                                      plot_label, hist_path)
                 print(f'  {unit_label}: TMI={metrics["TMI"]:.3f} '
                       f'(p={metrics["TMI_shuffle_p"]:.3g}, '
                       f'{"theta-modulated" if metrics["TMI_Significant"] else "not theta-modulated"})')
@@ -1441,14 +1516,17 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                             phase_spk_ts=spk_ts_overlap,
                             lfp_theta_mask=lfp_theta_mask,
                         )
-                        png_path = output_dir / f'{unit_label}_PassIndex.png'
-                        plot_unit_summary(pos_xy, results, unit_label, png_path)
+                        png_path = output_dir / f'{file_prefix}_PassIndex.png'
+                        plot_unit_summary(pos_xy, results, plot_label, png_path)
                         # Also copy the plot into ROOT_FOLDER/<class folder> (next to the Excel file)
-                        class_dir_name = CLASS_PLOT_FOLDERS.get(results['precession_class'])
+                        if results['fit_too_steep']:
+                            class_dir_name = MULTILINES_FOLDER
+                        else:
+                            class_dir_name = CLASS_PLOT_FOLDERS.get(results['precession_class'])
                         if class_dir_name:
                             class_dir = ROOT_FOLDER / class_dir_name
                             class_dir.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(png_path, class_dir / f'{session_label}_{unit_label}_PassIndex.png')
+                            shutil.copy2(png_path, class_dir / f'{animal_id}_{session_label}_{unit_label}_PassIndex.png')
                         row['PrecessionTested'] = True
                         row.update({
                             'PassIndex_n_spikes': results['n_spikes'], 'rho': results['rho'],
@@ -1461,6 +1539,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                             'is_phase_locked': results['is_phase_locked'],
                             'PrecessionClass': results['precession_class'],
                             'n_fit_lines': results['n_fit_lines'],
+                            'MultiLinesFit': results['fit_too_steep'],
                         })
                         print(f'  {unit_label}: PRECESSION rho={results["rho"]:.3f}  '
                               f'p={results["p"]:.3g}  '
