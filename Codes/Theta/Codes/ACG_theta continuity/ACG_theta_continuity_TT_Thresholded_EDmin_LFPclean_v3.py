@@ -42,6 +42,7 @@ from scipy.stats import pearsonr, spearmanr
 
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -103,7 +104,7 @@ THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 # interpolated over, then the x/y traces are Gaussian-smoothed with sigma
 # POS_SMOOTH_SIGMA_SMP (in samples). Matches the protocol in
 # PlaceCellCharacterization_SpeedModv3.py.
-POS_JUMP_THRESH_CMS  = 80.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
+POS_JUMP_THRESH_CMS  = 90.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
 POS_SMOOTH_SIGMA_SMP = 1.0    # Gaussian smoothing sigma (in samples) applied to x/y tracking position
 
 # The original MATLAB (create_sine_ref_xcorrs.m) hardcodes its reference-sine
@@ -958,22 +959,25 @@ def plot_edmin_rejected_freq_histogram_overlay(df, ed_min_thresh=ACG_ED_MIN_THRE
 
 
 def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
-                                color='#4C72B0', point_size=10, alpha=0.3):
+                                point_size=10, alpha=0.4):
     """Scatter of ED_min (fit-quality distance to the closest-matching
     reference sinusoid) vs. peakrangenorm (normalised autocorrelogram peak
     range), to test whether a poor sinusoid fit (high ED_min) predicts a low
-    peak range.
+    peak range. Points are colour-coded by animal.
 
     Deliberately NOT filtered on 'skipped'/'skipped_edmin' -- that flag is
     itself an ED_min threshold, so filtering on it would truncate exactly the
     high-ED_min epochs the hypothesis is about. Only epochs with no ED_min at
     all (too-short epochs, ED_min is NaN) are excluded.
 
-    Reports Pearson r and Spearman rho (each with a p-value) and overlays a
-    linear least-squares fit line plus the ACG_ED_MIN_THRESH cutoff.
+    Reports Pearson r and Spearman rho (each with a p-value), the share of
+    epochs on either side of the ACG_ED_MIN_THRESH cutoff (mean % per animal,
+    i.e. each animal weighted equally rather than each epoch), and overlays a
+    linear least-squares fit line plus the cutoff itself.
 
     Returns (fig, ax, stats_dict) where stats_dict has keys 'pearson_r',
-    'pearson_p', 'spearman_r', 'spearman_p', 'n'.
+    'pearson_p', 'spearman_r', 'spearman_p', 'n', 'pct_below_thresh',
+    'pct_at_or_above_thresh'.
     """
     scope = df if animal is None else df[df['animal'] == animal]
     sub = scope.dropna(subset=['ED_min', 'peakrangenorm'])
@@ -986,7 +990,8 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     if len(sub) < 2:
         ax.set_title('Not enough epochs for correlation')
         return fig, ax, {'pearson_r': np.nan, 'pearson_p': np.nan,
-                         'spearman_r': np.nan, 'spearman_p': np.nan, 'n': len(sub)}
+                         'spearman_r': np.nan, 'spearman_p': np.nan, 'n': len(sub),
+                         'pct_below_thresh': np.nan, 'pct_at_or_above_thresh': np.nan}
 
     x = sub['ED_min'].to_numpy()
     y = sub['peakrangenorm'].to_numpy()
@@ -994,7 +999,27 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     r_p, p_p = pearsonr(x, y)
     r_s, p_s = spearmanr(x, y)
 
-    ax.scatter(x, y, s=point_size, color=color, alpha=alpha, edgecolor='none', zorder=2)
+    # one fixed colour per animal (matplotlib's default cycle), shared by
+    # both accepted (filled) and rejected (open-circle outline) epochs
+    animal_labels = sorted(sub['animal'].unique())
+    cycle_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    animal_colors = {a: cycle_colors[i % len(cycle_colors)] for i, a in enumerate(animal_labels)}
+
+    for animal_label in animal_labels:
+        a_sub = sub[sub['animal'] == animal_label]
+        color = animal_colors[animal_label]
+        accepted = a_sub[a_sub['ED_min'] < ACG_ED_MIN_THRESH]
+        rejected = a_sub[a_sub['ED_min'] >= ACG_ED_MIN_THRESH]
+        label = f'{animal_label} (n={len(a_sub)})'
+
+        if len(accepted):
+            ax.scatter(accepted['ED_min'], accepted['peakrangenorm'], s=point_size,
+                      alpha=alpha, color=color, edgecolor='none', zorder=2, label=label)
+            label = None
+        if len(rejected):
+            ax.scatter(rejected['ED_min'], rejected['peakrangenorm'], s=point_size,
+                      alpha=alpha, facecolors='none', edgecolors=color, linewidths=0.7,
+                      zorder=2, label=label)
 
     slope, intercept = np.polyfit(x, y, 1)
     x_line = np.array([x.min(), x.max()])
@@ -1008,18 +1033,40 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     ax.set_ylabel('Autocorr. peak range (norm.)')
     title = 'ED_min vs. normalised peak range'
     ax.set_title(f'{animal}: {title}' if animal else title)
-    ax.legend(loc='upper right', fontsize=7, frameon=False)
+
+    animal_legend = ax.legend(loc='upper right', fontsize=6, frameon=False,
+                              ncol=2 if len(animal_labels) > 6 else 1)
+    ax.add_artist(animal_legend)
+    style_handles = [
+        Line2D([0], [0], marker='o', linestyle='none', markerfacecolor='0.3',
+              markeredgecolor='none', markersize=5,
+              label=f'ED_min < {ACG_ED_MIN_THRESH:g} (accepted)'),
+        Line2D([0], [0], marker='o', linestyle='none', markerfacecolor='none',
+              markeredgecolor='0.3', markersize=5,
+              label=f'ED_min >= {ACG_ED_MIN_THRESH:g} (rejected)'),
+    ]
+    ax.legend(handles=style_handles, loc='lower right', fontsize=6, frameon=False)
+
+    # per-animal share of epochs below/at-or-above threshold, then averaged
+    # across animals so recording-count imbalance doesn't dominate
+    pct_below_per_animal = sub.groupby('animal')['ED_min'].apply(
+        lambda v: 100 * (v < ACG_ED_MIN_THRESH).mean())
+    pct_below = pct_below_per_animal.mean()
+    pct_at_or_above = 100 - pct_below
 
     stats_text = (f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
                  f'Spearman rho = {r_s:.3f} (p = {p_s:.2e})\n'
-                 f'n = {len(sub)}')
+                 f'n = {len(sub)}\n'
+                 f'mean % ED_min < {ACG_ED_MIN_THRESH:g} per animal = {pct_below:.1f}%\n'
+                 f'mean % ED_min >= {ACG_ED_MIN_THRESH:g} per animal = {pct_at_or_above:.1f}%')
     ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
            fontsize=8, color='0.1',
            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
 
     fig.tight_layout()
     return fig, ax, {'pearson_r': r_p, 'pearson_p': p_p,
-                     'spearman_r': r_s, 'spearman_p': p_s, 'n': len(sub)}
+                     'spearman_r': r_s, 'spearman_p': p_s, 'n': len(sub),
+                     'pct_below_thresh': pct_below, 'pct_at_or_above_thresh': pct_at_or_above}
 
 
 def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):

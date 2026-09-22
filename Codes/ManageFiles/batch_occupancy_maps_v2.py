@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
-ROOT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Data_v2'  # root folder to search recursively
-OUTPUT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Data_v2/OccupancyMaps'  # all .png maps are saved here (flat, not mirrored)
+ROOT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Data_v2_Accepted/Fa23BD/Linear/Day1'  # root folder to search recursively
+OUTPUT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Data_v2_Accepted/Fa23BD/Linear/Day1/OccupancyMaps'  # all .png maps are saved here (flat, not mirrored)
 
 BIN_SIZE_CM = 2       # spatial bin edge length, cm
 SMOOTHING_SIGMA = 1.5   # Gaussian smoothing sigma, in bins; set to 0 to disable

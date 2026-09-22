@@ -28,12 +28,11 @@ Metrics compared (all restricted to place_cell == True):
     - pct_area         Percentage area occupied by fields per cell (sum of
                         each field's pct_of_occupied_area)
 
-For each metric, per-group descriptive statistics are computed. A Shapiro-Wilk
-normality check and a Levene equal-variance check are run per group and
-reported for reference, but the tests themselves are always non-parametric:
-an omnibus Kruskal-Wallis test across the 3 arena groups, followed by
-pairwise Wilcoxon rank-sum post-hoc tests, with Holm-Bonferroni correction
-across the 3 pairwise comparisons.
+For each metric, per-group descriptive statistics are computed, followed by
+an omnibus 3-group test (one-way ANOVA if all groups pass a Shapiro-Wilk
+normality check and a Levene equal-variance check, otherwise Kruskal-Wallis)
+and pairwise post-hoc tests (t-test or Mann-Whitney U, matching the omnibus
+choice) with Holm-Bonferroni correction across the 3 pairwise comparisons.
 
 Parameters to edit (below):
     INPUT_EXCEL  = path to the output_excel file from
@@ -198,9 +197,6 @@ def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str):
                          'normal_all_groups': np.nan, 'equal_variance_p': np.nan})
         return desc_df, omnibus, pd.DataFrame()
 
-    # Shapiro-Wilk normality (per group) and Levene equal-variance are still
-    # run and reported for reference, but no longer gate the test choice:
-    # the omnibus/post-hoc tests below are always non-parametric.
     normal = True
     for vals in groups.values():
         if len(vals) < 3:
@@ -216,9 +212,15 @@ def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str):
         p_levene = stats.levene(*groups.values()).pvalue
     except Exception:
         p_levene = np.nan
+    equal_var = bool(p_levene >= ALPHA) if not np.isnan(p_levene) else False
 
-    stat, p = stats.kruskal(*groups.values())
-    test_name = 'Kruskal-Wallis'
+    use_parametric = normal and equal_var and len(groups) >= 2
+    if use_parametric:
+        stat, p = stats.f_oneway(*groups.values())
+        test_name = 'one-way ANOVA'
+    else:
+        stat, p = stats.kruskal(*groups.values())
+        test_name = 'Kruskal-Wallis'
 
     omnibus.update({'test': test_name, 'statistic': stat, 'p_value': p,
                      'significant': bool(p < ALPHA), 'normal_all_groups': normal,
@@ -229,8 +231,12 @@ def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str):
     raw_ps = []
     for g1, g2 in pairs:
         v1, v2 = groups[g1], groups[g2]
-        stat_p, p_p = stats.ranksums(v1, v2)
-        ph_test = 'Wilcoxon rank-sum'
+        if use_parametric:
+            stat_p, p_p = stats.ttest_ind(v1, v2, equal_var=True)
+            ph_test = 't-test'
+        else:
+            stat_p, p_p = stats.mannwhitneyu(v1, v2, alternative='two-sided')
+            ph_test = 'Mann-Whitney U'
         raw_ps.append(p_p)
         posthoc_rows.append({'metric': metric_label, 'comparison': f'{g1} vs {g2}',
                               'test': ph_test, 'statistic': stat_p, 'p_raw': p_p})

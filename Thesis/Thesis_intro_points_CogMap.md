@@ -114,7 +114,7 @@
 - The functions attributed to rodent hippocampal theta are locomotion, memory and spatial navigation. But recordings from multiple species highlight that theta may play a role in gating whatever type os information would be relevant each species. BAts for examples, have very rate bouts of theta but the occurence is known to correlate with epochs of echolocation, primates also have fewer bouts although relatively higher than bats and their theta correlates more ofen with processing of visual information.
 
 ###### Type I and type II theta
-- THe mechanism of theta generation is complex with several inputs from multiple differnet types of inhibitory and excitatory cells giving rise to a slow oscillatory pattern in the hippocampus. The plethora of players seem to contirbute to two different types of theta in the CA1 brain region. Atropine sensitive, mobility dependent type I theta and immobility independent tpye II theta. 
+- The mechanism of theta generation is complex with several inputs from multiple differnet types of inhibitory and excitatory cells giving rise to a slow oscillatory pattern in the hippocampus. The plethora of players seem to contirbute to two different types of theta in the CA1 brain region. Atropine sensitive, mobility dependent type I theta and immobility independent tpye II theta. 
 - Type I theta is known to be continuously present as long as the animal is locomoting and is mainly associated with processing of spatial information. However, type II theta occurs only in bouts with at a lower amplitude with known functions in processing both spatial and non-spatial information/
 
 ###### Theta genesis

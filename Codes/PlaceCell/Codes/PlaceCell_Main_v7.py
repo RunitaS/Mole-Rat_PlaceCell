@@ -79,6 +79,7 @@ class _Metrics(TypedDict, total=False):
     speed_shuffle_ran_td:  bool | None
     p_speed:         bool | None
     n_speed:         bool | None
+    speed_modulated_final: bool | None
     place_cell:      bool | None
     session:         str
     unit:            str
@@ -186,7 +187,7 @@ SPEED_N_SHUFFLE      = 1000   # circular-shift shuffles for speed-modulation sig
 SPEED_SHUFFLE_MARGIN_S = 20.0 # min circular-shift offset (s) from either end, matches SIR shuffling
 
 POS_JUMP_THRESH_CMS  = 90.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
-POS_SMOOTH_SIGMA_SMP = 1.0   # Gaussian smoothing sigma (in samples) applied to x/y tracking position
+POS_SMOOTH_SIGMA_SMP = 5.0   # Gaussian smoothing sigma (in samples) applied to x/y tracking position
 
 SPEED_MOD_DOWNSAMPLE_FACTOR = 1   # downsample tracking for speed-modulation analysis only:
                                    # 30 fps -> 15 fps by keeping every alternate frame. The
@@ -210,7 +211,7 @@ _gpu_semaphore = threading.Semaphore(2)
 # bin, smoothed with a Gaussian kernel of sigma = 1.5 bins. Stored here as a
 # physical sigma in cm (1.5 * 2.1 cm) so it converts correctly to whatever
 # bin size (target_bin_cm) this script is run with.
-GAUSSIAN_SIGMA_CM = 4 #1.5 * 2.1
+GAUSSIAN_SIGMA_CM = 3 #1.5 * 2.1
 
 # ── Place-field detection ("threshold method") ────────────────────────────────
 # Applied only to cells that pass the place-cell criteria below (see
@@ -685,7 +686,11 @@ def _compute_speed_modulation(
               # Whether each method's initial (parametric) R²/p-value screen
               # passed and its circular-shift shuffle was therefore run at all
               # -- see the "initial significance gate" below.
-              'speed_shuffle_ran': False, 'speed_shuffle_ran_td': False}
+              'speed_shuffle_ran': False, 'speed_shuffle_ran_td': False,
+              # Final speed-modulated classification: requires BOTH the
+              # binned-regression and time-domain methods to be shuffle-confirmed
+              # (speed_modulated_shuffle and speed_modulated_td both True), set below.
+              'speed_modulated_final': None}
 
     n = len(t_us)
     if n < 3 or len(spike_ts_us) == 0:
@@ -1101,6 +1106,13 @@ def _compute_speed_modulation(
         fig_combined.savefig(save_path, dpi=150)
         print(f'  [SAVED] {save_path}')
 
+    # A cell is speed-modulated overall only if BOTH the binned-regression and
+    # time-domain scores clear their own shuffle test (bool(None) == False, so
+    # a method that never ran its shuffle -- initial fit not significant --
+    # correctly fails this combined classification too).
+    result['speed_modulated_final'] = (bool(result['speed_modulated_shuffle'])
+                                        and bool(result['speed_modulated_td']))
+
     return result
 
 
@@ -1220,7 +1232,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     counts: np.ndarray = np.asarray(hist_result[0])
     max_count = float(counts.max()) if counts.max() > 0 else 1.0
 
-    box_plot = ax.boxplot(sir_i, whis=[5, 95], orientation='horizontal', showfliers=False, # type: ignore
+    box_plot = ax.boxplot(sir_i, whis=[5, 95], vert=False, showfliers=False, # type: ignore
                           positions=[-max_count / 10], widths=max_count / 15)
     ax.plot([real_sir, real_sir], [0, max_count], 'r-.')
 
@@ -1246,7 +1258,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
         counts2: np.ndarray = np.asarray(hist_result2[0])
         max_count2 = float(counts2.max()) if counts2.max() > 0 else 1.0
 
-        box_plot2 = ax2.boxplot(coh_valid, whis=[5, 95], orientation='horizontal', showfliers=False, # type: ignore
+        box_plot2 = ax2.boxplot(coh_valid, whis=[5, 95], vert=False, showfliers=False, # type: ignore
                                 positions=[-max_count2 / 10], widths=max_count2 / 15)
         if np.isfinite(real_coherence):
             ax2.plot([real_coherence, real_coherence], [0, max_count2], 'r-.')
@@ -2533,7 +2545,7 @@ def _run_job(args):
         'speed_shuffle_mean_td': None, 'speed_shuffle_lo_td': None,
         'speed_shuffle_hi_td': None, 'speed_shuffle_p_td': None,
         'speed_modulated_td': None, 'speed_shuffle_ran_td': None,
-        'p_speed': None, 'n_speed': None,
+        'p_speed': None, 'n_speed': None, 'speed_modulated_final': None,
         'session': session_name, 'unit': ntt_file,
         'job_order': job_order, 'place_cell': None, 'n_fields_detected': None,
     }
@@ -2622,6 +2634,7 @@ def _run_job(args):
                 metrics['speed_shuffle_ran_td']    = speed_res['speed_shuffle_ran_td']
                 metrics['p_speed']                 = speed_res['p_speed']
                 metrics['n_speed']                 = speed_res['n_speed']
+                metrics['speed_modulated_final']   = speed_res['speed_modulated_final']
             except Exception as e:
                 with _print_lock:
                     print(f'  SPEED ERROR in {ntt_file} [{label}]: {e}')
@@ -2648,6 +2661,7 @@ def _run_job(args):
                 metrics['speed_shuffle_ran_td']    = None
                 metrics['p_speed']                 = None
                 metrics['n_speed']                 = None
+                metrics['speed_modulated_final']   = None
         else:
             metrics['speed_score']     = None
             metrics['speed_p_value']   = None
@@ -2672,6 +2686,7 @@ def _run_job(args):
             metrics['speed_shuffle_ran_td']    = None
             metrics['p_speed']                 = None
             metrics['n_speed']                 = None
+            metrics['speed_modulated_final']   = None
 
         metrics['session']   = session_name
         metrics['unit']      = ntt_file
@@ -2893,7 +2908,7 @@ if __name__ == "__main__":
                     'speed_score_td', 'speed_p_value_td', 'speed_r2_td',
                     'speed_shuffle_mean_td', 'speed_shuffle_lo_td', 'speed_shuffle_hi_td',
                     'speed_shuffle_p_td', 'speed_modulated_td', 'speed_shuffle_ran_td',
-                    'p_speed', 'n_speed',
+                    'p_speed', 'n_speed', 'speed_modulated_final',
                     'place_cell', 'n_fields_detected']
 
     # Shared columns first, then the 2-D grid (Open/Linear) field columns,
@@ -2937,13 +2952,13 @@ if __name__ == "__main__":
         df_fields.to_excel(writer, sheet_name='PlaceFields', index=False)
 
     n_place_speed_mod = int(((df_full['place_cell'] == True) &                       # noqa: E712
-                             (df_full['speed_modulated_shuffle'] == True)).sum())     # noqa: E712
+                             (df_full['speed_modulated_final'] == True)).sum())      # noqa: E712
 
     print(f'\nDone. Results saved to {output_excel}')
     print(f'Total units processed              : {len(df_full)}')
     print(f'Place cells found                  : {df_full["place_cell"].sum()}')
     print(f'Place cells also speed-modulated    : {n_place_speed_mod}  '
-          f'(shuffle-confirmed, {SPEED_N_SHUFFLE} shuffles, '
+          f'(binned + time-domain, both shuffle-confirmed, {SPEED_N_SHUFFLE} shuffles, '
           f'{SPEED_SHUFFLE_MARGIN_S:.0f}s window)')
     n_fields_col = pd.to_numeric(df_full['n_fields_detected'], errors='coerce')
     print(f'Place fields detected                : {len(df_fields)}  '
@@ -2978,6 +2993,12 @@ if __name__ == "__main__":
             csv_path = dir_to_csv.get(dirpath)
             if csv_path and os.path.isfile(csv_path):
                 shutil.copy2(csv_path, dest_dir)
+            # Also copy all .nev and .ncs files from the session folder
+            for fname in os.listdir(dirpath):
+                if fname.lower().endswith(('.nev', '.ncs')):
+                    src = os.path.join(dirpath, fname)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dest_dir)
             copied_tracking_dirs.add(dirpath)
 
     print(f'Place-cell files copied to : {Output_PlaceTrue}')
