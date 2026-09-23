@@ -168,10 +168,8 @@ RATEMAP_SMOOTH_SIGMA_BINS = 1.0  # Gaussian smoothing sigma (bins) applied to ra
 FIELD_PEAK_FRAC = 0.20
 MIN_FIELD_BINS  = 7
 
-# 'pixel' or 'cm' -- set interactively at startup (see __main__).
-COORD_UNITS = 'pixel'
-_PIXEL_ANSWERS = {'pixel', 'pixels', 'px'}
-_CM_ANSWERS    = {'cm', 'cms', 'centimeter', 'centimeters', 'centimetre', 'centimetres'}
+# 'pixel' or 'cm'
+COORD_UNITS = 'cm'
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),
@@ -2261,10 +2259,6 @@ def run_full_pipeline(out_dir: str) -> None:
 
 
 if __name__ == '__main__':
-    _coord_answer = input("Are the tracking coordinates in pixels or cm? [pixel/cm]: ").strip().lower()
-    while _coord_answer not in _PIXEL_ANSWERS | _CM_ANSWERS:
-        _coord_answer = input("Please enter 'pixel' or 'cm': ").strip().lower()
-    COORD_UNITS = 'pixel' if _coord_answer in _PIXEL_ANSWERS else 'cm'
     print(f"Using '{COORD_UNITS}' tracking coordinates.\n")
 
     run_full_pipeline(os.path.join(OUTPUT_DIR, 'AllArenas'))
