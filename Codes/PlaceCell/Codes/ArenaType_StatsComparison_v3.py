@@ -54,11 +54,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL = r'C:/Runita/NMR/analysis/ThesisStuff/All_TT_PlaceChar.xlsx'
-PLOTS_DIR   = r'C:/Runita/NMR/analysis/ThesisStuff/ArenaType_StatsPlots'
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted/All_TT_PlaceChar_VisitCrit.xlsx'
+PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted/ArenaType_StatsPlots'
 
 ARENA_TYPES = ['Open', 'Linear', 'Circle']
 ALPHA       = 0.05
@@ -705,6 +706,136 @@ def plot_speed_direction(df: pd.DataFrame, out_path: str):
     plt.close(fig)
 
 
+# ── Histograms by arena type ────────────────────────────────────────────────
+# Histogram plots of the place-cell characterization metrics, split by arena
+# type. Run at the end of __main__ on the SAME place-cell populations
+# (full_df / field_df) analyzed above.
+
+HIST_DIR = os.path.join(PLOTS_DIR, 'Histograms')
+N_BINS   = 15
+
+SPEED_METRICS = {
+    'speed_score':    'Speed score (binning procedure)',
+    'speed_score_td': 'Speed score (instantaneous procedure)',
+}
+HIST_FULL_METRICS = {k: v for k, v in FULL_METRICS.items() if k not in SPEED_METRICS}
+
+# Explicit p-type/n-type speed-cell colors (green/red) -- independent of the
+# per-arena ARENA_COLORS palette used elsewhere.
+P_COLOR = {'face': '#4CAF50', 'edge': '#1B5E20'}  # p-type (positive) speed cells
+N_COLOR = {'face': '#E53935', 'edge': '#7A0C0C'}  # n-type (negative) speed cells
+
+
+def _style_axis(ax):
+    ax.set_facecolor('#FCFCFB')
+    ax.yaxis.grid(True, linestyle='--', linewidth=0.7, color='#E1E0D9', zorder=0)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis='both', colors='#52514E', labelsize=9)
+    for spine in ('top', 'right'):
+        ax.spines[spine].set_visible(False)
+    for spine in ('left', 'bottom'):
+        ax.spines[spine].set_color('#C3C2B7')
+
+
+def plot_histogram_by_arena(df: pd.DataFrame, metric_col: str, metric_label: str,
+                             out_path: str):
+    """One figure per metric: histograms overlaid for each arena type present,
+    on shared bins so the three distributions are directly comparable."""
+    values = {}
+    for arena in ARENA_TYPES:
+        vals = pd.to_numeric(df.loc[df['arena_type'] == arena, metric_col],
+                              errors='coerce').dropna().to_numpy(dtype=float)
+        if len(vals):
+            values[arena] = vals
+    if not values:
+        return
+
+    all_vals = np.concatenate(list(values.values()))
+    bins = np.histogram_bin_edges(all_vals, bins=N_BINS)
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    fig.patch.set_facecolor('white')
+    _style_axis(ax)
+
+    for arena, vals in values.items():
+        c = ARENA_COLORS.get(arena, _DEFAULT_COLOR)
+        ax.hist(vals, bins=bins, histtype='stepfilled', facecolor=c['face'],
+                edgecolor='none', alpha=0.55, label=f'{arena} (n={len(vals)})',
+                zorder=2)
+        ax.hist(vals, bins=bins, histtype='step', edgecolor=c['edge'],
+                linewidth=1.5, zorder=3)
+
+    ax.set_xlabel(metric_label, fontsize=10)
+    ax.set_ylabel('Number of cells', fontsize=10)
+    ax.set_title(metric_label, fontsize=11, fontweight='bold', pad=10)
+    ax.legend(loc='best', fontsize=8, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def _speed_type_masks(sub: pd.DataFrame):
+    """Boolean (p_mask, n_mask) numpy arrays for a sub-dataframe, from its
+    p_speed / n_speed columns."""
+    p_mask = sub['p_speed'].apply(_to_tri_bool) == True   # noqa: E712
+    n_mask = sub['n_speed'].apply(_to_tri_bool) == True   # noqa: E712
+    return p_mask.to_numpy(), n_mask.to_numpy()
+
+
+def plot_speed_histograms_by_arena(df: pd.DataFrame, metric_col: str,
+                                    metric_label: str, out_path: str):
+    """Speed-score histogram restricted to cells that passed BOTH shuffle-
+    testing procedures, with one panel per arena type and p-type (green) /
+    n-type (red) speed cells stacked within each panel."""
+    if 'speed_modulated_final' in df.columns:
+        passed = df['speed_modulated_final'].apply(_to_tri_bool) == True  # noqa: E712
+    else:
+        passed = ((df['speed_modulated_shuffle'].apply(_to_tri_bool) == True) &   # noqa: E712
+                  (df['speed_modulated_td'].apply(_to_tri_bool) == True))          # noqa: E712
+
+    sub_all = df.loc[passed].copy()
+    sub_all[metric_col] = pd.to_numeric(sub_all[metric_col], errors='coerce')
+    sub_all = sub_all.dropna(subset=[metric_col])
+
+    present = [a for a in ARENA_TYPES if (sub_all['arena_type'] == a).any()]
+    if not present:
+        print(f'  No cells passed both shuffle tests for {metric_label}; skipping plot.')
+        return
+
+    bins = np.histogram_bin_edges(sub_all[metric_col].to_numpy(dtype=float), bins=N_BINS)
+
+    fig, axes = plt.subplots(1, len(present), figsize=(4.3 * len(present), 4.5),
+                              sharey=True)
+    fig.patch.set_facecolor('white')
+    axes = np.atleast_1d(axes)
+
+    for ax, arena in zip(axes, present):
+        sub = sub_all.loc[sub_all['arena_type'] == arena]
+        p_mask, n_mask = _speed_type_masks(sub)
+        p_vals = sub.loc[p_mask, metric_col].to_numpy(dtype=float)
+        n_vals = sub.loc[n_mask, metric_col].to_numpy(dtype=float)
+
+        _style_axis(ax)
+        ax.hist([p_vals, n_vals], bins=bins, stacked=True,
+                color=[P_COLOR['face'], N_COLOR['face']],
+                edgecolor=[P_COLOR['edge'], N_COLOR['edge']],
+                linewidth=1.2, zorder=2)
+        ax.set_title(f'{arena}\n(n={len(sub)}: {len(p_vals)} p-type, {len(n_vals)} n-type)',
+                     fontsize=9, fontweight='bold')
+        ax.set_xlabel(metric_label, fontsize=9)
+
+    axes[0].set_ylabel('Number of cells', fontsize=10)
+    handles = [Patch(facecolor=P_COLOR['face'], edgecolor=P_COLOR['edge'], label='p-type speed cell'),
+               Patch(facecolor=N_COLOR['face'], edgecolor=N_COLOR['edge'], label='n-type speed cell')]
+    fig.legend(handles=handles, loc='upper center', ncol=2, fontsize=9,
+               frameon=False, bbox_to_anchor=(0.5, 1.06))
+    fig.suptitle(f'{metric_label}\n(cells passed both shuffle-testing procedures)',
+                 fontsize=11, fontweight='bold', y=1.15)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches='tight')
+    plt.close(fig)
+
+
 if __name__ == '__main__':
     print(f'Loading {INPUT_EXCEL} ...')
     full, fields = load_sheets()
@@ -831,3 +962,55 @@ if __name__ == '__main__':
                   f"stat={stat_str}  p={row['p_value']:.4g}")
     else:
         print('\nNo significant differences found among the extra/categorical comparisons.')
+
+    # ── All statistics in one CSV ───────────────────────────────────────────
+    # Stacks every statistics table written to the workbook above into one
+    # long-format CSV. 'table' names the source sheet; the tables have
+    # different columns, so cells that don't apply to a table are left blank.
+    all_stats_tables = {
+        'Descriptives':             desc_df,
+        'OmnibusTests':             omnibus_df,
+        'PostHoc':                  posthoc_df,
+        'Descriptives_Extra':       extra_desc,
+        'OmnibusTests_Extra':       extra_omnibus,
+        'PostHoc_Extra':            extra_posthoc,
+        'CategoricalDescriptives':  cat_desc_df,
+        'CategoricalOmnibus':       cat_omnibus_df,
+        'CategoricalPostHoc':       cat_posthoc_df,
+        'SpeedDirection_Desc':      speed_dir_desc,
+        'SpeedDirection_Omnibus':   speed_dir_omnibus_df,
+        'SpeedDirection_PostHoc':   speed_dir_posthoc,
+    }
+    stats_csv_parts = []
+    for sheet_name, tbl in all_stats_tables.items():
+        if tbl is None or not len(tbl):
+            continue
+        tbl = tbl.copy()
+        tbl.insert(0, 'table', sheet_name)
+        stats_csv_parts.append(tbl)
+
+    STATS_CSV = os.path.splitext(INPUT_EXCEL)[0] + '_AllStats.csv'
+    pd.concat(stats_csv_parts, ignore_index=True).to_csv(
+        STATS_CSV, index=False, encoding='utf-8-sig')
+    print(f'\nAll statistics saved to {STATS_CSV}')
+
+    # ── Histograms by arena type ────────────────────────────────────────────
+    # Same place-cell populations (full_df / field_df) as the statistics above.
+    os.makedirs(HIST_DIR, exist_ok=True)
+
+    print('\nPlotting Full-sheet metric histograms by arena type...')
+    for col, label in HIST_FULL_METRICS.items():
+        plot_histogram_by_arena(full_df, col, label,
+                                 os.path.join(HIST_DIR, f'Hist_Full_{col}.png'))
+
+    print('Plotting PlaceFields-sheet metric histograms by arena type...')
+    for col, label in FIELD_METRICS.items():
+        plot_histogram_by_arena(field_df, col, label,
+                                 os.path.join(HIST_DIR, f'Hist_Fields_{col}.png'))
+
+    print('Plotting speed-score histograms (p-type/n-type, both shuffle tests passed)...')
+    for col, label in SPEED_METRICS.items():
+        plot_speed_histograms_by_arena(full_df, col, label,
+                                        os.path.join(HIST_DIR, f'Hist_Speed_{col}.png'))
+
+    print(f'\nDone. Histogram plots saved to {HIST_DIR}')

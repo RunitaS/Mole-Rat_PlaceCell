@@ -51,12 +51,12 @@ from openpyxl.drawing.image import Image as XLImage # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-ROOT_FOLDER  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2'
-OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2\QUALITY_METRICS.xlsx'
+ROOT_FOLDER  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data'
+OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data\QUALITY_METRICS.xlsx'
 
 # Sibling folder that receives accepted units' .ntt files plus every .csv/.ncs
 # file found in the same session folder (mirrors ROOT_FOLDER's subfolder tree).
-ACCEPTED_ROOT_FOLDER = ROOT_FOLDER.rstrip('\\/') + '_Accepted'
+ACCEPTED_ROOT_FOLDER = ROOT_FOLDER.rstrip('\\/') + '_SpikeQualityFiltered'
 
 # ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
 # OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
@@ -65,11 +65,44 @@ N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
 WAVEFORM_DURATION_MS = 5.0       # total duration spanned by the 32-sample waveform snippet
 SAMPLE_INTERVAL_MS   = WAVEFORM_DURATION_MS / N_SAMPLES
 
+# ── Figure palette (sampled from the reference c-Fos / MoBI-DisC figure) ──────
+PAL_MAGENTA  = '#FA7FFA'   # "Increased in CMF" points
+PAL_CYAN     = '#7FFAFA'   # "Increased in HMF" points
+PAL_BLUE     = '#7FB3E5'   # light blue: HMF box fill (c-Fos figure)
+PAL_DKBLUE   = '#0066CC'   # dark blue: HMF data points (c-Fos figure)
+PAL_GRAY     = '#7F7F7F'   # gray: CMF box fill (c-Fos figure)
+PAL_LTGRAY   = '#D4D4D4'   # "Excluded clusters"
+PAL_GREEN    = '#00C000'   # inclination trace
+PAL_ORANGE   = '#FF8000'   # azimuth trace
+PAL_RED      = '#FF0000'   # highlighted labels
+PAL_BLACK    = '#000000'
+FIG_FONT     = ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans']   # c-Fos figure uses Arial/Helvetica
+
+plt.rcParams.update({
+    'font.family':        'sans-serif',
+    'font.sans-serif':    FIG_FONT,
+    'text.color':         PAL_BLACK,
+    'axes.labelcolor':    PAL_BLACK,
+    'axes.edgecolor':     PAL_BLACK,
+    'axes.linewidth':     1.5,
+    'xtick.color':        PAL_BLACK,
+    'ytick.color':        PAL_BLACK,
+    'xtick.direction':    'out',
+    'ytick.direction':    'out',
+    'xtick.major.width':  1.5,
+    'ytick.major.width':  1.5,
+    'axes.facecolor':     'white',
+    'figure.facecolor':   'white',
+    'savefig.facecolor':  'white',
+    'axes.grid':          False,
+    'legend.frameon':     False,
+})
+
 # ── Waveform plot colours ──────────────────────────────────────────────────────
-COLOR_WAVEFORM = '#2C5F8A'
-COLOR_PEAK     = '#E06C75'
-COLOR_TROUGH   = '#4A90D9'
-COLOR_DURATION = '#5A9E6F'
+COLOR_WAVEFORM = PAL_GRAY
+COLOR_PEAK     = PAL_MAGENTA
+COLOR_TROUGH   = PAL_DKBLUE
+COLOR_DURATION = PAL_GREEN
 
 # ── SNR quality thresholds ─────────────────────────────────────────────────────
 SNR_LOW_BAD   = 1.5
@@ -77,13 +110,13 @@ SNR_LOW_OK    = 2.5
 SNR_HIGH_GOOD = 4.0
 
 # ── ISI violation thresholds (%) ──────────────────────────────────────────────
-ISI_GOOD_PCT   = 1.0   # < 1 %  → GREEN
+ISI_GOOD_PCT   = 0.1   # < 1 %  → GREEN
 ISI_MARGIN_PCT = 5.0   # 1–5 %  → YELLOW, > 5 % → RED
 
 # ── Unit acceptance thresholds (ISI + SNR + template correlation) ─────────────
 TEMPLATE_CORR_ACCEPT_MIN = 0.5   # template correlation must exceed this
-ACCEPTED_COLOR = '#4A90D9'       # color used for accepted units in stacked plots
-REJECTED_COLOR = '#B0B0B0'       # gray used for rejected units in stacked plots
+ACCEPTED_COLOR = PAL_BLUE        # color used for accepted units in stacked plots
+REJECTED_COLOR = PAL_GRAY        # gray used for rejected units in stacked plots
 
 # ── Spike duration onset/offset threshold ──────────────────────────────────────
 # Onset (depolarization begin) / offset (hyperpolarization end) are taken as the
@@ -260,7 +293,7 @@ def is_unit_accepted(isi_pct, snr_val, template_corr) -> bool:
 
 # ── Individual quality-metric functions ───────────────────────────────────────
 
-def compute_isi_violations(spike_ts_us: np.ndarray, ref_period_us: float = 2000.0) -> float:
+def compute_isi_violations(spike_ts_us: np.ndarray, ref_period_us: float = 1000.0) -> float:
     """Return % of ISIs that violate the refractory period (< ref_period_us)."""
     if len(spike_ts_us) < 2:
         return float('nan')
@@ -388,14 +421,13 @@ def plot_waveform(wf: np.ndarray, result: dict, out_path: str, title: str):
     time_axis = np.arange(N_SAMPLES) * SAMPLE_INTERVAL_MS
 
     fig, ax = plt.subplots(figsize=(6, 4.2))
-    fig.patch.set_facecolor('white')
 
     ax.plot(time_axis, wf, color=COLOR_WAVEFORM, linewidth=1.8, zorder=3)
     ax.scatter([result['peak_time_ms']], [result['peak_amp_uV']],
-               color=COLOR_PEAK, s=60, zorder=5,
+               facecolor=COLOR_PEAK, edgecolor=PAL_BLACK, linewidths=1.0, s=60, zorder=5,
                label=f"Peak  {result['peak_amp_uV']:.1f} uV")
     ax.scatter([result['trough_time_ms']], [result['trough_amp_uV']],
-               color=COLOR_TROUGH, s=60, zorder=5,
+               facecolor=COLOR_TROUGH, edgecolor=PAL_BLACK, linewidths=1.0, s=60, zorder=5,
                label=f"Trough  {result['trough_amp_uV']:.1f} uV")
 
     start_t = result['spike_start_time_ms']
@@ -403,22 +435,23 @@ def plot_waveform(wf: np.ndarray, result: dict, out_path: str, title: str):
     ax.scatter([start_t, end_t], [wf[result['spike_start_idx']], wf[result['spike_end_idx']]],
                color=COLOR_DURATION, marker='|', s=220, linewidths=2.2, zorder=6,
                label='Spike start/end')
-    ax.axvspan(start_t, end_t, color=COLOR_DURATION, alpha=0.08, zorder=1)
+    ax.axvspan(start_t, end_t, color=PAL_BLUE, alpha=0.25, linewidth=0, zorder=1)
 
-    ax.set_xlabel('Time (ms)', fontsize=10, labelpad=6)
-    ax.set_ylabel('Amplitude (uV)', fontsize=10, labelpad=6)
-    ax.set_title(title, fontsize=11, fontweight='bold', pad=10)
+    ax.set_xlabel('Time (ms)', fontsize=14, labelpad=6)
+    ax.set_ylabel('Amplitude (µV)', fontsize=14, labelpad=6)
+    ax.set_title(title, fontsize=15, pad=10)
+    ax.tick_params(labelsize=12)
     ax.spines[['top', 'right']].set_visible(False)
-    ax.legend(fontsize=8, framealpha=0.85, loc='best', edgecolor='#CCCCCC')
+    ax.legend(fontsize=11, loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=3)
 
     note = (f"Ch {result['best_channel']}  |  "
             f"P-T time = {result['pt_time_ms']:.3f} ms  |  "
             f"P/T ratio = {result['pt_ratio']:.3f}  |  "
             f"Spike duration = {result['spike_duration_ms']:.3f} ms")
-    ax.text(0.5, -0.22, note, transform=ax.transAxes, fontsize=8, ha='center')
+    ax.text(0.5, -0.34, note, transform=ax.transAxes, fontsize=11, ha='center')
 
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    fig.savefig(out_path, dpi=500, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -663,7 +696,7 @@ print('Excel data saved.')
 
 def make_histogram(values, accepted, title, xlabel,
                    thresholds=(), threshold_colors=(), threshold_labels=(),
-                   bar_color='#4A90D9', n_bins=30):
+                   bar_color=ACCEPTED_COLOR, n_bins=30):
     """
     Stacked histogram: for each bin, rejected units (accepted == False) are
     drawn as a gray segment at the bottom, accepted units in `bar_color` on
@@ -676,9 +709,11 @@ def make_histogram(values, accepted, title, xlabel,
     vals     = values[valid]
     acc      = accepted[valid] if len(accepted) == len(values) else np.zeros(vals.shape, dtype=bool)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    fig.patch.set_facecolor('#F7F9FC')
-    ax.set_facecolor('#F7F9FC')
+    # Plot on top; legend + statistics live in a separate panel below so they
+    # never overlap the bars.
+    fig, (ax, ax_info) = plt.subplots(2, 1, figsize=(8, 8),
+                                      gridspec_kw={'height_ratios': [5, 2.6]})
+    ax_info.axis('off')
 
     if len(vals) > 0:
         bin_edges    = np.histogram_bin_edges(vals, bins=n_bins)
@@ -687,11 +722,12 @@ def make_histogram(values, accepted, title, xlabel,
         n_rejected, _ = np.histogram(vals[~acc], bins=bin_edges)
         n_accepted, _ = np.histogram(vals[acc],  bins=bin_edges)
 
+        # Box-style bars (gray / light blue fill, black edge) like the c-Fos reference
         ax.bar(bin_centers, n_rejected, width=bin_widths, color=REJECTED_COLOR,
-               edgecolor='white', linewidth=0.6, zorder=3,
+               edgecolor=PAL_BLACK, linewidth=1.2, zorder=3,
                label=f'Discarded (n={int(n_rejected.sum())})')
         ax.bar(bin_centers, n_accepted, width=bin_widths, bottom=n_rejected,
-               color=bar_color, edgecolor='white', linewidth=0.6, zorder=3,
+               color=bar_color, edgecolor=PAL_BLACK, linewidth=1.2, zorder=3,
                label=f'Accepted (n={int(n_accepted.sum())})')
 
         for xv, col, lbl in zip(thresholds, threshold_colors, threshold_labels):
@@ -699,29 +735,26 @@ def make_histogram(values, accepted, title, xlabel,
 
         mean_v   = float(np.mean(vals))
         median_v = float(np.median(vals))
-        ax.axvline(mean_v,   color='#E06C75', linewidth=1.8, linestyle='-',  zorder=5,
+        ax.axvline(mean_v,   color=PAL_BLACK, linewidth=1.8, linestyle='-',  zorder=5,
                    label=f'Mean   {mean_v:.3f}')
-        ax.axvline(median_v, color='#2C5F8A', linewidth=1.8, linestyle=':', zorder=5,
+        ax.axvline(median_v, color=PAL_BLACK, linewidth=1.8, linestyle=':', zorder=5,
                    label=f'Median {median_v:.3f}')
 
-        ax.yaxis.grid(True, color='white', linewidth=0.8, zorder=2)
-        ax.set_axisbelow(True)
-
-        summary = (f'n = {len(vals)}\n'
-                   f'Mean ± SD\n'
-                   f'{mean_v:.3f} ± {float(np.std(vals)):.3f}')
-        ax.text(0.02, 0.97, summary, transform=ax.transAxes, fontsize=8.5,
-                va='top', ha='left',
-                bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
-                          edgecolor='#CCCCCC', alpha=0.9))
-        ax.legend(fontsize=8.5, framealpha=0.85, loc='upper right', edgecolor='#CCCCCC')
+        summary = (f'n = {len(vals)}     '
+                   f'Mean ± SD = {mean_v:.3f} ± {float(np.std(vals)):.3f}     '
+                   f'Median = {median_v:.3f}')
+        handles, labels = ax.get_legend_handles_labels()
+        ax_info.legend(handles, labels, fontsize=12, loc='upper center', ncol=2)
+        ax_info.text(0.5, 0.0, summary, transform=ax_info.transAxes, fontsize=12,
+                     va='bottom', ha='center')
     else:
         ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
-                ha='center', va='center', fontsize=12)
+                ha='center', va='center', fontsize=14)
 
-    ax.set_xlabel(xlabel, fontsize=11, labelpad=8)
-    ax.set_ylabel('Number of units', fontsize=11, labelpad=8)
-    ax.set_title(title, fontsize=13, fontweight='bold', pad=12)
+    ax.set_xlabel(xlabel, fontsize=15, labelpad=8)
+    ax.set_ylabel('Number of units', fontsize=15, labelpad=8)
+    ax.set_title(title, fontsize=17, pad=12)
+    ax.tick_params(labelsize=13)
     ax.spines[['top', 'right']].set_visible(False)
     plt.tight_layout()
     return fig
@@ -733,13 +766,13 @@ base = os.path.splitext(OUTPUT_EXCEL)[0]
 
 histogram_specs = [
     # (sheet_name,  png_suffix,        df_col,               title,                            xlabel,                          thresholds,                     thr_colors,                               thr_labels,                                              bar_color)
-    ('Hist_SNR',     '_hist_SNR',       'snr',                'SNR Distribution',               'SNR  (A_peak / σ_noise)',       (SNR_LOW_BAD, SNR_LOW_OK, SNR_HIGH_GOOD), ('#E06C75','#E5C07B','#C678DD'), (f'Too low {SNR_LOW_BAD}', f'Marginal {SNR_LOW_OK}', f'High {SNR_HIGH_GOOD}'), '#4A90D9'),
-    ('Hist_ISI',     '_hist_ISI',       'isi_violation_pct',  'ISI Violation Distribution',     'ISI violations  (%)',           (ISI_GOOD_PCT, ISI_MARGIN_PCT),  ('#98C379','#E5C07B'),                  (f'Good < {ISI_GOOD_PCT}%', f'Marginal < {ISI_MARGIN_PCT}%'),                 '#E06C75'),
-    ('Hist_TmplCorr','_hist_TmplCorr',  'template_correlation','Waveform Template Correlation', 'Mean Pearson r  (spike vs template)', (0.90,),                    ('#98C379',),                           ('r = 0.90',),                                                                   '#7CB9E8'),
-    ('Hist_PTTime',  '_hist_PTTime',    'pt_time_ms',         'Peak-to-Trough Time',            'PT time  (ms)',                 (),                              (),                                     (),                                                                              '#A8D8A8'),
-    ('Hist_SpikeDur','_hist_SpikeDur',  'spike_duration_ms',  'Spike Duration',                 'Spike duration  (ms)',          (),                              (),                                     (),                                                                              '#C9A8E0'),
-    ('Hist_PTRatio', '_hist_PTRatio',   'pt_ratio',           'Peak-to-Trough Ratio',           '|peak| / |trough|  (a.u.)',     (1.0,),                          ('#AAAAAA',),                           ('ratio = 1.0',),                                                                '#FFD580'),
-    ('Hist_CSI',     '_hist_CSI',       'csi',                'Complex Spike Index (CSI)',       'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)', (10.0,), ('#E06C75',),                           ('CSI = 10%',),                                                                  '#98C379'),
+    ('Hist_SNR',     '_hist_SNR',       'snr',                'SNR Distribution',               'SNR  (A_peak / σ_noise)',       (SNR_LOW_BAD, SNR_LOW_OK, SNR_HIGH_GOOD), (PAL_RED, PAL_ORANGE, PAL_GREEN), (f'Too low {SNR_LOW_BAD}', f'Marginal {SNR_LOW_OK}', f'High {SNR_HIGH_GOOD}'), ACCEPTED_COLOR),
+    ('Hist_ISI',     '_hist_ISI',       'isi_violation_pct',  'ISI Violation Distribution',     'ISI violations  (%)',           (ISI_GOOD_PCT, ISI_MARGIN_PCT),  (PAL_GREEN, PAL_ORANGE),                 (f'Good < {ISI_GOOD_PCT}%', f'Marginal < {ISI_MARGIN_PCT}%'),                 ACCEPTED_COLOR),
+    ('Hist_TmplCorr','_hist_TmplCorr',  'template_correlation','Waveform Template Correlation', 'Mean Pearson r  (spike vs template)', (0.90,),                    (PAL_GREEN,),                           ('r = 0.90',),                                                                   ACCEPTED_COLOR),
+    ('Hist_PTTime',  '_hist_PTTime',    'pt_time_ms',         'Peak-to-Trough Time',            'PT time  (ms)',                 (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
+    ('Hist_SpikeDur','_hist_SpikeDur',  'spike_duration_ms',  'Spike Duration',                 'Spike duration  (ms)',          (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
+    ('Hist_PTRatio', '_hist_PTRatio',   'pt_ratio',           'Peak-to-Trough Ratio',           '|peak| / |trough|  (a.u.)',     (1.0,),                          (PAL_GRAY,),                            ('ratio = 1.0',),                                                                ACCEPTED_COLOR),
+    ('Hist_CSI',     '_hist_CSI',       'csi',                'Complex Spike Index (CSI)',       'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)', (10.0,), (PAL_RED,),                             ('CSI = 10%',),                                                                  ACCEPTED_COLOR),
 ]
 
 png_paths = {}
@@ -752,7 +785,7 @@ for sheet_name, suffix, col, title, xlabel, thresholds, thr_colors, thr_labels, 
                           threshold_labels=thr_labels,
                           bar_color=bar_color)
     png  = base + suffix + '.png'
-    fig.savefig(png, dpi=150, bbox_inches='tight')
+    fig.savefig(png, dpi=500, bbox_inches='tight')
     plt.close(fig)
     png_paths[sheet_name] = png
     print(f'Histogram saved: {png}')
