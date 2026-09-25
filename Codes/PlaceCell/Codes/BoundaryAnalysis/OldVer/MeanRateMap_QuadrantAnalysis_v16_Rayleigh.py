@@ -69,6 +69,7 @@ only the coordinate transform, smoothing kernel and plotting differ per arena.
 """
 
 import os
+import re
 import hashlib
 import random
 import threading
@@ -77,6 +78,7 @@ import concurrent.futures
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, label
+from scipy.stats import rankdata
 
 import matplotlib
 matplotlib.use('Agg')
@@ -92,10 +94,10 @@ from matplotlib.colors import Normalize
 # Single root under which every animal/arena/day/session lives. Arena type is auto-detected
 # per session from its path (see ARENA_FOLDER_KEYWORDS / _detect_arena_key below) -- no
 # per-arena root folders needed any more.
-ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted\SessionType_Sorted\Open\Zero'
+ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted\SessionType_Sorted\Open\Cntrl'
 
 # Output folder for all figures / workbooks (same location as before, now derived from the root).
-OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_Rayleigh')
+OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_Rayleigh2')
 
 # Whole-arena bin coverage criterion (session-level). True: a session must have >= min_occ_s
 # occupancy in at least COVERAGE_FRACTION of the arena's total spatial bins (per handler, see
@@ -388,9 +390,9 @@ MAX_WORKERS    = 4
 # for a real effect when diffing two runs. Change it only to check robustness to the seed.
 BOOTSTRAP_SEED = 0
 
-POS_JUMP_THRESH_CMS  = 80.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
+POS_JUMP_THRESH_CMS  = 90.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
 POS_SMOOTH_SIGMA_SMP = 1.0    # Gaussian smoothing sigma (samples) applied to x/y tracking position
-RATEMAP_SMOOTH_SIGMA_BINS = 1.0  # Gaussian smoothing sigma (bins) applied to rate maps
+RATEMAP_SMOOTH_SIGMA_BINS = 3.0  # Gaussian smoothing sigma (bins) applied to rate maps
 
 # Place-field extraction (pass-index 'place' filter-band criteria, auto_filter_band in
 # pass_index_parser.m: field = area with raw rate >= 20% of the raw peak): a bin qualifies
@@ -398,7 +400,7 @@ RATEMAP_SMOOTH_SIGMA_BINS = 1.0  # Gaussian smoothing sigma (bins) applied to ra
 # of the raw rate map's peak; a connected run of qualifying bins is only kept as a field if
 # it spans at least MIN_FIELD_BINS contiguous bins.
 FIELD_PEAK_FRAC = 0.20
-MIN_FIELD_BINS  = 7
+MIN_FIELD_BINS  = 9
 
 # ── Colour scaling of the quadrant-fold figures (Fig1BD_QuadrantFold.png,
 # QuadrantFold_KDE.png). Both are 3-arena grids, and this decides whether the three arenas
@@ -2850,9 +2852,16 @@ def run_fine_kde_analysis(arena_handlers: dict, arena_results: dict, out_dir: st
 
 
 # ============================================================================
-# Rayleigh vector analysis (open field only)
+# Rayleigh vector analysis (open field only) -- DESCRIPTIVE ONLY
 #
-# Tests whether an OPEN-FIELD pooled mean rate map ('overall', 'peak', 'field' -- the same
+# NOTE: the output of this section (Rayleigh_OpenField*.png / .xlsx) is DESCRIPTIVE: it reports the
+# resultant length R and mean direction of the angularly-binned pooled map but NO p-value. The
+# old weighted-Rayleigh p (z = n R^2 with n = number of spatial bins, or of significant bins) was
+# removed because it is not valid: the weights are rates rather than counts, n is arbitrary, the
+# smoothed bins are not independent, and the pooled map is a single sample. The inferential
+# tests are in "Directional-preference tests across cells" (run_directional_vector_analysis).
+#
+# Summarises whether an OPEN-FIELD pooled mean rate map ('overall', 'peak', 'field' -- the same
 # three map types as the KDE analyses above, taken on the whole unfolded grid) has a
 # directional bias about the arena centre:
 #   1. Centre: the middle of the map's own circumference -- the midpoint of the extent of
@@ -2867,7 +2876,8 @@ def run_fine_kde_analysis(arena_handlers: dict, arena_results: dict, out_dir: st
 #   3. Each angular bin's magnitude is the sum (or mean, RAYLEIGH_MAGNITUDE) of its bins'
 #      map values, each first multiplied by a radial weight that grows with the bin's
 #      distance from the centre (RAYLEIGH_RADIAL_POWER), so wall-side bins count for more.
-#   4. Weighted Rayleigh test on the angular bins' magnitudes (angle = angular bin centre).
+#   4. Weighted resultant (R, mean direction) of the angular bins' magnitudes (angle = angular
+#      bin centre). Descriptive only -- no significance test.
 # ============================================================================
 
 RAYLEIGH_BIN_DEG   = 30.0
@@ -2943,75 +2953,60 @@ def angular_bin_magnitudes(handler, values_flat: np.ndarray, valid_flat: np.ndar
                 centre_bin=(cx_bin, cy_bin), circumference=circumference, n_used=int(use.sum()))
 
 
-def rayleigh_test(angles_deg: np.ndarray, weights: np.ndarray, n: float,
-                  bin_deg: float = 0.0) -> dict:
-    """Weighted Rayleigh test of uniformity for circular data. `weights` are the magnitudes at
-    `angles_deg`; `n` is the sample size the test is scaled by (z = n * R^2). bin_deg > 0 applies
-    the standard correction for grouped angles (Zar) to R. p via Zar's (1999) approximation."""
+def weighted_resultant(angles_deg: np.ndarray, weights: np.ndarray, bin_deg: float = 0.0) -> dict:
+    """DESCRIPTIVE weighted resultant of circular data: `weights` are the magnitudes at
+    `angles_deg`. bin_deg > 0 applies the standard correction for grouped angles (Zar) to R.
+    Deliberately returns no p-value -- see the section comment above."""
     w = np.clip(np.asarray(weights, dtype=float), 0.0, None)
     total = w.sum()
-    if total <= 0 or n <= 0:
-        return dict(R=np.nan, mean_dir_deg=np.nan, z=np.nan, p=np.nan, n=n)
+    if total <= 0:
+        return dict(R=np.nan, mean_dir_deg=np.nan)
     th = np.radians(angles_deg)
     C, S = (w * np.cos(th)).sum(), (w * np.sin(th)).sum()
     R = np.hypot(C, S) / total
     if bin_deg > 0:
         d = np.radians(bin_deg)
         R = min(1.0, R * (d / 2.0) / np.sin(d / 2.0))
-    z = n * R ** 2
-    Rn = n * R
-    p = float(min(1.0, np.exp(np.sqrt(1.0 + 4.0 * n + 4.0 * (n ** 2 - Rn ** 2)) - (1.0 + 2.0 * n))))
-    return dict(R=float(R), mean_dir_deg=float(np.degrees(np.arctan2(S, C)) % 360.0),
-                z=float(z), p=p, n=float(n))
+    return dict(R=float(R), mean_dir_deg=float(np.degrees(np.arctan2(S, C)) % 360.0))
 
 
-def _rayleigh_on_map(handler, vals: np.ndarray, valid: np.ndarray, n_obs, n_cells: int,
+def _rayleigh_on_map(handler, vals: np.ndarray, valid: np.ndarray, n_cells: int,
                      map_type: str) -> dict:
-    """Shared core: angular-bin magnitudes + Rayleigh test of one whole-arena map. n_obs is the
-    sample size for the test when it is not simply the number of valid spatial bins (None ->
-    use the number of valid spatial bins)."""
+    """Shared core: angular-bin magnitudes + descriptive resultant of one whole-arena map."""
     if n_cells == 0 or not valid.any():
         return dict(map_type=map_type, n_place_cells=n_cells, ang=None, stats=None,
                     map=vals, map_valid=valid)
     ang = angular_bin_magnitudes(handler, np.where(valid, vals, 0.0), valid)
-    n = ang['n_used'] if n_obs is None else n_obs
-    stats = rayleigh_test(ang['bin_centres_deg'], ang['magnitude'], n, bin_deg=RAYLEIGH_BIN_DEG)
-    stats['significant'] = bool(np.isfinite(stats['p']) and stats['p'] < RAYLEIGH_ALPHA)
+    stats = weighted_resultant(ang['bin_centres_deg'], ang['magnitude'], bin_deg=RAYLEIGH_BIN_DEG)
     return dict(map_type=map_type, n_place_cells=n_cells, ang=ang, stats=stats,
                 map=vals, map_valid=valid)
 
 
 def analyze_rayleigh(handler, results: list, map_type: str) -> dict:
-    """Rayleigh vector analysis of one pooled whole-arena map ('overall'/'peak'/'field').
-    n is the number of place-cell peaks for 'peak' (each a single observation) and the number
-    of valid spatial bins for the two mean rate maps."""
+    """Descriptive resultant of one pooled whole-arena map ('overall'/'peak'/'field')."""
     if map_type == 'peak':
-        vals, total = pool_peak_proportion_fine(handler, results)
-        valid, n_obs = np.isfinite(vals), total
+        vals, _ = pool_peak_proportion_fine(handler, results)
+        valid = np.isfinite(vals)
     else:
         vals, valid = _FINE_MAP_BUILDERS[map_type](handler, results)
-        n_obs = None
-    return _rayleigh_on_map(handler, vals, valid, n_obs, len(results), map_type)
+    return _rayleigh_on_map(handler, vals, valid, len(results), map_type)
 
 
 def analyze_rayleigh_kde(handler, results: list, map_type: str, kde_res: dict,
                          sig_only: bool = False) -> dict:
-    """Rayleigh vector analysis of the fine-map KDE map drawn by plot_fine_kde: the bootstrap
+    """Descriptive resultant of the fine-map KDE map drawn by plot_fine_kde: the bootstrap
     median KDE-smoothed map (kde_res['real_med'] from analyze_fine_kde), restricted to the bins
     that KDE analysis treats as genuinely sampled (kde_res['fine_valid']). Each bin enters with
     its firing-rate value times the radial (wall-proximity) weight of angular_bin_magnitudes.
 
-    sig_only=True further restricts the test to the bins whose bootstrap CI significantly exceeds
+    sig_only=True further restricts it to the bins whose bootstrap CI significantly exceeds
     the null (kde_res['sig_mask'], the NULL_MODE null -- the bins outlined in black on the KDE
-    figure), so only the significantly-elevated firing, weighted by its rate and its closeness
-    to the wall, contributes to the vector. n is then the number of significant bins for every
-    map type (for sig_only=False, as analyze_rayleigh: peaks for 'peak', else valid bins)."""
+    figure)."""
     vals = kde_res['real_med']
     valid = kde_res['fine_valid'] & np.isfinite(vals)
     if sig_only:
         valid &= kde_res['sig_mask']
-    n_obs = pool_peak_proportion_fine(handler, results)[1] if (map_type == 'peak' and not sig_only) else None
-    return _rayleigh_on_map(handler, vals, valid, n_obs, len(results), map_type)
+    return _rayleigh_on_map(handler, vals, valid, len(results), map_type)
 
 
 def plot_rayleigh(handler, results: dict, save_path: str, kind_label: str = 'pooled map'):
@@ -3040,13 +3035,13 @@ def plot_rayleigh(handler, results: dict, save_path: str, kind_label: str = 'poo
         ax_pol.bar(th, mag, width=np.radians(RAYLEIGH_BIN_DEG), color='0.6', edgecolor='0.3', lw=0.4)
         rmax = float(mag.max()) if mag.max() > 0 else 1.0
         ax_pol.annotate('', xy=(np.radians(st['mean_dir_deg']), st['R'] * rmax), xytext=(0, 0),
-                        arrowprops=dict(arrowstyle='->', color='crimson' if st['significant'] else 'k', lw=2))
+                        arrowprops=dict(arrowstyle='->', color='k', lw=2))
         ax_pol.set_title(f"R={st['R']:.3f}, mean dir={st['mean_dir_deg']:.0f} deg\n"
-                         f"z={st['z']:.2f}, p={st['p']:.3g}" + (' *' if st['significant'] else ''), fontsize=9)
+                         f"(descriptive -- see DirectionalVector_* for tests)", fontsize=9)
         ax_map.set_title(f"{_ARENA_TITLES[RAYLEIGH_ARENA_KEY]} -- {_MAP_TITLES[map_type]}\n"
                          f"(n={res['n_place_cells']} place cells)", fontsize=9)
 
-    fig.suptitle(f'Rayleigh vector analysis, {kind_label} ({RAYLEIGH_BIN_DEG:g} deg bins, '
+    fig.suptitle(f'Descriptive resultant vector, {kind_label} ({RAYLEIGH_BIN_DEG:g} deg bins, '
                  f'{RAYLEIGH_MAGNITUDE} magnitude, radial weight r^{RAYLEIGH_RADIAL_POWER:g})')
     fig.tight_layout()
     fig.savefig(save_path, dpi=200)
@@ -3070,9 +3065,8 @@ def export_rayleigh_summary(results_by_kind: dict, out_path: str):
                                  centre_bin_x=ang['centre_bin'][0], centre_bin_y=ang['centre_bin'][1],
                                  bin_deg=RAYLEIGH_BIN_DEG, magnitude=RAYLEIGH_MAGNITUDE,
                                  radial_power=RAYLEIGH_RADIAL_POWER,
-                                 n_spatial_bins=ang['n_used'], n_test=st['n'], R=st['R'],
-                                 mean_dir_deg=st['mean_dir_deg'], z=st['z'], p=st['p'],
-                                 significant=st['significant']))
+                                 n_spatial_bins=ang['n_used'], R=st['R'],
+                                 mean_dir_deg=st['mean_dir_deg']))
         for k, (c, m, mu, nb) in enumerate(zip(ang['bin_centres_deg'], ang['magnitude'],
                                                ang['magnitude_unweighted'], ang['n_spatial_bins'])):
             bin_rows.append(dict(map_kind=kind, map_type=map_type, angular_bin=k,
@@ -3087,9 +3081,10 @@ def export_rayleigh_summary(results_by_kind: dict, out_path: str):
 
 def run_rayleigh_analysis(arena_handlers: dict, arena_results: dict, out_dir: str,
                           fine_kde_results: dict | None = None) -> dict:
-    """Runs the Rayleigh vector analysis on every map type of the open field only: the pooled
-    mean rate maps and, when fine_kde_results (run_fine_kde_analysis' output) is given, the
-    fine-map KDE maps of plot_fine_kde as well."""
+    """Descriptive resultant-vector summary (plots + workbook, no p-values) of every map type of
+    the open field only: the pooled mean rate maps and, when fine_kde_results
+    (run_fine_kde_analysis' output) is given, the fine-map KDE maps of plot_fine_kde as well.
+    Inference lives in run_directional_vector_analysis."""
     handler, cells = arena_handlers[RAYLEIGH_ARENA_KEY], arena_results[RAYLEIGH_ARENA_KEY]
     results_by_kind = {'pooled': {mt: analyze_rayleigh(handler, cells, mt) for mt in _MAP_ORDER}}
     if fine_kde_results is not None:
@@ -3110,14 +3105,394 @@ def run_rayleigh_analysis(arena_handlers: dict, arena_results: dict, out_dir: st
     for kind, results in results_by_kind.items():
         for map_type in _MAP_ORDER:
             st = results[map_type]['stats']
-            tag = f'{RAYLEIGH_ARENA_KEY}/{kind}/{map_type} Rayleigh'
+            tag = f'{RAYLEIGH_ARENA_KEY}/{kind}/{map_type} resultant (descriptive)'
             if st is None:
                 print(f'[{tag}] no data / no significant bins')
             else:
-                print(f"[{tag}] R={st['R']:.4f}, "
-                      f"mean dir={st['mean_dir_deg']:.1f} deg, z={st['z']:.3f}, p={st['p']:.4g}"
-                      + (' -> significant directional bias' if st['significant'] else ' -> no significant bias'))
+                print(f"[{tag}] R={st['R']:.4f}, mean dir={st['mean_dir_deg']:.1f} deg")
     return results_by_kind
+
+
+# ============================================================================
+# Directional-preference tests across cells (open field only)
+#
+# Replaces the invalid weighted-Rayleigh p-values above. The independent unit of the data is the
+# cell (and, above it, the animal), NOT the spatial bin, so the inference is done on ONE VECTOR
+# PER CELL:
+#
+#   v_i = sum_j f_ij * d_j / sum_j f_ij   -   mean_j(d_j)  [over the cell's occupancy-passing bins]
+#
+# where d_j = (bin-centre j - arena centre) / arena radius, f_ij is the cell's weight in bin j,
+# and the sum runs over bins that pass occupancy (cell['valid'], i.e. >= min_occ_s and inside the
+# arena). v_i is the rate-weighted centroid of the cell's firing relative to the arena centre:
+# its ANGLE is the preferred direction and its LENGTH (0-1, in arena radii) carries both how far
+# from the centre and how concentrated the firing is -- so rate AND distance are both preserved
+# with no angular binning. The second term (VECTOR_SUBTRACT_COVERAGE) removes the centroid of
+# the cell's own sampled bins, so a flat map gives v_i = 0 and an animal that skipped one side of
+# the arena does not produce a spurious direction.
+#
+# Three kinds of per-cell weight f_ij are analysed, for each of the three map types:
+#   'rate'    : the cell's own map -- overall: fi_map on valid bins; field: fi_map inside the
+#               cell's place field; peak: a single 1 at the cell's peak bin.
+#   'kde'     : that same map after the fine-map KDE step (handler.smooth, the per-cell analogue of
+#               analyze_fine_kde's KDE smoothing).
+#   'kde_sig' : the 'kde' map restricted to the bins the POOLED fine-map KDE found significantly
+#               above the null (kde_res['sig_mask']). CAVEAT: those bins were selected using the
+#               same cells being tested, so the test is optimistic (selection bias) and only
+#               descriptive; it has no pooled-map permutation counterpart for the same reason.
+#
+# Tests (all rank/permutation based; the primary p is always the permutation p):
+#   * Moore's modified Rayleigh test on ANIMAL-MEAN vectors (angle, length): each animal's cells
+#     are averaged first, so n = number of animals and there is no pseudoreplication. p is by
+#     Monte-Carlo under Moore's null (uniform random angles, length ranks fixed); the asymptotic
+#     p = exp(-3 R*^2) is reported alongside.
+#   * Moore's test on all CELL vectors with an animal-CLUSTERED permutation: the statistic is
+#     computed on every cell, but the null rotates all cells of an animal together by one random
+#     angle, so cells of one animal cannot each count as independent evidence.
+#   * Moore's test on all cell vectors treating cells as independent -- REFERENCE ONLY
+#     (pseudoreplicated: cells of one animal/session are not independent).
+#   * Pooled-map permutation ('rate' and 'kde' kinds): every cell's map and its occupancy mask are
+#     independently rotated/reflected by one of the 8 symmetries of the square grid (exact, no
+#     interpolation, about the arena centre), the pooled map is rebuilt and its resultant length
+#     recomputed. The observed pooled R is compared to that null: spatial autocorrelation and the
+#     occupancy masks are preserved and no sample size enters. (Cells are treated as independent
+#     here, so it is subject to the same pseudoreplication caveat as the naive Moore test.)
+#
+# Moore's test is scale-free (uses ranks of the lengths) and, like Rayleigh, only detects a
+# UNIMODAL directional bias -- opposite or 4-fold symmetric preferences give R* ~ 0.
+# ============================================================================
+
+# regex applied to the session name (path relative to ROOT_DIRECTORY) to extract the animal ID,
+# e.g. 'Open\Fa1059_Day10_3Rotate' -> 'Fa1059'; falls back to the first path component
+ANIMAL_ID_REGEX = r'\b(Fa[0-9A-Za-z]+?)_'
+VECTOR_SUBTRACT_COVERAGE = True   # subtract the centroid of the cell's own sampled bins (see above)
+MOORE_N_PERM             = 10000  # Monte-Carlo draws for Moore's test
+CLUSTER_N_PERM          = 10000  # animal-clustered rotation permutations
+POOLED_N_PERM            = 2000   # pooled-map D4 permutations
+VECTOR_SEED              = 0
+_VECTOR_KINDS            = ('rate', 'kde', 'kde_sig')
+_VECTOR_KIND_TITLES = {'rate': 'per-cell mean rate maps', 'kde': 'per-cell fine-KDE maps',
+                       'kde_sig': 'per-cell fine-KDE maps, significant bins only'}
+
+
+def _animal_id(session_name: str) -> str:
+    m = re.search(ANIMAL_ID_REGEX, session_name)
+    return m.group(1) if m else os.path.normpath(session_name).split(os.sep)[0]
+
+
+def _bin_offsets(handler) -> tuple:
+    """(dx, dy) per flat bin: bin-centre offset from the arena centre in units of the arena
+    radius, so a vector's length is 0 at the centre and ~1 at the wall."""
+    cx_bin, cy_bin, _ = _circle_centre_from_circumference(handler)
+    bx, by = np.meshgrid(np.arange(handler.nx), np.arange(handler.ny), indexing='ij')
+    radius_bins = handler.diameter / 2.0 / handler.bin_cm
+    return (bx.ravel() - cx_bin) / radius_bins, (by.ravel() - cy_bin) / radius_bins
+
+
+def _cell_weight_map(handler, cell: dict, map_type: str, kind: str, sig_mask=None):
+    """(weights f_j, support mask) of one cell for a map type / kind, or None if the cell has no
+    usable map (no field, no peak, nothing left inside the significant bins). Only occupancy-
+    passing bins (cell['valid'] & handler.geom_valid) can carry weight."""
+    valid = cell['valid'] & handler.geom_valid
+    fi = np.where(valid & np.isfinite(cell['fi_map']), cell['fi_map'], 0.0)
+    if map_type == 'overall':
+        w, sup = fi, valid
+    elif map_type == 'field':
+        sup = valid & cell['field_mask']
+        w = np.where(sup, fi, 0.0)
+    else:  # 'peak'
+        pb = cell['peak_bin']
+        if pb is None or not valid[pb]:
+            return None
+        sup = valid
+        w = np.zeros(handler.n_bins)
+        w[pb] = 1.0
+    if not sup.any():
+        return None
+    if kind in ('kde', 'kde_sig'):
+        w = np.where(sup, handler.smooth(w, sup), 0.0)
+    if kind == 'kde_sig':
+        sup = sup & sig_mask
+        w = np.where(sup, w, 0.0)
+    return (w, sup) if w.sum() > 0 else None
+
+
+def _weighted_offset(dxy: tuple, w: np.ndarray, ref_mask: np.ndarray):
+    """Centroid of weights `w` minus (if VECTOR_SUBTRACT_COVERAGE) the centroid of `ref_mask`."""
+    s = w.sum()
+    if not s > 0 or not ref_mask.any():
+        return None
+    vx, vy = (w * dxy[0]).sum() / s, (w * dxy[1]).sum() / s
+    if VECTOR_SUBTRACT_COVERAGE:
+        vx -= dxy[0][ref_mask].mean()
+        vy -= dxy[1][ref_mask].mean()
+    return float(vx), float(vy)
+
+
+def _moore_pvalue_mc(ranks: np.ndarray, r_obs: float, rng: np.random.Generator,
+                     n_perm: int) -> float:
+    """Monte-Carlo p of Moore's R* under H0: the angles are uniform on the circle (independent of
+    the lengths), with the length ranks held fixed -- that is Moore's null, from which his tables
+    come. It is NOT a shuffle of the ranks over the observed angles: that conditions on the
+    observed angles, so it tests independence of length and angle, and cannot reject when the
+    angles all point the same way. The observed arrangement is counted, so p >= 1/(n_perm+1)."""
+    n = len(ranks)
+    count, done = 0, 0
+    while done < n_perm:
+        chunk = min(2000, n_perm - done)
+        th = rng.uniform(0.0, 2 * np.pi, size=(chunk, n))
+        count += int((np.hypot(np.cos(th) @ ranks, np.sin(th) @ ranks) / n ** 1.5 >= r_obs - 1e-12).sum())
+        done += chunk
+    return (1 + count) / (n_perm + 1)
+
+
+def moore_test(theta: np.ndarray, rho: np.ndarray, rng: np.random.Generator,
+               n_perm: int = MOORE_N_PERM) -> dict:
+    """Moore's (1980) modified Rayleigh test on n vectors (angle theta [rad], length rho).
+    Lengths are replaced by their ranks (ties averaged); C = sum rank*cos(theta),
+    S = sum rank*sin(theta), R* = sqrt(C^2 + S^2) / n^1.5. Under H0, 6 R*^2 is asymptotically
+    chi-square(2), i.e. p ~ exp(-3 R*^2) (reported as p_asymptotic, not reliable for small n); the
+    primary p (`p_perm`) is the Monte-Carlo p under uniform random angles (_moore_pvalue_mc)."""
+    theta, rho = np.asarray(theta, float), np.asarray(rho, float)
+    n = len(theta)
+    if n < 3:
+        return dict(n=n, Rstar=np.nan, mean_dir_deg=np.nan, p_asymptotic=np.nan, p_perm=np.nan,
+                    perm_method='n<3')
+    ranks = rankdata(rho)
+    C, S = float(ranks @ np.cos(theta)), float(ranks @ np.sin(theta))
+    r_obs = np.hypot(C, S) / n ** 1.5
+    return dict(n=n, Rstar=float(r_obs), mean_dir_deg=float(np.degrees(np.arctan2(S, C)) % 360.0),
+                p_asymptotic=float(min(1.0, np.exp(-3.0 * r_obs ** 2))),
+                p_perm=_moore_pvalue_mc(ranks, r_obs, rng, n_perm),
+                perm_method=f'monte_carlo_uniform_angles x{n_perm}')
+
+
+def moore_test_clustered(theta: np.ndarray, rho: np.ndarray, animal_idx: np.ndarray,
+                         rng: np.random.Generator, n_perm: int = CLUSTER_N_PERM) -> dict:
+    """Moore's R* on every cell vector, with an animal-clustered null: each permutation rotates ALL
+    cells of an animal by one common random angle (keeping the within-animal structure and the
+    length ranks), i.e. it asks whether the animals' orientations are non-uniform, not whether
+    cells are. Needs >= 3 animals."""
+    theta, rho = np.asarray(theta, float), np.asarray(rho, float)
+    n = len(theta)
+    n_anim = int(animal_idx.max()) + 1 if n else 0
+    if n < 3 or n_anim < 3:
+        return dict(n=n, n_animals=n_anim, Rstar=np.nan, mean_dir_deg=np.nan, p_perm=np.nan,
+                    perm_method='n_animals<3')
+    ranks = rankdata(rho)
+    C, S = float(ranks @ np.cos(theta)), float(ranks @ np.sin(theta))
+    r_obs = np.hypot(C, S) / n ** 1.5
+    count, done = 0, 0
+    while done < n_perm:
+        chunk = min(2000, n_perm - done)
+        phi = rng.uniform(0.0, 2 * np.pi, size=(chunk, n_anim))
+        th = theta[None, :] + phi[:, animal_idx]
+        count += int((np.hypot(np.cos(th) @ ranks, np.sin(th) @ ranks) / n ** 1.5 >= r_obs - 1e-12).sum())
+        done += chunk
+    return dict(n=n, n_animals=n_anim, Rstar=float(r_obs),
+                mean_dir_deg=float(np.degrees(np.arctan2(S, C)) % 360.0),
+                p_perm=(1 + count) / (n_perm + 1), perm_method='animal_cluster_rotation')
+
+
+def _d4_variants(arr_flat: np.ndarray, nx: int, ny: int) -> np.ndarray:
+    """The 8 symmetries of the square grid (4 rotations x optional mirror) of a flat (nx*ny) map,
+    as (8, n_bins). Variant 0 is the identity. Exact on the lattice, about the grid centre."""
+    a = arr_flat.reshape(nx, ny)
+    out = []
+    for k in range(4):
+        r = np.rot90(a, k)
+        out.append(r.ravel())
+        out.append(r[::-1].ravel())
+    return np.array(out)
+
+
+def pooled_map_permutation(handler, cells: list, map_type: str, kind: str, dxy: tuple,
+                           rng: np.random.Generator, n_perm: int = POOLED_N_PERM) -> dict:
+    """Pooled-map permutation null of the resultant length (see section comment). `cells` must
+    be the cells that have a per-cell vector for this map type, so the pooled map and the
+    per-cell tests use the same cells."""
+    nx, ny = handler.nx, handler.ny
+    cx_bin, cy_bin, _ = _circle_centre_from_circumference(handler)
+    if nx != ny or abs(cx_bin - (nx - 1) / 2.0) > 1e-9 or abs(cy_bin - (ny - 1) / 2.0) > 1e-9:
+        return dict(R_obs=np.nan, p_perm=np.nan, note='arena centre not on the grid centre')
+    usable = [(c, wm) for c in cells if (wm := _cell_weight_map(handler, c, map_type, 'rate')) is not None]
+    n = len(usable)
+    if n == 0:
+        return dict(R_obs=np.nan, p_perm=np.nan, note='no cells')
+
+    # per cell, per symmetry: numerator weights A, support B (normaliser / smoothing support)
+    # and occupancy-valid V (defines the coverage reference centroid)
+    A = np.zeros((n, 8, handler.n_bins))
+    B = np.zeros_like(A)
+    V = np.zeros_like(A)
+    for i, (c, (w, sup)) in enumerate(usable):
+        valid = c['valid'] & handler.geom_valid
+        A[i] = _d4_variants(w, nx, ny)
+        B[i] = _d4_variants(sup.astype(float), nx, ny)
+        V[i] = _d4_variants(valid.astype(float), nx, ny)
+
+    def _R(idx):
+        ar = np.arange(n)
+        a, b, v = A[ar, idx].sum(0), B[ar, idx].sum(0), V[ar, idx].sum(0)
+        sup = b > 0
+        # 'overall' pools as a per-bin mean over the cells valid there (pool_fine_map); the other
+        # two are sums (pool_field_only_map / pool_peak_proportion_fine), whose common scale
+        # cancels in the centroid
+        F = np.where(sup, a / np.where(sup, b, 1.0), 0.0) if map_type == 'overall' else a
+        if kind == 'kde':
+            F = np.where(sup, handler.smooth(np.where(sup, F, 0.0), sup), 0.0)
+        vec = _weighted_offset(dxy, F, v > 0)
+        return (np.nan, np.nan) if vec is None else (float(np.hypot(*vec)),
+                                                     float(np.degrees(np.arctan2(vec[1], vec[0])) % 360.0))
+
+    r_obs, dir_obs = _R(np.zeros(n, dtype=int))
+    r_null = np.array([_R(rng.integers(0, 8, size=n))[0] for _ in range(n_perm)])
+    return dict(R_obs=r_obs, mean_dir_deg=dir_obs,
+                p_perm=float((1 + np.sum(r_null >= r_obs - 1e-12)) / (n_perm + 1)),
+                R_null_p95=float(np.nanpercentile(r_null, 95)), n_perm=n_perm, note='')
+
+
+def plot_cell_vectors(kind: str, data_by_map: dict, save_path: str):
+    """One polar panel per map type: every cell's vector (angle, length in arena radii) as a dot
+    coloured by animal, the animal-mean vectors as arrows, and the test p-values in the title."""
+    fig = plt.figure(figsize=(5.2 * len(_MAP_ORDER), 5.6))
+    animals_all = sorted({a for d in data_by_map.values() for a in d['animals']})
+    colours = {a: plt.get_cmap('tab10')(i % 10) for i, a in enumerate(animals_all)}
+    for mi, map_type in enumerate(_MAP_ORDER):
+        ax = fig.add_subplot(1, len(_MAP_ORDER), mi + 1, projection='polar')
+        d = data_by_map.get(map_type)
+        if d is None or len(d['theta']) == 0:
+            ax.set_title(f'{_MAP_TITLES[map_type]}\n(no cells)', fontsize=9)
+            continue
+        rmax = max(float(d['rho'].max()), float(d['animal_rho'].max()), 1e-6) * 1.1
+        for a in np.unique(d['animals']):
+            m = d['animals'] == a
+            ax.scatter(d['theta'][m], d['rho'][m], s=14, alpha=0.5, color=colours[a],
+                       label=f'{a} (n={m.sum()})')
+        for a, th, r in zip(d['animal_labels'], d['animal_theta'], d['animal_rho']):
+            ax.annotate('', xy=(th, r), xytext=(0, 0),
+                        arrowprops=dict(arrowstyle='->', color=colours[a], lw=2.2))
+        ax.set_ylim(0, rmax)
+        t = d['tests']
+        ax.set_title(f"{_MAP_TITLES[map_type]}\n"
+                     f"Moore (animal means, n={t['animal']['n']}): p={t['animal']['p_perm']:.3g}\n"
+                     f"Moore (cells, animal-clustered, n={t['cluster']['n']}): p={t['cluster']['p_perm']:.3g}",
+                     fontsize=8)
+        if mi == 0:
+            ax.legend(fontsize=6, loc='upper left', bbox_to_anchor=(-0.25, 1.15))
+    fig.suptitle(f'Per-cell direction vectors, {_VECTOR_KIND_TITLES[kind]}\n'
+                 'dots = cells, arrows = animal means; length in arena radii'
+                 + ('  [bins selected on the same cells -- p optimistic]' if kind == 'kde_sig' else ''),
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
+
+
+def run_directional_vector_analysis(handler, cells: list, out_dir: str,
+                                    fine_kde_results: dict | None = None) -> dict:
+    """Per-cell vectors + Moore's test across animals / cells + pooled-map permutation, for the
+    open field (see the section comment). Writes DirectionalVector_OpenField.xlsx (sheets Tests,
+    CellVectors, AnimalVectors) and one DirectionalVector_OpenField_<kind>.png per kind."""
+    rng = np.random.default_rng(VECTOR_SEED)
+    dxy = _bin_offsets(handler)
+    kde = fine_kde_results[RAYLEIGH_ARENA_KEY] if fine_kde_results is not None else None
+    kinds = [k for k in _VECTOR_KINDS if k != 'kde_sig' or kde is not None]
+    cell_animals = [_animal_id(c['session']) for c in cells]
+
+    test_rows, cell_rows, animal_rows, results = [], [], [], {}
+    for kind in kinds:
+        data_by_map = {}
+        for map_type in _MAP_ORDER:
+            sig = kde[map_type]['sig_mask'] if (kind == 'kde_sig' and kde is not None) else None
+            used, vx, vy = [], [], []
+            for i, c in enumerate(cells):
+                wm = _cell_weight_map(handler, c, map_type, kind, sig)
+                vec = _weighted_offset(dxy, wm[0], c['valid'] & handler.geom_valid) if wm else None
+                if vec is not None:
+                    used.append(i); vx.append(vec[0]); vy.append(vec[1])
+            if not used:
+                continue
+            vx, vy = np.array(vx), np.array(vy)
+            theta, rho = np.arctan2(vy, vx), np.hypot(vx, vy)
+            animals = np.array([cell_animals[i] for i in used])
+            animal_labels = sorted(set(animals))
+            animal_idx = np.array([animal_labels.index(a) for a in animals])
+
+            # animal-mean vectors: average the (x, y) vectors of an animal's cells, then Moore's
+            # test on (angle, length) of those means
+            avx = np.array([vx[animals == a].mean() for a in animal_labels])
+            avy = np.array([vy[animals == a].mean() for a in animal_labels])
+            a_theta, a_rho = np.arctan2(avy, avx), np.hypot(avx, avy)
+
+            t_animal  = moore_test(a_theta, a_rho, rng)
+            t_cluster = moore_test_clustered(theta, rho, animal_idx, rng)
+            t_naive   = moore_test(theta, rho, rng)
+            t_pooled  = (pooled_map_permutation(handler, [cells[i] for i in used], map_type, kind, dxy, rng)
+                         if kind in ('rate', 'kde') else None)
+
+            sel_note = 'bins selected on the same cells: p optimistic' if kind == 'kde_sig' else ''
+            common = dict(kind=kind, map_type=map_type, n_cells=len(used), n_animals=len(animal_labels))
+            test_rows.append(dict(common, test='Moore, animal-mean vectors', n_units=t_animal['n'],
+                                  statistic_Rstar=t_animal['Rstar'], mean_dir_deg=t_animal['mean_dir_deg'],
+                                  p_asymptotic=t_animal['p_asymptotic'], p_perm=t_animal['p_perm'],
+                                  perm_method=t_animal['perm_method'], note=sel_note))
+            test_rows.append(dict(common, test='Moore, cell vectors, animal-clustered permutation',
+                                  n_units=t_cluster['n'], statistic_Rstar=t_cluster['Rstar'],
+                                  mean_dir_deg=t_cluster['mean_dir_deg'], p_asymptotic=np.nan,
+                                  p_perm=t_cluster['p_perm'], perm_method=t_cluster['perm_method'],
+                                  note=sel_note))
+            test_rows.append(dict(common, test='Moore, cell vectors, cells independent (reference only)',
+                                  n_units=t_naive['n'], statistic_Rstar=t_naive['Rstar'],
+                                  mean_dir_deg=t_naive['mean_dir_deg'],
+                                  p_asymptotic=t_naive['p_asymptotic'], p_perm=t_naive['p_perm'],
+                                  perm_method=t_naive['perm_method'],
+                                  note='pseudoreplicated' + ('; ' + sel_note if sel_note else '')))
+            if t_pooled is not None:
+                test_rows.append(dict(common, test='Pooled-map D4 permutation (resultant length)',
+                                      n_units=len(used), statistic_Rstar=t_pooled['R_obs'],
+                                      mean_dir_deg=t_pooled.get('mean_dir_deg', np.nan),
+                                      p_asymptotic=np.nan, p_perm=t_pooled['p_perm'],
+                                      perm_method=f"D4 x{t_pooled.get('n_perm', 0)}",
+                                      note=(t_pooled['note'] + '; ' if t_pooled['note'] else '')
+                                           + 'statistic is the pooled resultant length R, not R*; '
+                                           + f"null 95th pct R = {t_pooled.get('R_null_p95', np.nan):.4f}; "
+                                           + 'cells treated as independent'))
+
+            for j, i in enumerate(used):
+                cell_rows.append(dict(kind=kind, map_type=map_type, session=cells[i]['session'],
+                                      unit=cells[i]['unit'], animal=animals[j], vx=vx[j], vy=vy[j],
+                                      angle_deg=float(np.degrees(theta[j]) % 360.0), length=rho[j]))
+            for a, x, y, th, r in zip(animal_labels, avx, avy, a_theta, a_rho):
+                animal_rows.append(dict(kind=kind, map_type=map_type, animal=a,
+                                        n_cells=int((animals == a).sum()), vx=x, vy=y,
+                                        angle_deg=float(np.degrees(th) % 360.0), length=r))
+
+            data_by_map[map_type] = dict(theta=theta, rho=rho, animals=animals,
+                                         animal_labels=animal_labels, animal_theta=a_theta,
+                                         animal_rho=a_rho,
+                                         tests=dict(animal=t_animal, cluster=t_cluster, naive=t_naive,
+                                                    pooled=t_pooled))
+        results[kind] = data_by_map
+        if data_by_map:
+            plot_cell_vectors(kind, data_by_map,
+                              os.path.join(out_dir, f'DirectionalVector_OpenField_{kind}.png'))
+
+    out_path = os.path.join(out_dir, 'DirectionalVector_OpenField.xlsx')
+    with pd.ExcelWriter(out_path) as xw:
+        pd.DataFrame(test_rows).to_excel(xw, sheet_name='Tests', index=False)
+        pd.DataFrame(cell_rows).to_excel(xw, sheet_name='CellVectors', index=False)
+        pd.DataFrame(animal_rows).to_excel(xw, sheet_name='AnimalVectors', index=False)
+    print(f'[SAVED] {out_path}')
+
+    for r in test_rows:
+        if r['test'].startswith(('Moore, animal', 'Pooled')):
+            print(f"[{RAYLEIGH_ARENA_KEY}/{r['kind']}/{r['map_type']}] {r['test']}: "
+                  f"n={r['n_units']} (animals={r['n_animals']}), stat={r['statistic_Rstar']:.4f}, "
+                  f"dir={r['mean_dir_deg']:.1f} deg, p_perm={r['p_perm']:.4g}"
+                  + (' -> significant' if np.isfinite(r['p_perm']) and r['p_perm'] < RAYLEIGH_ALPHA else ''))
+    return results
 
 
 # ============================================================================
@@ -3676,6 +4051,9 @@ def run_full_pipeline(out_dir: str) -> None:
     quad_res     = run_quadrant_kde_analysis(arena_handlers, arena_results, out_dir)
     fine_res     = run_fine_kde_analysis(arena_handlers, arena_results, out_dir)
     run_rayleigh_analysis(arena_handlers, arena_results, out_dir, fine_kde_results=fine_res)
+    run_directional_vector_analysis(arena_handlers[RAYLEIGH_ARENA_KEY],
+                                    arena_results[RAYLEIGH_ARENA_KEY], out_dir,
+                                    fine_kde_results=fine_res)
 
     plot_null_comparison(arena_handlers, quad_res,
                          os.path.join(out_dir, 'QuadrantFold_KDE_NullComparison.png'), 'quad')
