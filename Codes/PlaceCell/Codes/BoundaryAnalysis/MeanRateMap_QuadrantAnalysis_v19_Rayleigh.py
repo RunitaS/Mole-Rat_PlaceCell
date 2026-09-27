@@ -107,7 +107,7 @@ ROTATE_SESSION_CCW_DEG  = 0.0 #120.0
 # `total_arena_bins`/`coverage_threshold_bins`), else every file (unit) from that session is
 # skipped -- computed dynamically per handler, so it tracks target_bin_cm/geometry.
 # False: the criterion is not applied.
-USE_BIN_COVERAGE_CRITERION = True
+USE_BIN_COVERAGE_CRITERION = False
 COVERAGE_FRACTION = 0.01      # DEBUG: temporarily lowered from 0.80 to test whether the
                                # rest of the pipeline (bootstrap, place-cell qualification,
                                # pooling, quadrant fold, plotting) runs end-to-end on

@@ -15,10 +15,8 @@ in v19. The tracking load / clean / smooth steps and the open-field frame correc
 on the arena centre, and the 'Rotate' session rotation) are ported unchanged from v19, so these
 occupancy maps sit in the same frame as that script's rate maps.
 
-Two averages are plotted per arena:
-  - mean % of session time per bin : each session's map is first normalised to sum to 100 %,
-                                     so every session counts equally regardless of its length
-  - mean dwell time per bin (s)    : plain mean of the raw per-session occupancy maps
+The average plotted per arena is the mean % of session time per bin: each session's map is first
+normalised to sum to 100 %, so every session counts equally regardless of its length.
 A bin a session never visited is NaN in that session's map. If USE_MIN_BIN_PCT_DWELL is True, a
 visited bin holding less than MIN_BIN_PCT_DWELL % of the session's total time is marked invalid (NaN) as well, and is
 excluded from that session's total, so the session's % map is computed over its valid bins only.
@@ -28,8 +26,12 @@ to 100 %); bins valid in no session stay NaN and are left blank in the plots.
 
 No session-level coverage criteria are applied: every tracking file found is used.
 
+A second row plots each arena's occupancy trajectory: the tracked positions of all its sessions
+chained file after file into one continuous path (one frame, 1/fps = 33.33 ms, assumed between the
+end of one file and the start of the next), drawn as thin light-gray lines so path density shows.
+
 Outputs (in OUTPUT_DIR):
-  MeanOccupancy_AllArenas.png   -- 2 rows (mean % time, mean seconds) x 3 arenas
+  MeanOccupancy_AllArenas.png   -- 2 rows (mean % time, trajectory) x 3 arenas
   MeanOccupancy_Sessions.xlsx   -- one row per session used (arena, duration, bins visited)
 """
 
@@ -82,6 +84,12 @@ MIN_BIN_PCT_DWELL = 0.1
 # Gaussian smoothing (bins) of the final mean occupancy maps; 0 = plot the raw (unsmoothed) mean.
 # Uses the same NaN-safe, arena-topology-aware smoothing as v19's rate maps.
 OCC_SMOOTH_SIGMA_BINS = 0.0
+
+# Trajectory plot: all sessions of an arena are chained end-to-start into one continuous
+# trajectory, with a gap of one frame (1/fps = 33.33 ms) between the last sample of one file and
+# the first sample of the next. Thin, light, semi-transparent lines so overlap shows path density.
+TRAJ_FILE_GAP_S = 1.0 / fps
+TRAJ_LINE_KW = dict(color='0.55', lw=0.25, alpha=0.35, solid_joinstyle='round', rasterized=True)
 
 CENTRE_OPEN_FIELD_TRACKING = True
 ROTATE_SESSION_KEYWORD     = 'rotate'
@@ -281,6 +289,15 @@ class OpenFieldHandler:
         sample_valid = np.hypot(x_cm - self.cx, y_cm - self.cy) <= (self.diameter / 2.0 + self.bin_cm)
         return bx * self.ny + by, sample_valid
 
+    def plot_trajectory(self, ax, x_cm, y_cm):
+        ax.plot(x_cm, y_cm, **TRAJ_LINE_KW)
+        ax.add_patch(matplotlib.patches.Circle((self.cx, self.cy), self.diameter / 2.0,
+                                               fill=False, edgecolor='0.35', lw=1.0, zorder=5))
+        ax.set_xlim(0, self.diameter)
+        ax.set_ylim(0, self.diameter)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
         grid = np.full(self.n_bins, np.nan)
         m = valid_flat & self.geom_valid
@@ -323,6 +340,19 @@ class CircularTrackHandler:
         on_track = (r >= self.inner_r - self.radial_tol_cm) & (r <= self.outer_r + self.radial_tol_cm)
         return bx * self.ny + by, on_track
 
+    def plot_trajectory(self, ax, x_cm, y_cm):
+        # Cartesian axes (not polar): polar Line2D segments are drawn as straight chords in
+        # display space, which cut across the ring. Same orientation as plot_fine (0 deg = East, CCW).
+        ax.plot(x_cm, y_cm, **TRAJ_LINE_KW)
+        for rr in (self.inner_r, self.outer_r):
+            ax.add_patch(matplotlib.patches.Circle((self.cx, self.cy), rr, fill=False,
+                                                   edgecolor='0.35', lw=0.8, zorder=5))
+        lim = self.outer_r + 5
+        ax.set_xlim(self.cx - lim, self.cx + lim)
+        ax.set_ylim(self.cy - lim, self.cy + lim)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
         theta_edges = np.linspace(0, 2 * np.pi, self.nx + 1)
         r_edges = np.linspace(self.inner_r, self.outer_r, self.ny + 1)
@@ -362,6 +392,15 @@ class LinearTrackHandler:
         by = np.clip((np.clip(y_cm, 0, self.width) / self.bin_cm_y).astype(int), 0, self.ny - 1)
         return bx * self.ny + by, np.ones(len(x_cm), dtype=bool)
 
+    def plot_trajectory(self, ax, x_cm, y_cm):
+        ax.plot(x_cm, y_cm, **TRAJ_LINE_KW)
+        ax.add_patch(matplotlib.patches.Rectangle((0, 0), self.length, self.width,
+                                                  fill=False, edgecolor='0.35', lw=1.0, zorder=5))
+        ax.set_xlim(-1, self.length + 1)
+        ax.set_ylim(-1, self.width + 1)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
     def plot_fine(self, ax, values_flat, valid_flat, cmap, norm):
         grid = np.full(self.n_bins, np.nan)
         grid[valid_flat] = values_flat[valid_flat]
@@ -381,16 +420,19 @@ def make_handler(cfg: dict):
 # ============================================================================
 
 def session_occupancy(csv_path: str, handler):
-    """Dwell time (s) per flat bin for one session, or None if the tracking is unusable.
-    Same dt / binning arithmetic as v19's compute_cell_ratemap, without any spikes."""
+    """(occ, (x_cm, y_cm, t_us)) for one session, or (None, None) if the tracking is unusable.
+    occ is the dwell time (s) per flat bin -- same dt / binning arithmetic as v19's
+    compute_cell_ratemap, without any spikes; the positions are the oriented, on-arena samples
+    that went into it (used for the trajectory plot)."""
     x_cm, y_cm, t = _session_positions(csv_path, handler)
     if len(t) < 2:
-        return None
+        return None, None
     x_cm, y_cm = handler.orient(x_cm, y_cm)
     bin_idx, sample_valid = handler.to_bins(x_cm, y_cm)
+    x_cm, y_cm = x_cm[sample_valid], y_cm[sample_valid]
     t, bin_idx = t[sample_valid], bin_idx[sample_valid]
     if len(t) < 2:
-        return None
+        return None, None
 
     dt = np.empty(len(t), dtype=np.float64)
     dt[0] = 1.0 / fps
@@ -399,7 +441,24 @@ def session_occupancy(csv_path: str, handler):
     occ = np.zeros(handler.n_bins, dtype=np.float64)
     np.add.at(occ, bin_idx, dt)
     occ[(occ <= 0) | ~handler.geom_valid] = np.nan   # unvisited (or outside-arena) bins -> NaN
-    return occ
+    return occ, (x_cm, y_cm, t)
+
+
+def chain_trajectories(trajs: list) -> tuple:
+    """Concatenate per-session (x, y, t_us) in order into one trajectory (x, y, t_s). Each
+    session's clock is shifted so its first sample comes TRAJ_FILE_GAP_S after the previous
+    session's last sample."""
+    xs, ys, ts = [], [], []
+    t_next = 0.0
+    for x, y, t_us in trajs:
+        t_s = (t_us - t_us[0]) * 1e-6 + t_next
+        xs.append(x)
+        ys.append(y)
+        ts.append(t_s)
+        t_next = t_s[-1] + TRAJ_FILE_GAP_S
+    if not ts:
+        return np.array([]), np.array([]), np.array([])
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(ts)
 
 
 def find_tracking_files(arena_key: str) -> list:
@@ -422,10 +481,10 @@ def find_tracking_files(arena_key: str) -> list:
 
 def collect_arena_occupancy(arena_key: str) -> dict:
     handler = make_handler(ARENA_CONFIGS[arena_key])
-    maps, rows = [], []
+    maps, rows, trajs = [], [], []
     for session_name, csv_path in find_tracking_files(arena_key):
         try:
-            occ = session_occupancy(csv_path, handler)
+            occ, traj = session_occupancy(csv_path, handler)
         except Exception as e:
             print(f'  ERROR [{arena_key}] {session_name}: {e}')
             continue
@@ -447,6 +506,7 @@ def collect_arena_occupancy(arena_key: str) -> dict:
             print(f'  [SKIP all bins < {MIN_BIN_PCT_DWELL:g} %] [{arena_key}] {session_name}')
             continue
         maps.append(occ)
+        trajs.append(traj)
         rows.append(dict(arena=arena_key, session=session_name,
                          tracking_file=os.path.basename(csv_path),
                          total_time_s=round(raw_total, 2),
@@ -460,27 +520,23 @@ def collect_arena_occupancy(arena_key: str) -> dict:
     if maps:
         stack = np.array(maps)
         visited_any = np.isfinite(stack).any(axis=0) & handler.geom_valid
-        mean_s = np.full(handler.n_bins, np.nan)
         mean_pct = np.full(handler.n_bins, np.nan)
-        # Plain means over ALL sessions: a session that never entered (or had only a low-dwell,
-        # invalid visit to) a bin contributes 0 s there; bins valid in no session stay NaN.
+        # Plain mean over ALL sessions: a session that never entered (or had only a low-dwell,
+        # invalid visit to) a bin contributes 0 % there; bins valid in no session stay NaN.
         # Each session's % is taken over its valid bins only, so it sums to 100 %.
         pct_stack = stack / np.nansum(stack, axis=1, keepdims=True) * 100.0
-        mean_s[visited_any] = np.nan_to_num(stack[:, visited_any], nan=0.0).mean(axis=0)
         mean_pct[visited_any] = np.nan_to_num(pct_stack[:, visited_any], nan=0.0).mean(axis=0)
     else:
-        mean_s = mean_pct = np.full(handler.n_bins, np.nan)
+        mean_pct = np.full(handler.n_bins, np.nan)
         visited_any = np.zeros(handler.n_bins, dtype=bool)
 
     if OCC_SMOOTH_SIGMA_BINS > 0 and visited_any.any():
-        def _sm(v):
-            return _gaussian_smooth_2d(v.reshape(handler.nx, handler.ny),
+        mean_pct = _gaussian_smooth_2d(mean_pct.reshape(handler.nx, handler.ny),
                                        visited_any.reshape(handler.nx, handler.ny),
                                        OCC_SMOOTH_SIGMA_BINS, handler.wrap_x).ravel()
-        mean_s, mean_pct = _sm(mean_s), _sm(mean_pct)
 
-    return dict(handler=handler, mean_s=mean_s, mean_pct=mean_pct, valid=visited_any,
-                n_sessions=len(maps), rows=rows)
+    return dict(handler=handler, mean_pct=mean_pct, valid=visited_any,
+                n_sessions=len(maps), rows=rows, traj=chain_trajectories(trajs))
 
 
 # ============================================================================
@@ -499,14 +555,14 @@ def _cmap_norm(values):
 
 
 def plot_mean_occupancy(arena_data: dict, save_path: str):
-    rows = [('mean_pct', 'Mean % of session time per bin', '% of session time'),
-            ('mean_s',   'Mean dwell time per bin (s)',    'Dwell time (s)')]
-    fig = plt.figure(figsize=(15, 10))
+    rows = [('mean_pct', 'Mean % of session time per bin', '% of session time')]
+    n_rows = len(rows) + 1
+    fig = plt.figure(figsize=(15, 5 * n_rows))
     for ri, (key, row_title, cbar_label) in enumerate(rows):
         for ci, arena_key in enumerate(_ARENA_ORDER):
             d = arena_data[arena_key]
             proj = 'polar' if arena_key == 'circular_track' else None
-            ax = fig.add_subplot(2, 3, ri * 3 + ci + 1, projection=proj)
+            ax = fig.add_subplot(n_rows, 3, ri * 3 + ci + 1, projection=proj)
             if not d['valid'].any():
                 ax.axis('off')
                 ax.set_title(f"{_ARENA_TITLES[arena_key]}\n(no sessions)")
@@ -516,6 +572,19 @@ def plot_mean_occupancy(arena_data: dict, save_path: str):
             ax.set_title(f"{_ARENA_TITLES[arena_key]} -- {row_title}\n(n={d['n_sessions']} sessions)",
                          fontsize=9)
             fig.colorbar(im, ax=ax, shrink=0.7, label=cbar_label)
+
+    # Last row: all sessions chained into one continuous trajectory
+    for ci, arena_key in enumerate(_ARENA_ORDER):
+        d = arena_data[arena_key]
+        ax = fig.add_subplot(n_rows, 3, len(rows) * 3 + ci + 1)
+        x, y, t_s = d['traj']
+        if len(t_s) < 2:
+            ax.axis('off')
+            ax.set_title(f"{_ARENA_TITLES[arena_key]}\n(no sessions)")
+            continue
+        d['handler'].plot_trajectory(ax, x, y)
+        ax.set_title(f"{_ARENA_TITLES[arena_key]} -- Occupancy trajectory, sessions chained\n"
+                     f"(n={d['n_sessions']} sessions, {t_s[-1] / 60.0:.1f} min total)", fontsize=9)
 
     smooth_note = (f'Gaussian-smoothed, sigma {OCC_SMOOTH_SIGMA_BINS:g} bins' if OCC_SMOOTH_SIGMA_BINS > 0
                    else 'unsmoothed')

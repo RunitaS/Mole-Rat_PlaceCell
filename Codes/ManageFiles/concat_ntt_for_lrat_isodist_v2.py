@@ -41,8 +41,8 @@ from collections import defaultdict
 from pathlib import Path
 
 # ── configuration ──────────────────────────────────────X:\NMR_group_data\Runita\Data\Ephys_Data\AllSortedData\Tetrode───────────────────────
-INPUT_ROOT  = r"X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode"
-OUTPUT_ROOT = r"X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Concat"
+INPUT_ROOT  = r"X:\NMR_group_data\Runita\Analysis\Fa23BD_SpikeSorting\spikesorted\Klustakwik_Day6_Linear\Klustawik_Day6_Linear\LinTT8_Concat"
+OUTPUT_ROOT = r"X:\NMR_group_data\Runita\Analysis\Fa23BD_SpikeSorting\spikesorted\Klustakwik_Day6_Linear\Klustawik_Day6_Linear\LinTT8_Concat\Concat"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Neuralynx NTT binary layout ──────────────────────────────────────────────

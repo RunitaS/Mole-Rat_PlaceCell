@@ -79,6 +79,8 @@ class _Metrics(TypedDict, total=False):
     speed_shuffle_ran_td:  bool | None
     p_speed:         bool | None
     n_speed:         bool | None
+    final_speed_score: float | None
+    speed_cell:      bool | str | None   # True / False / 'not tested'
     place_cell:      bool | None
     session:         str
     unit:            str
@@ -135,19 +137,13 @@ def _gpu_util_pct() -> int:
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# root_folder  = r'C:\Runita\SessionType_Sorted'
-# output_excel = r'C:\Runita\SessionType_Sorted\All_TT_PlaceChar_VisitCrit.xlsx'
 
-# # Destination for .ntt + tracking files of confirmed place cells (folder pattern
-# # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-# Output_PlaceTrue = r'C:\Runita\SessionType_Sorted\All_TT_PlaceTrue'
-
-root_folder  = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\All_TT_PlaceChar_VisitCrit.xlsx'
+root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\All_TT_PlaceChar_VisitCrit.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\PC_True'
 
 # # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
@@ -2531,6 +2527,7 @@ def _run_job(args):
         'speed_shuffle_hi_td': None, 'speed_shuffle_p_td': None,
         'speed_modulated_td': None, 'speed_shuffle_ran_td': None,
         'p_speed': None, 'n_speed': None,
+        'final_speed_score': float('nan'), 'speed_cell': 'not tested',
         'session': session_name, 'unit': ntt_file,
         'job_order': job_order, 'place_cell': None, 'n_fields_detected': None,
     }
@@ -2669,6 +2666,32 @@ def _run_job(args):
             metrics['speed_shuffle_ran_td']    = None
             metrics['p_speed']                 = None
             metrics['n_speed']                 = None
+
+        # ── Final speed score / speed-cell classification ──────────────────────
+        # final_speed_score: mean of the binned (speed_score) and time-domain
+        # (speed_score_td) scores; NaN if either is missing.
+        # speed_cell, evaluated in this order:
+        #   False        - binned and time-domain scores have opposite signs, or
+        #                  either shuffle test ran and failed
+        #   True         - both shuffle tests ran and passed
+        #   'not tested' - otherwise (a shuffle never ran, or speed wasn't computed)
+        _s_bin = float('nan') if metrics['speed_score']    is None else float(metrics['speed_score'])
+        _s_td  = float('nan') if metrics['speed_score_td'] is None else float(metrics['speed_score_td'])
+        _both_scores = bool(np.isfinite(_s_bin) and np.isfinite(_s_td))
+        if _both_scores:
+            metrics['final_speed_score'] = round((_s_bin + _s_td) / 2.0, 4)
+        else:
+            metrics['final_speed_score'] = float('nan')
+        _mod_bin = metrics['speed_modulated_shuffle']
+        _mod_td  = metrics['speed_modulated_td']
+        if _both_scores and np.sign(_s_bin) * np.sign(_s_td) < 0:
+            metrics['speed_cell'] = False
+        elif _mod_bin is False or _mod_td is False:
+            metrics['speed_cell'] = False
+        elif _mod_bin is True and _mod_td is True:
+            metrics['speed_cell'] = True
+        else:
+            metrics['speed_cell'] = 'not tested'
 
         metrics['session']   = session_name
         metrics['unit']      = ntt_file
@@ -2891,6 +2914,7 @@ if __name__ == "__main__":
                     'speed_shuffle_mean_td', 'speed_shuffle_lo_td', 'speed_shuffle_hi_td',
                     'speed_shuffle_p_td', 'speed_modulated_td', 'speed_shuffle_ran_td',
                     'p_speed', 'n_speed',
+                    'final_speed_score', 'speed_cell',
                     'place_cell', 'n_fields_detected']
 
     # Shared columns first, then the 2-D grid (Open/Linear) field columns,
@@ -2927,21 +2951,47 @@ if __name__ == "__main__":
     all_field_rows = [f for r in results for f in r[3]]
     df_fields = pd.DataFrame(all_field_rows, columns=field_columns)
 
+    # Speed-cell counts (Full session), using speed_cell: passed BOTH the
+    # binned and time-domain shuffle tests with same-sign scores.
+    _is_speed    = df_full['speed_cell'] == True    # noqa: E712  ('not tested' compares False)
+    _is_place    = df_full['place_cell'] == True    # noqa: E712
+    _is_nonplace = df_full['place_cell'] == False   # noqa: E712
+    n_speed_cells        = int(_is_speed.sum())
+    n_place_speed_mod    = int((_is_place & _is_speed).sum())
+    n_nonplace_speed_mod = int((_is_nonplace & _is_speed).sum())
+    n_speed_not_tested   = int((df_full['speed_cell'] == 'not tested').sum())
+
+    df_speed_summary = pd.DataFrame({
+        'metric': ['Total units processed',
+                   'Place cells',
+                   'Speed cells (all, passed binned AND inst. tests)',
+                   'Place cells also speed-modulated',
+                   'Non-place cells speed-modulated',
+                   'Speed not tested'],
+        'count':  [len(df_full),
+                   int(_is_place.sum()),
+                   n_speed_cells,
+                   n_place_speed_mod,
+                   n_nonplace_speed_mod,
+                   n_speed_not_tested],
+    })
+
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         df_full.to_excel(writer,   sheet_name='Full',        index=False)
         df_first.to_excel(writer,  sheet_name='First_Half',  index=False)
         df_second.to_excel(writer, sheet_name='Second_Half', index=False)
         df_fields.to_excel(writer, sheet_name='PlaceFields', index=False)
-
-    n_place_speed_mod = int(((df_full['place_cell'] == True) &                       # noqa: E712
-                             (df_full['speed_modulated_shuffle'] == True)).sum())     # noqa: E712
+        df_speed_summary.to_excel(writer, sheet_name='Speed_Summary', index=False)
 
     print(f'\nDone. Results saved to {output_excel}')
     print(f'Total units processed              : {len(df_full)}')
     print(f'Place cells found                  : {df_full["place_cell"].sum()}')
-    print(f'Place cells also speed-modulated    : {n_place_speed_mod}  '
+    print(f'Speed cells (binned AND inst. tests): {n_speed_cells}  '
           f'(shuffle-confirmed, {SPEED_N_SHUFFLE} shuffles, '
           f'{SPEED_SHUFFLE_MARGIN_S:.0f}s window)')
+    print(f'Place cells also speed-modulated    : {n_place_speed_mod}')
+    print(f'Non-place cells speed-modulated     : {n_nonplace_speed_mod}')
+    print(f'Speed not tested                    : {n_speed_not_tested}')
     n_fields_col = pd.to_numeric(df_full['n_fields_detected'], errors='coerce')
     print(f'Place fields detected                : {len(df_fields)}  '
           f'(threshold method, across {int((n_fields_col > 0).sum())} place cell(s))')

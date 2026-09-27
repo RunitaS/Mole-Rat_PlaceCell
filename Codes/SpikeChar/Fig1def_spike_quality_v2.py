@@ -1,0 +1,1123 @@
+# -*- coding: utf-8 -*-
+"""
+Single-unit quality metrics for Neuralynx .ntt files.
+Outputs a colour-coded Excel workbook with per-unit metrics and individual histograms.
+
+Metrics computed
+────────────────
+  SNR                  – A_peak / σ_noise  (MAD-based: σ = MAD/0.6745 on first-5-sample baseline)
+  ISI violation %      – fraction of ISIs < 2 ms (good: < 1 %)
+  Template correlation – mean Pearson r of each spike vs. mean waveform
+  Peak/trough time+amp – peak and trough time (ms) and amplitude (µV) on best channel (mean waveform)
+  PT time (ms)         – peak-to-trough time on best channel (mean waveform)
+  PT ratio             – |peak| / |trough| on best channel (mean waveform)
+  Spike duration (ms)  – time from onset of depolarization to end of the after-hyperpolarization
+                         on best channel (mean waveform); onset/offset are the baseline threshold
+                         crossings that bracket the peak and trough
+  Presence ratio       – fraction of 1-s bins that contain ≥ 1 spike
+  CSI                  – complex spike index: % of all ISIs in [3, 20] ms
+                         where the 2nd spike amplitude < 1st (Bhatt et al. 2020)
+
+Acceptance criteria (unit is "accepted" only if ALL three hold)
+─────────────────────────────────────────────────────────────
+  ISI violation %       < 1 %
+  SNR                   > 2.5
+  Template correlation  > 0.5
+
+Multi-trigger (bursting) review
+──────────────────────────────
+  For every spike, local maxima on the best channel that occur ≥ MULTI_TRIGGER_OFFSET_SAMPLES
+  after the main peak and exceed both MULTI_TRIGGER_AMP_FRAC × that spike's main peak and
+  MULTI_TRIGGER_NOISE_K × baseline σ are counted as secondary triggers. Units with more than
+  MULTI_TRIGGER_MIN_PEAKS such peaks are held back and shown in a GUI after the scan, where
+  each can be manually accepted or rejected. The manual decision overrides the automatic
+  one (for copying and for the accepted/rejected colouring in every histogram).
+
+Accepted units' .ntt files, plus every .csv and .ncs file found alongside them,
+are copied into a sibling '<ROOT_FOLDER>_Accepted' tree that mirrors the
+session subfolder structure. In every histogram below, rejected units are
+drawn as a gray segment stacked at the bottom of each bin, with accepted
+units in color on top.
+
+References
+──────────
+Lee D et al. (2018) Exp Neurobiol 27:593-604.
+Ludwig KA et al. (2011) J Neural Eng 8:014001.
+Bhatt DL et al. / Bhatt et al. 2020 — Cell 2000 (S0092-8674(00)81828-0)
+"""
+
+import os
+import shutil
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
+import matplotlib # type: ignore
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt # type: ignore
+from openpyxl import load_workbook # type: ignore
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side # type: ignore
+from openpyxl.utils import get_column_letter # type: ignore
+from openpyxl.drawing.image import Image as XLImage # type: ignore
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+ROOT_FOLDER  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data'
+OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data\QUALITY_METRICS.xlsx'
+
+# Sibling folder that receives accepted units' .ntt files plus every .csv/.ncs
+# file found in the same session folder (mirrors ROOT_FOLDER's subfolder tree).
+ACCEPTED_ROOT_FOLDER = ROOT_FOLDER.rstrip('\\/') + '_SpkQltyFilt'
+
+# ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
+# OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
+
+N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
+WAVEFORM_DURATION_MS = 5.0       # total duration spanned by the 32-sample waveform snippet
+SAMPLE_INTERVAL_MS   = WAVEFORM_DURATION_MS / N_SAMPLES
+
+# ── Figure palette (sampled from the reference c-Fos / MoBI-DisC figure) ──────
+PAL_MAGENTA  = '#FA7FFA'   # "Increased in CMF" points
+PAL_CYAN     = '#7FFAFA'   # "Increased in HMF" points
+PAL_BLUE     = '#7FB3E5'   # light blue: HMF box fill (c-Fos figure)
+PAL_DKBLUE   = '#0066CC'   # dark blue: HMF data points (c-Fos figure)
+PAL_GRAY     = '#7F7F7F'   # gray: CMF box fill (c-Fos figure)
+PAL_LTGRAY   = '#D4D4D4'   # "Excluded clusters"
+PAL_GREEN    = '#00C000'   # inclination trace
+PAL_ORANGE   = '#FF8000'   # azimuth trace
+PAL_RED      = '#FF0000'   # highlighted labels
+PAL_BLACK    = '#000000'
+FIG_FONT     = ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans']   # c-Fos figure uses Arial/Helvetica
+
+plt.rcParams.update({
+    'font.family':        'sans-serif',
+    'font.sans-serif':    FIG_FONT,
+    'text.color':         PAL_BLACK,
+    'axes.labelcolor':    PAL_BLACK,
+    'axes.edgecolor':     PAL_BLACK,
+    'axes.linewidth':     1.5,
+    'xtick.color':        PAL_BLACK,
+    'ytick.color':        PAL_BLACK,
+    'xtick.direction':    'out',
+    'ytick.direction':    'out',
+    'xtick.major.width':  1.5,
+    'ytick.major.width':  1.5,
+    'axes.facecolor':     'white',
+    'figure.facecolor':   'white',
+    'savefig.facecolor':  'white',
+    'axes.grid':          False,
+    'legend.frameon':     False,
+})
+
+# ── Waveform plot colours ──────────────────────────────────────────────────────
+COLOR_WAVEFORM = PAL_GRAY
+COLOR_PEAK     = PAL_MAGENTA
+COLOR_TROUGH   = PAL_DKBLUE
+COLOR_DURATION = PAL_GREEN
+
+# ── SNR quality thresholds ─────────────────────────────────────────────────────
+SNR_LOW_BAD   = 1.5
+SNR_LOW_OK    = 2.5
+SNR_HIGH_GOOD = 4.0
+
+# ── ISI violation thresholds (%) ──────────────────────────────────────────────
+ISI_GOOD_PCT   = 0.1   # < 1 %  → GREEN
+ISI_MARGIN_PCT = 5.0   # 1–5 %  → YELLOW, > 5 % → RED
+
+# ── Unit acceptance thresholds (ISI + SNR + template correlation) ─────────────
+TEMPLATE_CORR_ACCEPT_MIN = 0.5   # template correlation must exceed this
+ACCEPTED_COLOR = PAL_BLUE        # color used for accepted units in stacked plots
+REJECTED_COLOR = PAL_GRAY        # gray used for rejected units in stacked plots
+
+# ── Spike duration onset/offset threshold ──────────────────────────────────────
+# Onset (depolarization begin) / offset (hyperpolarization end) are taken as the
+# baseline threshold crossings bracketing the trough/peak, where the threshold is
+# this many MAD-based baseline sigmas away from the baseline mean.
+SPIKE_DURATION_THRESHOLD_K = 2.0
+
+# ── Multi-trigger (bursting) detection → manual review GUI ────────────────────
+MULTI_TRIGGER_OFFSET_SAMPLES = 4     # secondary peaks searched from main peak + this many samples
+MULTI_TRIGGER_AMP_FRAC       = 0.5   # secondary peak must exceed this fraction of the spike's main peak
+MULTI_TRIGGER_NOISE_K        = 3.0   # ...and this many baseline MAD-sigmas (suppresses noise wiggles)
+MULTI_TRIGGER_MIN_PEAKS      = 10    # unit flagged for review if total secondary peaks > this
+REVIEW_MAX_SPIKES_SHOWN      = 300   # per category (clean / multi-trigger) drawn in the GUI
+
+# ── openpyxl fill colours ─────────────────────────────────────────────────────
+FILL_RED    = PatternFill(fill_type='solid', fgColor='FFFF9999')
+FILL_YELLOW = PatternFill(fill_type='solid', fgColor='FFFFFF99')
+FILL_GREEN  = PatternFill(fill_type='solid', fgColor='FF99FF99')
+FILL_PURPLE = PatternFill(fill_type='solid', fgColor='FFD9B3FF')
+FILL_HEADER = PatternFill(fill_type='solid', fgColor='FF2E4057')
+
+FONT_HEADER = Font(bold=True, color='FFFFFFFF', name='Calibri', size=10)
+FONT_BODY   = Font(name='Calibri', size=10)
+ALIGN_CTR   = Alignment(horizontal='center', vertical='center')
+ALIGN_LEFT  = Alignment(horizontal='left',   vertical='center')
+
+THIN_BORDER = Border(
+    left=Side(style='thin'),  right=Side(style='thin'),
+    top=Side(style='thin'),   bottom=Side(style='thin'),
+)
+
+# ── Neuralynx dtype constants ─────────────────────────────────────────────────
+NTT_HEADER_BYTES   = 16 * 1024
+NCS_HEADER_BYTES   = 16 * 1024
+DEFAULT_ADBITVOLTS = 0.000000195
+
+NTT_DTYPE = np.dtype([
+    ('timestamp',   '<u8'),
+    ('sc_number',   '<u4'),
+    ('cell_number', '<u4'),
+    ('params',      '<u4', (8,)),
+    ('waveforms',   '<i2', (32, 4)),
+])
+
+NCS_RECORD_DTYPE = np.dtype([
+    ('timestamp',   '<u8'),
+    ('channel_nr',  '<u4'),
+    ('sample_freq', '<u4'),
+    ('n_valid',     '<u4'),
+    ('samples',     '<i2', (512,)),
+])
+
+# ── All metric keys (used for consistent NaN rows on error) ───────────────────
+ALL_METRIC_KEYS = [
+    'n_spikes',
+    'peak_to_peak_ch0_uV', 'peak_to_peak_ch1_uV',
+    'peak_to_peak_ch2_uV', 'peak_to_peak_ch3_uV',
+    'best_channel', 'a_peak_uV', 'sigma_noise_uV', 'snr', 'snr_db',
+    'isi_violation_pct', 'template_correlation',
+    'pt_best_channel', 'peak_time_ms', 'peak_amp_uV',
+    'trough_time_ms', 'trough_amp_uV', 'pt_time_ms', 'pt_ratio',
+    'spike_start_time_ms', 'spike_end_time_ms', 'spike_duration_ms',
+    'csi',
+    'n_multi_trigger_peaks',
+]
+
+COLUMN_ORDER = ['session', 'unit'] + ALL_METRIC_KEYS + ['multi_trigger', 'manual_review', 'accepted']
+
+
+# ── Helpers: file I/O ──────────────────────────────────────────────────────────
+
+def _parse_adbitvolts(path: str) -> float:
+    try:
+        with open(path, 'rb') as fh:
+            header_raw = fh.read(NTT_HEADER_BYTES)
+        header_txt = header_raw.decode('latin-1', errors='replace')
+        for line in header_txt.splitlines():
+            if 'ADBitVolts' in line:
+                for p in line.split():
+                    try:
+                        val = float(p)
+                        if 0 < val < 1:
+                            return val
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return DEFAULT_ADBITVOLTS
+
+
+def load_ntt_waveforms(ntt_path: str, exclude_cluster0: bool = True):
+    """
+    Load waveforms/timestamps from an .ntt file.
+
+    exclude_cluster0 : if True (default), spikes with cell_number == 0
+        (unclustered / noise cluster) are dropped, so metrics are computed
+        only on the sorted main cluster.
+    """
+    adbitvolts = _parse_adbitvolts(ntt_path)
+    uv_scale   = adbitvolts * 1e6
+    spike_data = np.memmap(ntt_path, dtype=NTT_DTYPE, mode='r',
+                           offset=NTT_HEADER_BYTES)
+    cell_number = spike_data['cell_number']  # type: ignore[index]
+    if exclude_cluster0:
+        keep = cell_number != 0
+        spike_data = spike_data[keep]
+    waveforms  = spike_data['waveforms'].astype(np.float64) * uv_scale  # type: ignore[operator]
+    timestamps = spike_data['timestamp'].astype(np.float64)
+    return waveforms, timestamps, adbitvolts
+
+
+# ── SNR: MAD-based noise estimator ───────────────────────────────────────────
+
+def compute_snr_mad(waveforms: np.ndarray) -> dict:
+    """
+    SNR for tetrode (.ntt) data using the mean-waveform peak amplitude and a
+    MAD-based noise estimate from the pre-spike baseline.
+
+    waveforms : (n_spikes, n_samples, n_channels)
+    Returns dict with best_channel, a_peak_uV, sigma_noise_uV, snr, snr_db.
+    """
+    # Transpose to (n_channels, n_samples, n_spikes) for indexing clarity
+    wf = np.transpose(waveforms, (2, 1, 0))          # (4, 32, n_spikes)
+
+    mean_wf = wf.mean(axis=2)                         # (4, 32)
+    max_idx  = np.unravel_index(np.argmax(np.abs(mean_wf)), mean_wf.shape)
+    best_ch  = int(max_idx[0])
+
+    a_peak = float(np.max(np.abs(mean_wf[best_ch, :])))
+
+    baseline = wf[best_ch, :5, :].flatten()           # first 5 samples as noise proxy
+    mad = np.median(np.abs(baseline - np.median(baseline)))
+    sigma_noise = float(mad / 0.6745)
+
+    if sigma_noise > 0:
+        snr    = a_peak / sigma_noise
+        snr_db = 20.0 * np.log10(snr) if snr > 0 else float('nan')
+    else:
+        snr = snr_db = float('nan')
+
+    return {
+        'best_channel':   best_ch,
+        'a_peak_uV':      round(a_peak,      4),
+        'sigma_noise_uV': round(sigma_noise, 4),
+        'snr':            round(snr,    4) if not np.isnan(snr)    else float('nan'),
+        'snr_db':         round(snr_db, 4) if not np.isnan(snr_db) else float('nan'),
+    }
+
+
+# ── Quality label helpers ─────────────────────────────────────────────────────
+
+def snr_quality(snr_val) -> tuple:
+    if snr_val is None or (isinstance(snr_val, float) and np.isnan(snr_val)):
+        return ('N/A', PatternFill())
+    if snr_val < SNR_LOW_BAD:
+        return ('Too low', FILL_RED)
+    if snr_val < SNR_LOW_OK:
+        return ('Marginal', FILL_YELLOW)
+    if snr_val <= SNR_HIGH_GOOD:
+        return ('Good', FILL_GREEN)
+    return ('Very high', FILL_PURPLE)
+
+
+def isi_quality(pct) -> tuple:
+    if pct is None or (isinstance(pct, float) and np.isnan(pct)):
+        return ('N/A', PatternFill())
+    if pct < ISI_GOOD_PCT:
+        return ('Good', FILL_GREEN)
+    if pct < ISI_MARGIN_PCT:
+        return ('Marginal', FILL_YELLOW)
+    return ('High', FILL_RED)
+
+
+def is_unit_accepted(isi_pct, snr_val, template_corr) -> bool:
+    """A unit is accepted only if ISI violation < 1 %, SNR > 2.5, and
+    template correlation > 0.5 all hold (NaN/None in any metric → rejected)."""
+    for v in (isi_pct, snr_val, template_corr):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return False
+    return (isi_pct < ISI_GOOD_PCT) and (snr_val > SNR_LOW_OK) and (template_corr > TEMPLATE_CORR_ACCEPT_MIN)
+
+
+# ── Individual quality-metric functions ───────────────────────────────────────
+
+def compute_isi_violations(spike_ts_us: np.ndarray, ref_period_us: float = 1000.0) -> float:
+    """Return % of ISIs that violate the refractory period (< ref_period_us)."""
+    if len(spike_ts_us) < 2:
+        return float('nan')
+    isis = np.diff(np.sort(spike_ts_us))
+    return float(np.sum(isis < ref_period_us) / len(isis) * 100.0)
+
+
+def compute_template_correlation(waveforms: np.ndarray) -> float:
+    """Mean Pearson r between each spike waveform and the mean template, averaged across channels."""
+    n_spikes = waveforms.shape[0]
+    if n_spikes < 2:
+        return float('nan')
+    template = waveforms.mean(axis=0)               # (32, 4)
+    t = template - template.mean(axis=0)            # demean along time
+    w = waveforms - waveforms.mean(axis=1, keepdims=True)  # (n, 32, 4)
+
+    numer    = np.sum(t[np.newaxis] * w, axis=1)   # (n, 4)
+    t_sq_sum = np.sum(t ** 2, axis=0)              # (4,)
+    w_sq_sum = np.sum(w ** 2, axis=1)              # (n, 4)
+    denom    = np.sqrt(t_sq_sum[np.newaxis] * w_sq_sum)
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        corr = np.where(denom > 0, numer / denom, np.nan)
+
+    return float(np.nanmean(corr))
+
+
+def compute_spike_duration(wf: np.ndarray, peak_idx: int, trough_idx: int,
+                            k: float = SPIKE_DURATION_THRESHOLD_K) -> dict:
+    """
+    Spike duration: time from the onset of depolarization to the end of the
+    after-hyperpolarization, on a single channel's mean waveform.
+
+    The baseline (first 5 samples, same convention as the SNR estimator) gives
+    a MAD-based sigma. Onset is the last baseline-level sample before the
+    earlier of the peak/trough (depolarization begins where the trace first
+    departs the baseline band); offset is the first baseline-level sample
+    after the later of the peak/trough (hyperpolarization ends where the
+    trace returns to the baseline band).
+
+    wf : (32,) mean waveform on the channel used for peak/trough detection.
+    """
+    n = wf.shape[0]
+    baseline      = wf[:5]
+    baseline_mean = float(np.mean(baseline))
+    mad           = np.median(np.abs(baseline - np.median(baseline)))
+    sigma         = float(mad / 0.6745) if mad > 0 else float(np.std(baseline))
+    if sigma == 0:
+        sigma = float(np.finfo(float).eps)
+    threshold = k * sigma
+
+    first_ext = min(peak_idx, trough_idx)
+    last_ext  = max(peak_idx, trough_idx)
+
+    start_idx = 0
+    for i in range(first_ext, -1, -1):
+        if abs(wf[i] - baseline_mean) < threshold:
+            start_idx = i
+            break
+
+    end_idx = n - 1
+    for i in range(last_ext, n):
+        if abs(wf[i] - baseline_mean) < threshold:
+            end_idx = i
+            break
+
+    duration_ms = (end_idx - start_idx) * SAMPLE_INTERVAL_MS
+
+    return {
+        'start_idx':          start_idx,
+        'start_time_ms':      round(start_idx * SAMPLE_INTERVAL_MS, 5),
+        'end_idx':             end_idx,
+        'end_time_ms':         round(end_idx * SAMPLE_INTERVAL_MS, 5),
+        'spike_duration_ms':   round(duration_ms, 5),
+    }
+
+
+def compute_pt(waveforms: np.ndarray) -> dict:
+    """
+    waveforms : (n_spikes, 32, 4) microvolts
+
+    Selects the channel whose MEAN waveform reaches the highest peak
+    (max amplitude, not peak-to-peak spread), then measures peak/trough
+    time, amplitude ratio, and spike duration on that channel's mean
+    waveform.
+    """
+    mean_wf = waveforms.mean(axis=0)          # (32, 4)
+
+    peak_per_channel = mean_wf.max(axis=0)    # (4,)
+    best_ch = int(np.argmax(peak_per_channel))
+    wf = mean_wf[:, best_ch]                  # (32,)
+
+    peak_idx   = int(np.argmax(wf))
+    trough_idx = int(np.argmin(wf))
+    peak_val   = float(wf[peak_idx])
+    trough_val = float(wf[trough_idx])
+
+    pt_time_ms = abs(peak_idx - trough_idx) * SAMPLE_INTERVAL_MS
+    pt_ratio   = abs(peak_val) / abs(trough_val) if trough_val != 0 else float('nan')
+
+    duration_result = compute_spike_duration(wf, peak_idx, trough_idx)
+
+    return {
+        'best_channel':   best_ch,
+        'peak_idx':       peak_idx,
+        'peak_time_ms':   round(peak_idx * SAMPLE_INTERVAL_MS, 5),
+        'peak_amp_uV':    round(peak_val, 4),
+        'trough_idx':     trough_idx,
+        'trough_time_ms': round(trough_idx * SAMPLE_INTERVAL_MS, 5),
+        'trough_amp_uV':  round(trough_val, 4),
+        'pt_time_ms':     round(pt_time_ms, 5),
+        'pt_ratio':       round(pt_ratio, 4) if not np.isnan(pt_ratio) else float('nan'),
+        'spike_start_idx':      duration_result['start_idx'],
+        'spike_start_time_ms':  duration_result['start_time_ms'],
+        'spike_end_idx':        duration_result['end_idx'],
+        'spike_end_time_ms':    duration_result['end_time_ms'],
+        'spike_duration_ms':    duration_result['spike_duration_ms'],
+        'mean_waveform':  wf,   # used for plotting only, dropped before Excel export
+    }
+
+
+# ── Per-file waveform figure ─────────────────────────────────────────────────
+
+def plot_waveform(wf: np.ndarray, result: dict, out_path: str, title: str):
+    time_axis = np.arange(N_SAMPLES) * SAMPLE_INTERVAL_MS
+
+    fig, ax = plt.subplots(figsize=(6, 4.2))
+
+    ax.plot(time_axis, wf, color=COLOR_WAVEFORM, linewidth=1.8, zorder=3)
+    ax.scatter([result['peak_time_ms']], [result['peak_amp_uV']],
+               facecolor=COLOR_PEAK, edgecolor=PAL_BLACK, linewidths=1.0, s=60, zorder=5,
+               label=f"Peak  {result['peak_amp_uV']:.1f} uV")
+    ax.scatter([result['trough_time_ms']], [result['trough_amp_uV']],
+               facecolor=COLOR_TROUGH, edgecolor=PAL_BLACK, linewidths=1.0, s=60, zorder=5,
+               label=f"Trough  {result['trough_amp_uV']:.1f} uV")
+
+    start_t = result['spike_start_time_ms']
+    end_t   = result['spike_end_time_ms']
+    ax.scatter([start_t, end_t], [wf[result['spike_start_idx']], wf[result['spike_end_idx']]],
+               color=COLOR_DURATION, marker='|', s=220, linewidths=2.2, zorder=6,
+               label='Spike start/end')
+    ax.axvspan(start_t, end_t, color=PAL_BLUE, alpha=0.25, linewidth=0, zorder=1)
+
+    ax.set_xlabel('Time (ms)', fontsize=14, labelpad=6)
+    ax.set_ylabel('Amplitude (µV)', fontsize=14, labelpad=6)
+    ax.set_title(title, fontsize=15, pad=10)
+    ax.tick_params(labelsize=12)
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.legend(fontsize=11, loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=3)
+
+    note = (f"Ch {result['best_channel']}  |  "
+            f"P-T time = {result['pt_time_ms']:.3f} ms  |  "
+            f"P/T ratio = {result['pt_ratio']:.3f}  |  "
+            f"Spike duration = {result['spike_duration_ms']:.3f} ms")
+    ax.text(0.5, -0.34, note, transform=ax.transAxes, fontsize=11, ha='center')
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=500, bbox_inches='tight')
+    plt.close(fig)
+
+
+
+def compute_csi(waveforms: np.ndarray, spike_ts_us: np.ndarray,
+                min_isi_us: float = 3000.0, max_isi_us: float = 20000.0) -> float:
+    """
+    Complex Spike Index: % of ALL consecutive ISIs that fall in [3, 20] ms
+    AND whose second spike has a smaller amplitude than the first.
+    (Bhatt et al. 2020 / Ranck 1973)
+    """
+    if len(spike_ts_us) < 2:
+        return float('nan')
+    sort_idx  = np.argsort(spike_ts_us)
+    ts_sorted = spike_ts_us[sort_idx]
+    wf_sorted = waveforms[sort_idx]
+
+    isis     = np.diff(ts_sorted)
+    in_range = (isis >= min_isi_us) & (isis <= max_isi_us)
+
+    if not np.any(in_range):
+        return 0.0
+
+    mean_pp = (wf_sorted.max(axis=1) - wf_sorted.min(axis=1)).mean(axis=1)  # (n_spikes,)
+    first_pp  = mean_pp[:-1][in_range]
+    second_pp = mean_pp[1:][in_range]
+
+    n_complex = int(np.sum(second_pp < first_pp))
+    return round(float(n_complex / len(isis) * 100.0), 4)
+
+
+def detect_multi_triggers(waveforms: np.ndarray, best_ch: int, peak_idx: int,
+                          offset: int = MULTI_TRIGGER_OFFSET_SAMPLES,
+                          amp_frac: float = MULTI_TRIGGER_AMP_FRAC,
+                          noise_k: float = MULTI_TRIGGER_NOISE_K) -> np.ndarray:
+    """
+    Count secondary peaks per spike on `best_ch`, searching from
+    `peak_idx + offset` to the end of the 32-sample snippet. A sample is a
+    secondary peak if it is a local maximum (the last sample counts if still
+    rising, i.e. a truncated second spike) and exceeds both amp_frac × the
+    spike's own main-peak amplitude and noise_k × the baseline MAD-sigma.
+
+    Returns (n_spikes,) int array of secondary-peak counts.
+    """
+    wf = waveforms[:, :, best_ch]                       # (n, 32)
+    n_spk, n_smp = wf.shape
+    start = peak_idx + max(int(offset), 1)
+    if n_spk == 0 or start >= n_smp:
+        return np.zeros(n_spk, dtype=int)
+
+    baseline = wf[:, :5].flatten()
+    sigma    = float(np.median(np.abs(baseline - np.median(baseline))) / 0.6745)
+
+    main_amp = wf[:, peak_idx]                          # (n,)
+    prev = wf[:, start - 1:n_smp - 1]
+    cur  = wf[:, start:]
+    nxt  = np.concatenate([wf[:, start + 1:], np.full((n_spk, 1), -np.inf)], axis=1)
+
+    thr     = np.maximum(amp_frac * main_amp, noise_k * sigma)
+    is_peak = (cur > prev) & (cur >= nxt) & (cur > thr[:, None]) & (main_amp > 0)[:, None]
+    return is_peak.sum(axis=1)
+
+
+# ── Manual review GUI for multi-trigger units ────────────────────────────────
+
+def review_multi_trigger_units(candidates: list) -> dict:
+    """
+    Tk window listing every flagged unit. For the selected unit, all four
+    channels are drawn: clean spikes in light gray, spikes with secondary
+    triggers in red, mean waveform in black; the dashed line on the best
+    channel marks where the secondary-peak search starts.
+
+    Keys: A = accept, R = reject (both advance), ←/→ = previous/next.
+    Units left undecided keep their automatic decision.
+
+    Returns {candidate_index: True (accept) / False (reject)}.
+    """
+    try:
+        import tkinter as tk
+        from matplotlib.figure import Figure # type: ignore
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg # type: ignore
+    except ImportError as exc:
+        print(f'Manual review GUI unavailable ({exc}); keeping automatic decisions.')
+        return {}
+
+    decisions = {}
+    state     = {'i': 0}
+    rng       = np.random.default_rng(0)
+    time_axis = np.arange(N_SAMPLES) * SAMPLE_INTERVAL_MS
+
+    root = tk.Tk()
+    root.title('Multi-trigger unit review  —  A: accept   R: reject   ←/→: navigate')
+    root.geometry('1500x900')
+
+    left = tk.Frame(root)
+    left.pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
+    listbox = tk.Listbox(left, width=55, font=('Consolas', 9), exportselection=False)
+    sb = tk.Scrollbar(left, orient=tk.VERTICAL, command=listbox.yview)
+    listbox.config(yscrollcommand=sb.set)
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+    listbox.pack(side=tk.LEFT, fill=tk.Y)
+
+    right = tk.Frame(root)
+    right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    fig    = Figure(figsize=(11, 7.5))
+    canvas = FigureCanvasTkAgg(fig, master=right)
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    btns = tk.Frame(right)
+    btns.pack(fill=tk.X, pady=4)
+    status_var = tk.StringVar()
+
+    def list_label(k):
+        c = candidates[k]
+        if k in decisions:
+            tag = 'ACCEPT' if decisions[k] else 'REJECT'
+        else:
+            tag = 'auto:acc' if c['auto_accepted'] else 'auto:rej'
+        return f'[{tag:>8s}] {c["session"]} | {c["unit"]}'
+
+    def refresh_item(k):
+        listbox.delete(k)
+        listbox.insert(k, list_label(k))
+        colour = 'black'
+        if k in decisions:
+            colour = 'forest green' if decisions[k] else 'red3'
+        listbox.itemconfig(k, fg=colour)
+
+    def draw(k):
+        c = candidates[k]
+        fig.clear()
+        try:
+            waveforms, _, _ = load_ntt_waveforms(c['ntt_path'])
+        except Exception as exc:
+            fig.text(0.5, 0.5, f'Could not load file:\n{exc}', ha='center', va='center')
+            canvas.draw()
+            return
+        counts  = detect_multi_triggers(waveforms, c['best_ch'], c['peak_idx'])
+        idx_mt  = np.flatnonzero(counts > 0)
+        idx_ok  = np.flatnonzero(counts == 0)
+        if len(idx_mt) > REVIEW_MAX_SPIKES_SHOWN:
+            idx_mt = rng.choice(idx_mt, REVIEW_MAX_SPIKES_SHOWN, replace=False)
+        if len(idx_ok) > REVIEW_MAX_SPIKES_SHOWN:
+            idx_ok = rng.choice(idx_ok, REVIEW_MAX_SPIKES_SHOWN, replace=False)
+
+        axes = fig.subplots(2, 2, sharex=True, sharey=True)
+        for ch, ax in enumerate(axes.flat):
+            if len(idx_ok):
+                ax.plot(time_axis, waveforms[idx_ok, :, ch].T, color=PAL_LTGRAY, lw=0.5, alpha=0.6)
+            if len(idx_mt):
+                ax.plot(time_axis, waveforms[idx_mt, :, ch].T, color=PAL_RED, lw=0.6, alpha=0.35)
+            ax.plot(time_axis, waveforms[:, :, ch].mean(axis=0), color=PAL_BLACK, lw=2.2)
+            is_best = ch == c['best_ch']
+            if is_best:
+                ax.axvline((c['peak_idx'] + MULTI_TRIGGER_OFFSET_SAMPLES) * SAMPLE_INTERVAL_MS,
+                           color=PAL_DKBLUE, lw=1.2, ls='--')
+            ax.set_title(f'Ch {ch}' + ('  (best)' if is_best else ''),
+                         fontsize=11, fontweight='bold' if is_best else 'normal')
+            ax.spines[['top', 'right']].set_visible(False)
+            if ch >= 2:
+                ax.set_xlabel('Time (ms)')
+            if ch % 2 == 0:
+                ax.set_ylabel('Amplitude (µV)')
+
+        def fmt(v):
+            return 'nan' if v is None or (isinstance(v, float) and np.isnan(v)) else f'{v:.3f}'
+        fig.suptitle(
+            f'{c["session"]} | {c["unit"]}   ({k + 1}/{len(candidates)})\n'
+            f'n spikes = {waveforms.shape[0]}   |   secondary peaks = {int(counts.sum())} '
+            f'in {int((counts > 0).sum())} spikes (red)   |   '
+            f'SNR = {fmt(c["snr"])}   ISI viol = {fmt(c["isi"])} %   TmplCorr = {fmt(c["tmpl_corr"])}   |   '
+            f'auto: {"ACCEPTED" if c["auto_accepted"] else "REJECTED"}',
+            fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.92))
+        canvas.draw()
+
+        n_done = len(decisions)
+        current = ('ACCEPTED' if decisions[k] else 'REJECTED') if k in decisions else 'undecided'
+        status_var.set(f'This unit: {current}     |     reviewed {n_done}/{len(candidates)}')
+
+    def select(k):
+        k = max(0, min(k, len(candidates) - 1))
+        state['i'] = k
+        listbox.selection_clear(0, tk.END)
+        listbox.selection_set(k)
+        listbox.see(k)
+        draw(k)
+
+    def decide(value):
+        k = state['i']
+        decisions[k] = value
+        refresh_item(k)
+        if k < len(candidates) - 1:
+            select(k + 1)
+        else:
+            select(k)
+
+    def on_list_select(_event):
+        sel = listbox.curselection()
+        if sel and sel[0] != state['i']:
+            select(sel[0])
+
+    tk.Button(btns, text='◀ Prev', width=10, command=lambda: select(state['i'] - 1)).pack(side=tk.LEFT, padx=4)
+    tk.Button(btns, text='Accept (A)', width=14, bg='#99FF99',
+              command=lambda: decide(True)).pack(side=tk.LEFT, padx=4)
+    tk.Button(btns, text='Reject (R)', width=14, bg='#FF9999',
+              command=lambda: decide(False)).pack(side=tk.LEFT, padx=4)
+    tk.Button(btns, text='Next ▶', width=10, command=lambda: select(state['i'] + 1)).pack(side=tk.LEFT, padx=4)
+    tk.Label(btns, textvariable=status_var, font=('Calibri', 11)).pack(side=tk.LEFT, padx=16)
+    tk.Button(btns, text='Done — apply decisions', width=24,
+              command=root.destroy).pack(side=tk.RIGHT, padx=4)
+
+    for k in range(len(candidates)):
+        listbox.insert(tk.END, list_label(k))
+    listbox.bind('<<ListboxSelect>>', on_list_select)
+    root.bind('<KeyPress-a>', lambda _e: decide(True))
+    root.bind('<KeyPress-A>', lambda _e: decide(True))
+    root.bind('<KeyPress-r>', lambda _e: decide(False))
+    root.bind('<KeyPress-R>', lambda _e: decide(False))
+    root.bind('<Left>',  lambda _e: select(state['i'] - 1))
+    root.bind('<Right>', lambda _e: select(state['i'] + 1))
+    root.protocol('WM_DELETE_WINDOW', root.destroy)
+
+    select(0)
+    root.focus_force()
+    root.mainloop()
+    return decisions
+
+
+# ── Master metric computation ─────────────────────────────────────────────────
+
+def compute_metrics(ntt_path: str) -> dict:
+    waveforms, spike_ts, _ = load_ntt_waveforms(ntt_path)
+    n_spikes = waveforms.shape[0]
+
+    nan_row = {k: float('nan') for k in ALL_METRIC_KEYS}
+    nan_row['n_spikes'] = 0
+    if n_spikes == 0:
+        return nan_row
+
+    # ── Per-channel peak-to-peak (mean across spikes) ─────────────────────────
+    pp_per_spike        = waveforms.max(axis=1) - waveforms.min(axis=1)  # (n, 4)
+    mean_pp_per_channel = pp_per_spike.mean(axis=0)                      # (4,)
+
+    # ── SNR via MAD-based noise estimator ────────────────────────────────────
+    snr_metrics = compute_snr_mad(waveforms)
+
+    # ── Waveform shape metrics (peak-to-trough) ───────────────────────────────
+    pt_result = compute_pt(waveforms)
+
+    return {
+        'n_spikes':             n_spikes,
+        'peak_to_peak_ch0_uV':  round(float(mean_pp_per_channel[0]), 4),
+        'peak_to_peak_ch1_uV':  round(float(mean_pp_per_channel[1]), 4),
+        'peak_to_peak_ch2_uV':  round(float(mean_pp_per_channel[2]), 4),
+        'peak_to_peak_ch3_uV':  round(float(mean_pp_per_channel[3]), 4),
+        **snr_metrics,
+        'isi_violation_pct':    round(compute_isi_violations(spike_ts), 4),
+        'template_correlation': round(compute_template_correlation(waveforms), 4),
+        'pt_best_channel':      pt_result['best_channel'],
+        'peak_time_ms':         pt_result['peak_time_ms'],
+        'peak_amp_uV':          pt_result['peak_amp_uV'],
+        'trough_time_ms':       pt_result['trough_time_ms'],
+        'trough_amp_uV':        pt_result['trough_amp_uV'],
+        'pt_time_ms':           pt_result['pt_time_ms'],
+        'pt_ratio':             pt_result['pt_ratio'],
+        'spike_start_time_ms':  pt_result['spike_start_time_ms'],
+        'spike_end_time_ms':    pt_result['spike_end_time_ms'],
+        'spike_duration_ms':    pt_result['spike_duration_ms'],
+        'csi':                  compute_csi(waveforms, spike_ts),
+        'n_multi_trigger_peaks': int(detect_multi_triggers(waveforms, pt_result['best_channel'],
+                                                           pt_result['peak_idx']).sum()),
+        '_pt_plot':            pt_result,   # not an Excel column; used for per-unit waveform plots
+    }
+
+
+# ── Batch scan ────────────────────────────────────────────────────────────────
+
+WAVEFORM_PLOT_DIR = os.path.join(os.path.dirname(OUTPUT_EXCEL), 'waveform_plots')
+os.makedirs(WAVEFORM_PLOT_DIR, exist_ok=True)
+
+records = []
+waveform_plot_entries = []   # [(label, png_path), ...] for Excel embedding
+n_units_copied = 0
+n_support_files_copied = 0
+review_candidates = []   # multi-trigger units held back for the manual review GUI
+for dirpath, _, filenames in os.walk(ROOT_FOLDER):
+    ntt_files = sorted(f for f in filenames if f.lower().endswith('.ntt'))
+    if not ntt_files:
+        continue
+
+    session_name = os.path.relpath(dirpath, ROOT_FOLDER)
+    dest_dir     = os.path.join(ACCEPTED_ROOT_FOLDER, session_name)
+
+    # Copy every .csv and .ncs file in this session folder, regardless of
+    # any individual unit's acceptance (they describe the recording session,
+    # not a single cluster).
+    support_files = sorted(f for f in filenames if f.lower().endswith(('.csv', '.ncs')))
+    if support_files:
+        os.makedirs(dest_dir, exist_ok=True)
+        for support_file in support_files:
+            shutil.copy2(os.path.join(dirpath, support_file), os.path.join(dest_dir, support_file))
+            n_support_files_copied += 1
+
+    for ntt_file in ntt_files:
+        ntt_path = os.path.join(dirpath, ntt_file)
+        print(f'Processing: {session_name}  |  {ntt_file}')
+        multi_trigger = False
+        try:
+            metrics  = compute_metrics(ntt_path)
+            pt_plot  = metrics.pop('_pt_plot', None)
+            accepted = is_unit_accepted(metrics.get('isi_violation_pct'),
+                                        metrics.get('snr'),
+                                        metrics.get('template_correlation'))
+            multi_trigger = (pt_plot is not None and
+                             metrics.get('n_multi_trigger_peaks', 0) > MULTI_TRIGGER_MIN_PEAKS)
+            if multi_trigger and pt_plot is not None:
+                # Copying is deferred until after manual review
+                print(f'  -> multi-trigger: {metrics["n_multi_trigger_peaks"]} secondary peaks, '
+                      f'queued for manual review')
+                review_candidates.append({
+                    'record_idx':    len(records),
+                    'session':       session_name,
+                    'unit':          ntt_file,
+                    'ntt_path':      ntt_path,
+                    'dest_dir':      dest_dir,
+                    'best_ch':       pt_plot['best_channel'],
+                    'peak_idx':      pt_plot['peak_idx'],
+                    'auto_accepted': accepted,
+                    'snr':           metrics.get('snr'),
+                    'isi':           metrics.get('isi_violation_pct'),
+                    'tmpl_corr':     metrics.get('template_correlation'),
+                })
+            elif accepted:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copy2(ntt_path, os.path.join(dest_dir, ntt_file))
+                n_units_copied += 1
+            if pt_plot is not None:
+                unit_label = f'{session_name}_{os.path.splitext(ntt_file)[0]}'.replace(os.sep, '_')
+                png_path   = os.path.join(WAVEFORM_PLOT_DIR, f'{unit_label}_waveform.png')
+                plot_waveform(pt_plot['mean_waveform'], pt_plot, png_path,
+                             title=f'{session_name} | {ntt_file}')
+                waveform_plot_entries.append((f'{session_name} | {ntt_file}', png_path))
+        except Exception as exc:
+            print(f'  ERROR: {exc}')
+            metrics  = {k: None for k in ALL_METRIC_KEYS}
+            accepted = False
+        metrics['session']  = session_name # type: ignore
+        metrics['unit']     = ntt_file # type: ignore
+        metrics['multi_trigger'] = multi_trigger # type: ignore
+        metrics['manual_review'] = '' # type: ignore
+        metrics['accepted'] = accepted # type: ignore
+        records.append(metrics)
+
+# ── Manual review of multi-trigger (bursting) units ───────────────────────────
+# The manual decision overrides the automatic one, so manually accepted units
+# are copied to ACCEPTED_ROOT_FOLDER and coloured as accepted in all histograms.
+
+n_manual_accepted = n_manual_rejected = 0
+if review_candidates:
+    print(f'\n{len(review_candidates)} unit(s) with > {MULTI_TRIGGER_MIN_PEAKS} secondary peaks '
+          f'-> opening manual review GUI...')
+    decisions = review_multi_trigger_units(review_candidates)
+    for k, cand in enumerate(review_candidates):
+        rec = records[cand['record_idx']]
+        if k in decisions:
+            rec['accepted']      = decisions[k]
+            rec['manual_review'] = 'accepted' if decisions[k] else 'rejected'
+            if decisions[k]:
+                n_manual_accepted += 1
+            else:
+                n_manual_rejected += 1
+        else:
+            rec['manual_review'] = 'not reviewed'
+        if rec['accepted']:
+            os.makedirs(cand['dest_dir'], exist_ok=True)
+            shutil.copy2(cand['ntt_path'], os.path.join(cand['dest_dir'], cand['unit']))
+            n_units_copied += 1
+    print(f'Manual review: {n_manual_accepted} accepted, {n_manual_rejected} rejected, '
+          f'{len(review_candidates) - len(decisions)} not reviewed (automatic decision kept)')
+
+print(f'\nAccepted units copied: {n_units_copied}  |  Support files (.csv/.ncs) copied: {n_support_files_copied}')
+print(f'Accepted-unit tree: {ACCEPTED_ROOT_FOLDER}')
+
+# ── Build DataFrame ───────────────────────────────────────────────────────────
+
+df = pd.DataFrame(records, columns=COLUMN_ORDER)
+df.to_excel(OUTPUT_EXCEL, index=False, engine='openpyxl')
+
+# ── Post-process: colour coding via openpyxl ──────────────────────────────────
+
+wb = load_workbook(OUTPUT_EXCEL)
+ws = wb.active
+assert ws is not None
+ws.title = 'Quality Metrics'
+
+COL_WIDTHS = {
+    'session':              28, 'unit':                 18,
+    'n_spikes':             10,
+    'peak_to_peak_ch0_uV':  18, 'peak_to_peak_ch1_uV':  18,
+    'peak_to_peak_ch2_uV':  18, 'peak_to_peak_ch3_uV':  18,
+    'best_channel':         14, 'a_peak_uV':            14, 'sigma_noise_uV':       16,
+    'snr':                  10, 'snr_db':               10,
+    'isi_violation_pct':    18, 'template_correlation':  22,
+    'pt_best_channel':      14, 'peak_time_ms':          14, 'peak_amp_uV':          14,
+    'trough_time_ms':       14, 'trough_amp_uV':         14, 'pt_time_ms':           14,
+    'pt_ratio':             12,
+    'spike_start_time_ms':  16, 'spike_end_time_ms':     16, 'spike_duration_ms':    16,
+    'csi':                  10,
+    'n_multi_trigger_peaks': 20, 'multi_trigger':        14, 'manual_review':        16,
+}
+for col_idx, col_name in enumerate(COLUMN_ORDER, start=1):
+    ws.column_dimensions[get_column_letter(col_idx)].width = COL_WIDTHS.get(col_name, 14)
+
+for cell in ws[1]:
+    cell.fill = FILL_HEADER; cell.font = FONT_HEADER
+    cell.alignment = ALIGN_CTR; cell.border = THIN_BORDER
+ws.row_dimensions[1].height = 22
+ws.freeze_panes = 'A2'
+
+snr_col     = COLUMN_ORDER.index('snr')               + 1
+snr_db_col  = COLUMN_ORDER.index('snr_db')            + 1
+isi_col     = COLUMN_ORDER.index('isi_violation_pct') + 1
+
+# Two appended quality-label columns (right after the data)
+SNR_QUALITY_COL = len(COLUMN_ORDER) + 1
+ISI_QUALITY_COL = len(COLUMN_ORDER) + 2
+
+for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row), start=2):
+    # Base styling
+    for cell in row:
+        cell.font      = FONT_BODY
+        cell.border    = THIN_BORDER
+        cell.alignment = ALIGN_CTR if cell.column > 1 else ALIGN_LEFT # type: ignore
+
+    # SNR colour
+    try:
+        snr_val = float(ws.cell(row=row_idx, column=snr_col).value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        snr_val = float('nan')
+    snr_lbl, snr_fill = snr_quality(snr_val)
+    ws.cell(row=row_idx, column=snr_col).fill    = snr_fill
+    ws.cell(row=row_idx, column=snr_db_col).fill = snr_fill
+
+    c = ws.cell(row=row_idx, column=SNR_QUALITY_COL, value=snr_lbl)  # type: ignore[arg-type]
+    c.fill = snr_fill; c.font = FONT_BODY; c.alignment = ALIGN_CTR; c.border = THIN_BORDER
+
+    # ISI colour
+    try:
+        isi_val = float(ws.cell(row=row_idx, column=isi_col).value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        isi_val = float('nan')
+    isi_lbl, isi_fill = isi_quality(isi_val)
+    ws.cell(row=row_idx, column=isi_col).fill = isi_fill
+
+    c = ws.cell(row=row_idx, column=ISI_QUALITY_COL, value=isi_lbl)  # type: ignore[arg-type]
+    c.fill = isi_fill; c.font = FONT_BODY; c.alignment = ALIGN_CTR; c.border = THIN_BORDER
+
+# Quality label column headers
+for col_idx, label in [(SNR_QUALITY_COL, 'SNR Quality'), (ISI_QUALITY_COL, 'ISI Quality')]:
+    c = ws.cell(row=1, column=col_idx, value=label)
+    c.fill = FILL_HEADER; c.font = FONT_HEADER; c.alignment = ALIGN_CTR; c.border = THIN_BORDER
+    ws.column_dimensions[get_column_letter(col_idx)].width = 14
+
+# ── Legend sheet ──────────────────────────────────────────────────────────────
+
+leg = wb.create_sheet('Legend')
+leg.column_dimensions['A'].width = 16
+leg.column_dimensions['B'].width = 36
+leg.column_dimensions['C'].width = 24
+
+legend_rows = [
+    ('Colour',  'Meaning',                                  'Threshold'),
+    ('GREEN',   'SNR good / ISI low (< 1 %)',               f'SNR {SNR_LOW_OK}–{SNR_HIGH_GOOD}  |  ISI < {ISI_GOOD_PCT} %'),
+    ('YELLOW',  'SNR marginal / ISI borderline (1–5 %)',    f'SNR {SNR_LOW_BAD}–{SNR_LOW_OK}  |  ISI {ISI_GOOD_PCT}–{ISI_MARGIN_PCT} %'),
+    ('RED',     'SNR too low / ISI high (> 5 %)',           f'SNR < {SNR_LOW_BAD}  |  ISI > {ISI_MARGIN_PCT} %'),
+    ('PURPLE',  'SNR very high – check for artefacts',      f'SNR > {SNR_HIGH_GOOD}'),
+]
+fills_legend = [FILL_HEADER, FILL_GREEN, FILL_YELLOW, FILL_RED, FILL_PURPLE]
+for r_idx, (row_data, fill) in enumerate(zip(legend_rows, fills_legend), start=1):
+    for c_idx, val in enumerate(row_data, start=1):
+        cell = leg.cell(row=r_idx, column=c_idx, value=val)  # type: ignore[arg-type]
+        cell.fill = fill
+        cell.font = FONT_HEADER if r_idx == 1 else FONT_BODY
+        cell.alignment = ALIGN_CTR; cell.border = THIN_BORDER
+    leg.row_dimensions[r_idx].height = 20
+
+wb.save(OUTPUT_EXCEL)
+print('Excel data saved.')
+
+
+# ── Histogram helper ──────────────────────────────────────────────────────────
+
+def make_histogram(values, accepted, title, xlabel,
+                   thresholds=(), threshold_colors=(), threshold_labels=(),
+                   bar_color=ACCEPTED_COLOR, n_bins=30):
+    """
+    Stacked histogram: for each bin, rejected units (accepted == False) are
+    drawn as a gray segment at the bottom, accepted units in `bar_color` on
+    top, so discarded cells are visually separated from the accepted ones
+    within the same bin.
+    """
+    values   = np.asarray(values,   dtype=float)
+    accepted = np.asarray([bool(a) if a is not None else False for a in accepted], dtype=bool)
+    valid    = ~np.isnan(values)
+    vals     = values[valid]
+    acc      = accepted[valid] if len(accepted) == len(values) else np.zeros(vals.shape, dtype=bool)
+
+    # Plot on top; legend + statistics live in a separate panel below so they
+    # never overlap the bars.
+    fig, (ax, ax_info) = plt.subplots(2, 1, figsize=(8, 8),
+                                      gridspec_kw={'height_ratios': [5, 2.6]})
+    ax_info.axis('off')
+
+    if len(vals) > 0:
+        bin_edges    = np.histogram_bin_edges(vals, bins=n_bins)
+        bin_widths   = np.diff(bin_edges)
+        bin_centers  = bin_edges[:-1] + bin_widths / 2
+        n_rejected, _ = np.histogram(vals[~acc], bins=bin_edges)
+        n_accepted, _ = np.histogram(vals[acc],  bins=bin_edges)
+
+        # Box-style bars (gray / light blue fill, black edge) like the c-Fos reference
+        ax.bar(bin_centers, n_rejected, width=bin_widths, color=REJECTED_COLOR,
+               edgecolor=PAL_BLACK, linewidth=1.2, zorder=3,
+               label=f'Discarded (n={int(n_rejected.sum())})')
+        ax.bar(bin_centers, n_accepted, width=bin_widths, bottom=n_rejected,
+               color=bar_color, edgecolor=PAL_BLACK, linewidth=1.2, zorder=3,
+               label=f'Accepted (n={int(n_accepted.sum())})')
+
+        for xv, col, lbl in zip(thresholds, threshold_colors, threshold_labels):
+            ax.axvline(xv, color=col, linewidth=1.5, linestyle='--', zorder=4, label=lbl)
+
+        mean_v   = float(np.mean(vals))
+        median_v = float(np.median(vals))
+        ax.axvline(mean_v,   color=PAL_BLACK, linewidth=1.8, linestyle='-',  zorder=5,
+                   label=f'Mean   {mean_v:.3f}')
+        ax.axvline(median_v, color=PAL_BLACK, linewidth=1.8, linestyle=':', zorder=5,
+                   label=f'Median {median_v:.3f}')
+
+        summary = (f'n = {len(vals)}     '
+                   f'Mean ± SD = {mean_v:.3f} ± {float(np.std(vals)):.3f}     '
+                   f'Median = {median_v:.3f}')
+        handles, labels = ax.get_legend_handles_labels()
+        ax_info.legend(handles, labels, fontsize=12, loc='upper center', ncol=2)
+        ax_info.text(0.5, 0.0, summary, transform=ax_info.transAxes, fontsize=12,
+                     va='bottom', ha='center')
+    else:
+        ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
+                ha='center', va='center', fontsize=14)
+
+    ax.set_xlabel(xlabel, fontsize=15, labelpad=8)
+    ax.set_ylabel('Number of units', fontsize=15, labelpad=8)
+    ax.set_title(title, fontsize=17, pad=12)
+    ax.tick_params(labelsize=13)
+    ax.spines[['top', 'right']].set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
+# ── Build and save all histograms ─────────────────────────────────────────────
+
+base = os.path.splitext(OUTPUT_EXCEL)[0]
+
+histogram_specs = [
+    # (sheet_name,  png_suffix,        df_col,               title,                            xlabel,                          thresholds,                     thr_colors,                               thr_labels,                                              bar_color)
+    ('Hist_SNR',     '_hist_SNR',       'snr',                'SNR Distribution',               'SNR  (A_peak / σ_noise)',       (SNR_LOW_BAD, SNR_LOW_OK, SNR_HIGH_GOOD), (PAL_RED, PAL_ORANGE, PAL_GREEN), (f'Too low {SNR_LOW_BAD}', f'Marginal {SNR_LOW_OK}', f'High {SNR_HIGH_GOOD}'), ACCEPTED_COLOR),
+    ('Hist_ISI',     '_hist_ISI',       'isi_violation_pct',  'ISI Violation Distribution',     'ISI violations  (%)',           (ISI_GOOD_PCT, ISI_MARGIN_PCT),  (PAL_GREEN, PAL_ORANGE),                 (f'Good < {ISI_GOOD_PCT}%', f'Marginal < {ISI_MARGIN_PCT}%'),                 ACCEPTED_COLOR),
+    ('Hist_TmplCorr','_hist_TmplCorr',  'template_correlation','Waveform Template Correlation', 'Mean Pearson r  (spike vs template)', (0.90,),                    (PAL_GREEN,),                           ('r = 0.90',),                                                                   ACCEPTED_COLOR),
+    ('Hist_PTTime',  '_hist_PTTime',    'pt_time_ms',         'Peak-to-Trough Time',            'PT time  (ms)',                 (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
+    ('Hist_SpikeDur','_hist_SpikeDur',  'spike_duration_ms',  'Spike Duration',                 'Spike duration  (ms)',          (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
+    ('Hist_PTRatio', '_hist_PTRatio',   'pt_ratio',           'Peak-to-Trough Ratio',           '|peak| / |trough|  (a.u.)',     (1.0,),                          (PAL_GRAY,),                            ('ratio = 1.0',),                                                                ACCEPTED_COLOR),
+    ('Hist_CSI',     '_hist_CSI',       'csi',                'Complex Spike Index (CSI)',       'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)', (10.0,), (PAL_RED,),                             ('CSI = 10%',),                                                                  ACCEPTED_COLOR),
+]
+
+png_paths = {}
+accepted_flags = df['accepted'].values if 'accepted' in df.columns else np.zeros(len(df), dtype=bool)
+for sheet_name, suffix, col, title, xlabel, thresholds, thr_colors, thr_labels, bar_color in histogram_specs:
+    vals = df[col].values if col in df.columns else []
+    fig  = make_histogram(vals, accepted_flags, title, xlabel,
+                          thresholds=thresholds,
+                          threshold_colors=thr_colors,
+                          threshold_labels=thr_labels,
+                          bar_color=bar_color)
+    png  = base + suffix + '.png'
+    fig.savefig(png, dpi=500, bbox_inches='tight')
+    plt.close(fig)
+    png_paths[sheet_name] = png
+    print(f'Histogram saved: {png}')
+
+# ── Embed all histograms as separate sheets ───────────────────────────────────
+
+wb2 = load_workbook(OUTPUT_EXCEL)
+
+for sheet_name, suffix, col, title, *_ in histogram_specs:
+    hs = wb2.create_sheet(sheet_name)
+    hs.sheet_view.showGridLines = False
+    tc = hs.cell(row=1, column=1, value=title)
+    tc.font      = Font(bold=True, size=13, color='FF2E4057', name='Calibri')
+    tc.alignment = Alignment(horizontal='left', vertical='center')
+    hs.row_dimensions[1].height = 24
+    img = XLImage(png_paths[sheet_name])
+    img.anchor = 'A3'
+    hs.add_image(img)
+
+# ── Embed per-unit waveform plots (one sheet, stacked rows) ───────────────────
+
+if waveform_plot_entries:
+    ROWS_PER_PLOT = 34   # label row + ~image height in default-height rows
+    wf_sheet = wb2.create_sheet('Waveforms')
+    wf_sheet.sheet_view.showGridLines = False
+    wf_sheet.column_dimensions['A'].width = 16
+
+    row_cursor = 1
+    for label, png_path in waveform_plot_entries:
+        tc = wf_sheet.cell(row=row_cursor, column=1, value=label)
+        tc.font      = Font(bold=True, size=11, color='FF2E4057', name='Calibri')
+        tc.alignment = Alignment(horizontal='left', vertical='center')
+        img = XLImage(png_path)
+        img.anchor = f'A{row_cursor + 1}'
+        wf_sheet.add_image(img)
+        row_cursor += ROWS_PER_PLOT
+
+wb2.save(OUTPUT_EXCEL)
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+print(f'\nDone. Results saved to {OUTPUT_EXCEL}')
+print(f'Total units processed: {len(df)}')
+
+for col, label in [('snr', 'SNR quality'), ('isi_violation_pct', 'ISI quality')]:
+    if df[col].notna().any():
+        qual_fn = snr_quality if col == 'snr' else isi_quality
+        summary = df[col].apply(lambda v: qual_fn(v)[0]).value_counts()
+        print(f'\n{label}:')
+        for lbl, n in summary.items():
+            print(f'  {lbl:12s}: {n}')
+
+for col in ['isi_violation_pct', 'template_correlation', 'pt_time_ms',
+            'pt_ratio', 'spike_duration_ms', 'csi']:
+    vals = df[col].dropna()
+    if len(vals):
+        print(f'\n{col}: mean={vals.mean():.4f}  median={vals.median():.4f}  SD={vals.std():.4f}  n={len(vals)}')
+
+# ── Final accepted/rejected tally (printed last, once everything else is done) ─
+n_accepted = int(df['accepted'].sum())
+n_rejected = int((~df['accepted']).sum())
+print(f'\n{"="*50}')
+print(f'Cells accepted (ISI<1%, SNR>2.5, TmplCorr>0.5): {n_accepted}')
+print(f'Cells rejected: {n_rejected}')
+print(f'Multi-trigger units reviewed manually: {n_manual_accepted} accepted, '
+      f'{n_manual_rejected} rejected (of {len(review_candidates)} flagged)')
+print(f'{"="*50}')

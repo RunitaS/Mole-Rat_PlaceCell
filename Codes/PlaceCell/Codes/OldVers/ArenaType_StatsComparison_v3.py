@@ -302,7 +302,7 @@ plt.rcParams.update({
 _HUES = [
     {'face': PAL_CYAN,    'edge': PAL_BLACK, 'dark': '#00B3B3',  'light': '#CCFDFD'},  # cyan
     {'face': PAL_MAGENTA, 'edge': PAL_BLACK, 'dark': '#C000C0',  'light': '#FDCCFD'},  # magenta
-    {'face': '#7FE07F',   'edge': PAL_BLACK, 'dark': PAL_GREEN,  'light': '#CCF2CC'},  # green
+    {'face': PAL_BLUE,    'edge': PAL_BLACK, 'dark': PAL_DKBLUE, 'light': '#CCE1F5'},  # blue
 ]
 ARENA_COLORS = {a: _HUES[i] for i, a in enumerate(ARENA_TYPES)}
 _DEFAULT_COLOR = {'face': PAL_GRAY, 'edge': PAL_BLACK, 'dark': PAL_GRAY, 'light': '#D4D4D4'}
