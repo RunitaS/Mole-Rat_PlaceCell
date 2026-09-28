@@ -1,6 +1,7 @@
 """
-Goes through every .xlsx file in a hardcoded directory and, for every sheet,
-checks whether cell A1 already holds "time" or 0/"0".
+Recursively goes through every .xlsx and .csv file under a hardcoded root
+directory (all folders and subfolders) and, for every sheet (or the single
+table in a .csv), checks whether cell A1 already holds "time" or 0/"0".
 
 If neither is present, column A is assumed to be missing its header, so the
 script:
@@ -12,11 +13,12 @@ script:
 Requires: openpyxl  (pip install openpyxl)
 """
 
+import csv
 import os
 from openpyxl import load_workbook
 
-# ---- hardcode your directory here ----
-DIRECTORY = r"C:/Runita/NMR/analysis/TrackingCorrection"
+# ---- hardcode your root directory here ----
+ROOT_DIRECTORY = r"X:\NMR_group_data\Runita\AllData_Backup\AllSortedData\Neuropixel"
 
 
 def needs_time_header(value):
@@ -48,23 +50,70 @@ def fix_sheet(ws):
     return True
 
 
+def fix_xlsx(filepath):
+    wb = load_workbook(filepath)
+
+    modified = False
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if fix_sheet(ws):
+            modified = True
+            print(f"Fixed '{sheet_name}' in {filepath}")
+
+    if modified:
+        wb.save(filepath)
+
+
+def fix_csv(filepath):
+    # Preserve a UTF-8 BOM and the original line endings if present.
+    with open(filepath, "rb") as f:
+        raw = f.read()
+    encoding = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
+    line_terminator = "\r\n" if b"\r\n" in raw else "\n"
+
+    with open(filepath, "r", newline="", encoding=encoding) as f:
+        rows = list(csv.reader(f))
+
+    if not rows:
+        return
+
+    a1 = rows[0][0] if rows[0] else None
+    if not needs_time_header(a1):
+        return
+
+    col_a_values = [row[0] if row else "" for row in rows]
+
+    # Drop the last entry, then shift everything down by one row.
+    shifted_values = ["time"] + col_a_values[:-1]
+    for row, val in zip(rows, shifted_values):
+        if row:
+            row[0] = val
+        else:
+            row.append(val)
+
+    with open(filepath, "w", newline="", encoding=encoding) as f:
+        csv.writer(f, lineterminator=line_terminator).writerows(rows)
+
+    print(f"Fixed {filepath}")
+
+
 def main():
-    for filename in os.listdir(DIRECTORY):
-        if not filename.lower().endswith(".xlsx"):
-            continue
+    for dirpath, _, filenames in os.walk(ROOT_DIRECTORY):
+        for filename in filenames:
+            # Skip Excel's temporary lock files (e.g. "~$data.xlsx").
+            if filename.startswith("~$"):
+                continue
 
-        filepath = os.path.join(DIRECTORY, filename)
-        wb = load_workbook(filepath)
+            filepath = os.path.join(dirpath, filename)
+            ext = os.path.splitext(filename)[1].lower()
 
-        modified = False
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            if fix_sheet(ws):
-                modified = True
-                print(f"Fixed '{sheet_name}' in {filename}")
-
-        if modified:
-            wb.save(filepath)
+            try:
+                if ext == ".xlsx":
+                    fix_xlsx(filepath)
+                elif ext == ".csv":
+                    fix_csv(filepath)
+            except Exception as e:
+                print(f"ERROR processing {filepath}: {e}")
 
 
 if __name__ == "__main__":

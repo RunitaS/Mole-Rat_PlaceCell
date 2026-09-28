@@ -44,6 +44,12 @@ Tracking load/clean/smooth (pixel<->cm handling, jump removal, Gaussian smoothin
 spike-position matching (50 ms gate) are ported from
 PlaceCellCharacterization_SpeedModv3_DownsampledPos15.py.
 
+VELOCITY FILTER: after smoothing, speed is computed frame by frame from the smoothed trajectory,
+and every spike whose matched frame has speed < MIN_SPEED_CMS (0.5 cm/s, immobility -- non-spatial
+SWR / consolidation firing) or > MAX_SPEED_CMS (90 cm/s, tracking artifact) is excluded from ALL
+analyses; with SPEED_FILTER_OCCUPANCY those frames are dropped from occupancy as well (see
+_speed_mask, compute_cell_ratemap).
+
 CELL SELECTION: this script does NOT re-test cells for place-cell qualification. Every .ntt
 file under ROOT_DIRECTORY is taken as an already-qualified place cell -- qualification
 (n_spikes, peak rate, SIR, sparsity, shuffle significance) was done by the upstream pipeline
@@ -94,10 +100,10 @@ from matplotlib.colors import Normalize
 # Single root under which every animal/arena/day/session lives. Arena type is auto-detected
 # per session from its path (see ARENA_FOLDER_KEYWORDS / _detect_arena_key below) -- no
 # per-arena root folders needed any more.
-ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted\SessionType_Sorted\Open\Cntrl'
+ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\Data\SessionTypeSorted_PC\Open\Cntrl'
 
 # Output folder for all figures / workbooks (same location as before, now derived from the root).
-OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_Rayleigh2')
+OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad')
 
 ROTATE_SESSION_KEYWORD  = 'rotate'
 ROTATE_SESSION_CCW_DEG  = 0.0 #120.0
@@ -392,7 +398,24 @@ MAX_WORKERS    = 4
 BOOTSTRAP_SEED = 0
 
 POS_JUMP_THRESH_CMS  = 90.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
-POS_SMOOTH_SIGMA_SMP = 1.0    # Gaussian smoothing sigma (samples) applied to x/y tracking position
+POS_SMOOTH_SIGMA_SMP = 5.0    # Gaussian smoothing sigma (samples) applied to x/y tracking position
+
+# ── Velocity filter (applied before ANY analysis). Spikes fired while the animal is immobile
+# are dominated by non-spatial sharp-wave-ripple (SWR) / memory-consolidation firing, which
+# biases the pooled firing density; implausibly fast frames are tracking artifacts. Speed is
+# computed from the SMOOTHED trajectory as frame-by-frame displacement / frame interval
+# (~33 ms at fps=30), and every spike whose matched tracking frame has speed outside
+# [MIN_SPEED_CMS, MAX_SPEED_CMS] is discarded -- from the rate maps, SIR/sparsity, the
+# bootstrap, peak/field extraction, and so from every pooled map and statistic downstream
+# (see _speed_mask / compute_cell_ratemap).
+SPEED_FILTER_ENABLED = True
+MIN_SPEED_CMS        = 0.5    # below this the animal is treated as immobile (SWR-prone)
+MAX_SPEED_CMS        = 90.0   # above this the frame is treated as a tracking artifact
+# True: the same out-of-range frames are also removed from OCCUPANCY (standard practice) --
+# otherwise the immobile time would stay in the rate denominator with its spikes removed,
+# artificially lowering the rate wherever the animal rests (typically near walls).
+# False: only the spikes are removed; occupancy uses every frame.
+SPEED_FILTER_OCCUPANCY = True
 RATEMAP_SMOOTH_SIGMA_BINS = 3.0  # Gaussian smoothing sigma (bins) applied to rate maps
 
 # Place-field extraction (pass-index 'place' filter-band criteria, auto_filter_band in
@@ -548,6 +571,28 @@ def _session_positions(csv_path: str, handler) -> tuple:
     x_cm, y_cm = _centre_open_field_tracking(x_cm, y_cm, session_dir, handler)
     x_cm, y_cm = _apply_session_rotation(x_cm, y_cm, session_dir, handler)
     return x_cm, y_cm, t
+
+
+def _speed_mask(x_cm: np.ndarray, y_cm: np.ndarray, t_us: np.ndarray) -> np.ndarray:
+    """Per-frame boolean: True where the animal's speed lies within
+    [MIN_SPEED_CMS, MAX_SPEED_CMS] (all True when SPEED_FILTER_ENABLED is False).
+
+    Speed of frame i is the displacement of the smoothed trajectory from frame i-1 to i
+    divided by the actual timestamp interval (so dropped frames are handled correctly);
+    frame 0 takes frame 1's speed. Must be called on the FULL, contiguous tracking series
+    (before any off-arena samples are removed), otherwise removed samples would create
+    artificial jumps."""
+    n = len(t_us)
+    if not SPEED_FILTER_ENABLED or n < 2:
+        return np.ones(n, dtype=bool)
+    dt_s = np.diff(t_us) * 1e-6
+    step_cm = np.hypot(np.diff(x_cm), np.diff(y_cm))
+    speed = np.full(n - 1, np.nan)
+    ok = dt_s > 0
+    speed[ok] = step_cm[ok] / dt_s[ok]
+    speed = np.concatenate(([speed[0]], speed))
+    # NaN speed (zero dt) compares False on both sides -> frame excluded
+    return (speed >= MIN_SPEED_CMS) & (speed <= MAX_SPEED_CMS)
 
 
 def _stable_seed(*parts) -> int:
@@ -1254,12 +1299,17 @@ def extract_place_field_mask(cell: dict, handler) -> np.ndarray:
 def compute_cell_ratemap(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarray,
                          spike_ts: np.ndarray, handler) -> dict | None:
     x_cm, y_cm = handler.orient(x_cm, y_cm)
+    moving = _speed_mask(x_cm, y_cm, t)
     bin_idx, sample_valid = handler.to_bins(x_cm, y_cm)
     t = t[sample_valid]
     bin_idx = bin_idx[sample_valid]
+    moving = moving[sample_valid]
     if len(t) < 2:
         return None
 
+    # spikes are matched against every on-arena frame (not only the in-speed ones), so a spike
+    # fired during immobility is matched to its own immobile frame and rejected, rather than
+    # being re-credited to the nearest in-speed frame
     idx   = np.searchsorted(t, spike_ts, side='left')
     idx_l = np.clip(idx - 1, 0, len(t) - 1)
     idx_r = np.clip(idx,     0, len(t) - 1)
@@ -1268,15 +1318,27 @@ def compute_cell_ratemap(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarray,
     nearest = np.where(dist_l <= dist_r, idx_l, idx_r)
     min_dist = np.minimum(dist_l, dist_r)
 
-    valid_spike = min_dist <= MAX_GAP_US
-    spike_frame = nearest[valid_spike]
+    matched     = min_dist <= MAX_GAP_US
+    valid_spike = matched & moving[nearest]
     n_spikes    = int(valid_spike.sum())
+    n_spikes_speed_excluded = int((matched & ~moving[nearest]).sum())
 
     n = len(t)
     dt_frames = np.empty(n, dtype=np.float64)
     dt_frames[0] = 1.0 / fps
     raw_dt = np.diff(t) * 1e-6
     dt_frames[1:] = np.minimum(raw_dt, 2.0 / fps)
+
+    if SPEED_FILTER_OCCUPANCY:
+        # drop out-of-speed frames entirely; spike frame indices are remapped onto the kept
+        # frames so the bootstrap's circular shift also only moves spikes among in-speed frames
+        new_index = np.cumsum(moving) - 1
+        spike_frame = new_index[nearest[valid_spike]]
+        t, bin_idx, dt_frames = t[moving], bin_idx[moving], dt_frames[moving]
+        if len(t) < 2:
+            return None
+    else:
+        spike_frame = nearest[valid_spike]
 
     n_bins = handler.n_bins
     occ_map   = np.zeros(n_bins, dtype=np.float64)
@@ -1293,7 +1355,7 @@ def compute_cell_ratemap(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarray,
     fr_smooth = handler.smooth(fr_raw, valid)
     fi_map = field_index_map(fr_smooth, valid)
 
-    result = dict(n_spikes=n_spikes, fr_raw=fr_raw, fr_smooth=fr_smooth, fi_map=fi_map,
+    result = dict(n_spikes=n_spikes, n_spikes_speed_excluded=n_spikes_speed_excluded, fr_raw=fr_raw, fr_smooth=fr_smooth, fi_map=fi_map,
                   occ_map=occ_map, valid=valid, bin_idx=bin_idx,
                   spike_frame=spike_frame, t=t, n_bins=n_bins)
 
@@ -1412,9 +1474,11 @@ def session_zone_coverage(csv_path: str, handler) -> tuple | None:
     if len(t) < 2:
         return None
     x_cm, y_cm = handler.orient(x_cm, y_cm)
+    moving = _speed_mask(x_cm, y_cm, t)
     bin_idx, sample_valid = handler.to_bins(x_cm, y_cm)
     t = t[sample_valid]
     bin_idx = bin_idx[sample_valid]
+    moving = moving[sample_valid]
     if len(t) < 2:
         return None
 
@@ -1423,6 +1487,10 @@ def session_zone_coverage(csv_path: str, handler) -> tuple | None:
     dt_frames[0] = 1.0 / fps
     raw_dt = np.diff(t) * 1e-6
     dt_frames[1:] = np.minimum(raw_dt, 2.0 / fps)
+
+    # same occupancy the rate maps use (velocity-filtered when SPEED_FILTER_OCCUPANCY)
+    if SPEED_FILTER_OCCUPANCY:
+        bin_idx, dt_frames = bin_idx[moving], dt_frames[moving]
 
     occ_map = np.zeros(handler.n_bins, dtype=np.float64)
     np.add.at(occ_map, bin_idx, dt_frames)
@@ -1480,7 +1548,8 @@ def process_unit(csv_path: str, ntt_path: str, ntt_file: str, session_name: str,
 
     return dict(
         session=session_name, unit=ntt_file,
-        n_spikes=cell['n_spikes'], peak_fr=cell['peak_fr'], mean_fr=cell['mean_fr'],
+        n_spikes=cell['n_spikes'], n_spikes_speed_excluded=cell['n_spikes_speed_excluded'],
+        peak_fr=cell['peak_fr'], mean_fr=cell['mean_fr'],
         sir=cell['sir'], sparsity=cell['sparsity'],
         bootstrap_sig=boot_sig,
         fr_raw=cell['fr_raw'], fr_smooth=cell['fr_smooth'], fi_map=cell['fi_map'], valid=cell['valid'], occ_map=cell['occ_map'],
@@ -4002,9 +4071,11 @@ def _debug_occupancy_and_rawrate(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarr
     (gaps, duplicated wrap, off-center ring, wrong radial split) show up even in
     sparsely-sampled bins that compute_cell_ratemap would mask out as invalid."""
     x_cm, y_cm = handler.orient(x_cm, y_cm)
+    moving = _speed_mask(x_cm, y_cm, t)
     bin_idx, sample_valid = handler.to_bins(x_cm, y_cm)
     t = t[sample_valid]
     bin_idx = bin_idx[sample_valid]
+    moving = moving[sample_valid]
     if len(t) < 2:
         return None
 
@@ -4015,13 +4086,15 @@ def _debug_occupancy_and_rawrate(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarr
     dist_r  = np.abs(spike_ts - t[idx_r])
     nearest = np.where(dist_l <= dist_r, idx_l, idx_r)
     min_dist = np.minimum(dist_l, dist_r)
-    valid_spike = min_dist <= MAX_GAP_US
+    valid_spike = (min_dist <= MAX_GAP_US) & moving[nearest]
     spike_frame = nearest[valid_spike]
 
     n = len(t)
     dt_frames = np.empty(n, dtype=np.float64)
     dt_frames[0] = 1.0 / fps
     dt_frames[1:] = np.minimum(np.diff(t) * 1e-6, 2.0 / fps)
+    if SPEED_FILTER_OCCUPANCY:
+        dt_frames[~moving] = 0.0
 
     n_bins = handler.n_bins
     occ_map   = np.zeros(n_bins, dtype=np.float64)
@@ -4149,7 +4222,8 @@ def export_excel(arena_handlers: dict, arena_results: dict, out_path: str):
                 q = None
             rows.append(dict(
                 arena=key, session=r['session'], unit=r['unit'],
-                n_spikes=r['n_spikes'], peak_fr=r['peak_fr'], mean_fr=r['mean_fr'],
+                n_spikes=r['n_spikes'], n_spikes_speed_excluded=r.get('n_spikes_speed_excluded'),
+                peak_fr=r['peak_fr'], mean_fr=r['mean_fr'],
                 sir=r['sir'], sparsity=r['sparsity'],
                 bootstrap_sig=r['bootstrap_sig'],
                 peak_quadrant_bin=q,
