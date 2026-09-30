@@ -68,20 +68,51 @@ Pairwise p-values are Holm-Bonferroni corrected within each metric. For the
 Circle) or a group is at 0 % / 100 %, chi-square + Fisher's exact are used
 instead; the 'model_note' column records which test was used and why.
 
+Only the arenas in ANALYZE_ARENAS are analyzed (Linear track by default).
+
+First vs second half of the session (sheets 'First_Half' / 'Second_Half',
+same columns as 'Full', one row per session + unit):
+
+  - Between session types: the same session-type comparison as above is run
+    on each half separately, for the metrics the half sheets hold (peak/mean
+    firing rate, SIR, sparsity, coherence; theta modulation, coherence shuffle
+    significance, place-cell yield). Stability, speed and field metrics are
+    not computed per half. Place-cell population = whole-session place cells
+    (their half-session values); place-cell yield uses each half's own
+    place_cell classification of all units.
+  - Within session: for each session type, the same cells' 1st half vs 2nd
+    half values are compared with a paired test: Wilcoxon signed-rank
+    (continuous metrics) / exact McNemar (True/False outcomes). The whole
+    session is left out (both halves are subsets of it, so comparing against
+    it is not meaningful); with two conditions there is no omnibus test or
+    multiple-comparison correction. Cells missing a value in either half are
+    excluded from that test (complete cases). Plots: 1st half = session
+    color, 2nd half = gray; significance bracket only where the test is
+    significant.
+  - Pooled over session types: the same paired tests with every session
+    type's cells clubbed into one group ('All'): all 1st halves vs all 2nd
+    halves. Sheets 'Pooled_*_<arena>', plots in HalfSession/Pooled. A cell
+    recorded in several sessions contributes one row per session (rows
+    treated as independent units).
+
 Parameters to edit (below):
     INPUT_EXCEL  = path to the output_excel file from
                    PlaceCellChar_FieldDetect_Main_v3.py -- also where these
                    statistics sheets get appended (in place)
     PLOTS_DIR    = folder to save comparison plots to (one sub-folder per arena)
+    ANALYZE_ARENAS = arena types to analyze
 """
 
 import os
 import re
+import shutil
 import textwrap
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+from statsmodels.stats.contingency_tables import cochrans_q, mcnemar
 
 import matplotlib
 matplotlib.use('Agg')
@@ -94,14 +125,16 @@ import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-# INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\All_TT_PlaceChar_VisitCrit.xlsx'
-# PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\ArenaType_StatsPlots_KW'
-
-INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\All_TT_PlaceChar_VisitCrit.xlsx'
-PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SessionType_StatsPlots'
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\LinearTrack_GeoMagVsZero\Data_Control\All_TT_PlaceChar_AdptBin.xlsx'
+PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\LinearTrack_GeoMagVsZero\Data_Control\SessionType_StatsPlots_Lin_FldVsZero'
 
 
 ARENA_TYPES = ['Open', 'Linear', 'Circle']
+# Arenas actually analyzed (the others are recognized but skipped).
+ANALYZE_ARENAS = ['Linear']
+
+# Half-session sheets of INPUT_EXCEL, keyed by condition name.
+HALF_SHEETS = {'H1': 'First_Half', 'H2': 'Second_Half'}
 
 # Session types within each arena, in plotting order.
 ARENA_SESSION_TYPES = {
@@ -706,7 +739,10 @@ def _add_significance_legend(ax_info, metric_col: str, ref: dict):
 
 
 def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: str,
-                stats_lines=None, posthoc_df=None):
+                stats_lines=None, posthoc_df=None, box_face=None):
+    """Box plot + jittered points per session type. `box_face` (a color)
+    overrides the per-session box fill (e.g. gray for the 2nd half); the
+    points keep their session colors."""
     present = []
     subsets = {}
     for a in SESSION_TYPE_ORDER:
@@ -739,7 +775,7 @@ def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: 
                      medianprops=dict(linewidth=MEDIAN_LW, color=PAL_BLACK),
                      zorder=2)
     for patch, arena in zip(bp['boxes'], present):
-        patch.set_facecolor(SESSION_COLORS.get(arena, _DEFAULT_COLOR)['face'])
+        patch.set_facecolor(box_face or SESSION_COLORS.get(arena, _DEFAULT_COLOR)['face'])
         patch.set_edgecolor(PAL_BLACK)
 
     rng = np.random.default_rng(0)
@@ -769,7 +805,7 @@ def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: 
 
 
 def run_all_comparisons(df: pd.DataFrame, metrics: dict, plot_prefix: str,
-                        plots_dir: str):
+                        plots_dir: str, box_face=None):
     all_desc, all_omnibus, all_posthoc = [], [], []
     os.makedirs(plots_dir, exist_ok=True)
     for col, label in metrics.items():
@@ -781,7 +817,7 @@ def run_all_comparisons(df: pd.DataFrame, metrics: dict, plot_prefix: str,
         plot_metric(df, col, label,
                     os.path.join(plots_dir, f'{plot_prefix}_{col}.png'),
                     stats_lines=_continuous_stats_lines(desc_df, omnibus, posthoc_df),
-                    posthoc_df=posthoc_df)
+                    posthoc_df=posthoc_df, box_face=box_face)
 
     desc_df    = pd.concat(all_desc, ignore_index=True) if all_desc else pd.DataFrame()
     omnibus_df = pd.DataFrame(all_omnibus)
@@ -832,7 +868,7 @@ def compare_categorical(df: pd.DataFrame, col: str, label: str):
 
 
 def plot_categorical(df: pd.DataFrame, col: str, label: str, out_path: str,
-                     stats_lines=None, posthoc_df=None):
+                     stats_lines=None, posthoc_df=None, box_face=None):
     present, pct_true, ns = [], [], []
     for a in SESSION_TYPE_ORDER:
         sub = df.loc[df['session_type'] == a, col].apply(_to_tri_bool).dropna()
@@ -850,7 +886,7 @@ def plot_categorical(df: pd.DataFrame, col: str, label: str, out_path: str,
     _draw_stats(ax_info, stats_lines)
 
     positions = np.arange(len(present))
-    faces = [SESSION_COLORS.get(a, _DEFAULT_COLOR)['face'] for a in present]
+    faces = [box_face or SESSION_COLORS.get(a, _DEFAULT_COLOR)['face'] for a in present]
     ax.bar(positions, pct_true, color=faces, edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW,
            width=BAR_WIDTH, zorder=2)
 
@@ -1171,6 +1207,29 @@ def _print_significant(tbl: pd.DataFrame, title: str, metric_width: int, test_wi
               f"stat={stat_str}  p={row['p_value']:.4g}")
 
 
+def _write_tables(tables: dict):
+    """Append `tables` ({sheet_name: DataFrame}) to INPUT_EXCEL as sheets.
+    mode='a' + if_sheet_exists='replace' overwrites only sheets with a
+    matching name (e.g. on a re-run) and leaves every other sheet untouched.
+    Sheet names are capped at 31 characters by Excel.
+
+    The workbook is written to a temporary copy next to it and only swapped
+    in (os.replace) once the save has completed, so a crash, an interrupted
+    run or another program touching the file mid-save can't leave
+    INPUT_EXCEL half-written/corrupted. Close the workbook in Excel first."""
+    tmp = os.path.splitext(INPUT_EXCEL)[0] + '_writing.tmp.xlsx'
+    shutil.copy2(INPUT_EXCEL, tmp)
+    try:
+        with pd.ExcelWriter(tmp, engine='openpyxl', mode='a',
+                            if_sheet_exists='replace') as writer:
+            for sheet_name, tbl in tables.items():
+                tbl.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        os.replace(tmp, INPUT_EXCEL)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def run_arena(arena: str, full_df: pd.DataFrame, field_df: pd.DataFrame,
               all_units_df: pd.DataFrame) -> dict:
     """Run the whole session-type comparison for one arena type: statistics
@@ -1259,10 +1318,7 @@ def run_arena(arena: str, full_df: pd.DataFrame, field_df: pd.DataFrame,
         f'SpeedDirection_Omnibus_{arena}':   speed_dir_omnibus_df,
         f'SpeedDirection_PostHoc_{arena}':   speed_dir_posthoc,
     }
-    with pd.ExcelWriter(INPUT_EXCEL, engine='openpyxl', mode='a',
-                        if_sheet_exists='replace') as writer:
-        for sheet_name, tbl in tables.items():
-            tbl.to_excel(writer, sheet_name=sheet_name, index=False)
+    _write_tables(tables)
     print(f'\nStatistics for {arena} appended to {INPUT_EXCEL}')
     print(f'Box/bar plots saved to {plots_dir}')
 
@@ -1290,6 +1346,535 @@ def run_arena(arena: str, full_df: pd.DataFrame, field_df: pd.DataFrame,
                                                os.path.join(hist_dir, f'Hist_Speed_{col}.png'))
     print(f'Histogram plots for {arena} saved to {hist_dir}')
 
+    return tables
+
+
+# ── First vs second half of the session ─────────────────────────────────────
+# The 'First_Half' / 'Second_Half' sheets hold the same characterization run
+# on each half of every session (one row per session + unit, like 'Full').
+# Stability, speed and field metrics aren't computed per half, so only the
+# metrics below are compared.
+
+CONDITIONS  = ['Whole', 'H1', 'H2']
+# Pooled analysis: halves only (both are subsets of the whole session).
+HALF_CONDITIONS = ['H1', 'H2']
+COND_LABELS = {'Whole': 'Full session', 'H1': 'Geomagnetic Field', 'H2': 'Zero Field'}
+HALF_DIRS   = {'H1': 'FirstHalf', 'H2': 'SecondHalf'}
+
+HALF_CONTINUOUS_METRICS = {
+    'peak_fr':   'Peak firing rate',
+    'mean_fr':   'Mean firing rate',
+    'sir':       'Spatial information score',
+    'sparsity':  'Sparsity',
+    'coherence': 'Coherence score',
+}
+# True/False outcomes of the whole-session place cells.
+HALF_BINARY_METRICS_PLACE_CELLS = {
+    'theta_modulated':         'Theta modulation (% of place cells)',
+    'coherence_bootstrap_sig': 'Coherence shuffle significance (% of place cells)',
+}
+# Place-cell classification of every recorded unit (each condition's own flag).
+HALF_BINARY_METRICS_ALL_UNITS = {
+    'place_cell': 'Place-cell yield (% of recorded units classified as place cells)',
+}
+
+# 2nd half is drawn in gray; whole session and 1st half keep the session's
+# shade of cyan (whole session hatched to tell it from the 1st half).
+HALF2_GRAY  = '#A6A6A6'
+WHOLE_HATCH = '////'
+COND_STEP   = 0.28
+COND_WIDTH  = 0.24
+PAIR_LINE_COLOR = '#C8C8C8'
+
+# Group label of the pooled analysis (all session types clubbed together),
+# and the group order of the within-session tests/plots.
+POOLED = 'All'
+WITHIN_GROUP_ORDER = SESSION_TYPE_ORDER + [POOLED]
+SESSION_COLORS[POOLED] = _shade('#4DA6A6', '#1F5C5C', '#B8DBDB')
+
+
+def _cond_offsets(conds) -> dict:
+    """x offset of each condition's box/bar, centred on the group tick."""
+    mid = (len(conds) - 1) / 2
+    return {c: COND_STEP * (i - mid) for i, c in enumerate(conds)}
+
+
+def _omnibus_sheet_names(conds) -> tuple:
+    """(continuous, binary) test-sheet name parts for a condition set."""
+    return ('Friedman', 'CochranQ') if len(conds) > 2 else ('Wilcoxon', 'McNemar')
+
+
+def _cond_style(session_type: str, cond: str):
+    """(face color, hatch) of one condition's box/bar within a session type."""
+    if cond == 'H2':
+        return HALF2_GRAY, None
+    face = SESSION_COLORS.get(session_type, _DEFAULT_COLOR)['face']
+    return face, (WHOLE_HATCH if cond == 'Whole' else None)
+
+
+def load_half_sheets() -> dict:
+    return {cond: pd.read_excel(INPUT_EXCEL, sheet_name=sheet)
+            for cond, sheet in HALF_SHEETS.items()}
+
+
+def build_condition_df(full: pd.DataFrame, halves: dict, arena: str,
+                       place_cells_only: bool) -> pd.DataFrame:
+    """Long table, one row per unit x condition (Whole / H1 / H2), for the
+    units of `arena`: the whole-session place cells (place_cells_only) or all
+    recorded units. Half-session rows are matched to the whole session by
+    session + unit, so every unit has one row per condition (NaN where a
+    half has no value)."""
+    base = full[full['place_cell'].apply(_to_bool)] if place_cells_only else full
+    base = _tag_session_type(base, 'unit(s) (half-session analysis)')
+    base = base[base['arena_type'] == arena]
+    tag_cols = ['session', 'unit', 'arena_type', 'session_type', 'animal', 'rec_day', 'cell_id']
+    keys = base[tag_cols]
+
+    frames = [base.assign(condition='Whole')]
+    for cond, half in halves.items():
+        half = half.drop(columns=[c for c in tag_cols if c not in ('session', 'unit')],
+                         errors='ignore')
+        frames.append(keys.merge(half, on=['session', 'unit'], how='left')
+                          .assign(condition=cond))
+    return pd.concat(frames, ignore_index=True)
+
+
+def _to_binary_float(v) -> float:
+    b = _to_tri_bool(v)
+    return np.nan if b is None else float(b)
+
+
+def _paired_wide(df: pd.DataFrame, col: str, session_type: str, binary: bool,
+                 conds=CONDITIONS):
+    """(complete-case wide table: one row per unit, one column per condition
+    in `conds`; number of units before dropping incomplete ones)."""
+    sub = df.loc[(df['session_type'] == session_type) & df['condition'].isin(conds),
+                 ['session', 'unit', 'condition', col]].copy()
+    sub[col] = (sub[col].map(_to_binary_float) if binary
+                else pd.to_numeric(sub[col], errors='coerce'))
+    wide = (sub.set_index(['session', 'unit', 'condition'])[col]
+               .unstack('condition').reindex(columns=conds))
+    return wide.dropna(), len(wide)
+
+
+def _wilcoxon(x, y):
+    """Two-sided Wilcoxon signed-rank test (T, p); p = 1 if every pair ties."""
+    d = np.asarray(x, dtype=float) - np.asarray(y, dtype=float)
+    if not np.any(d != 0):
+        return np.nan, 1.0
+    res = stats.wilcoxon(x, y, alternative='two-sided')
+    return res.statistic, res.pvalue
+
+
+def _mcnemar(x, y):
+    """Exact McNemar test (smaller discordant count, p); p = 1 without
+    discordant pairs."""
+    x, y = np.asarray(x, dtype=int), np.asarray(y, dtype=int)
+    b, c = int(((x == 1) & (y == 0)).sum()), int(((x == 0) & (y == 1)).sum())
+    if b + c == 0:
+        return np.nan, 1.0
+    res = mcnemar([[int(((x == 1) & (y == 1)).sum()), b],
+                   [c, int(((x == 0) & (y == 0)).sum())]], exact=True)
+    return res.statistic, res.pvalue
+
+
+def compare_within_session(df: pd.DataFrame, col: str, label: str, binary: bool,
+                           conds=CONDITIONS):
+    """The `conds` conditions (default whole session vs 1st half vs 2nd half)
+    of the same units, separately for each session type. Three conditions:
+    Friedman + Wilcoxon signed-rank (continuous) / Cochran's Q + exact McNemar
+    (binary), post-hoc p-values Holm-corrected per session type. Two
+    conditions: the Wilcoxon / McNemar test itself is the omnibus row and the
+    single post-hoc row (p_holm = p_raw). Returns (desc_df, omnibus_df,
+    posthoc_df)."""
+    paired_only = len(conds) == 2
+    desc_rows, omni_rows, post_rows = [], [], []
+    for st in WITHIN_GROUP_ORDER:
+        if not (df['session_type'] == st).any():
+            continue
+        wide, n_all = _paired_wide(df, col, st, binary, conds)
+        n = len(wide)
+
+        for cond in conds:
+            v = wide[cond].to_numpy(dtype=float)
+            row = {'metric': label, 'session_type': st, 'condition': COND_LABELS[cond], 'n': n}
+            if binary:
+                row.update({'n_true': int(v.sum()), 'n_false': int(n - v.sum()),
+                            'pct_true': 100.0 * v.mean() if n else np.nan})
+            elif n:
+                row.update({'mean': np.mean(v), 'median': np.median(v),
+                            'q1': np.percentile(v, 25), 'q3': np.percentile(v, 75),
+                            'std': np.std(v, ddof=1) if n > 1 else np.nan,
+                            'sem': stats.sem(v) if n > 1 else np.nan,
+                            'min': np.min(v), 'max': np.max(v)})
+            desc_rows.append(row)
+
+        if paired_only:
+            omni = {'metric': label, 'session_type': st, 'n_cells': n,
+                    'n_excluded_incomplete': n_all - n,
+                    'test': 'McNemar (exact)' if binary else 'Wilcoxon signed-rank',
+                    'stat_name': 'b/c min' if binary else 'T', 'dof': np.nan}
+            stat, p = np.nan, np.nan
+            if n >= 3:
+                c1, c2 = conds
+                stat, p = (_mcnemar if binary else _wilcoxon)(wide[c1], wide[c2])
+                if binary:
+                    omni['pct_diff'] = 100.0 * (wide[c1].mean() - wide[c2].mean())
+                else:
+                    omni['median_diff'] = float(np.median(wide[c1] - wide[c2]))
+            else:
+                omni['test'] = 'insufficient data'
+            omni.update({'statistic': stat, 'p_value': p,
+                         'significant': bool(pd.notna(p) and p < ALPHA)})
+            omni_rows.append(omni)
+        else:
+            omni = {'metric': label, 'session_type': st, 'n_cells': n,
+                    'n_excluded_incomplete': n_all - n,
+                    'test': "Cochran's Q" if binary else 'Friedman',
+                    'stat_name': 'Q' if binary else 'chi2', 'dof': len(conds) - 1}
+            stat, p, kendall_w = np.nan, np.nan, np.nan
+            if n >= 3:
+                if binary:
+                    if (wide.nunique(axis=1) == 1).all():   # no unit changes class
+                        stat, p = 0.0, 1.0
+                    else:
+                        res = cochrans_q(wide.to_numpy(dtype=int))
+                        stat, p = float(res.statistic), float(res.pvalue)
+                else:
+                    stat, p = stats.friedmanchisquare(*[wide[c].to_numpy(dtype=float)
+                                                        for c in conds])
+                    kendall_w = stat / (n * (len(conds) - 1))
+            else:
+                omni['test'] = 'insufficient data'
+            omni.update({'statistic': stat, 'p_value': p,
+                         'significant': bool(pd.notna(p) and p < ALPHA)})
+            if not binary:
+                omni['kendall_w'] = kendall_w
+            omni_rows.append(omni)
+
+        if n < 3:
+            continue
+        rows = []
+        for c1, c2 in combinations(conds, 2):
+            s, pp = (_mcnemar if binary else _wilcoxon)(wide[c1], wide[c2])
+            r = {'metric': label, 'session_type': st, 'comparison': f'{c1} vs {c2}',
+                 'test': 'McNemar (exact)' if binary else 'Wilcoxon signed-rank',
+                 'stat_name': 'b/c min' if binary else 'T', 'statistic': s,
+                 'n': n, 'p_raw': pp}
+            if binary:
+                r['pct_diff'] = 100.0 * (wide[c1].mean() - wide[c2].mean())
+            else:
+                r['median_diff'] = float(np.median(wide[c1] - wide[c2]))
+            rows.append(r)
+        post_rows += ccs._finish_posthoc(rows)
+    return pd.DataFrame(desc_rows), pd.DataFrame(omni_rows), pd.DataFrame(post_rows)
+
+
+def _within_stats_lines(omni_df, post_df, desc_df, binary: bool, conds=CONDITIONS) -> list:
+    paired_only = len(conds) == 2
+    lines = []
+    for _, o in omni_df.iterrows():
+        st = o['session_type']
+        excl = (f', {int(o["n_excluded_incomplete"])} incomplete excluded'
+                if o['n_excluded_incomplete'] else '')
+        d = desc_df[desc_df['session_type'] == st]
+        if binary:
+            parts = [f'{COND_LABELS[c]} {r["pct_true"]:.1f} %'
+                     for c, (_, r) in zip(conds, d.iterrows()) if pd.notna(r.get('pct_true'))]
+        else:
+            parts = [f'{COND_LABELS[c]} med {r["median"]:.3g}'
+                     for c, (_, r) in zip(conds, d.iterrows()) if pd.notna(r.get('median'))]
+        lines.append(f'{_label(st)} (n={int(o["n_cells"])}{excl}): ' + ', '.join(parts))
+        if o['test'] == 'insufficient data':
+            lines.append('    insufficient data for a statistical test')
+            continue
+        w = f', Kendall W = {o["kendall_w"]:.3f}' if pd.notna(o.get('kendall_w', np.nan)) else ''
+        dof = f'dof = {int(o["dof"])}, ' if pd.notna(o['dof']) else ''
+        stat = f'{o["stat_name"]} = {o["statistic"]:.3f}, ' if pd.notna(o['statistic']) else ''
+        lines.append(f'    {o["test"]}: {stat}{dof}'
+                     f'p = {_fmt_p(o["p_value"])} {_stars(o["p_value"])}{w}')
+        if paired_only:
+            continue
+        ph = post_df[post_df['session_type'] == st] if len(post_df) else post_df
+        for _, r in ph.iterrows():
+            c1, c2 = r['comparison'].split(' vs ')
+            lines.append(f'    {COND_LABELS[c1]} vs {COND_LABELS[c2]}: p = {_fmt_p(r["p_raw"])}, '
+                         f'p(Holm) = {_fmt_p(r["p_holm"])} {_stars(r["p_holm"])}')
+    if paired_only:
+        test = 'exact McNemar' if binary else 'Wilcoxon signed-rank'
+        lines.append(f'Paired {COND_LABELS[conds[0]]} vs {COND_LABELS[conds[1]]} ({test}); '
+                     f'bracket shown only where significant.')
+    else:
+        test = "Cochran's Q + exact McNemar" if binary else 'Friedman + Wilcoxon signed-rank'
+        lines.append(f'Within-session repeated measures ({test}, Holm-Bonferroni corrected per '
+                     f'session type); brackets shown only where the omnibus test is significant.')
+    return lines
+
+
+def _within_title(label: str, conds) -> str:
+    names = ['whole session' if c == 'Whole' else COND_LABELS[c] for c in conds]
+    return f'{label}: ' + ' vs '.join(names)
+
+
+def _within_brackets(ax, omni_df, post_df, x0: dict, conds=CONDITIONS):
+    """Significance brackets between the conditions of each session type
+    whose omnibus test is significant."""
+    if not len(post_df):
+        return
+    sig_st = set(omni_df.loc[omni_df['significant'] == True, 'session_type'])  # noqa: E712
+    ph = post_df[post_df['session_type'].isin(sig_st)].copy()
+    if not len(ph):
+        return
+    ph['comparison'] = [' vs '.join(f'{st}:{c}' for c in cmp.split(' vs '))
+                        for st, cmp in zip(ph['session_type'], ph['comparison'])]
+    off = _cond_offsets(conds)
+    x_of = {f'{st}:{c}': x0[st] + off[c] for st in x0 for c in conds}
+    _add_sig_brackets(ax, ph, x_of, inset=0.02)
+
+
+def _condition_legend(ax_info, session_type: str, conds=CONDITIONS):
+    handles = []
+    for cond in conds:
+        face, hatch = _cond_style(session_type, cond)
+        handles.append(Patch(facecolor=face, edgecolor=PAL_BLACK, hatch=hatch,
+                             linewidth=BOX_LW, label=COND_LABELS[cond]))
+    ax_info.legend(handles=handles, loc='upper center', fontsize=FS_LEGEND, ncol=len(conds))
+
+
+def _within_fig(n_groups: int, stats_lines):
+    fig_w = n_groups * GROUP_W * 2 + AXIS_PAD_W
+    stats_lines = _wrap_stats(stats_lines, fig_w)
+    fig, ax, ax_info = _new_fig((fig_w, 5.5), legend_rows=1, stats_lines=stats_lines)
+    _draw_stats(ax_info, stats_lines)
+    return fig, ax, ax_info
+
+
+def plot_within_continuous(df: pd.DataFrame, col: str, label: str, out_path: str,
+                           desc_df, omni_df, post_df, conds=CONDITIONS):
+    """Per session type: one box per condition in `conds` (default whole
+    session / 1st half / 2nd half) of the same units, with each unit's values
+    joined by a thin line."""
+    present = [st for st in WITHIN_GROUP_ORDER
+               if st in set(omni_df['session_type']) and
+               int(omni_df.loc[omni_df['session_type'] == st, 'n_cells'].iloc[0]) > 0]
+    if not present:
+        return
+    fig, ax, ax_info = _within_fig(len(present),
+                                   _within_stats_lines(omni_df, post_df, desc_df, False, conds))
+    x0 = {st: 2.0 * i for i, st in enumerate(present)}
+    off = _cond_offsets(conds)
+    rng = np.random.default_rng(0)
+    box_kw = dict(showfliers=False, patch_artist=True, widths=COND_WIDTH,
+                  boxprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
+                  whiskerprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
+                  capprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
+                  medianprops=dict(linewidth=MEDIAN_LW, color=PAL_BLACK), zorder=2)
+
+    for st in present:
+        wide, _ = _paired_wide(df, col, st, binary=False, conds=conds)
+        xs = np.array([x0[st] + off[c] for c in conds])
+        bp = ax.boxplot([wide[c].to_numpy(dtype=float) for c in conds],
+                        positions=xs, **box_kw)
+        for patch, cond in zip(bp['boxes'], conds):
+            face, hatch = _cond_style(st, cond)
+            patch.set_facecolor(face)
+            patch.set_edgecolor(PAL_BLACK)
+            if hatch:
+                patch.set_hatch(hatch)
+
+        jit = rng.uniform(-0.06, 0.06, size=len(wide))
+        X = xs[:, None] + jit[None, :]
+        Y = wide[conds].to_numpy(dtype=float).T
+        ax.plot(X, Y, color=PAIR_LINE_COLOR, linewidth=0.4,
+                alpha=0.7, zorder=2.5)
+        face = SESSION_COLORS.get(st, _DEFAULT_COLOR)['face']
+        ax.scatter(X.ravel(), Y.ravel(), s=12, facecolors=face, edgecolors=PAL_BLACK,
+                   linewidths=0.4, zorder=3)
+
+    _condition_legend(ax_info, present[0], conds)
+    n_of = dict(zip(omni_df['session_type'], omni_df['n_cells']))
+    ax.set_xticks([x0[st] for st in present])
+    ax.set_xticklabels([f'{_label(st)}\n(n={int(n_of[st])})' for st in present])
+    ax.set_xlim(-0.6, x0[present[-1]] + 0.6)
+    ax.set_ylabel(textwrap.fill(label, 30), fontsize=FS_LABEL, labelpad=8)
+    _set_title(ax, _within_title(label, conds))
+    _style_axes(ax)
+    _within_brackets(ax, omni_df, post_df, x0, conds)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+def plot_within_binary(df: pd.DataFrame, col: str, label: str, out_path: str,
+                       desc_df, omni_df, post_df, conds=CONDITIONS):
+    """Per session type: % True in each condition of `conds` (default whole
+    session / 1st half / 2nd half)."""
+    present = [st for st in WITHIN_GROUP_ORDER
+               if st in set(omni_df['session_type']) and
+               int(omni_df.loc[omni_df['session_type'] == st, 'n_cells'].iloc[0]) > 0]
+    if not present:
+        return
+    fig, ax, ax_info = _within_fig(len(present),
+                                   _within_stats_lines(omni_df, post_df, desc_df, True, conds))
+    x0 = {st: 2.0 * i for i, st in enumerate(present)}
+    off = _cond_offsets(conds)
+    for st in present:
+        d = desc_df[desc_df['session_type'] == st].reset_index(drop=True)
+        for cond, (_, r) in zip(conds, d.iterrows()):
+            face, hatch = _cond_style(st, cond)
+            ax.bar(x0[st] + off[cond], r['pct_true'], width=COND_WIDTH,
+                   color=face, hatch=hatch, edgecolor=PAL_BLACK, linewidth=BAR_EDGE_LW,
+                   zorder=2)
+
+    _condition_legend(ax_info, present[0], conds)
+    n_of = dict(zip(omni_df['session_type'], omni_df['n_cells']))
+    ax.set_xticks([x0[st] for st in present])
+    ax.set_xticklabels([f'{_label(st)}\n(n={int(n_of[st])})' for st in present])
+    ax.set_xlim(-0.6, x0[present[-1]] + 0.6)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel('% of cells', fontsize=FS_LABEL, labelpad=8)
+    _set_title(ax, _within_title(label, conds))
+    _style_axes(ax)
+    _within_brackets(ax, omni_df, post_df, x0, conds)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+def _paired_data_table(pc_df: pd.DataFrame) -> pd.DataFrame:
+    """Wide table of the extracted parameters: one row per whole-session place
+    cell, one column per metric x condition (e.g. 'sir_H1')."""
+    cols = list(HALF_CONTINUOUS_METRICS) + list(HALF_BINARY_METRICS_PLACE_CELLS) + ['place_cell']
+    idx = ['session', 'unit', 'session_type', 'animal', 'rec_day', 'cell_id']
+    wide = pc_df.set_index(idx + ['condition'])[cols].unstack('condition')
+    wide = wide.reindex(columns=pd.MultiIndex.from_product([cols, CONDITIONS]))
+    wide.columns = [f'{m}_{c}' for m, c in wide.columns]
+    return wide.reset_index()
+
+
+def run_halves(arena: str, full: pd.DataFrame, halves: dict) -> dict:
+    """First vs second half analysis for one arena: session-type comparison on
+    each half, and the within-session (and pooled) 1st vs 2nd half comparison.
+    Writes sheets to INPUT_EXCEL and plots to PLOTS_DIR/<arena>/HalfSession.
+    Returns {sheet_name: table}."""
+    pc_df  = build_condition_df(full, halves, arena, place_cells_only=True)
+    all_df = build_condition_df(full, halves, arena, place_cells_only=False)
+    if not len(pc_df):
+        print(f'No place cells in the {arena} arena; skipping the half-session analysis.')
+        return {}
+    half_root  = os.path.join(PLOTS_DIR, arena, 'HalfSession')
+    within_dir = os.path.join(half_root, 'WithinSession')
+    os.makedirs(within_dir, exist_ok=True)
+    print(f'\n{"=" * 70}\n{arena} arena -- first vs second half of the session\n{"=" * 70}')
+
+    tables = {f'HalfData_{arena}': _paired_data_table(pc_df)}
+
+    # ── Between session types, each half separately ─────────────────────────
+    for cond in HALF_SHEETS:
+        tag, face = cond, (HALF2_GRAY if cond == 'H2' else None)
+        plots_dir = os.path.join(half_root, HALF_DIRS[cond])
+        pc_c, all_c = pc_df[pc_df['condition'] == cond], all_df[all_df['condition'] == cond]
+        metrics = {k: f'{v} ({COND_LABELS[cond]})' for k, v in HALF_CONTINUOUS_METRICS.items()}
+        desc, omni, post = run_all_comparisons(pc_c, metrics, plot_prefix=tag,
+                                               plots_dir=plots_dir, box_face=face)
+
+        cat_d, cat_o, cat_p = [], [], []
+        for pop, mets in ((all_c, HALF_BINARY_METRICS_ALL_UNITS),
+                          (pc_c, HALF_BINARY_METRICS_PLACE_CELLS)):
+            for col, lab in mets.items():
+                lab = f'{lab} ({COND_LABELS[cond]})'
+                d, o, p = compare_categorical(pop, col, lab)
+                cat_d.append(d)
+                cat_o.append(o)
+                if len(p):
+                    cat_p.append(p)
+                plot_categorical(pop, col, lab,
+                                 os.path.join(plots_dir, f'{tag}_Categorical_{col}.png'),
+                                 stats_lines=_categorical_stats_lines(d, o, p),
+                                 posthoc_df=p, box_face=face)
+        cat_omni = pd.DataFrame(cat_o)
+        tables.update({
+            f'Desc_{arena}_{tag}':       desc,
+            f'Omnibus_{arena}_{tag}':    omni,
+            f'PostHoc_{arena}_{tag}':    post,
+            f'CatDesc_{arena}_{tag}':    pd.concat(cat_d, ignore_index=True) if cat_d else pd.DataFrame(),
+            f'CatOmnibus_{arena}_{tag}': cat_omni,
+            f'CatPostHoc_{arena}_{tag}': pd.concat(cat_p, ignore_index=True) if cat_p else pd.DataFrame(),
+        })
+        _print_significant(pd.concat([omni, cat_omni], ignore_index=True),
+                           f'{arena}, {COND_LABELS[cond]}, between session types', 65, 16)
+
+    # ── Within session: 1st half vs 2nd half ────────────────────────────────
+    # Per session type, the same cells' two halves (paired test). The whole
+    # session is not compared: both halves are subsets of it.
+    tables.update(_run_within(pc_df, all_df, within_dir, 'Within', arena,
+                              conds=HALF_CONDITIONS))
+
+    # ── Pooled over session types: 1st half vs 2nd half ─────────────────────
+    # Every session type's cells in one group ('All'): all 1st halves clubbed
+    # together vs all 2nd halves. The whole session is not compared (both
+    # halves are subsets of it), so this is a direct paired test.
+    pooled_dir = os.path.join(half_root, 'Pooled')
+    os.makedirs(pooled_dir, exist_ok=True)
+    tables.update(_run_within(pc_df.assign(session_type=POOLED),
+                              all_df.assign(session_type=POOLED),
+                              pooled_dir, 'Pooled', arena, conds=HALF_CONDITIONS))
+
+    _write_tables(tables)
+    print(f'\nHalf-session statistics for {arena} appended to {INPUT_EXCEL}')
+    print(f'Half-session plots saved to {half_root}')
+
+    for prefix, what, conds in (('Within', 'Within-session', HALF_CONDITIONS),
+                                ('Pooled', 'Pooled (all session types)', HALF_CONDITIONS)):
+        cont_name, bin_name = _omnibus_sheet_names(conds)
+        cont_test, bin_test = (('Friedman', "Cochran's Q") if len(conds) > 2
+                               else ('Wilcoxon signed-rank', 'McNemar (exact)'))
+        for tbl, test in ((tables[f'{prefix}_{cont_name}_{arena}'], cont_test),
+                          (tables[f'{prefix}_{bin_name}_{arena}'], bin_test)):
+            sig = tbl[tbl['significant'] == True] if len(tbl) else tbl  # noqa: E712
+            print(f'\n{what} {test} tests, {arena}: {len(sig)} of {len(tbl)} significant')
+            for _, r in sig.iterrows():
+                print(f"  {r['metric']:45s} {_label(r['session_type']):5s} "
+                      f"stat={r['statistic']:.3f}  p={r['p_value']:.4g}  (n={int(r['n_cells'])})")
+    return tables
+
+
+def _run_within(pc_df: pd.DataFrame, all_df: pd.DataFrame, out_dir: str,
+                prefix: str, arena: str, conds=CONDITIONS) -> dict:
+    """Repeated-measures tests between the `conds` conditions (default whole
+    vs 1st half vs 2nd half: Friedman / Cochran's Q + post-hoc; two
+    conditions: Wilcoxon / McNemar only) and plots for every metric, per
+    session_type group of pc_df / all_df. Returns {sheet_name: table}, sheet
+    names starting with `prefix`."""
+    w_desc, w_omni, w_post = [], [], []
+    b_desc, b_omni, b_post = [], [], []
+    for col, lab in HALF_CONTINUOUS_METRICS.items():
+        d, o, p = compare_within_session(pc_df, col, lab, binary=False, conds=conds)
+        w_desc.append(d); w_omni.append(o); w_post.append(p)
+        plot_within_continuous(pc_df, col, lab, os.path.join(out_dir, f'{prefix}_{col}.png'),
+                               d, o, p, conds)
+    for pop, mets in ((all_df, HALF_BINARY_METRICS_ALL_UNITS),
+                      (pc_df, HALF_BINARY_METRICS_PLACE_CELLS)):
+        for col, lab in mets.items():
+            d, o, p = compare_within_session(pop, col, lab, binary=True, conds=conds)
+            b_desc.append(d); b_omni.append(o); b_post.append(p)
+            plot_within_binary(pop, col, lab,
+                               os.path.join(out_dir, f'{prefix}_Categorical_{col}.png'),
+                               d, o, p, conds)
+
+    def _cat(parts):
+        parts = [p for p in parts if len(p)]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    cont_name, bin_name = _omnibus_sheet_names(conds)
+    tables = {
+        f'{prefix}_Desc_{arena}':          _cat(w_desc),
+        f'{prefix}_{cont_name}_{arena}':   _cat(w_omni),
+        f'{prefix}_CatDesc_{arena}':       _cat(b_desc),
+        f'{prefix}_{bin_name}_{arena}':    _cat(b_omni),
+    }
+    # With two conditions the single pairwise test is already the test sheet.
+    if len(conds) > 2:
+        tables[f'{prefix}_PostHoc_{arena}']    = _cat(w_post)
+        tables[f'{prefix}_CatPostHoc_{arena}'] = _cat(b_post)
     return tables
 
 
@@ -1334,10 +1919,20 @@ if __name__ == '__main__':
     print('\nPlace cells by arena type (Full sheet):')
     print(full_df['arena_type'].value_counts().reindex(ARENA_TYPES).fillna(0).astype(int))
 
+    print(f'Analyzing arena(s): {", ".join(ANALYZE_ARENAS)}')
+    full_df      = full_df[full_df['arena_type'].isin(ANALYZE_ARENAS)]
+    field_df     = field_df[field_df['arena_type'].isin(ANALYZE_ARENAS)]
+    all_units_df = all_units_df[all_units_df['arena_type'].isin(ANALYZE_ARENAS)]
+
     all_tables = {}
-    for arena in ARENA_TYPES:
+    for arena in ANALYZE_ARENAS:
         for sheet_name, tbl in run_arena(arena, full_df, field_df, all_units_df).items():
             all_tables[sheet_name] = tbl
+
+    # ── First vs second half of the session ─────────────────────────────────
+    halves = load_half_sheets()
+    for arena in ANALYZE_ARENAS:
+        all_tables.update(run_halves(arena, full, halves))
 
     # ── All statistics in one CSV ───────────────────────────────────────────
     # Stacks every statistics table written to the workbook into one
@@ -1352,7 +1947,8 @@ if __name__ == '__main__':
         stats_csv_parts.append(tbl)
 
     if stats_csv_parts:
-        STATS_CSV = os.path.splitext(INPUT_EXCEL)[0] + '_SessionType_AllStats.csv'
+        STATS_CSV = (os.path.splitext(INPUT_EXCEL)[0]
+                     + f'_SessionType_{"_".join(ANALYZE_ARENAS)}_AllStats.csv')
         pd.concat(stats_csv_parts, ignore_index=True).to_csv(
             STATS_CSV, index=False, encoding='utf-8-sig')
         print(f'\nAll statistics saved to {STATS_CSV}')

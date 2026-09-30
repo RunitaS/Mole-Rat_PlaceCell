@@ -36,9 +36,15 @@ session -- within an arena (e.g. Linear: 332 place-cell rows from 195 cells)
 and, for units recorded in two arenas on the same day, across arenas. Those
 rows are not independent. Tests used (see CellClusteredStats_Utils.py):
 
-  - continuous metrics: Kruskal-Wallis omnibus test, pairwise Mann-Whitney U
-    post hoc tests. These treat every row as independent (no correction for
-    repeated cells); the 'model_note' column reports how many cells repeat.
+  - continuous metrics (CONTINUOUS_TEST below):
+      'KW'  : Kruskal-Wallis omnibus test, pairwise Mann-Whitney U post hoc
+              tests. These treat every row as independent (no correction for
+              repeated cells); the 'model_note' column reports how many cells
+              repeat.
+      'LMM' : linear mixed model (on ranks, METRIC_TRANSFORM)
+                metric ~ arena_type + (1|animal) + (1|animal:day) + (1|cell)
+              omnibus likelihood-ratio test, pairwise Wald contrasts
+              (CellClusteredStats_Utils.compare_continuous_nested).
   - % outcomes and speed direction (p/n/non): chi-square test of
     independence, pairwise chi-square post hoc tests (Yates-corrected for
     2 x 2 tables). Also treat rows as independent; 'model_note' flags
@@ -73,10 +79,13 @@ import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\All_TT_PlaceChar_VisitCrit.xlsx'
-PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\ArenaType_StatsPlots'
+# INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\All_TT_PlaceChar_VisitCrit.xlsx'
+# PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\ArenaType_StatsPlots'
 
-ARENA_TYPES = ['Open', 'Linear', 'Circle']
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\All_TT_PlaceChar_AdptBin.xlsx'
+PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\ArenaType_StatsPlots_AdptBin'
+
+ARENA_TYPES = ['Circle', 'Linear', 'Open']
 ALPHA       = 0.05
 
 # True: a unit with the same label recorded in two arenas on the same day
@@ -84,6 +93,19 @@ ALPHA       = 0.05
 # day's sessions in both arenas were spike-sorted together; set False if each
 # arena was sorted separately (labels then coincide only by chance).
 LINK_CELLS_ACROSS_ARENAS = True
+
+# Test for the continuous metrics:
+#   'LMM' : nested linear mixed model (accounts for repeated cells, days and
+#           animals; see CellClusteredStats_Utils.compare_continuous_nested)
+#   'KW'  : Kruskal-Wallis omnibus + pairwise Mann-Whitney U post-hoc, Holm-
+#           Bonferroni corrected -- ASSUMES every row is independent (ignores
+#           cells recorded in several sessions / arenas of one day)
+CONTINUOUS_TEST = 'KW'
+
+# With CONTINUOUS_TEST = 'LMM', the model is fitted to 'rank' (the ranks of
+# the metric; robust, the mixed-model analogue of Kruskal-Wallis) or 'none'
+# (the raw values).
+METRIC_TRANSFORM = 'rank'
 
 FULL_METRICS = {
     'peak_fr':         'Peak firing rate',
@@ -220,8 +242,11 @@ def build_field_metrics_df(full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataF
 
 def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str):
     """Descriptive stats, omnibus test, and post-hoc pairwise tests for one
-    metric across arena types: Kruskal-Wallis, then pairwise Mann-Whitney U
-    (Holm-Bonferroni corrected). Returns (desc_df, omnibus_row, posthoc_df)."""
+    metric across arena types. CONTINUOUS_TEST = 'KW': Kruskal-Wallis, then
+    pairwise Mann-Whitney U (Holm-Bonferroni corrected), rows treated as
+    independent; 'LMM': nested linear mixed model accounting for repeated
+    cells, days and animals (CellClusteredStats_Utils.compare_continuous_nested).
+    Returns (desc_df, omnibus_row, posthoc_df)."""
     groups, n_cells = {}, {}
     for arena in ARENA_TYPES:
         sub = df.loc[df['arena_type'] == arena, [metric_col, 'cell_id']].copy()
@@ -247,17 +272,23 @@ def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str):
     omnibus = {'metric': metric_label, 'n_groups': len(groups),
                'groups': ', '.join(f'{a} (n={len(v)})' for a, v in groups.items())}
 
-    if len(groups) < 2 or any(len(v) < 2 for v in groups.values()):
-        omni, posthoc_rows = None, []
-    else:
-        sub = df[df['arena_type'].isin(groups)].copy()
-        sub[metric_col] = pd.to_numeric(sub[metric_col], errors='coerce')
-        summary = ccs.repetition_summary(sub.dropna(subset=[metric_col]), 'arena_type')
-        try:
-            omni, posthoc_rows = ccs._classic_continuous(
-                groups, f'Kruskal-Wallis + Mann-Whitney U (rows treated as independent): {summary}')
-        except ValueError:  # e.g. all values identical
+    if CONTINUOUS_TEST == 'KW':
+        if len(groups) < 2 or any(len(v) < 2 for v in groups.values()):
             omni, posthoc_rows = None, []
+        else:
+            sub = df[df['arena_type'].isin(groups)].copy()
+            sub[metric_col] = pd.to_numeric(sub[metric_col], errors='coerce')
+            summary = ccs.repetition_summary(sub.dropna(subset=[metric_col]), 'arena_type')
+            try:
+                omni, posthoc_rows = ccs._classic_continuous(
+                    groups, f'Kruskal-Wallis + Mann-Whitney U (rows treated as independent): {summary}')
+            except ValueError:  # e.g. all values identical
+                omni, posthoc_rows = None, []
+    elif CONTINUOUS_TEST == 'LMM':
+        omni, posthoc_rows = ccs.compare_continuous_nested(df, 'arena_type', ARENA_TYPES,
+                                                           metric_col, transform=METRIC_TRANSFORM)
+    else:
+        raise ValueError(f"CONTINUOUS_TEST must be 'LMM' or 'KW', not {CONTINUOUS_TEST!r}")
     if omni is None:
         omnibus.update({'test': 'insufficient data', 'statistic': np.nan,
                          'p_value': np.nan, 'significant': False})

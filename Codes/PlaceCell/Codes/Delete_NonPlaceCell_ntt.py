@@ -28,8 +28,8 @@ import pandas as pd
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-input_excel = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\All_TT_PlaceChar_VisitCrit.xlsx'
-data_root   = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData'
+input_excel = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\Data\RecDaySorted_PC\All_TT_PlaceChar_VisitCrit.xlsx'
+data_root   = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\Data\RecDaySorted_PC'
 
 SHEET_NAME = 'Full'   # place_cell verdict (incl. field-detection overrides) lives here
 DRY_RUN    = True     # True: report only, nothing is deleted
@@ -48,6 +48,20 @@ def _is_false(val) -> bool:
         return False
     try:
         return float(val) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_true(val) -> bool:
+    """True only for an explicit True verdict (bool, 0/1 or 'TRUE' text)."""
+    if isinstance(val, bool):
+        return val is True
+    if isinstance(val, str):
+        return val.strip().upper() == 'TRUE'
+    if pd.isna(val):
+        return False
+    try:
+        return float(val) == 1.0
     except (TypeError, ValueError):
         return False
 
@@ -112,3 +126,22 @@ if __name__ == '__main__':
     print(f'Log saved to : {log_path}')
     if DRY_RUN:
         print('\nDRY_RUN is True – nothing was deleted. Set DRY_RUN = False to delete.')
+
+    # ── Verify every place_cell == True unit is still present in data_root ──
+    place_cells = df[df['place_cell'].apply(_is_true)]
+    missing_rows = []
+    for _, row in place_cells.iterrows():
+        ntt_path = _resolve_ntt_path(row[session_col], row[unit_col])
+        if not os.path.isfile(ntt_path):
+            missing_rows.append({**row.to_dict(), 'expected_path': ntt_path})
+
+    print(f'\nPlace cells (place_cell == True): {len(place_cells)}  |  '
+          f'present: {len(place_cells) - len(missing_rows)}  |  missing: {len(missing_rows)}')
+
+    if missing_rows:
+        missing_path = os.path.splitext(input_excel)[0] + (
+            f'_missing_placecells_{datetime.now():%Y%m%d_%H%M%S}.xlsx')
+        pd.DataFrame(missing_rows).to_excel(missing_path, index=False)
+        print(f'Missing place cells saved to: {missing_path}')
+    else:
+        print('All place cells are present in data_root.')

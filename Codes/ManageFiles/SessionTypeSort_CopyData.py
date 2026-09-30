@@ -39,12 +39,12 @@ import shutil
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-SRC_ROOT = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\Data'
-DST_ROOT = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\SessionTypeSorted'
+SRC_ROOT = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\PC_True\RecDaySorted'
+DST_ROOT = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\PC_True\SessionTypeSorted'
 
-DRY_RUN         = False
+DRY_RUN         = True
 COPY_EXTENSIONS = None   # e.g. ('.ntt', '.csv', '.xlsx', '.nvt')
-OVERWRITE       = False
+OVERWRITE       = True
 
 ARENA_TYPES = ['Open', 'Linear', 'Circle']
 ARENA_SESSION_TYPES = {

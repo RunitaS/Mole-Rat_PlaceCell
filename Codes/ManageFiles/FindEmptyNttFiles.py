@@ -5,7 +5,7 @@ import sys
 from openpyxl import Workbook
 
 # ---- Settings ----
-ROOT_DIR = r"X:\NMR_group_data\Runita\Data\Ephys_Data\AllSortedData\Tetrode"   # <-- change this
+ROOT_DIR = r"X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\LinearTrack_GeoMagVsZero\Data_Control"   # <-- change this
 SAVE_XLSX = True                               # also write results as a 3-sheet .xlsx into ROOT_DIR
 
 # Neuralynx .ntt layout: 16384-byte (16 KB) text header, then 304-byte spike records.

@@ -42,9 +42,9 @@ from openpyxl.styles import Font, PatternFill
 
 # ── configuration ──────────────────────────────────────────────────────────
 INPUT_ROOTS = [
-    r"X:\NMR_group_data\Runita\AllData_Backup\AllSortedData\Tetrode",
+    r"X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\LinearTrack_GeoMagVsZero\Data",
 ]
-OUTPUT_XLSX = r"X:\NMR_group_data\Runita\AllData_Backup\AllSortedData\Tetrode/ntt_spike_counts_backup.xlsx"
+OUTPUT_XLSX = r"X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\LinearTrack_GeoMagVsZero\Data\ntt_spike_counts_backup.xlsx"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Neuralynx NTT binary layout (see concat_ntt_for_lrat_isodist_v3.py) ──────
