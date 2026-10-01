@@ -65,7 +65,6 @@ only the coordinate transform, smoothing kernel and plotting differ per arena.
 """
 
 import os
-import glob
 import hashlib
 import random
 import concurrent.futures
@@ -73,7 +72,7 @@ import concurrent.futures
 import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
-from scipy.stats import gaussian_kde, chi2
+from scipy.stats import gaussian_kde
 
 import matplotlib
 matplotlib.use('Agg')
@@ -88,7 +87,7 @@ from matplotlib.colors import Normalize
 # Single root under which every animal/arena/day/session lives. Arena type is auto-detected
 # per session from its path (see ARENA_FOLDER_KEYWORDS / _detect_arena_key below) -- no
 # per-arena root folders needed any more.
-ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\SessionType_Sorted\CorrectedData\Data\SessionTypeSorted_PC\Open\Cntrl'
+ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\Open_KDE\CorrectedData\Data\SessionTypeSorted_PC\Open\Cntrl'
 
 # Output folder for all figures / workbooks (same location as before, now derived from the root).
 OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_CorrRayleigh_Test')
@@ -268,14 +267,6 @@ KDE_BW_METHOD = 'scott'
 # sampled arena, so bins near the walls are not biased low by kernel mass leaking out of the
 # arena (important for an edge-vs-centre analysis). False: plain scipy KDE.
 KDE_EDGE_CORRECTION = True
-
-# ── Real-vs-null KDE comparison (Duong 2013, 'Local significant differences from
-# nonparametric two-sample tests', J. Nonparametr. Stat. 25:635-645) -- see
-# duong_local_test / compare_kde_to_null. Each real KDE (overall / field-only / peak) is
-# compared bin by bin with the matching KDE of every observed-null file
-# (NullMeanRateMap_SimulatedFields_v1.py writes them as Null_<mode>_<k>x<k>.npz into the same
-# output folder); p-values are adjusted across bins with Hochberg (1988) at DUONG_ALPHA.
-DUONG_ALPHA = 0.05
 
 # 'pixel' or 'cm'
 COORD_UNITS = 'cm'
@@ -1520,208 +1511,6 @@ def plot_kde_maps(arena_handlers: dict, arena_results: dict, map_kind: str, save
         print(f'[SAVED] {npz_path}')
 
 
-# ============================================================================
-# Real vs observed-null KDE: Duong (2013) local significant difference test
-# ============================================================================
-
-def _hochberg_reject(p: np.ndarray, alpha: float) -> tuple:
-    """Hochberg (1988) step-up procedure, as in Duong (2013) step 2: sort p ascending,
-    j* = max{j : P(j) <= alpha / (m - j + 1)}, reject every test with P <= P(j*).
-    Returns (reject mask, P(j*) or NaN if nothing is rejected)."""
-    m = len(p)
-    reject = np.zeros(m, dtype=bool)
-    if m == 0:
-        return reject, np.nan
-    order = np.argsort(p)
-    ok = p[order] <= alpha / (m - np.arange(1, m + 1) + 1)
-    if not ok.any():
-        return reject, np.nan
-    j_star = int(np.flatnonzero(ok).max())
-    reject[order[:j_star + 1]] = True
-    return reject, float(p[order[j_star]])
-
-
-def duong_local_test(kde_1: dict, n_1: int, kde_2: dict, n_2: int, test_bins: np.ndarray,
-                     alpha: float = DUONG_ALPHA) -> dict:
-    """Duong (2013) local two-sample test of H0(x): f1(x) = f2(x) at every bin in test_bins.
-
-    At each bin, U(x) = [f1(x) - f2(x)]^2 and, under H0,
-        U(x) / sigma^2(x) ~ chi^2_1,
-        sigma^2(x) = R(K) [ f1(x) / (n1 |H1|^1/2) + f2(x) / (n2 |H2|^1/2) ],
-    with R(K) = 1 / (4 pi) for the 2D Gaussian kernel and H = the KDE's bandwidth
-    covariance (kde_density_map's 'cov'). The p-values are Hochberg-adjusted across bins.
-
-    With KDE_EDGE_CORRECTION the density is raw / kmass (kmass = fraction of the kernel
-    inside the arena), so its variance is the raw KDE variance / kmass^2; estimating the raw
-    variance from raw = density * kmass gives R(K) density / (n |H|^1/2 kmass) -- wall bins
-    get a proportionally wider null.
-
-    n is the number of independent observations behind each KDE (cells). The asymptotics are
-    exact for point data (the peak-proportion map = KDE of cell peak locations); for the
-    overall / field-only maps each cell contributes a whole map, so n = cells is an
-    approximation.
-
-    Returns dict of full-length (n_bins) arrays: diff (f1 - f2), z (signed sqrt of the chi^2
-    statistic), p, sig (Hochberg-rejected), plus p_threshold (P(j*))."""
-    RK = 1.0 / (4.0 * np.pi)
-
-    def _var(kde_out, n):
-        dens, raw = kde_out['density'], kde_out['density_raw']
-        kmass = np.where(dens > 0, raw / np.where(dens > 0, dens, 1.0), 1.0)
-        return RK * dens / (n * np.sqrt(np.linalg.det(kde_out['cov'])) * kmass)
-
-    n_bins = len(test_bins)
-    diff = np.full(n_bins, np.nan)
-    z    = np.full(n_bins, np.nan)
-    p    = np.full(n_bins, np.nan)
-    sig  = np.zeros(n_bins, dtype=bool)
-
-    sigma2 = _var(kde_1, n_1) + _var(kde_2, n_2)
-    t = test_bins & np.isfinite(sigma2) & (sigma2 > 0)
-    diff[t] = kde_1['density'][t] - kde_2['density'][t]
-    z[t] = diff[t] / np.sqrt(sigma2[t])
-    p[t] = chi2.sf(z[t] ** 2, df=1)
-    sig[t], p_thr = _hochberg_reject(p[t], alpha)
-    return dict(diff=diff, z=z, p=p, sig=sig, test_bins=t, p_threshold=p_thr)
-
-
-def _null_n_cells(null_npz, null_summary, key: str, fallback: int) -> int:
-    """Number of simulated cells behind one arena's null KDE: from the null .npz
-    (<arena>_n_cells), else from Null_Summary.xlsx, else fallback (the real n -- this
-    doubles the null variance term, i.e. is conservative)."""
-    if f'{key}_n_cells' in null_npz.files:
-        return int(null_npz[f'{key}_n_cells'])
-    if null_summary is not None:
-        sel = null_summary[(null_summary['arena'] == key)
-                           & (null_summary['mode'] == str(null_npz['mode']))
-                           & (null_summary['field_size_bins'] == int(null_npz['field_size_bins']))]
-        if len(sel):
-            return int(sel['n_sim_cells'].iloc[0])
-    print(f'  [WARN] no simulated-cell count for {key} in the null file -- using the real n ({fallback})')
-    return fallback
-
-
-def plot_duong_comparison(arena_handlers: dict, tests: dict, null_tag: str, save_path: str):
-    """3 x 3 grid (map kind x arena) of real minus null KDE density on each arena's flat bin
-    grid (plot_bins_2d): faint = every tested bin, solid = bins where Duong's local test is
-    significant after Hochberg adjustment (red: real > null, blue: real < null)."""
-    fig = plt.figure(figsize=(22, 14))
-    gs = fig.add_gridspec(len(_KDE_MAP_KINDS), len(_ARENA_ORDER), width_ratios=[1.0, 1.7, 1.7])
-    for row, (kind, (_, title, _)) in enumerate(_KDE_MAP_KINDS.items()):
-        for col, key in enumerate(_ARENA_ORDER):
-            ax = fig.add_subplot(gs[row, col])
-            res = tests.get((key, kind))
-            if res is None:
-                ax.set_title(f'{_ARENA_TITLES[key]} -- {title}\n(no real or null KDE)', fontsize=9)
-                ax.axis('off')
-                continue
-            handler = arena_handlers[key]
-            t, sig, diff = res['test_bins'], res['sig'], res['diff']
-            vmax = float(np.nanmax(np.abs(diff[t]))) if t.any() else 1.0
-            norm = Normalize(vmin=-vmax, vmax=vmax if vmax > 0 else 1e-12)
-            cmap = _get_cmap('RdBu_r')
-            cmap.set_bad((1.0, 1.0, 1.0, 0.0))   # transparent, so the faint layer shows through
-            handler.plot_bins_2d(ax, diff, t, cmap, norm).set_alpha(0.3)
-            if sig.any():
-                handler.plot_bins_2d(ax, diff, sig, cmap, norm)
-            fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
-                         shrink=0.8 if key == 'open_field' else 1.0,
-                         label='Real - null KDE density (cm$^{-2}$)')
-            n_pos = int((sig & (diff > 0)).sum())
-            n_neg = int((sig & (diff < 0)).sum())
-            ax.set_title(f'{_ARENA_TITLES[key]} -- {title}\n'
-                         f'n real={res["n_real"]}, n null={res["n_null"]}; significant bins: '
-                         f'real>null {n_pos}, real<null {n_neg} of {int(t.sum())}', fontsize=9)
-    fig.suptitle(f'Real vs observed null ({null_tag}) KDE -- Duong (2013) local test, Hochberg '
-                 f'alpha={DUONG_ALPHA}\nfaint = not significant, solid = significant '
-                 f'(red: real > null, blue: real < null)')
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
-    plt.close(fig)
-    print(f'[SAVED] {save_path}')
-
-
-def compare_kde_to_null(arena_handlers: dict, arena_results: dict, out_dir: str) -> None:
-    """Runs duong_local_test between every real KDE (overall / field-only / peak, per arena;
-    same fit as plot_kde_maps) and the matching KDE of every observed-null file
-    Null_<mode>_<k>x<k>.npz found in out_dir (written by
-    NullMeanRateMap_SimulatedFields_v1.py -- run it first). Bins tested = sampled in both
-    the real and the null domain. Writes, per null file, Duong_Real_vs_<null>.png and .npz
-    (diff / z / p / sig per arena and map kind), and one Duong_Real_vs_Null.xlsx summary."""
-    null_files = sorted(glob.glob(os.path.join(out_dir, 'Null_*x*.npz')))
-    if not null_files:
-        print(f'[SKIP Duong test] no Null_<mode>_<k>x<k>.npz in {out_dir} -- '
-              f'run NullMeanRateMap_SimulatedFields_v1.py first')
-        return
-    summary_path = os.path.join(out_dir, 'Null_Summary.xlsx')
-    null_summary = pd.read_excel(summary_path) if os.path.exists(summary_path) else None
-
-    # real KDEs, fit exactly as in plot_kde_maps
-    real = {}
-    for key in _ARENA_ORDER:
-        handler, results = arena_handlers[key], arena_results[key]
-        domain = _union_valid(handler, results)
-        for kind, (pool_fn, _, _) in _KDE_MAP_KINDS.items():
-            values, values_are_mass = pool_fn(handler, results)
-            kde_out = kde_density_map(handler, values, domain, values_are_mass) if domain.any() else None
-            n = (sum(r['peak_bin_raw'] is not None for r in results) if kind == 'peak'
-                 else len(results))
-            real[(key, kind)] = (kde_out, domain, n)
-
-    rows = []
-    for path in null_files:
-        null_tag = os.path.splitext(os.path.basename(path))[0][len('Null_'):]
-        null = np.load(path)
-        tests, saved = {}, {}
-        for key in _ARENA_ORDER:
-            for kind in _KDE_MAP_KINDS:
-                kde_r, domain_r, n_r = real[(key, kind)]
-                pre = f'{key}_{kind}'
-                if kde_r is None or f'{pre}_density' not in null.files or n_r == 0:
-                    tests[(key, kind)] = None
-                    continue
-                kde_n = dict(density=null[f'{pre}_density'], density_raw=null[f'{pre}_density_raw'],
-                             cov=null[f'{pre}_cov'])
-                n_n = _null_n_cells(null, null_summary, key, fallback=n_r)
-                test_bins = (domain_r & null[f'{key}_domain']
-                             & np.isfinite(kde_r['density']) & np.isfinite(kde_n['density']))
-                res = duong_local_test(kde_r, n_r, kde_n, n_n, test_bins)
-                res.update(n_real=n_r, n_null=n_n)
-                tests[(key, kind)] = res
-                for k in ('diff', 'z', 'p', 'sig', 'test_bins'):
-                    saved[f'{pre}_{k}'] = res[k]
-
-                sig, diff, t = res['sig'], res['diff'], res['test_bins']
-                sd_r = np.sqrt(np.diag(kde_r['cov']))
-                sd_n = np.sqrt(np.diag(kde_n['cov']))
-                rows.append(dict(
-                    null=null_tag, arena=key, map_kind=kind, n_real=n_r, n_null=n_n,
-                    n_bins_tested=int(t.sum()),
-                    n_sig_real_gt_null=int((sig & (diff > 0)).sum()),
-                    n_sig_real_lt_null=int((sig & (diff < 0)).sum()),
-                    pct_bins_sig=100.0 * sig.sum() / t.sum() if t.any() else np.nan,
-                    hochberg_p_threshold=res['p_threshold'],
-                    min_p=float(np.nanmin(res['p'])) if t.any() else np.nan,
-                    max_abs_z=float(np.nanmax(np.abs(res['z']))) if t.any() else np.nan,
-                    real_bw_sd_x_cm=sd_r[0], real_bw_sd_y_cm=sd_r[1],
-                    null_bw_sd_x_cm=sd_n[0], null_bw_sd_y_cm=sd_n[1]))
-                print(f'  [Duong {null_tag}] {key} {kind}: {int(sig.sum())}/{int(t.sum())} bins '
-                      f'significant (real>null {rows[-1]["n_sig_real_gt_null"]}, '
-                      f'real<null {rows[-1]["n_sig_real_lt_null"]})')
-
-        plot_duong_comparison(arena_handlers, tests, null_tag,
-                              os.path.join(out_dir, f'Duong_Real_vs_{null_tag}.png'))
-        if saved:
-            npz_path = os.path.join(out_dir, f'Duong_Real_vs_{null_tag}.npz')
-            np.savez_compressed(npz_path, alpha=DUONG_ALPHA, **saved)
-            print(f'[SAVED] {npz_path}')
-
-    if rows:
-        xlsx = os.path.join(out_dir, 'Duong_Real_vs_Null.xlsx')
-        pd.DataFrame(rows).to_excel(xlsx, index=False)
-        print(f'[SAVED] {xlsx}')
-
-
 def _debug_occupancy_and_rawrate(x_cm: np.ndarray, y_cm: np.ndarray, t: np.ndarray,
                                   spike_ts: np.ndarray, handler) -> dict | None:
     """Same bin-assignment + spike-matching arithmetic as compute_cell_ratemap, but with
@@ -1989,7 +1778,6 @@ def run_full_pipeline(out_dir: str) -> None:
                   os.path.join(out_dir, 'KDE_FieldOnly_MeanFieldIndex.png'))
     plot_kde_maps(arena_handlers, arena_results, 'peak',
                   os.path.join(out_dir, 'KDE_PeakProportion_Map.png'))
-    compare_kde_to_null(arena_handlers, arena_results, out_dir)
     export_excel(arena_handlers, arena_results,
                  os.path.join(out_dir, 'AllArenas_Summary.xlsx'))
 
@@ -2000,3 +1788,89 @@ if __name__ == '__main__':
     run_full_pipeline(os.path.join(OUTPUT_DIR, 'AllArenas'))
 
     print('\nDone.')
+
+"""
+CORRECT OBSERVED NULL ALGO:
+
+I found the problem with the previous observed null. It wasn't coded the way I asked claude to code it.
+What I want the observed null to be is what a mean rate map would look like if the animals travelled through the trajectory that did (data for this is available in the tracking files.  If all animals had place fields that were uniformly covering the arena i.e. tiling the arena under consideration unfirmly and also not overlapping with each other at any bin, and the animals had travelled through this kind of spatial map, what would the mean overall rate map, mean field only rate map, and peak proportion rate map look like. 
+
+Here's the algrithm for this process. 
+Step 1:
+Get the occupancy maps from all the tracking files, concatenate all the data as mentioned in the mean occupancy code attached.
+
+Step 2: 
+For each arena (Open, Linear, Circle), Get simulated sets of perfect place fields (firing rate should use the pass index method: peak should have rate 1, with neightbouring bins gradually decreasing their firing rate upto 0). Tile the entire arena uniformly with these place fields. They should not over lap with each other at any bin. For now set the field size as 3 by 3 bins so it will have 9 contiguous bins in total. Increase the number of bins by 1 to 3 bins if required so that it fits the geometry to make it uniform and non overlapping. 
+
+Step 3: 
+Consider an animal travelled this cognitive map and fired at these locations at the rate predicted by the fields tiling the arena unifmormly with the trajectory extracted from the concatenated trajectory path. what would be the resultant mean overall rate map? resulatant mean field only rate map (which includes only bins with firing rate upto 20% of the peak bin firing rate hence some bins will be excluded from this)? resultant peak proportion map?
+Get these 3 types of final rate maps which will be the observed nulls for their corresponding mean rate map type.
+
+Step 4: 
+Apply KDE analysis to the observed null maps (same as the one used on the real data).
+
+Step 5:
+Compare the Kernels of real mean maps with their corresponding observed null kernels using Duong's test.
+Show less
+This is a new null model, so I'll write it as a new script rather than modify the relocation one. First I'll check the pipeline constants and how v22 consumes null files.
+"""
+
+
+"""
+The centre dome is expected. This null gives it by construction, so it isn't a bug and it doesn't mean 
+the cells over-represent the centre. The null in NullMeanRateMap_SimulatedFields_v2.py places field 
+centres uniformly across bins and never uses occupancy. Two pieces of geometry then push the pooled 
+map toward the centre.
+
+1. Coverage: fields are large compared with the arena
+A bin's value in the pooled mean map is roughly: 
+(chance that a randomly placed field covers the bin) × (mean field index when it does).
+
+Centre bin: it is covered whenever a field centre lands within about one field radius R of it. 
+That whole disc lies inside the arena.
+Wall bin: about half of that disc lies outside the wall, so only about half the possible field 
+centres can cover it. On top of that, fields placed near the wall are cut off at the wall 
+(relocated_raw_map, lines 269–273).
+So even with perfectly uniform placement, coverage at the centre should be about twice coverage 
+at the wall, and your null shows that ratio:
+
+field-only: about 0.30 at the centre vs about 0.15 at the edge
+overall: about 0.40 vs about 0.20
+The docstring's claim that relocation removes the "pure-geometry centre dome" is only partly true. 
+Moving from a 25×25 tiling to relocation fixed the problem of peaks sitting on the rims of 
+unsampled holes. It can't remove the convolution of uniform centres with 20–30 cm fields in 
+a 60 cm disc.
+
+2. Min–max normalisation adds to the overall map
+field_index_map sets each cell's 0 at its lowest-rate bin. That's normally the bin farthest 
+from the field, and in a disc the farthest point from anywhere is on the wall. So wall bins 
+are repeatedly each cell's zero, while centre bins, never more than about 30 cm from any field, 
+sit on the field's tail.
+
+Why the wall-hugging doesn't show up
+None of the pooled mean maps weight by occupancy:
+
+Overall and field-only maps: each bin is divided by the number of cells that sampled it (pool_fine_map). 
+Oversampling a wall bin lowers its noise but doesn't raise its value.
+Null placement: it's uniform over sampled bins, not weighted by time spent there (line 363).
+The only place behaviour enters is which bins count as sampled. That's why the peak-proportion null is 
+higher at the walls: in sessions where the animal rarely entered the centre, few centre bins pass 
+min_occ_s, so most of that session's field centres are drawn from the wall ring. The denominator is 
+the global cell count.
+
+What this means for your analysis
+The null is the baseline for this geometry and pipeline. The comparison that tells you something is 
+real vs null, which your Duong test already does. If the real map also peaks in the centre but less 
+than the null does, real fields are closer to the walls than chance.
+
+To confirm the geometry explanation before trusting it:
+
+Shrink the fields: temporarily set RELOCATE_MARGIN_BINS = 0 and scale each field's offsets (dx, dy) 
+down by about half. The dome should flatten sharply.
+Compute coverage directly: for each session, convolve its sampled-bin mask with each field's footprint 
+and average. This prediction should match the null's field-only map almost exactly.
+If your hypothesis is instead "fields follow where the animal spends time", the null should draw centres 
+weighted by occ_map rather than uniformly. That's a different question, and that null would move toward 
+the walls.
+
+"""

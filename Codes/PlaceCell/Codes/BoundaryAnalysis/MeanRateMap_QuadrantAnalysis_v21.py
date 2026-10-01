@@ -79,6 +79,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches
+import matplotlib.collections
 from matplotlib.colors import Normalize
 
 # ============================================================================
@@ -1601,10 +1602,46 @@ def _null_n_cells(null_npz, null_summary, key: str, fallback: int) -> int:
     return fallback
 
 
+DUONG_REAL_GT_COLOR = '#FF00FF'   # fluorescent magenta: outline of real > null clusters
+DUONG_NULL_GT_COLOR = '#00FFFF'   # fluorescent cyan: outline of null > real clusters
+
+
+def _outline_bin_clusters(ax, handler, mask_flat: np.ndarray, color: str, lw: float = 1.8):
+    """Draws the outer boundary of every contiguous cluster of bins in mask_flat, on the same
+    (x_edges, y_edges) grid that handler.plot_bins_2d uses: an edge is drawn wherever a masked
+    bin borders an unmasked bin or the grid border."""
+    if isinstance(handler, CircularTrackHandler):
+        x_edges = np.linspace(0.0, handler.circumference_cm, handler.nx + 1)
+        y_edges = np.linspace(0.0, handler.track_width_cm, handler.ny + 1)
+    elif isinstance(handler, LinearTrackHandler):
+        x_edges = np.arange(handler.nx + 1) * handler.bin_cm_x
+        y_edges = np.arange(handler.ny + 1) * handler.bin_cm_y
+    else:
+        x_edges = np.arange(handler.nx + 1) * handler.bin_cm
+        y_edges = np.arange(handler.ny + 1) * handler.bin_cm
+    m = np.pad(mask_flat.reshape(handler.nx, handler.ny), 1, constant_values=False)
+    segs = []
+    for i, j in zip(*np.nonzero(m[1:-1, 1:-1])):
+        x0, x1, y0, y1 = x_edges[i], x_edges[i + 1], y_edges[j], y_edges[j + 1]
+        if not m[i, j + 1]:       # left neighbour (i - 1)
+            segs.append([(x0, y0), (x0, y1)])
+        if not m[i + 2, j + 1]:   # right neighbour (i + 1)
+            segs.append([(x1, y0), (x1, y1)])
+        if not m[i + 1, j]:       # lower neighbour (j - 1)
+            segs.append([(x0, y0), (x1, y0)])
+        if not m[i + 1, j + 2]:   # upper neighbour (j + 1)
+            segs.append([(x0, y1), (x1, y1)])
+    if segs:
+        ax.add_collection(matplotlib.collections.LineCollection(
+            segs, colors=color, linewidths=lw, capstyle='round', zorder=6))
+
+
 def plot_duong_comparison(arena_handlers: dict, tests: dict, null_tag: str, save_path: str):
     """3 x 3 grid (map kind x arena) of real minus null KDE density on each arena's flat bin
     grid (plot_bins_2d): faint = every tested bin, solid = bins where Duong's local test is
-    significant after Hochberg adjustment (red: real > null, blue: real < null)."""
+    significant after Hochberg adjustment (red: real > null, blue: real < null). Contiguous
+    clusters of significant bins are outlined in fluorescent magenta where the real KDE is
+    higher and in fluorescent cyan where the observed null is higher."""
     fig = plt.figure(figsize=(22, 14))
     gs = fig.add_gridspec(len(_KDE_MAP_KINDS), len(_ARENA_ORDER), width_ratios=[1.0, 1.7, 1.7])
     for row, (kind, (_, title, _)) in enumerate(_KDE_MAP_KINDS.items()):
@@ -1624,6 +1661,8 @@ def plot_duong_comparison(arena_handlers: dict, tests: dict, null_tag: str, save
             handler.plot_bins_2d(ax, diff, t, cmap, norm).set_alpha(0.3)
             if sig.any():
                 handler.plot_bins_2d(ax, diff, sig, cmap, norm)
+                _outline_bin_clusters(ax, handler, sig & (diff > 0), DUONG_REAL_GT_COLOR)
+                _outline_bin_clusters(ax, handler, sig & (diff < 0), DUONG_NULL_GT_COLOR)
             fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
                          shrink=0.8 if key == 'open_field' else 1.0,
                          label='Real - null KDE density (cm$^{-2}$)')
@@ -1634,7 +1673,8 @@ def plot_duong_comparison(arena_handlers: dict, tests: dict, null_tag: str, save
                          f'real>null {n_pos}, real<null {n_neg} of {int(t.sum())}', fontsize=9)
     fig.suptitle(f'Real vs observed null ({null_tag}) KDE -- Duong (2013) local test, Hochberg '
                  f'alpha={DUONG_ALPHA}\nfaint = not significant, solid = significant '
-                 f'(red: real > null, blue: real < null)')
+                 f'(red: real > null, blue: real < null); cluster outlines: magenta = real higher, '
+                 f'cyan = null higher')
     fig.tight_layout()
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
