@@ -7,7 +7,7 @@
     - Complex spikeing index
 
 - Place Cell Characterization:
-    - Peak and mena firing rate
+    - Peak and mean firing rate
     - Spatial information score
     - Coherence score
     - Sparsity score
