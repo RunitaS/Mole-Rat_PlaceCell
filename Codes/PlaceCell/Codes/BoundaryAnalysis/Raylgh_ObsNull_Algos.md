@@ -60,6 +60,3 @@ Apply KDE analysis to the observed null maps (same as the one used on the real d
 
 Step 5:
 Compare the Kernels of real mean maps with their corresponding observed null kernels using Duong's test.
-Show less
-This is a new null model, so I'll write it as a new script rather than modify the relocation one. First I'll 
-check the pipeline constants and how v22 consumes null files.
