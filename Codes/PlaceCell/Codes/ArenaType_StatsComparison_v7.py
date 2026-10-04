@@ -82,8 +82,8 @@ import CellClusteredStats_Utils as ccs
 # INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\All_TT_PlaceChar_VisitCrit.xlsx'
 # PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\ArenaType_StatsPlots'
 
-INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\All_TT_PlaceChar_AdptBin.xlsx'
-PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\ArenaCompare_Stats'
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\All_TT_PlaceChar_Sir_Spar_AdptBin_woZero.xlsx'
+PLOTS_DIR   = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\ArenaCompare_Stats_Lin_woZero'
 
 ARENA_TYPES = ['Circle', 'Linear', 'Open']
 ALPHA       = 0.05

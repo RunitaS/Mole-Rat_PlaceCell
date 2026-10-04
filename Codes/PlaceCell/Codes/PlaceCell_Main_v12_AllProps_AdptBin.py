@@ -312,12 +312,12 @@ ntt_dtype = np.dtype([
     ('waveforms',   '<i2', (32, 4)),
 ])
 
-ANIMAL_NAMES = ('Fa1059', 'Fa23BD', 'Fa8477', 'Fa5384')
+ANIMAL_NAMES = ('Fa1059', 'Fa23BD', 'Fa8477', 'Fa5834')
 
 
 def _animal_relpath(dirpath: str) -> str | None:
     """Return the portion of `dirpath` starting at the animal-ID folder
-    (Fa1059 / Fa23BD / Fa8477 / Fa5384), or None if no such folder is found.
+    (Fa1059 / Fa23BD / Fa8477 / Fa5834), or None if no such folder is found.
     """
     parts = os.path.normpath(dirpath).split(os.sep)
     for i, part in enumerate(parts):
