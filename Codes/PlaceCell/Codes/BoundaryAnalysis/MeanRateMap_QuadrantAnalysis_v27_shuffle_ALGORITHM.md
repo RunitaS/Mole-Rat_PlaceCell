@@ -108,11 +108,11 @@ Every arena is a 2-D grid of `nx × ny` bins stored as a flat index `flat = i·n
 ### 4.1 Load (`_load_tracking`)
 1. Read the table (Excel or CSV). In `'cm'` mode: t = column 0 (µs), x = column 3, y = column 4.
 2. Drop samples with x = 1 or x = −1 (the tracker's "lost" values).
-3. Forward differences: dx_k = x_{k+1} − x_k, dy_k, dt_k (the last sample gets dx = dy = 0, dt = 1).
-4. Speed_k = √(dx² + dy²) / dt for dt > 0. Keep samples with dt > 0 **and** speed < 0.006 cm/µs
+3. Forward differences: dx_k = x_{k+1} − x_k, dy_k, dt_k (the last sample gets dx = dy = 0, dt = 1) <FIX: {x_:1 = x_:-1, y_:1 = y_:-1, dt = 33.33 msec}.
+4. Speed_k = √(dx² + dy²) / dt for dt > 0. Keep samples with dt > 0 **and** speed < 0.006 cm/µs <FIX: 0.00009 cm/µs>
    (= 6000 cm/s, so this removes only gross glitches).
 5. Sort by time.
-6. Shift so min(x) = min(y) = 0 (cm mode). In pixel mode, also divide by
+6. Shift so min(x) = min(y) = 0 (cm mode). In pixel mode, also divide by <FIX: Use center as midpoint instead, or skip this step. Centering procedure repeated in step 4.3>
    px_per_cm = max(x-extent, y-extent) / arena width.
 
 ### 4.2 Jump removal and smoothing (`_smooth_tracking_position`)
@@ -124,9 +124,10 @@ Every arena is a 2-D grid of `nx × ny` bins stored as a flat index `flat = i·n
 
 ### 4.3 Centring (`_centre_open_field_tracking`), open field only
 x ← x + (cx − (min x + max x)/2), y ← y + (cy − (min y + max y)/2): the midpoint of the trajectory's bounding box
-is moved to the arena centre (30, 30).
+is moved to the arena centre (30, 30). <FIX: Apply to all arenas>
 
-### 4.4 Frame table (`_session_frames`)
+### 4.4 Frame table (`_session_frames`) 
+<FIX: Apply 0.5 min speed requirement to all arenas, not just linear track>
 1. Orient (linear track only, Section 2.3).
 2. Speed filter (`_speed_mask`): v_k = |p_k − p_{k−1}| / Δt (cm/s); frame 0 takes v_1.
    `moving_k = 0.5 ≤ v_k ≤ 90` (a NaN speed fails).
@@ -146,7 +147,7 @@ is moved to the arena centre (30, 30).
 ### 5.2 Spike-to-frame matching and speed filter (`compute_cell_ratemap`)
 1. For each spike, find the frames immediately before and after it (`searchsorted`) and take the nearer
    one (ties go to the earlier frame).
-2. Matched if |t_spike − t_frame| ≤ 50 ms. Used if matched **and** the frame is moving.
+2. Matched if |t_spike − t_frame| ≤ 50 ms. Used if matched **and** the *frame is moving*.
    `n_spikes` = used spikes; `n_spikes_speed_excluded` = matched spikes on non-moving frames.
 3. Remove non-moving frames from occupancy: `new_index = cumsum(moving) − 1` maps each original frame to its
    position among moving frames; the spike frames are re-indexed with it; t, bin and dt keep only the moving frames.
@@ -154,22 +155,24 @@ is moved to the arena centre (30, 30).
 ### 5.3 Maps (`compute_cell_ratemap` → `rate_maps_from_counts`)
 1. Occupancy: occ_i = Σ dt_k over moving frames in bin i (s).
 2. Spike counts: s_i = number of used spikes whose frame lies in bin i.
-3. Valid bins: occ_i ≥ 1 s **and** `geom_valid`.
+3. Valid bins: occ_i ≥ 1 s **and** *`geom_valid`* <FIX: Bin centering criteria only applied to open>.
 4. Raw rate: r_i^raw = s_i / occ_i (Hz) in valid bins, 0 elsewhere.
-5. Smoothed rate (`_gaussian_smooth_2d`), a normalised convolution with σ = 3 bins:
+5. Smoothed rate (`_gaussian_smooth_2d`), a normalised convolution with σ = 3 bins: <FIX: Apply 2D Gaussian smoothin edge correction>
    r^smooth = G * (r^raw·M) / G * M, where M = valid mask and * is 2-D Gaussian filtering (zero padding; the angular
    axis wraps on the circular track). Invalid bins are set to 0.
 6. Field-index map (`field_index_map`): FI_i = (r_i − min r) / (max r − min r) over valid bins (0 if the map is flat,
-   NaN in invalid bins).
+   NaN in invalid bins). <FIX: Make sure the Field-index transformation is applied to smoothed rate map>
 
 ### 5.4 Metrics (`rate_maps_from_counts`), using the smoothed rates over valid bins
-- p_i = occ_i / Σ occ
-- Mean rate r̄ = Σ p_i r_i; peak rate = max r_i
-- Skaggs spatial information (bits/spike): SI = Σ p_i (r_i/r̄) log₂(r_i/r̄), summed over bins with r_i > 0
-- Sparsity = (Σ p_i r_i)² / Σ p_i r_i²
+<FIX: Confirm if these metrics are calculated on raw rate maps>
+- **p_i = occ_i / Σ occ** WhoKnew! probability of occupancy in a bin is basically proportion of time spent in that bin.
+- Mean rate **r̄ = Σ p_i r_i**; **peak rate = max r_i**
+- Skaggs spatial information (bits/spike): **SI = Σ p_i (r_i/r̄) log₂(r_i/r̄), summed over bins with r_i > 0**
+- **Sparsity = (Σ p_i r_i)² / Σ p_i r_i²**
 - All values are rounded to 4 decimals.
 
 ### 5.5 Peaks and place field (`_cell_peaks_and_field`, `extract_place_field_mask`)
+<FIX: Extract fields from smoothed rate maps, but detect peak bin from raw rate maps>
 1. `peak_bin` = argmax of the smoothed rate over valid bins; `peak_bin_raw` = argmax of the raw rate.
 2. Candidate field bins: valid **and** r^smooth > r̄ **and** r^smooth > 0.2 · peak.
 3. Group the candidates into 8-connected components (`_connected_components_2d_flat`: an iterative depth-first
@@ -181,7 +184,7 @@ is moved to the arena centre (30, 30).
    regardless of thread order.
 2. If there are no spikes → not significant; if the session has ≤ 1200 moving frames (2 × 20 s) → sig = None.
 3. Repeat 1000 times: draw a shift k uniformly in [600, N − 600] frames; shifted spike frames = (f + k) mod N;
-   rebuild the spike map with occupancy and valid bins unchanged; smooth; compute SI.
+   rebuild the spike map with occupancy and valid bins unchanged; smooth; compute SI. <MAJOR FIX: bootstrapping is applied to smoothed rate map>
 4. Significant if the real SI > 95th percentile of the 1000 shuffled SIs. The flag is reported, but it does not
    exclude any cells.
 

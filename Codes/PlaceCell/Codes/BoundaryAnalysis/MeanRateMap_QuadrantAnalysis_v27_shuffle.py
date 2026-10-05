@@ -225,7 +225,7 @@ fps           = 30
 # Side length of a spatial bin (cm): every arena is binned at ~2 x 2 cm.
 target_bin_cm  = 2.0
 # Minimum occupancy (seconds) for a bin to count as validly sampled.
-min_occ_s      = 1
+min_occ_s      = 0.5 #1
 
 # Open field: bins whose centre is within 9.25 cm of the wall form the "edge zone".
 OPEN_EDGE_ZONE_THRESHOLD_CM   = 9.25

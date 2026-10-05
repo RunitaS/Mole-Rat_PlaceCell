@@ -37,12 +37,21 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
+# root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2'
+# output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\All_TT_PlaceChar_Sir_Spar_AdptBin.xlsx'
+
+# # Destination for .ntt + tracking files of confirmed place cells (folder pattern
+# # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
+# Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\PC_True_Sir_Spar_AdptBin'
+
+
 root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\All_TT_PlaceChar_Sir_Spar_AdptBin.xlsx'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\All_TT_PlaceChar_SirSparADptBin_Bin4x4.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\PC_True_Sir_Spar_AdptBin'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\PC_True_irSparADptBin_Bin4x4'
+
 
 
 # Per-unit figure subfolders, created next to each .ntt file
@@ -62,7 +71,7 @@ RATEMAPS_SUBDIR  = 'ratemaps_Sir_Spar_AdptBin'
 # unsmoothed ratemap over all valid bins, and sparsity over all valid bins
 # (for comparison).
 USE_OCC_WEIGHTED_SI = True
-SI_MIN_OCC_S        = 0.2     # min raw occupancy (s) for a bin to enter the SIR and sparsity sums
+SI_MIN_OCC_S        = 0.5     # min raw occupancy (s) for a bin to enter the SIR and sparsity sums
 
 
 class _Metrics(TypedDict, total=False):
@@ -168,13 +177,13 @@ def _gpu_util_pct() -> int:
 # (input/output directories are set at the top of the file)
 
 fps           = 30           # tracking frame rate (Hz)
-target_bin_cm  = 2.0          # bin size in cm
+target_bin_cm  = 4.0          # bin size in cm
 arena_width_cm = 80.0         # physical arena width in cm
 # ── Valid-bin criteria (each can be switched on/off independently) ──────────
 # A bin is valid only if it passes every enabled criterion. If both are False,
 # any bin with non-zero occupancy is valid.
 use_min_occ_s   = False        # True: exclude bins with < min_occ_s seconds occupancy
-min_occ_s       = 1            #       occupancy threshold (s)
+min_occ_s       = 0.5          #       occupancy threshold (s)
 use_min_visits  = True         # True: exclude bins visited < min_visits times
 min_visits      = 2            #       a "visit" = one contiguous entry into the bin
                                #       (time spent in the bin per visit is irrelevant)
