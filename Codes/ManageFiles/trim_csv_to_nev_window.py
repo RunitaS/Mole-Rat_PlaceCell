@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
-ROOT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Data_v2'  # root folder containing subfolders with .nev + .csv files
+ROOT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt_v2/QualFilt_Data'  # root folder containing subfolders with .nev + .csv files
 
 MATCH_TOLERANCE_MS = 50000  # max allowed difference between a .nev timestamp and its matched csv row
 # (camera start/stop typically lags the .nev event by up to a few hundred ms

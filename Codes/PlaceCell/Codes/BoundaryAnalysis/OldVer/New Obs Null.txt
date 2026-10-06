@@ -1,0 +1,35 @@
+## New Obs Null
+
+Step 0: combined occupancy: each session's dwell map is normalized to sum to 1, then the sessions are averaged (weight 1 per session, or by number of cells). The same KDE as the real maps is fitted to it to get p_occ, which is plotted for reference.
+
+Step 1: one null cell per real cell: it keeps the cell's real occupancy and the real number of spikes that entered its rate map. Those spikes are placed uniformly in time, which is one random draw over bins weighted by time spent in each bin. Setting NULL_SPIKE_MODE = 'occupancy' gives the hybrid version, where spikes are also weighted by p_occ.
+The null cells go through the real pipeline: they use the same functions as the real cells (rate_maps_from_counts and _cell_peaks_and_field), so the minimum-dwell threshold, smoothing, field detection and peak finding are identical.
+
+Steps 2–3: pooling: the null cells are pooled with your three existing pooling functions, and each null population map gets the same KDE. This repeats N_NULL_ITER = 1000 times, spread over NULL_MAX_WORKERS processes, and runs serially if a process pool can't start.
+
+Step 4: Method 1 statistics:
+Jensen–Shannon divergence and a Wasserstein distance.
+A log₂ enrichment map and a z map.
+A "global envelope" that flags bins significantly above or below the null while controlling false positives across all bins at once. These clusters are outlined in green and magenta, as in the Duong figures.
+Step 4: Method 2 statistics: mean distance to wall, fraction of mass in the edge zone, a distance-to-wall Wasserstein distance, and distance profiles with a 95% null band.
+p-values: each null iteration is compared against the mean of the other iterations, so no null is compared with a reference that includes itself.
+
+Step 5: Duong test: this used to be skipped. It now runs against the KDE of the mean null map.
+
+
+## Where it differs:
+
+Wasserstein distance: the 2D distance is computed as a "sliced" Wasserstein (averaged over 36 one-dimensional projections, still in cm). Exact 2D optimal transport over about 1,000 iterations × 9 maps is too slow.
+
+Distance-to-wall: the 1D distributions are read off the 2D KDEs rather than from a separate 1D KDE, so real and null share one smoothing.
+
+Quadrant statistics are not implemented. Only distance to wall and the edge zone are covered.
+Bursting: null spikes are independent in time, so bursts aren't reproduced and the null maps may be slightly less noisy than real bursty cells. This is noted in the header.
+
+## Other code changes:
+
+compute_cell_ratemap now also records spike_occ_map, the time per bin on frames where a spike can count.
+
+run_duong_tests now takes the null cell counts (n_null_cells) in place of the old null_results argument.
+
+New outputs: ObsNull_CombinedOccupancy.png, ObsNull_<kind>.png, ObsNull_Statistics.png, ObsNull_DistToWall.png, ObsNull_Stats.xlsx and ObsNull_Results.npz.

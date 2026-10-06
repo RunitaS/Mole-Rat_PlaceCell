@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 
-ROOT_DIRECTORY = "X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode"
+ROOT_DIRECTORY = "X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt_v2/QualFilt_Data"
 
 
 def remove_csv_files(directory, dry_run=False):

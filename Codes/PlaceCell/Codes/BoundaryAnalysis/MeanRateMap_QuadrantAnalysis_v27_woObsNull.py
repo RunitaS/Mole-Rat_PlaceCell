@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Mean Rate Map Analysis (S1H, after Muessig et al.) + KDE + Duong (2013) local test
+Mean Rate Map Analysis (after Muessig et al.) + KDE + Duong (2013) local test
 
 PIPELINE (run_full_pipeline), per arena:
   1. MEAN MAPS -- the pooled maps of the recorded place cells (described below): overall mean

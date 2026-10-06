@@ -55,10 +55,18 @@ the real timestamp as the interpolation axis) from their nearest surrounding
 good neighbors. Points beyond the first/last good point are held at the
 nearest good value.
 
-Output, per input file, saved next to the input (OUTPUT_SUFFIX appended):
-    <name>_corrected.csv     -- timestamp, x_px, y_px, x_cm, y_cm, was_interpolated
+Output, per input file:
+    <name>.csv               -- the input file itself, OVERWRITTEN in place with
+                                 timestamp, x_px, y_px, x_cm, y_cm, was_interpolated
+                                 (so each folder keeps exactly one tracking file)
     <name>_density_check.png -- density map + flagged points, for a sanity check
                                  (only if MAKE_DIAGNOSTIC_PLOT is True)
+
+A file whose header already has a 'was_interpolated' column has already been
+corrected by this script and is skipped, so re-running never re-corrects
+(and re-scales) an already-corrected file. Leftover <name>_corrected.csv
+files from older versions of this script are skipped and listed as a warning
+so they can be removed by hand.
 """
 
 import os
@@ -84,17 +92,29 @@ DENSITY_BIN_CM = 2.0             # approx. bin size (cm) for the 2D occupancy hi
 MIN_BIN_COUNT_FRACTION = 0.02    # a bin must hold >= this fraction of the busiest bin's count to count as "in arena"
 
 MAKE_DIAGNOSTIC_PLOT = True
-OUTPUT_SUFFIX = '_corrected'
+LEGACY_OUTPUT_SUFFIX = '_corrected'  # separate output files written by older versions of this script
+CORRECTED_MARKER_COLUMN = 'was_interpolated'  # present in a file's header once it has been corrected
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def find_csv_files(root_dir):
-    csv_paths = []
+    """Returns (csv_paths, legacy_paths): the tracking .csv files to correct,
+    and any leftover <name>_corrected.csv files from older script versions."""
+    csv_paths, legacy_paths = [], []
     for folder, _dirnames, filenames in os.walk(root_dir):
         for f in filenames:
-            if f.lower().endswith('.csv') and not f.endswith(OUTPUT_SUFFIX + '.csv'):
+            if not f.lower().endswith('.csv'):
+                continue
+            if f.endswith(LEGACY_OUTPUT_SUFFIX + '.csv'):
+                legacy_paths.append(os.path.join(folder, f))
+            else:
                 csv_paths.append(os.path.join(folder, f))
-    return sorted(csv_paths)
+    return sorted(csv_paths), sorted(legacy_paths)
+
+
+def is_already_corrected(csv_path):
+    header = pd.read_csv(csv_path, nrows=0).columns
+    return CORRECTED_MARKER_COLUMN in header
 
 
 def load_raw_tracking(csv_path):
@@ -214,6 +234,10 @@ def process_file(csv_path, arena_size_cm):
     name = os.path.splitext(os.path.basename(csv_path))[0]
     out_dir = os.path.dirname(csv_path)
 
+    if is_already_corrected(csv_path):
+        print(f"  SKIP: already corrected ('{CORRECTED_MARKER_COLUMN}' column present)")
+        return
+
     t, x_px, y_px = load_raw_tracking(csv_path)
     if len(t) < 2:
         print(f"  SKIP: fewer than 2 valid tracking samples in {csv_path}")
@@ -246,16 +270,27 @@ def process_file(csv_path, arena_size_cm):
     print(f"  x_dist_px={x_dist_px:.2f}, y_dist_px={y_dist_px:.2f}, "
           f"arena_size_cm={arena_size_cm}, scale={scale_cm_per_px:.5f} cm/px")
 
-    out_path = os.path.join(out_dir, f"{name}{OUTPUT_SUFFIX}.csv")
-    pd.DataFrame(dict(
-        timestamp=t, x_px=x_corr, y_px=y_corr, x_cm=x_cm, y_cm=y_cm, was_interpolated=bad_mask,
-    )).to_csv(out_path, index=False)
-    print(f"  Saved -> {out_path}")
+    # Overwrite the input so each folder keeps a single tracking file. Write to
+    # a temp file first and swap it in, so a crash mid-write can't leave the
+    # original half-written.
+    tmp_path = csv_path + '.tmp'
+    pd.DataFrame({
+        'timestamp': t, 'x_px': x_corr, 'y_px': y_corr, 'x_cm': x_cm, 'y_cm': y_cm,
+        CORRECTED_MARKER_COLUMN: bad_mask,
+    }).to_csv(tmp_path, index=False)
+    os.replace(tmp_path, csv_path)
+    print(f"  Overwrote -> {csv_path}")
 
 
 def process_arena(root_dir, arena_size_cm, arena_label):
-    csv_files = find_csv_files(root_dir)
+    csv_files, legacy_files = find_csv_files(root_dir)
     print(f"\n[{arena_label}] Found {len(csv_files)} .csv file(s) under {root_dir}")
+    if legacy_files:
+        print(f"[{arena_label}] WARNING: {len(legacy_files)} leftover "
+              f"*{LEGACY_OUTPUT_SUFFIX}.csv file(s) from an older run (skipped, delete by hand "
+              f"so each folder has one tracking file):")
+        for path in legacy_files:
+            print(f"    {path}")
     for i, csv_path in enumerate(csv_files, start=1):
         print(f"[{arena_label} {i}/{len(csv_files)}] {csv_path}")
         try:

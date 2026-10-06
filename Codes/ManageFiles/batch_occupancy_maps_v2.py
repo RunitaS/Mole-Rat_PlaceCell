@@ -8,8 +8,9 @@ Walks ROOT_DIR (including all subfolders and sub-subfolders), finds every
     Column D (index 3) -> x position, cm
     Column E (index 4) -> y position, cm
 
-Each occupancy map is saved as a .png in OUTPUT_DIR, named after the .csv
-file it was generated from (e.g. Session1.csv -> Session1.png).
+Each occupancy map is saved as a .png in OUTPUT_DIR, named after the folder
+containing the .csv and the .csv itself, so duplicate .csv names across
+folders don't collide (e.g. Rat01/Session1.csv -> Rat01_Session1.png).
 """
 
 import os
@@ -22,8 +23,8 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
-ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\Open_KDE\CorrectedData\Data\SessionTypeSorted_PC\Open\Cntrl'  # root folder to search recursively
-OUTPUT_DIR = r'X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\Open_KDE\CorrectedData\Data\SessionTypeSorted_PC\Open\Cntrl\OccupancyMaps'  # all .png maps are saved here (flat, not mirrored)
+ROOT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt_v2/QualFilt_Data'  # root folder to search recursively
+OUTPUT_DIR = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt_v2/QualFilt_Data/OccupancyMaps/Corr'  # all .png maps are saved here (flat, not mirrored)
 
 BIN_SIZE_CM = 2       # spatial bin edge length, cm
 SMOOTHING_SIGMA = 1.5   # Gaussian smoothing sigma, in bins; set to 0 to disable
@@ -154,11 +155,14 @@ def main():
 
     n_total = len(csv_files)
     n_ok, n_skip, n_err = 0, 0, 0
+    skipped, errored = [], []  # (csv_path, reason) for the end-of-run summary
     run_start = time.time()
 
     for i, csv_path in enumerate(csv_files, start=1):
         csv_name = os.path.splitext(os.path.basename(csv_path))[0]
-        out_path = os.path.join(OUTPUT_DIR, csv_name + '.png')
+        folder_name = os.path.basename(os.path.dirname(csv_path))
+        map_name = f"{folder_name}_{csv_name}"  # folder prefix disambiguates duplicate .csv names
+        out_path = os.path.join(OUTPUT_DIR, map_name + '.png')
         t0 = time.time()
 
         print(f"[{i}/{n_total}] Processing {csv_path} ...", flush=True)
@@ -168,6 +172,7 @@ def main():
             if len(t) < 2:
                 print(f"[{i}/{n_total}] SKIP: fewer than 2 valid tracking samples", flush=True)
                 n_skip += 1
+                skipped.append((csv_path, 'fewer than 2 valid tracking samples'))
                 continue
 
             occ_map_sec, x_edges, y_edges, unvisited = compute_occupancy_map(
@@ -176,18 +181,38 @@ def main():
 
             if os.path.exists(out_path):
                 print(f"[{i}/{n_total}] WARN: {out_path} already exists and will be "
-                      f"overwritten (duplicate .csv filename across folders)", flush=True)
+                      f"overwritten (duplicate folder + .csv filename)", flush=True)
 
-            plot_occupancy_map(occ_map_sec, x_edges, y_edges, unvisited, csv_name, out_path, DPI)
+            plot_occupancy_map(occ_map_sec, x_edges, y_edges, unvisited, map_name, out_path, DPI)
             n_ok += 1
             print(f"[{i}/{n_total}] OK ({time.time() - t0:.1f}s) -> {out_path}", flush=True)
 
         except Exception as exc:
             n_err += 1
+            errored.append((csv_path, str(exc)))
             print(f"[{i}/{n_total}] ERROR: {csv_path}: {exc}", flush=True)
 
     print(f"Done in {time.time() - run_start:.1f}s: "
           f"{n_ok} saved, {n_skip} skipped, {n_err} errored (of {n_total} total)", flush=True)
+
+    print_failures('SKIPPED', skipped)
+    print_failures('ERRORED', errored)
+
+
+def print_failures(label, failures):
+    """List failed files grouped by their containing directory."""
+    if not failures:
+        return
+
+    by_dir = {}
+    for csv_path, reason in failures:
+        by_dir.setdefault(os.path.dirname(csv_path), []).append((os.path.basename(csv_path), reason))
+
+    print(f"\n{label}: {len(failures)} file(s) in {len(by_dir)} folder(s)", flush=True)
+    for folder in sorted(by_dir):
+        print(f"  {folder}", flush=True)
+        for name, reason in by_dir[folder]:
+            print(f"      {name}  ({reason})", flush=True)
 
 
 if __name__ == '__main__':

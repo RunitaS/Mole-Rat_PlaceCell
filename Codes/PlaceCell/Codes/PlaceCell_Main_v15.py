@@ -37,12 +37,21 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
-root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SirSparADptBin_Corrected.xlsx'
+# root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt'
+# output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SirSparADptBin_Corrected.xlsx'
+
+# # Destination for .ntt + tracking files of confirmed place cells (folder pattern
+# # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
+# Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected'
+
+
+root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\All_TT_PlaceChar_SirSparADptBin_Corrected.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt_v2\PC_True_irSparADptBin_Corrected'
+
 
 
 # Per-unit figure subfolders, created next to each .ntt file
