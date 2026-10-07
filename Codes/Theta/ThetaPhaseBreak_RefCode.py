@@ -3,11 +3,12 @@
 Combined theta-modulation + phase-precession pipeline, run sequentially per
 unit (one .ntt file = one already-isolated unit):
 
-  Step 1 (visualization only): polar plot of spike counts vs. theta phase,
-    phase estimated by linear interpolation between consecutive peaks of the
-    bandpass-filtered LFP (0 deg at a peak, 360 deg at the next; see
-    peak_interp_phase, after AditiPrecessionUtils.getPhase). The same
-    peak-to-peak interpolation is used for Step 3's spatial pass-index phase.
+  Step 1 (visualization only): polar plot of spike counts vs. instantaneous
+    theta phase, phase estimated via the Generalized Phase (GP) of the
+    bandpass-filtered LFP -- a corrected analytic-signal phase (Davis,
+    Muller et al. 2020, Nature 587:432-436) that fixes the reversed-phase
+    assignments a plain Hilbert transform makes during brief epochs of
+    collapsed/negative instantaneous frequency.
   Step 2: Theta Modulation Index (TMI) for that unit (Frank et al. 2001:
     TMI = 1 - the minimum of the smoothed, normalized theta-phase
     histogram), tested for significance via that paper's shuffling
@@ -27,15 +28,11 @@ unit (one .ntt file = one already-isolated unit):
 ROOT_FOLDER is searched recursively; every folder that directly contains at
 least one .ncs and at least one .ntt file is treated as a session. Data
 layout expected per session folder:
-    *.ncs   Neuralynx continuous (LFP) file, one per tetrode/channel. By
-            default (MATCH_SPIKE_LFP_FILE = True) each .ntt file is matched
-            to the .ncs file sharing its embedded channel number (e.g.
-            TT1.ntt -> CSC1.ncs, TT12.ntt -> CSC12.ncs) via
-            match_ncs_to_ntt(), rather than every unit in the session being
-            referenced to a single session-wide LFP channel. Set
-            MATCH_SPIKE_LFP_FILE = False to skip this per-tetrode matching
-            (it can be slow) and reference every unit to the session's first
-            .ncs file instead.
+    *.ncs   Neuralynx continuous (LFP) file, one per tetrode/channel. Each
+            .ntt file is matched to the .ncs file sharing its embedded
+            channel number (e.g. TT1.ntt -> CSC1.ncs, TT12.ntt -> CSC12.ncs)
+            via match_ncs_to_ntt(), rather than every unit in the session
+            being referenced to a single session-wide LFP channel.
     *.ntt   Neuralynx tetrode spike files, one file per already-isolated
             unit. Every .ntt file in the folder is processed.
     tracking .csv file, auto-detected as the first .csv in the folder (only
@@ -52,19 +49,18 @@ units the timestamp column is actually stored in.
 Output: one row per unit is appended to a single summary table written to
 ROOT_FOLDER/theta_phase.xlsx, covering Step 1's polar-plot statistics
 (MRL, preferred phase, Rayleigh p), Step 2's TMI and its shuffle p-value,
-and Step 3's phase-precession fit (rho, p, slope, PrecessionClass) where it ran.
-Step 3's significance is Kempter et al.'s (2012) asymptotic z-test on the
-circular-linear correlation (no shuffling), not a fixed slope-magnitude
-window: p < ALPHA gates significance. A significant fit with slope below
--SLOPE_THRESH_DEG_PER_PASS (22 deg/pass) is labeled phase_precessing
-(is_precessing); above +22 deg/pass, phase_succeeding (is_recessing); a
-non-significant fit, or one with |slope| <= 22 deg/pass, is labeled
-phase_locked (is_phase_locked). Each cell's PassIndex plot is also copied to
-ROOT_FOLDER/PhasePrecessing_Plots, PhaseSucceeding_Plots or PhaseLocked_Plots
-(beside the Excel file).
-
-Per-unit plots (polar plot from Step 1, and the 6-panel Pass Index summary
-from Step 3, when run) are saved to
+and Step 3's phase-precession fit (rho, p, slope, p_rho_shuffle,
+p_slope_shuffle, PrecessionClass) where it ran. Step 3's significance is a
+circular time-shift shuffle test (shuffle_precession_significance), not a
+fixed slope-magnitude window: spike times are circularly shifted against
+the position/theta-phase traces many times to build a null distribution of
+rho (and, as a secondary diagnostic, of the slope itself), and p_rho_shuffle
+< ALPHA gates significance. A significant negative slope is labeled
+phase_precessing (is_precessing); a significant positive slope is labeled
+phase_recessing (is_recessing); a non-significant fit on an otherwise
+theta-modulated cell is labeled phase_locked (is_phase_locked) rather than
+discarded. Per-unit plots (polar plot from Step 1, and the 6-panel Pass
+Index summary from Step 3, when run) are saved to
 <session_folder>/ThetaPhasePrecession_Combined/.
 
 If ROOT_FOLDER's cell sessions are laid out as
@@ -85,13 +81,12 @@ ROOT_FOLDER/ArenaComparison_TMI.png with 'ArenaComparison_TMI_Omnibus' /
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 """
 
-#!Correct phase slope testing! Most precessing/recessing cells classified as phase locked.
+#!Correct phase slope testing! Most precessing/recessing cells classified as phase locked. 
 #!Criteria is too strict.
 
 from __future__ import annotations
 
 import re
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -100,58 +95,19 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy import signal, stats
-from scipy.ndimage import gaussian_filter, distance_transform_edt
+from scipy.ndimage import gaussian_filter, distance_transform_edt, label
 from scipy.optimize import minimize_scalar
+from scipy.interpolate import PchipInterpolator
 from scipy.special import erf
 
 # ============================================================================
 # Configuration -- EDIT THESE
 # ============================================================================
-#ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
 
-ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PhasePrec_Debug") 
-OUTPUT_EXCEL_NAME = 'theta_phase_Interp.xlsx'   # written to ROOT_FOLDER
-# PrecessionClass -> folder (in ROOT_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
-CLASS_PLOT_FOLDERS = {
-    'phase_precessing': 'PhasePrecessing_Plots',
-    'phase_succeeding': 'PhaseSucceeding_Plots',
-    'phase_locked': 'PhaseLocked_Plots',
-}
-# Fits whose wrapped phase line has > MAX_FIT_LINES segments (biologically implausible)
-MULTILINES_FOLDER = 'MultiLinesFit'
+ROOT_FOLDER = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/Debug")
+OUTPUT_EXCEL_NAME = 'theta_phase_GPA_debug.xlsx'   # written to ROOT_FOLDER
 
 TRACKING_TIME_UNIT = 'us'     # 'us', 'ms', or 's' -- units of the tracking timestamp column
-
-# --- Spike/LFP channel-matching toggle ---
-# True (default): match each .ntt tetrode file to the .ncs LFP file sharing its
-# embedded channel number (e.g. TT1.ntt -> CSC1.ncs), via match_ncs_to_ntt() --
-# more accurate (each tetrode's spikes are referenced to their own LFP channel),
-# but loading/filtering a separate LFP file per matched channel can be slow.
-# False: skip matching and reference every tetrode in the session to the first
-# .ncs file found (sorted naturally, e.g. CSC1 before CSC2/CSC10), loaded and
-# filtered once for the whole session -- much faster, at the cost of using one
-# session-wide LFP channel instead of each tetrode's own.
-MATCH_SPIKE_LFP_FILE = False
-
-# --- ACG theta-positive epoch criterion (Dunn et al. 2022; see acg_theta_epoch_mask) ---
-# True: only spikes falling in 1 s LFP epochs whose autocorrelogram matches a 3-7 Hz
-# sinusoid well (ED_min < ACG_ED_MIN_THRESH) are used for Steps 1-3 (polar plot, TMI,
-# phase precession). The rate map / place field is still built from all spikes, so the
-# field definition is unaffected. False: use the entire signal, as before.
-USE_ACG_THETA_EPOCHS = True
-ACG_ED_MIN_THRESH = 1.0          # keep epochs with ED_min strictly below this
-ACG_EPOCH_SEC = 1.0
-ACG_FS = 1000.0                  # Hz, LFP is resampled to this rate for the ACG analysis
-ACG_FREQ_RANGE = (3.0, 7.0)      # Hz, reference sinusoid bank
-ACG_FREQ_RES = 0.1               # Hz, bank step
-ACG_LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]   # mains notch (ACG analysis copy only)
-ACG_NOTCH_Q = 30.0
-ACG_LOWPASS_CUTOFF_HZ = 100.0
-ACG_LOWPASS_ORDER = 4
-ACG_REJECT_DELTA_OVER_THETA = True   # drop epochs whose 1-3 Hz power exceeds 3-7 Hz power
-ACG_DELTA_BAND = (1.0, 3.0)
-ACG_REJECT_MAD_ARTIFACTS = True      # drop epochs with outlier peak-to-peak amplitude
-ACG_MAD_THRESH = 5.0
 
 # --- Step 3: Pass Index phase-precession parameters ---
 METHOD = 'place'              # 'place' (recommended for place cells) or 'grid'
@@ -161,10 +117,11 @@ FILTER_BAND = 'auto'          # (low, high) cycles/unit-distance for the spatial
 LFP_FILTER_BAND = (3.0, 7.0) # Hz, theta band used for both the theta-modulation test and LFP phase
 SLOPE_BNDS = None             # optional (low, high) bound on precession slope (cycles/unit)
 MIN_SPIKES_FOR_FIT = 50       # skip circular-linear fit if fewer spikes than this
-SLOPE_THRESH_DEG_PER_PASS = 15.0   # significant fits need |slope| (deg/pass) above this to be
-                              # precessing (negative) / succeeding (positive); else phase locked
-MAX_FIT_LINES = 3            # a fit whose wrapped phase line has more segments than this is
-                              # marked non-precessing and gets no further analysis
+N_PRECESSION_SHUFFLES = 500    # circular time-shift shuffles testing the pass-index/theta-phase
+                                # circular-linear fit (rho, slope) against a null of no position-phase
+                                # relationship -- see shuffle_precession_significance
+PRECESSION_MIN_SHIFT_FRAC = 0.1  # minimum circular shift, as a fraction of the overlap window's
+                                  # duration, so no shuffle leaves spikes nearly unshifted
 
 # --- Step 1/2: theta phase-locking / modulation parameters ---
 PHASE_BIN_SIZE_DEG = 36             # degrees per polar-histogram bin (360 must be divisible by this);
@@ -176,9 +133,6 @@ TMI_BURST_MAX_GAP_SEC = 0.05        # consecutive spikes closer than this (Frank
 TMI_BURST_PHASE_BIN_DEG = 36        # in the same real-phase bin this wide are kept together as one
                                      # burst and given the same shuffled phase (calc_tmi's own bin width)
 RANDOM_SEED = 0                     # seed for the TMI shuffle test's RNG, for reproducibility
-
-LFP_MATCH_JITTER_FACTOR = 1.25      # a spike is matched to an LFP sample only if the nearest sample is
-                                     # within 1/(1.25*lfp_fs) s (one sample interval, less jitter margin)
 
 NCS_SAMPLES_PER_RECORD = 512
 HEADER_BYTES = 16 * 1024
@@ -455,119 +409,214 @@ def auto_filter_band(method, rmap, occupancy, binside, n_dims=2):
 
 
 # ============================================================================
-# ACG theta-positive epoch detection (Dunn et al. 2022, Nat Commun 13:6997,
-# Supp. Fig. 5; ported from ACG_theta_continuity_TT_Thresholded_EDmin_LFPclean_v3.py).
+# Generalized Phase (Davis, Muller et al. 2020, Nature 587:432-436; Muller et
+# al. 2016, eLife 5:e17267) -- corrected replacement for the plain Hilbert-
+# transform phase used throughout this module. Ported from
+# generalized_phase_vector.m, https://github.com/mullerlab/generalized-phase
+# (single-channel/vector form, adapted here for a time series rather than an
+# electrode-array datacube).
 #
-# The LFP is resampled to ACG_FS, line-noise notched, detrended and low-passed,
-# split into ACG_EPOCH_SEC epochs, and each epoch's autocorrelogram is compared
-# with a bank of reference-sinusoid autocorrelograms spanning ACG_FREQ_RANGE.
-# ED_min = the normalised Euclidean distance to the closest reference sinusoid
-# (0 = perfect sinusoid). An epoch is "theta-positive" if ED_min < ACG_ED_MIN_THRESH.
-# Optionally (same as the ACG script) epochs are first rejected if delta power
-# exceeds theta power or if their peak-to-peak amplitude is a robust MAD outlier.
+# The plain Hilbert-transform analytic signal (np.angle(signal.hilbert(x)))
+# assigns phase via a simple four-quadrant arctangent every sample, with no
+# safeguard against epochs where the signal's instantaneous frequency
+# collapses or reverses sign (e.g. near a local double-peak/notch in the
+# filtered waveform). Those epochs manifest as brief backward ("negative
+# frequency") jumps in phase -- reverse phase assignments -- riding on top of
+# the otherwise-correct forward progression. GP detects instantaneous
+# frequency dropping below the passband's own low-frequency edge, blanks
+# that epoch (extended by a safety window), and reconstructs it by
+# shape-preserving (pchip) interpolation of the unwrapped phase trend from
+# the surrounding reliable samples, instead of trusting the raw arctangent
+# there.
 # ============================================================================
 
-def _acg_notch(x, fs_hz, freqs, q):
-    y = np.asarray(x, dtype=np.float64)
-    for f0 in freqs:
-        if 0 < f0 < fs_hz / 2.0:
-            b, a = signal.iirnotch(f0, q, fs_hz)
-            y = signal.filtfilt(b, a, y)
-    return y
+def _gp_rewrap(xp):
+    """rewrap.m: fold an unwrapped phase trace back into (-pi, pi]."""
+    return xp - 2 * np.pi * np.floor((xp - np.pi) / (2 * np.pi)) - 2 * np.pi
 
 
-def _acg_reference_bank(ref_freqs, datsize, fs):
-    """Normalised autocorrelogram of each reference sinusoid -> (refXC, refED)."""
-    reft = np.arange(datsize) / fs
-    refXC = np.empty((2 * datsize - 1, len(ref_freqs)))
-    for n, freq in enumerate(ref_freqs):
-        refsig = np.sin(2 * np.pi * freq * reft)
-        xc = signal.correlate(refsig, refsig, mode='full', method='auto')
-        refXC[:, n] = xc / np.max(xc)
-    return refXC, np.linalg.norm(refXC, axis=0)
+def generalized_phase_vector(x, fs, lp, nwin=3):
+    """Generalized Phase of a single real-valued time series
+    (generalized_phase_vector.m). Drop-in replacement for
+    np.angle(signal.hilbert(x)) via np.angle(xgp): corrects the analytic
+    signal's phase for epochs where the instantaneous frequency falls below
+    `lp`, which otherwise corrupt the plain Hilbert phase with spurious
+    reversed-phase assignments.
 
+    Parameters
+    ----------
+    x  : 1D real array, already bandpass-filtered over the band of interest
+         (the same band whose low edge is passed as `lp`).
+    fs : sampling rate of x, in the same units as lp is expressed per
+         second (Hz for a genuine time series; for the arc-length-resampled
+         pass-index trace elsewhere in this module, the sampling rate along
+         that resampled arc-length axis, matching its own filter band).
+    lp : low-frequency cutoff -- the lower edge of the bandpass filter that
+         produced x. Instantaneous frequency below this value marks a
+         phase-slip epoch to be corrected.
+    nwin : safety-window multiplier extending each detected phase-slip
+         epoch (generalized_phase_vector.m default: 3).
 
-def acg_theta_epoch_mask(lfp_sig, lfp_fs):
-    """Per-epoch theta-positive mask for one LFP trace.
-
-    Epoch i spans [t0 + i*ACG_EPOCH_SEC, t0 + (i+1)*ACG_EPOCH_SEC) where t0 is
-    the first LFP sample's time. Returns (ok, ed_min): boolean mask and ED_min
-    per epoch (NaN where the epoch was rejected before/without an ACG fit).
+    Returns
+    -------
+    xgp     : complex analytic signal with the corrected ("generalized") phase.
+    wt_pre  : instantaneous frequency of the RAW, pre-correction Hilbert
+         phase (same rate units as fs) -- used internally to detect
+         phase-slip epochs (idx = wt_pre < lp) and returned for debugging/
+         comparison. Expected to dip below `lp` (and swing outside the
+         passband generally) exactly in those epochs, since that is the
+         artifact this function corrects.
+    idx     : boolean mask, True where the sample fell inside a phase-slip
+         epoch and its phase in `xgp` was therefore *reconstructed*
+         (pchip-filled across a gap whose true cumulative cycle count is
+         not preserved) rather than measured. Safe to read xgp's *wrapped*
+         phase (np.angle(xgp)) at these samples; NOT safe to use them (or
+         their immediate neighbours) for anything depending on the rate of
+         change of phase, such as instantaneous frequency -- see
+         gp_instantaneous_frequency below, which excludes them for exactly
+         this reason.
     """
-    x = signal.resample_poly(lfp_sig, int(ACG_FS), int(round(lfp_fs)))
-    x = _acg_notch(x, ACG_FS, ACG_LINE_HARMONICS, ACG_NOTCH_Q)
-    x = signal.detrend(x, type='linear')
-    b, a = signal.butter(ACG_LOWPASS_ORDER, ACG_LOWPASS_CUTOFF_HZ / (ACG_FS / 2.0), btype='low')
-    x = signal.filtfilt(b, a, x)
+    x = np.asarray(x, dtype=np.float64)
+    npts = x.shape[0]
+    dt = 1.0 / fs
 
-    nperseg = int(round(ACG_FS * ACG_EPOCH_SEC))
-    n_total = len(x) // nperseg
-    if n_total == 0:
-        return np.zeros(0, dtype=bool), np.zeros(0)
-    epochs = x[:n_total * nperseg].reshape(n_total, nperseg)
+    def _inst_freq(xo):
+        wt = np.zeros(npts)
+        wt[:-1] = np.angle(xo[1:] * np.conj(xo[:-1])) / (2 * np.pi * dt)
+        return wt
 
-    keep = np.ones(n_total, dtype=bool)
-    if ACG_REJECT_DELTA_OVER_THETA:
-        win = signal.get_window('hann', nperseg)
-        for i in range(n_total):
-            f, pxx = signal.welch(epochs[i], fs=ACG_FS, window=win, nperseg=nperseg,
-                                  noverlap=0, detrend='constant')
-            low = pxx[(f >= ACG_DELTA_BAND[0]) & (f <= ACG_DELTA_BAND[1])].sum()
-            theta = pxx[(f >= ACG_FREQ_RANGE[0]) & (f <= ACG_FREQ_RANGE[1])].sum()
-            keep[i] = low <= theta
-    if ACG_REJECT_MAD_ARTIFACTS and keep.any():
-        p2p = epochs.max(axis=1) - epochs.min(axis=1)
-        med = np.median(p2p[keep])
-        mad = np.median(np.abs(p2p[keep] - med)) or 1e-20
-        keep &= ~(0.6745 * (p2p - med) / mad > ACG_MAD_THRESH)
+    # analytic signal representation (scipy.signal.hilbert already implements
+    # the single-sided FFT approach of Marple 1999 used by the MATLAB original)
+    xo = signal.hilbert(x)
+    ph = np.angle(xo)
+    md = np.abs(xo)
+    wt_raw = _inst_freq(xo)
 
-    ref_freqs = np.arange(ACG_FREQ_RANGE[0], ACG_FREQ_RANGE[1] + ACG_FREQ_RES / 2, ACG_FREQ_RES)
-    refXC, refED = _acg_reference_bank(ref_freqs, nperseg, ACG_FS)
+    # rectify rotation direction so instantaneous frequency is positive
+    finite_wt = wt_raw[np.isfinite(wt_raw)]
+    sign_if = np.sign(np.mean(finite_wt)) if finite_wt.size else 1.0
+    if sign_if == -1:
+        xo = md * np.exp(1j * (sign_if * ph))
+        ph = np.angle(xo)
+        md = np.abs(xo)
+        wt_raw = _inst_freq(xo)
 
-    ed_min = np.full(n_total, np.nan)
-    for i in np.flatnonzero(keep):
-        xc = signal.correlate(epochs[i], epochs[i], mode='full', method='auto')
-        peak = np.max(xc)
-        if not np.isfinite(peak) or peak <= 0:
-            continue
-        xc = xc / peak
-        ed = np.sqrt(np.sum((refXC - xc[:, None]) ** 2, axis=0)) / refED
-        ed_min[i] = ed.min()
+    if np.all(np.isnan(ph)):
+        return np.full(npts, np.nan, dtype=np.complex128), wt_raw, np.ones(npts, dtype=bool)
 
-    ok = np.isfinite(ed_min) & (ed_min < ACG_ED_MIN_THRESH)
-    return ok, ed_min
+    # find negative-/low-frequency ("phase slip") epochs and extend each by
+    # nwin x its own width
+    idx = wt_raw < lp
+    idx[0] = False
+    labeled, n_groups = label(idx)
+    for kk in range(1, n_groups + 1):
+        idxs = np.flatnonzero(labeled == kk)
+        start, stop = idxs[0], idxs[-1]
+        extended_stop = min(start + (stop - start) * nwin, npts - 1)
+        idx[start:extended_stop + 1] = True
+
+    # unwrap only the trustworthy (unflagged) samples, then reconstruct the
+    # flagged samples by shape-preserving (pchip) interpolation of that
+    # trustworthy unwrapped trend, and rewrap.
+    #
+    # (A previous version of this port instead unwrapped the FULL raw phase
+    # trace first -- including through the flagged phase-slip epochs -- before
+    # blanking and pchip-filling them, on the theory that this better preserves
+    # the true cycle count spanned by each excised epoch. In practice this made
+    # the instantaneous-frequency estimates *worse*, not better: the raw
+    # Hilbert phase genuinely wobbles/reverses inside a phase-slip epoch (that
+    # is the artifact being corrected), so integrating through it with
+    # np.unwrap bakes a fractional-cycle drift into the very anchor points the
+    # pchip reconstruction relies on -- unlike a clean whole-cycle ambiguity,
+    # this drift does not cancel under rewrapping and corrupts both the
+    # reconstructed span and everything downstream. Confirmed against
+    # ThetaVsSpeed_v3_binning.py, whose GP instantaneous-frequency estimates
+    # (same algorithm, unwrap-valid-only) matched expected theta frequencies
+    # while this file's full-trace-unwrap version did not; reverted to
+    # unwrap-valid-only here to match.)
+    valid = ~idx
+    if np.count_nonzero(valid) < 2:
+        return np.full(npts, np.nan, dtype=np.complex128), wt_raw, np.ones(npts, dtype=bool)
+
+    valid_positions = np.flatnonzero(valid)
+    p_valid_unwrapped = np.unwrap(ph[valid])
+
+    p = np.empty(npts, dtype=np.float64)
+    p[valid] = p_valid_unwrapped
+    invalid_positions = np.flatnonzero(idx)
+    if invalid_positions.size:
+        filler = PchipInterpolator(valid_positions, p_valid_unwrapped, extrapolate=True)
+        p[invalid_positions] = filler(invalid_positions)
+
+    p = _gp_rewrap(p)
+
+    xgp = md * np.exp(1j * p)
+    return xgp, wt_raw, idx
 
 
-def times_in_ok_epochs(t_s, t0_s, epoch_ok):
-    """Boolean mask over times `t_s` (s) that fall inside a theta-positive epoch."""
-    idx = np.floor((np.asarray(t_s) - t0_s) / ACG_EPOCH_SEC).astype(np.int64)
-    inb = (idx >= 0) & (idx < len(epoch_ok))
-    out = np.zeros(len(idx), dtype=bool)
-    out[inb] = epoch_ok[idx[inb]]
-    return out
+def gp_instantaneous_frequency(xgp, idx, fs, lowcut, highcut):
+    """Per-sample instantaneous frequency (Hz) from a Generalized-Phase
+    analytic signal `xgp`/`idx` (generalized_phase_vector's own return),
+    for debugging/QC plots (e.g. plot_gp_instantaneous_frequency) -- NOT a
+    naive derivative of xgp's phase at every sample, which would include
+    epochs where that phase was fabricated rather than measured.
 
+    Two classes of sample are treated as unreliable rather than reported
+    as if they were real measurements (ported from
+    ThetaVsSpeed_v3_binning.py's estimate_instantaneous_frequency_power,
+    frequency half only, with an added repair step for the second class):
 
-# ============================================================================
-# Theta phase by peak-to-peak linear interpolation (AditiPrecessionUtils.getPhase).
-#
-# The bandpass-filtered signal's peaks are located; phase is 0 deg at each peak
-# and rises linearly to 360 deg at the next one, so a time point t falling
-# between peaks (t_k, t_k+1) has phase 360*(t - t_k)/(t_k+1 - t_k). Points
-# before the first or after the last peak have no defined phase (NaN).
-# ============================================================================
+      - reconstructed samples (idx): xgp's phase there was pchip-filled
+        across a phase-slip gap to give a plausible *wrapped* value, not a
+        plausible *rate of change* -- see generalized_phase_vector's own
+        docstring. A frequency estimate spans two samples (i, i+1), so
+        either endpoint being reconstructed invalidates it. These are left
+        as NaN; there is no trustworthy rate of change to recover here.
+      - any surviving estimate outside the bandpass filter's own
+        [lowcut, highcut] range: even a "trustworthy" sample can't produce
+        a frequency outside the band that was filtered into xgp in the
+        first place; a value out there means the analytic-signal estimate
+        itself is unreliable there (e.g. right at the filter's transition
+        band, or straddling a reconstructed/valid boundary). Unlike the
+        reconstructed case, this class is sandwiched between genuinely
+        trustworthy estimates on either side, so instead of discarding it
+        we shape-preserving (pchip) interpolate a replacement value from
+        the surrounding in-band, non-reconstructed estimates -- the same
+        strategy generalized_phase_vector itself uses to bridge phase-slip
+        epochs, applied one level up (to frequency instead of phase).
+        These repaired samples are NOT measurements; they are returned
+        with a separate mask so callers can display them distinctly
+        instead of silently blending them with real estimates.
 
-def peak_interp_phase(x, t, query_t=None):
-    """Unwrapped phase (rad, 2*pi per cycle, 0 at the first peak) of the
-    filtered signal `x` sampled at times `t`, evaluated at `query_t` (defaults
-    to `t`) by linear interpolation between consecutive peaks. NaN outside the
-    [first peak, last peak] span (or everywhere if fewer than 2 peaks)."""
-    t = np.asarray(t, dtype=np.float64)
-    q = t if query_t is None else np.asarray(query_t, dtype=np.float64)
-    pk_idx, _ = signal.find_peaks(x)
-    if len(pk_idx) < 2:
-        return np.full(q.shape, np.nan)
-    return np.interp(q, t[pk_idx], 2 * np.pi * np.arange(len(pk_idx)),
-                     left=np.nan, right=np.nan)
+    Returns
+    -------
+    freq : per-sample instantaneous frequency (Hz), length len(xgp), with
+        reconstructed-adjacent samples left as NaN and out-of-band samples
+        pchip-repaired (or left NaN if there weren't enough trustworthy
+        neighbours to interpolate from).
+    interpolated : boolean mask, True where `freq` was filled by the
+        out-of-band pchip repair rather than measured directly.
+    """
+    dt = 1.0 / fs
+    freq = np.full(len(xgp), np.nan)
+    freq[:-1] = np.angle(xgp[1:] * np.conj(xgp[:-1])) / (2 * np.pi * dt)
+    reconstructed = idx[:-1] | idx[1:]
+    freq[:-1][reconstructed] = np.nan
+    with np.errstate(invalid='ignore'):
+        out_of_band = (freq < lowcut) | (freq > highcut)
+
+    interpolated = np.zeros(len(xgp), dtype=bool)
+    trustworthy = np.isfinite(freq) & ~out_of_band
+    anchor_positions = np.flatnonzero(trustworthy)
+    target_positions = np.flatnonzero(out_of_band)
+    if anchor_positions.size >= 2 and target_positions.size:
+        filler = PchipInterpolator(anchor_positions, freq[anchor_positions], extrapolate=True)
+        repaired = np.clip(filler(target_positions), lowcut, highcut)
+        freq[target_positions] = repaired
+        interpolated[target_positions] = True
+    else:
+        freq[out_of_band] = np.nan
+    return freq, interpolated
 
 
 # ============================================================================
@@ -593,11 +642,6 @@ def anglereg(x: np.ndarray, theta: np.ndarray, bnds=None):
     exhaustively via the same grid+refine strategy (not a single bounded
     local optimization, which is equally vulnerable to local optima within
     a wide bnds range).
-
-    The grid search itself is vectorized over all grid points at once
-    (chunked to bound peak memory) rather than calling neg_resultant in a
-    Python-level loop, since this function runs once per real fit plus once
-    per unit -- the unvectorized loop dominated Step 3's runtime.
     """
     theta = np.mod(theta, 2 * np.pi)
     x = np.asarray(x, dtype=np.float64)
@@ -616,22 +660,7 @@ def anglereg(x: np.ndarray, theta: np.ndarray, bnds=None):
 
     grid_n = max(500, int(200 * (hi - lo) * max(np.ptp(x), 1.0)))
     grid = np.linspace(lo, hi, grid_n)
-
-    # costs[j] = neg_resultant(grid[j]) for every j at once, via an (n, chunk)
-    # broadcast of phase residuals instead of grid_n separate Python calls.
-    # Chunked over the grid axis so a large spike count doesn't blow up
-    # memory (bounded to roughly 20M float64 elements, ~160MB, per chunk).
-    max_chunk_elems = 20_000_000
-    chunk_size = max(1, min(grid_n, max_chunk_elems // max(n, 1)))
-    costs = np.empty(grid_n, dtype=np.float64)
-    for start in range(0, grid_n, chunk_size):
-        stop = min(start + chunk_size, grid_n)
-        s_chunk = grid[start:stop]
-        phase = theta[:, None] - 2 * np.pi * s_chunk[None, :] * x[:, None]
-        cos_sum = np.cos(phase).sum(axis=0) / n
-        sin_sum = np.sin(phase).sum(axis=0) / n
-        costs[start:stop] = -np.sqrt(cos_sum ** 2 + sin_sum ** 2)
-
+    costs = np.fromiter((neg_resultant(s) for s in grid), dtype=np.float64, count=grid_n)
     s0 = grid[np.argmin(costs)]
     step = (hi - lo) / grid_n
 
@@ -642,6 +671,7 @@ def anglereg(x: np.ndarray, theta: np.ndarray, bnds=None):
     b = np.arctan2(np.sum(np.sin(theta - 2 * np.pi * s * x)),
                    np.sum(np.cos(theta - 2 * np.pi * s * x)))
     return s, b
+
 
 def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     """Linear-circular correlation (Kempter et al. 2012). Returns (rho, p, s, b)."""
@@ -657,14 +687,14 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
         s, b = anglereg(x, theta, slope_bnds)
 
     n = len(x)
+    # 2*pi factor: s is in cycles per unit x (matching anglereg's own
+    # optimizer, theta - 2*pi*s*x), so the fitted phase is 2*pi*s*x, not
+    # s*x -- this was previously omitted, which decoupled rho/p from the
+    # fitted slope for anything but near-zero s.
     phi = np.mod(2 * np.pi * s * x, 2 * np.pi)
     theta_w = np.mod(theta, 2 * np.pi)
-    
-    # --- BUG FIX ---
-    # Kempter et al. 2012: Because phi and theta can span a full cycle, their standard 
-    # circular means are undefined. We use the regression parameters mapped from the linear mean.
-    phi_bar = 2 * np.pi * s * np.mean(x)
-    theta_bar = phi_bar + b
+    phi_bar = np.angle(np.sum(np.exp(1j * phi)) / n)
+    theta_bar = np.angle(np.sum(np.exp(1j * theta_w)) / n)
 
     num = np.sum(np.sin(theta_w - theta_bar) * np.sin(phi - phi_bar))
     den = np.sqrt(np.sum(np.sin(theta_w - theta_bar) ** 2) * np.sum(np.sin(phi - phi_bar) ** 2))
@@ -680,65 +710,66 @@ def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
     return rho, p, s, b
 
 
-"""
-The bug is in the kempter_lincirc function, specifically in how the circular means (phi_bar and theta_bar) 
-are calculated. When a cell exhibits strong phase precession, its spikes sweep across a wide range of theta 
-phases—often a full $360^\circ$ cycle. The circular mean of a distribution spanning a full cycle is mathematically 
-undefined because its mean resultant vector length approaches zero. As a result, np.angle(np.sum(np.exp(1j * phi)) / n) 
-evaluates to a highly unstable, arbitrary noise angle.This arbitrary angle shifts the phase in np.sin(phi - phi_bar) 
-and np.sin(theta_w - theta_bar), destroying the phase alignment between the two variables. This artificially drives 
-the correlation numerator (num) to near-zero, minimizing $\rho$ and yielding a high, non-significant $p$-value. 
-This is why visually strong precessing cells are being classified as phase-locked.Kempter et al. (2012) explicitly 
-highlight this exact pitfall. To circumvent the undefined circular mean, you must bypass np.angle entirely and define 
-the mean phase using the linear mean $\bar{x}$ combined with the regression intercept $b$.
-"""
+def shuffle_precession_significance(spk_ts, ts2, unwrapped_pass_index, lfp_ts, unwrapped_lfp_phase,
+                                     observed_rho, observed_s, rng,
+                                     n_shuffles=N_PRECESSION_SHUFFLES,
+                                     min_shift_frac=PRECESSION_MIN_SHIFT_FRAC, slope_bnds=None):
+    """Null distribution for the pass-index/theta-phase circular-linear fit
+    (Kempter et al. 2012), via a circular time-shift shuffle: spike times are
+    shifted by a random offset -- at least min_shift_frac of the available
+    window, so no shuffle leaves the true alignment nearly intact -- and
+    wrapped within the overlap of the arc-length-resampled position trace
+    and the LFP phase trace; pass index and theta phase are then
+    re-interpolated at the shifted times and refit exactly as for the real
+    data (same anglereg/kempter_lincirc call, so the null also reflects the
+    slope being *estimated*, not assumed known).
 
-"""
-BUG FIX:
-The surrounding statistical logic in your pipeline is mathematically sound:Asymptotic z-test: 
-Your test statistic $z = \rho \sqrt{n \frac{\lambda_{20} \lambda_{02}}{\lambda_{22}}}$ and 
-standard normal conversion $p = 1 - \text{erf}(\vert{}z\vert{} / \sqrt{2})$ are correct implementations 
-of the asymptotic test.Optimization: The chunked grid-search followed by minimize_scalar in anglereg 
-is a highly robust way to avoid the local minima that frequently trap standard gradient descent in 
-circular-linear optimization.Slope Conversion: Multiplying by $4\pi$ (np.rad2deg(4 * np.pi * s)) correctly 
-accounts for the fact that $x \in [-1, 1]$ means one pass equals 2 units, yielding $720s$ degrees per pass.
-"""
+    This preserves each spike train's own temporal structure (ISI/bursting)
+    and the natural relationship between position and LFP theta phase,
+    destroying only the cell-specific link between spike timing and where in
+    the field / theta cycle the animal actually was -- analogous to Step 2's
+    TMI shuffle test, and more robust than kempter_lincirc's own asymptotic
+    z-test (which assumes large-n normality of the underlying circular
+    moments) for the bursty, autocorrelated spike trains phase precession is
+    measured from. Used in place of a fixed slope-magnitude window to decide
+    significance, so a real but shallow precession is not discarded just for
+    being outside an arbitrary deg/pass range.
 
-# def kempter_lincirc(x, theta, s=None, b=None, slope_bnds=None):
-#     """Linear-circular correlation (Kempter et al. 2012). Returns (rho, p, s, b)."""
-#     x = np.asarray(x, dtype=np.float64)
-#     theta = np.asarray(theta, dtype=np.float64)
-#     good = ~np.isnan(x) & ~np.isnan(theta)
-#     x, theta = x[good], theta[good]
+    Returns (p_rho, p_slope, shuffle_rhos, shuffle_slopes). p_rho tests the
+    fitted circular-linear correlation rho (the combined
+    goodness-of-fit-and-slope statistic used for classification below);
+    p_slope tests the fitted slope s alone, reported as a secondary
+    diagnostic.
+    """
+    t_lo = max(ts2.min(), lfp_ts.min())
+    t_hi = min(ts2.max(), lfp_ts.max())
+    duration = t_hi - t_lo
+    min_shift = min_shift_frac * duration
 
-#     if len(x) == 0:
-#         return np.nan, np.nan, np.nan, np.nan
+    shuffle_rhos = np.full(n_shuffles, np.nan)
+    shuffle_slopes = np.full(n_shuffles, np.nan)
+    for i in range(n_shuffles):
+        shift = rng.uniform(min_shift, duration - min_shift)
+        shifted_ts = t_lo + np.mod(spk_ts - t_lo + shift, duration)
 
-#     if s is None:
-#         s, b = anglereg(x, theta, slope_bnds)
+        shifted_unwrapped = _interp_nearest_extrap(ts2, unwrapped_pass_index, shifted_ts)
+        shifted_pass_index = (np.mod(shifted_unwrapped + np.pi, 2 * np.pi) - np.pi) / np.pi
+        shifted_theta_phase = np.mod(np.interp(shifted_ts, lfp_ts, unwrapped_lfp_phase)
+                                      + np.pi, 2 * np.pi) - np.pi
 
-#     n = len(x)
-#     # 2*pi factor: s is in cycles per unit x (matching anglereg's own
-#     # optimizer, theta - 2*pi*s*x), so the fitted phase is 2*pi*s*x, not
-#     # s*x -- this was previously omitted, which decoupled rho/p from the
-#     # fitted slope for anything but near-zero s.
-#     phi = np.mod(2 * np.pi * s * x, 2 * np.pi)
-#     theta_w = np.mod(theta, 2 * np.pi)
-#     phi_bar = np.angle(np.sum(np.exp(1j * phi)) / n)
-#     theta_bar = np.angle(np.sum(np.exp(1j * theta_w)) / n)
+        rho_i, _p_i, s_i, _b_i = kempter_lincirc(shifted_pass_index, shifted_theta_phase,
+                                                  slope_bnds=slope_bnds)
+        shuffle_rhos[i] = rho_i
+        shuffle_slopes[i] = s_i
 
-#     num = np.sum(np.sin(theta_w - theta_bar) * np.sin(phi - phi_bar))
-#     den = np.sqrt(np.sum(np.sin(theta_w - theta_bar) ** 2) * np.sum(np.sin(phi - phi_bar) ** 2))
-#     rho = (np.abs(num / den) if den > 0 else 0.0) * np.sign(s)
+    valid = np.isfinite(shuffle_rhos) & np.isfinite(shuffle_slopes)
+    n_valid = int(np.sum(valid))
+    if n_valid == 0 or np.isnan(observed_rho) or np.isnan(observed_s):
+        return np.nan, np.nan, shuffle_rhos, shuffle_slopes
 
-#     def lam(i, j):
-#         return np.sum((np.sin(phi - phi_bar) ** i) * (np.sin(theta_w - theta_bar) ** j)) / n
-
-#     l20, l02, l22 = lam(2, 0), lam(0, 2), lam(2, 2)
-#     z = rho * np.sqrt(n * l20 * l02 / l22) if l22 > 0 else 0.0
-#     p = 1 - erf(np.abs(z) / np.sqrt(2))
-
-#     return rho, p, s, b
+    p_rho = float((np.sum(np.abs(shuffle_rhos[valid]) >= np.abs(observed_rho)) + 1) / (n_valid + 1))
+    p_slope = float((np.sum(np.abs(shuffle_slopes[valid]) >= np.abs(observed_s)) + 1) / (n_valid + 1))
+    return p_rho, p_slope, shuffle_rhos, shuffle_slopes
 
 
 # ============================================================================
@@ -748,12 +779,7 @@ accounts for the fact that $x \in [-1, 1]$ means one pass equals 2 units, yieldi
 def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
                         method='place', binside='auto', smth_width='auto',
                         filter_band='auto', lfp_filter_band=(3.0, 7.0),
-                        slope_bnds=None,
-                        phase_spk_ts=None, lfp_theta_mask=None):
-    """`spk_ts` (all spikes) defines the rate map / place field. If `phase_spk_ts`
-    is given (ACG theta-positive spikes), only those spikes enter the pass-index /
-    theta-phase analysis and shuffles. `lfp_theta_mask` (bool per LFP sample), if
-    given, restricts the density-map occupancy to theta-positive samples."""
+                        slope_bnds=None):
     n_dims = pos_xy.shape[1]
     if binside == 'auto':
         binside = 2.0 * n_dims
@@ -765,10 +791,6 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     fi_map = field_index_map(rmap, occupancy, method)
     field_index = field_index_per_position(pos_xy, fi_map, x_edges, y_edges)
 
-    if phase_spk_ts is not None:
-        spk_ts = phase_spk_ts
-        spk_xy, _ = spk_pos(pos_ts, pos_xy, spk_ts)
-
     cc, ts2, resampled = sample_along_arc(pos_ts, pos_xy, field_index)
 
     if filter_band == 'auto':
@@ -776,24 +798,17 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     fs_arc = 1.0 / np.mean(np.diff(cc))
     filtered_field_index = bandpass_filter(resampled, filter_band[0], filter_band[1], fs_arc)
 
-    # Spatial pass-index phase: peak-to-peak interpolation of the filtered field-index
-    # trace (0 at a field-index peak, wrapped to [-1, 1) x pi). NaN before the first /
-    # after the last peak.
-    def _wrap_pm_pi(u):
-        return np.mod(u + np.pi, 2 * np.pi) - np.pi
-
-    pass_index_trace = _wrap_pm_pi(peak_interp_phase(filtered_field_index, ts2)) / np.pi
-    spk_pass_index = _wrap_pm_pi(peak_interp_phase(filtered_field_index, ts2, spk_ts)) / np.pi
+    xgp_field_index, _, _ = generalized_phase_vector(filtered_field_index, fs_arc, filter_band[0])
+    pass_index_trace = np.angle(xgp_field_index) / np.pi
+    unwrapped = np.unwrap(pass_index_trace * np.pi)
+    spk_unwrapped = _interp_nearest_extrap(ts2, unwrapped, spk_ts)
+    spk_pass_index = (np.mod(spk_unwrapped + np.pi, 2 * np.pi) - np.pi) / np.pi
 
     filtered_lfp = bandpass_filter(lfp_sig, lfp_filter_band[0], lfp_filter_band[1], lfp_fs)
-    lfp_phase = _wrap_pm_pi(peak_interp_phase(filtered_lfp, lfp_ts))
-    spk_theta_phase = _wrap_pm_pi(peak_interp_phase(filtered_lfp, lfp_ts, spk_ts))
-
-    # Spikes outside either phase's first/last-peak span have no defined phase: drop them.
-    spk_theta_phase[~spikes_with_lfp_sample(spk_ts, lfp_ts, lfp_fs)] = np.nan
-    spk_valid = np.isfinite(spk_pass_index) & np.isfinite(spk_theta_phase)
-    spk_ts, spk_xy = spk_ts[spk_valid], spk_xy[spk_valid]
-    spk_pass_index, spk_theta_phase = spk_pass_index[spk_valid], spk_theta_phase[spk_valid]
+    xgp_lfp, _, _ = generalized_phase_vector(filtered_lfp, lfp_fs, lfp_filter_band[0])
+    lfp_phase = np.angle(xgp_lfp)
+    unwrapped_lfp_phase = np.unwrap(lfp_phase)
+    spk_theta_phase = np.mod(np.interp(spk_ts, lfp_ts, unwrapped_lfp_phase) + np.pi, 2 * np.pi) - np.pi
 
     rho, p, s, b = kempter_lincirc(spk_pass_index, spk_theta_phase, slope_bnds=slope_bnds)
     # s is cycles per unit of pass index; a full pass spans 2 units (-1 to
@@ -804,37 +819,28 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     # below) by a factor of 2.
     slope_deg_per_pass = np.rad2deg(4 * np.pi * s) if not np.isnan(s) else np.nan
 
-    # Significance: Kempter et al. (2012) asymptotic z-test on the circular-linear
-    # correlation (p from kempter_lincirc); no shuffling.
-    is_significant_precession = bool(np.isfinite(p) and p < ALPHA)
+    # Significance via circular time-shift shuffle (shuffle_precession_significance)
+    # rather than a fixed slope-magnitude window: a real but shallow precession
+    # should not be discarded just for falling outside an arbitrary deg/pass
+    # range, and kempter_lincirc's own asymptotic p (still reported below as
+    # 'p', for QC) assumes large-n normality that real spike trains can violate.
+    p_rho_shuffle, p_slope_shuffle, _shuffle_rhos, _shuffle_slopes = shuffle_precession_significance(
+        spk_ts, ts2, unwrapped, lfp_ts, unwrapped_lfp_phase, rho, s, rng, slope_bnds=slope_bnds)
 
-    # Number of wrapped line segments the fitted phase line (2*pi*s*x + b, drawn
-    # mod 2*pi as in plot_unit_summary) makes over the spikes' pass-index extent.
-    # More than MAX_FIT_LINES is an implausibly steep fit: the cell is marked
-    # non-precessing.
-    n_fit_lines = np.nan
-    fit_too_steep = False
-    if len(spk_pass_index) > 0 and np.isfinite(s) and np.isfinite(b):
-        ph_ends = 2 * np.pi * s * np.array([np.min(spk_pass_index), np.max(spk_pass_index)]) + b
-        n_fit_lines = int(np.floor(ph_ends.max() / (2 * np.pi)) - np.floor(ph_ends.min() / (2 * np.pi)) + 1)
-        fit_too_steep = bool(n_fit_lines > MAX_FIT_LINES)
-    if fit_too_steep:
-        is_significant_precession = False
-    # Significant fit (z-test) AND slope beyond +/-SLOPE_THRESH_DEG_PER_PASS:
-    # negative -> phase precessing (spike phase advances to earlier phase over
-    # the field pass); positive -> phase succeeding (phase moves later).
-    # Otherwise (non-significant, or |slope| within the threshold): phase locked.
-    is_precessing = bool(is_significant_precession and slope_deg_per_pass < -SLOPE_THRESH_DEG_PER_PASS)
-    is_recessing = bool(is_significant_precession and slope_deg_per_pass > SLOPE_THRESH_DEG_PER_PASS)
-    is_phase_locked = bool(np.isfinite(p) and not (is_precessing or is_recessing))
-    if not np.isfinite(p):
+    is_significant_precession = bool(np.isfinite(p_rho_shuffle) and p_rho_shuffle < ALPHA)
+    # Negative slope: theta-phase precessing (spike phase advances to earlier
+    # phase over the field pass). Positive slope: theta-phase recessing
+    # (phase moves later). Neither significant: phase locked (theta-modulated,
+    # per Step 2's TMI gate, but with no systematic phase drift across the field).
+    is_precessing = bool(is_significant_precession and s < 0)
+    is_recessing = bool(is_significant_precession and s > 0)
+    is_phase_locked = bool(np.isfinite(p_rho_shuffle) and not is_significant_precession)
+    if not np.isfinite(p_rho_shuffle):
         precession_class = None
-    elif fit_too_steep:
-        precession_class = 'non_precessing'
     elif is_precessing:
         precession_class = 'phase_precessing'
     elif is_recessing:
-        precession_class = 'phase_succeeding'
+        precession_class = 'phase_recessing'
     else:
         precession_class = 'phase_locked'
 
@@ -854,10 +860,7 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     pi_edges = np.linspace(-1, 1, 41)
     ph_edges = np.linspace(0, 2 * np.pi, 101)
     dt_lfp = float(np.mean(np.diff(lfp_ts)))
-    occ_sel = np.isfinite(lfp_pass_index) & np.isfinite(lfp_phase)   # phase is NaN outside first/last peak
-    if lfp_theta_mask is not None:
-        occ_sel &= lfp_theta_mask
-    occ_density, _, _ = np.histogram2d(lfp_pass_index[occ_sel], np.mod(lfp_phase, 2 * np.pi)[occ_sel],
+    occ_density, _, _ = np.histogram2d(lfp_pass_index, np.mod(lfp_phase, 2 * np.pi),
                                         bins=[pi_edges, ph_edges])
     occ_density *= dt_lfp
     spk_density, _, _ = np.histogram2d(spk_pass_index, np.mod(spk_theta_phase, 2 * np.pi),
@@ -875,9 +878,9 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
         'rho': rho, 'p': p, 's': s, 'b': b,
         'slope_deg_per_pass': slope_deg_per_pass,
         'r_squared': r_squared, 'phase_range_deg': phase_range_deg,
+        'p_rho_shuffle': p_rho_shuffle, 'p_slope_shuffle': p_slope_shuffle,
         'is_precessing': is_precessing, 'is_recessing': is_recessing,
         'is_phase_locked': is_phase_locked, 'precession_class': precession_class,
-        'n_fit_lines': n_fit_lines, 'fit_too_steep': fit_too_steep,
         'density': density, 'pi_edges': pi_edges, 'ph_edges': ph_edges,
         'n_spikes': len(spk_ts),
     }
@@ -958,30 +961,16 @@ def find_phase_peak_valley(spike_phase_deg):
     return peak_phase_deg, valley_phase_deg, tmi
 
 
-def spikes_with_lfp_sample(spk_ts, lfp_ts, lfp_fs, jitter_factor=LFP_MATCH_JITTER_FACTOR):
-    """Boolean mask: True where the LFP sample closest in time to the spike is
-    within 1/(jitter_factor*lfp_fs) s of it (i.e. one inter-sample interval, less
-    a margin for timestamp jitter). False for spikes in LFP gaps / outside the
-    recording, which must be skipped."""
-    spk_ts = np.asarray(spk_ts, dtype=np.float64)
-    if len(lfp_ts) == 0 or len(spk_ts) == 0:
-        return np.zeros(len(spk_ts), dtype=bool)
-    idx = np.searchsorted(lfp_ts, spk_ts)
-    left = np.clip(idx - 1, 0, len(lfp_ts) - 1)
-    right = np.clip(idx, 0, len(lfp_ts) - 1)
-    nearest_dt = np.minimum(np.abs(spk_ts - lfp_ts[left]), np.abs(lfp_ts[right] - spk_ts))
-    return nearest_dt <= 1.0 / (jitter_factor * lfp_fs)
-
-
-def assign_spike_phase(spk_ts, lfp_ts, filtered_lfp, lfp_fs):
-    """Theta phase (rad, [0, 2*pi), 0 at an LFP theta peak) at each spike
-    time, by linear interpolation between the consecutive filtered-LFP peaks
-    bracketing the spike (AditiPrecessionUtils.getPhase). NaN for spikes
-    before the first or after the last LFP peak, or with no LFP sample within
-    one inter-sample interval (see spikes_with_lfp_sample)."""
-    phase = np.mod(peak_interp_phase(filtered_lfp, lfp_ts, spk_ts), 2 * np.pi)
-    phase[~spikes_with_lfp_sample(spk_ts, lfp_ts, lfp_fs)] = np.nan
-    return phase
+def assign_spike_phase(spk_ts, lfp_ts, lfp_phase_unwrapped):
+    """Interpolated Generalized Phase (GP) theta phase (rad, wrapped to
+    [0, 2*pi)) at each spike time. Interpolates cos/sin of the unwrapped
+    phase separately (not
+    the angle itself) so the 0/2*pi wraparound doesn't corrupt the
+    interpolated value. Spikes outside the LFP's time range are clamped to
+    the nearest end sample (np.interp's default extrapolation)."""
+    cos_i = np.interp(spk_ts, lfp_ts, np.cos(lfp_phase_unwrapped))
+    sin_i = np.interp(spk_ts, lfp_ts, np.sin(lfp_phase_unwrapped))
+    return np.mod(np.arctan2(sin_i, cos_i), 2 * np.pi)
 
 
 def _burst_groups(spk_ts, phase_deg, max_gap_sec=TMI_BURST_MAX_GAP_SEC,
@@ -1029,18 +1018,15 @@ def shuffle_tmi_significance(spk_ts, phase_deg, observed_tmi, rng, n_shuffles=N_
     return pval, shuffle_tmis
 
 
-def compute_theta_modulation(spk_ts, lfp_ts, filtered_lfp, lfp_fs, rng):
-    """Steps 1 & 2 for one unit: peak-interpolated theta-phase polar-plot
-    statistics (MRL, preferred phase, Rayleigh test) plus the Theta Modulation
-    Index and its shuffle-test significance. Spikes with no defined phase
-    (outside the LFP's first/last peak) are dropped.
+def compute_theta_modulation(spk_ts, lfp_ts, lfp_phase_unwrapped, rng):
+    """Steps 1 & 2 for one unit: Generalized-Phase polar-plot statistics
+    (MRL, preferred phase, Rayleigh test) plus the Theta Modulation Index and its
+    shuffle-test significance.
 
     Returns (metrics dict, phase_deg array of per-spike theta phase, for
     plotting the Step 1 polar histogram).
     """
-    phase_rad = assign_spike_phase(spk_ts, lfp_ts, filtered_lfp, lfp_fs)
-    has_phase = np.isfinite(phase_rad)
-    spk_ts, phase_rad = spk_ts[has_phase], phase_rad[has_phase]
+    phase_rad = assign_spike_phase(spk_ts, lfp_ts, lfp_phase_unwrapped)
     phase_deg = np.degrees(phase_rad)
     n = len(phase_deg)
 
@@ -1074,7 +1060,7 @@ def compute_theta_modulation(spk_ts, lfp_ts, filtered_lfp, lfp_fs, rng):
 def plot_polar_theta(phase_deg, mrl, pref_phase_deg, rayleigh_p, is_sig, title, out_path: Path,
                       bin_size_deg=PHASE_BIN_SIZE_DEG):
     """Step 1 (visualization only): polar histogram of spike counts vs.
-    peak-interpolated theta phase, with the MRL/preferred-phase vector."""
+    Generalized-Phase theta phase, with the MRL/preferred-phase vector."""
     fig = plt.figure(figsize=(5, 5))
     ax = fig.add_subplot(1, 1, 1, projection='polar')
     edges_deg = np.arange(0, 360 + bin_size_deg, bin_size_deg)
@@ -1107,7 +1093,7 @@ def plot_polar_theta(phase_deg, mrl, pref_phase_deg, rayleigh_p, is_sig, title, 
 
 def plot_phase_histogram(phase_deg, is_sig, title, out_path: Path,
                           bin_size_deg=PHASE_BIN_SIZE_DEG):
-    """Linear histogram of spike counts vs. peak-interpolated theta phase
+    """Linear histogram of spike counts vs. Generalized-Phase theta phase
     bin (same phase data and bin width as plot_polar_theta, shown over two
     repeated 360-degree cycles for readability)."""
     edges_deg = np.arange(0, 360 + bin_size_deg, bin_size_deg)
@@ -1130,6 +1116,78 @@ def plot_phase_histogram(phase_deg, is_sig, title, out_path: Path,
     ax.set_title(f'{title}\nn={len(phase_deg)} spikes ({sig_str})', fontsize=9)
 
     fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_gp_instantaneous_frequency(wt_pre, wt_post, filter_band, title, out_path: Path,
+                                     display_margin_hz=10.0, wt_post_interpolated=None):
+    """Debug plot (per LFP file): instantaneous-frequency distribution
+    BEFORE Generalized Phase correction (wt_pre -- generalized_phase_
+    vector's internal raw-Hilbert-phase estimate, used only to detect
+    phase-slip epochs) side by side with AFTER correction (wt_post --
+    gp_instantaneous_frequency's estimate from the phase-slip-stitched
+    analytic signal; reconstructed-adjacent samples excluded, out-of-band
+    samples pchip-repaired -- see its own docstring), on the same figure
+    so the effect of the correction is directly comparable.
+
+    `wt_post_interpolated`, if given, is gp_instantaneous_frequency's own
+    mask of which wt_post samples are pchip-repaired rather than measured.
+    Those are stacked on top of the measured-sample bars in a visually
+    distinct color so the repair is legible in the histogram instead of
+    being silently blended into the same bars as real estimates.
+
+    Both panels share one x-axis window (filter band +/- display_margin_hz)
+    so the two histograms are visually comparable; the fraction of samples
+    landing outside that window is reported in the panel title instead of
+    stretching the axis to chase outliers (a single near-zero-envelope
+    sample can otherwise blow up the raw Hilbert phase to a huge spurious
+    instantaneous frequency and swamp the whole plot).
+    """
+    lo_edge = filter_band[0] - display_margin_hz
+    hi_edge = filter_band[1] + display_margin_hz
+    bins = np.linspace(lo_edge, hi_edge, 200)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True, sharey=True)
+    panels = [(axes[0], wt_pre, 'PRE-GP correction (raw Hilbert phase)', None),
+              (axes[1], wt_post, 'POST-GP correction', wt_post_interpolated)]
+
+    for ax, wt, label, interp_mask in panels:
+        finite = np.isfinite(wt)
+        finite_wt = wt[finite]
+
+        if interp_mask is not None and finite_wt.size:
+            is_interp = interp_mask[finite]
+            measured = finite_wt[~is_interp]
+            repaired = finite_wt[is_interp]
+            ax.hist([measured, repaired], bins=bins, stacked=True,
+                    color=['#4C72B0', '#DD8452'], edgecolor='none',
+                    label=['measured', 'pchip-repaired (out-of-band)'])
+        else:
+            ax.hist(finite_wt, bins=bins, color='#4C72B0', edgecolor='none')
+        ax.axvline(filter_band[0], color='red', linestyle='--', linewidth=1,
+                   label=f'filter band [{filter_band[0]:g}, {filter_band[1]:g}] Hz')
+        ax.axvline(filter_band[1], color='red', linestyle='--', linewidth=1)
+        ax.set_xlabel('Instantaneous frequency (Hz)')
+
+        if finite_wt.size:
+            pctiles = np.percentile(finite_wt, [1, 50, 99])
+            pct_outside = 100.0 * np.mean((finite_wt < lo_edge) | (finite_wt > hi_edge))
+            range_str = (f'true range=[{finite_wt.min():.2f}, {finite_wt.max():.2f}] Hz\n'
+                         f'median={pctiles[1]:.2f} Hz | 1st-99th pct=[{pctiles[0]:.2f}, {pctiles[2]:.2f}] Hz | '
+                         f'{pct_outside:.2f}% outside plotted window')
+            if interp_mask is not None:
+                pct_repaired = 100.0 * np.mean(interp_mask[finite])
+                range_str += f'\n{pct_repaired:.2f}% pchip-repaired'
+        else:
+            range_str = 'no finite instantaneous-frequency samples'
+        ax.set_title(f'{label}\n{range_str}', fontsize=8.5)
+        ax.legend(fontsize=8)
+
+    axes[0].set_ylabel('Sample count')
+    fig.suptitle(title, fontsize=11, fontweight='bold')
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
@@ -1164,18 +1222,10 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
     ax.set_aspect('equal')
 
     ax = axes[1, 0]
-    # background gradient: theta peak (0/360/720 deg) -> trough (180/540 deg), light viridis
-    ph_bg = np.linspace(0, 720, 721)
-    peakness = 0.5 * (1 + np.cos(np.deg2rad(ph_bg)))  # 1 at peak, 0 at trough
-    vir = plt.get_cmap('viridis')(0.15 + 0.8 * peakness)[:, :3]
-    bg_alpha = 0.3  # viridis opacity: lower = lighter/more transparent
-    bg = bg_alpha * vir + (1 - bg_alpha) * 1.0  # blend with white for a lighter hue
-    ax.imshow(bg[:, None, :], origin='lower', aspect='auto', extent=[-1, 1, 0, 720],
-              zorder=0, interpolation='bilinear')
-    pi_dup =np.concatenate([results['spk_pass_index'], results['spk_pass_index']])
+    pi_dup = np.concatenate([results['spk_pass_index'], results['spk_pass_index']])
     phase_dup = np.concatenate([np.rad2deg(np.mod(results['spk_theta_phase'], 2 * np.pi)),
                                  np.rad2deg(np.mod(results['spk_theta_phase'], 2 * np.pi)) + 360])
-    ax.scatter(pi_dup, phase_dup, s=8, alpha=0.6, color='k', zorder=2)
+    ax.scatter(pi_dup, phase_dup, s=8, alpha=0.6)
     s, b = results['s'], results['b']
     if not np.isnan(s):
         xg = np.linspace(-1, 1, 500)
@@ -1187,9 +1237,9 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
     ax.set_ylim(0, 720)
     ax.set_xlabel('Pass index')
     ax.set_ylabel('LFP phase (deg)')
-    ax.set_title(f'rho={results["rho"]:.2f}  p={results["p"]:.3g}  '
+    ax.set_title(f'rho={results["rho"]:.2f}  p_shuffle={results["p_rho_shuffle"]:.3g}\n'
                  f'slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
-                 f'class={results["precession_class"]}', fontsize=9)
+                 f'class={results["precession_class"]}')
 
     ax = axes[1, 1]
     ph_centers = np.rad2deg(0.5 * (results['ph_edges'][:-1] + results['ph_edges'][1:]))
@@ -1204,18 +1254,13 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
     ax.set_title('Density map')
 
     axes[1, 2].axis('off')
-    text_lines = [
-        f"n_spikes = {results['n_spikes']}",
-        '-- Kempter (circular-linear, asymptotic z-test) --',
-        f"rho = {results['rho']:.3f}",
-        f"p (asymptotic) = {results['p']:.4g}",
-        f"slope = {results['slope_deg_per_pass']:.2f} deg/pass",
-        f"class = {results['precession_class']}",
-    ]
-    for i, line in enumerate(text_lines):
-        is_class_line = line.startswith('class = ')
-        axes[1, 2].text(0.0, 0.95 - i * 0.08, line, fontsize=10,
-                         fontweight='bold' if is_class_line else 'normal')
+    axes[1, 2].text(0.0, 0.9, f"n_spikes = {results['n_spikes']}", fontsize=11)
+    axes[1, 2].text(0.0, 0.75, f"rho = {results['rho']:.3f}", fontsize=11)
+    axes[1, 2].text(0.0, 0.6, f"p (asymptotic) = {results['p']:.4g}", fontsize=11)
+    axes[1, 2].text(0.0, 0.45, f"slope = {results['slope_deg_per_pass']:.2f} deg/pass", fontsize=11)
+    axes[1, 2].text(0.0, 0.3, f"p_rho_shuffle = {results['p_rho_shuffle']:.4g}", fontsize=11)
+    axes[1, 2].text(0.0, 0.15, f"p_slope_shuffle = {results['p_slope_shuffle']:.4g}", fontsize=11)
+    axes[1, 2].text(0.0, 0.0, f"class = {results['precession_class']}", fontsize=11, fontweight='bold')
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
@@ -1251,16 +1296,6 @@ def match_ncs_to_ntt(ntt_path: Path, ncs_files: list[Path]) -> Path:
     raise FileNotFoundError(
         f'No .ncs file matching {ntt_path.name} (tetrode number {tt_num}) found among: '
         f'{[p.name for p in ncs_files]}')
-
-
-def detect_animal_id(folder_path: Path) -> str:
-    """Animal ID: the first path component under ROOT_FOLDER, per the layout
-    ROOT_FOLDER/<animal>/<arena>/DayN/<session>. Falls back to the folder four
-    levels up if folder_path isn't under ROOT_FOLDER."""
-    try:
-        return folder_path.relative_to(ROOT_FOLDER).parts[0]
-    except (ValueError, IndexError):
-        return folder_path.parts[-4] if len(folder_path.parts) >= 4 else 'UnknownAnimal'
 
 
 def detect_arena(folder_path: Path) -> str | None:
@@ -1385,7 +1420,7 @@ def plot_arena_comparison(df_sig: pd.DataFrame, pairwise_df: pd.DataFrame, out_p
 
 
 def process_session(data_folder: Path, rng) -> list[dict]:
-    output_dir = data_folder / 'ThetaMod_PhasePrecession_LFPshuffle'
+    output_dir = data_folder / 'ThetaMod_PhasePrecession'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncs_files = sorted(data_folder.glob('*.ncs'), key=_natural_key)
@@ -1401,11 +1436,11 @@ def process_session(data_folder: Path, rng) -> list[dict]:
         print(f'  {exc} -- Step 3 (phase precession) will be skipped for this session.')
 
     session_label = '_'.join(data_folder.parts[-3:])
-    animal_id = detect_animal_id(data_folder)
     ntt_files = sorted(data_folder.glob('*.ntt'), key=_natural_key)
 
-    # Cache per matched .ncs file (channel loading, theta filtering, ACG epochs)
-    # so tetrodes that happen to share one don't reload/refilter it more than once.
+    # Cache per matched .ncs file (channel-loading, GP filtering, and the
+    # per-LFP-file instantaneous-frequency debug plot) so tetrodes that
+    # happen to share one don't reload/refilter/re-plot it more than once.
     lfp_cache: dict[Path, dict] = {}
 
     rows = []
@@ -1413,12 +1448,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
         print(f'Processing: {ntt_path.name}')
 
         try:
-            if MATCH_SPIKE_LFP_FILE:
-                theta_ncs = match_ncs_to_ntt(ntt_path, ncs_files)
-            elif ncs_files:
-                theta_ncs = ncs_files[0]
-            else:
-                raise FileNotFoundError(f'No .ncs files found in {data_folder}')
+            theta_ncs = match_ncs_to_ntt(ntt_path, ncs_files)
         except FileNotFoundError as exc:
             print(f'  {exc} -- skipping this tetrode.')
             continue
@@ -1427,63 +1457,52 @@ def process_session(data_folder: Path, rng) -> list[dict]:
             print(f'  Using LFP file: {theta_ncs.name}')
             lfp_sig, lfp_ts, lfp_fs = load_ncs(theta_ncs)
             filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
+            xgp_lfp, lfp_inst_freq_pre, lfp_gp_idx = generalized_phase_vector(
+                filtered_lfp, lfp_fs, LFP_FILTER_BAND[0])
+            lfp_inst_freq_post, lfp_inst_freq_post_interp = gp_instantaneous_frequency(
+                xgp_lfp, lfp_gp_idx, lfp_fs, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1])
+            lfp_phase_unwrapped = np.unwrap(np.angle(xgp_lfp))
+
+            freq_plot_path = output_dir / f'{theta_ncs.stem}_GPA_InstFreqRange.png'
+            plot_gp_instantaneous_frequency(lfp_inst_freq_pre, lfp_inst_freq_post, LFP_FILTER_BAND,
+                                             theta_ncs.name, freq_plot_path,
+                                             wt_post_interpolated=lfp_inst_freq_post_interp)
+            print(f'  GPA instantaneous-frequency range plot saved to {freq_plot_path}')
 
             t_start = t_stop = None
             if pos_ts is not None:
                 t_start = max(pos_ts.min(), lfp_ts.min())
                 t_stop = min(pos_ts.max(), lfp_ts.max())
 
-            acg_epoch_ok = None
-            lfp_theta_mask = None
-            if USE_ACG_THETA_EPOCHS:
-                acg_epoch_ok, acg_ed_min = acg_theta_epoch_mask(lfp_sig, lfp_fs)
-                lfp_theta_mask = times_in_ok_epochs(lfp_ts, lfp_ts[0], acg_epoch_ok)
-                n_fit = int(np.isfinite(acg_ed_min).sum())
-                print(f'  ACG theta-positive epochs (ED_min < {ACG_ED_MIN_THRESH:g}): '
-                      f'{int(acg_epoch_ok.sum())}/{len(acg_epoch_ok)} '
-                      f'({n_fit} passed delta/theta + artifact screening)')
-
             lfp_cache[theta_ncs] = dict(lfp_sig=lfp_sig, lfp_ts=lfp_ts, lfp_fs=lfp_fs,
-                                         filtered_lfp=filtered_lfp,
-                                         t_start=t_start, t_stop=t_stop,
-                                         acg_epoch_ok=acg_epoch_ok, lfp_theta_mask=lfp_theta_mask)
+                                         lfp_phase_unwrapped=lfp_phase_unwrapped,
+                                         t_start=t_start, t_stop=t_stop)
 
         lfp_data = lfp_cache[theta_ncs]
         lfp_sig, lfp_ts, lfp_fs = lfp_data['lfp_sig'], lfp_data['lfp_ts'], lfp_data['lfp_fs']
-        filtered_lfp = lfp_data['filtered_lfp']
+        lfp_phase_unwrapped = lfp_data['lfp_phase_unwrapped']
         t_start, t_stop = lfp_data['t_start'], lfp_data['t_stop']
-        acg_epoch_ok, lfp_theta_mask = lfp_data['acg_epoch_ok'], lfp_data['lfp_theta_mask']
 
         units = load_ntt_spike_times(ntt_path)
         for cell_number, spk_ts in units.items():
             unit_label = f'{ntt_path.stem}_cell{cell_number}' if len(units) > 1 else ntt_path.stem
-            plot_label = f'{animal_id} | {unit_label}'
-            file_prefix = f'{animal_id}_{unit_label}'
-            row = dict(Animal=animal_id, Session=session_label, FolderPath=str(data_folder), Unit=unit_label,
+            row = dict(Session=session_label, FolderPath=str(data_folder), Unit=unit_label,
                        ntt_file=ntt_path.name, lfp_file=theta_ncs.name, cell_number=cell_number,
                        n_spikes_total=len(spk_ts))
 
-            # ---- ACG theta-positive spike selection (Steps 1-3 use only these spikes) ----
-            spk_ts_all = spk_ts
-            if USE_ACG_THETA_EPOCHS:
-                spk_ts = spk_ts_all[times_in_ok_epochs(spk_ts_all, lfp_ts[0], acg_epoch_ok)]
-                row['n_spikes_ACGtheta'] = len(spk_ts)
-                row['ACGtheta_epoch_frac'] = (float(acg_epoch_ok.mean()) if len(acg_epoch_ok)
-                                               else np.nan)
-
             # ---- Steps 1 & 2: theta phase-locking polar plot + TMI shuffle test ----
-            metrics, phase_deg = compute_theta_modulation(spk_ts, lfp_ts, filtered_lfp, lfp_fs, rng)
+            metrics, phase_deg = compute_theta_modulation(spk_ts, lfp_ts, lfp_phase_unwrapped, rng)
             row.update(metrics)
 
             if metrics['n_spikes_theta'] >= MIN_SPIKES_FOR_TMI:
-                polar_path = output_dir / f'{file_prefix}_PolarPlot.png'
+                polar_path = output_dir / f'{unit_label}_PolarPlot.png'
                 plot_polar_theta(phase_deg, metrics['MRL'], metrics['PreferredPhase_deg'],
                                   metrics['Rayleigh_p'], metrics['SignificantThetaModulation'],
-                                  plot_label, polar_path)
+                                  unit_label, polar_path)
 
-                hist_path = output_dir / f'{file_prefix}_PhaseHistogram.png'
+                hist_path = output_dir / f'{unit_label}_PhaseHistogram.png'
                 plot_phase_histogram(phase_deg, metrics['SignificantThetaModulation'],
-                                      plot_label, hist_path)
+                                      unit_label, hist_path)
                 print(f'  {unit_label}: TMI={metrics["TMI"]:.3f} '
                       f'(p={metrics["TMI_shuffle_p"]:.3g}, '
                       f'{"theta-modulated" if metrics["TMI_Significant"] else "not theta-modulated"})')
@@ -1499,10 +1518,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
             elif pos_ts is None:
                 row['PrecessionSkippedReason'] = 'no tracking file found for this session'
             else:
-                # spk_ts is already ACG-theta-filtered (if enabled): these are the
-                # spikes used for phase; all spikes in the window define the field.
                 spk_ts_overlap = spk_ts[(spk_ts >= t_start) & (spk_ts <= t_stop)]
-                spk_ts_all_overlap = spk_ts_all[(spk_ts_all >= t_start) & (spk_ts_all <= t_stop)]
                 if len(spk_ts_overlap) < MIN_SPIKES_FOR_FIT:
                     row['PrecessionSkippedReason'] = (
                         f'only {len(spk_ts_overlap)} spikes in tracking/LFP overlap window '
@@ -1510,28 +1526,19 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                 else:
                     try:
                         results = compute_pass_index(
-                            pos_ts, pos_xy, spk_ts_all_overlap, lfp_ts, lfp_sig, lfp_fs, rng,
+                            pos_ts, pos_xy, spk_ts_overlap, lfp_ts, lfp_sig, lfp_fs, rng,
                             method=METHOD, binside=BINSIDE, smth_width=SMTH_WIDTH,
                             filter_band=FILTER_BAND, lfp_filter_band=LFP_FILTER_BAND,
                             slope_bnds=SLOPE_BNDS,
-                            phase_spk_ts=spk_ts_overlap,
-                            lfp_theta_mask=lfp_theta_mask,
                         )
-                        png_path = output_dir / f'{file_prefix}_PassIndex.png'
-                        plot_unit_summary(pos_xy, results, plot_label, png_path)
-                        # Also copy the plot into ROOT_FOLDER/<class folder> (next to the Excel file)
-                        if results['fit_too_steep']:
-                            class_dir_name = MULTILINES_FOLDER
-                        else:
-                            class_dir_name = CLASS_PLOT_FOLDERS.get(results['precession_class'])
-                        if class_dir_name:
-                            class_dir = ROOT_FOLDER / class_dir_name
-                            class_dir.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(png_path, class_dir / f'{animal_id}_{session_label}_{unit_label}_PassIndex.png')
+                        png_path = output_dir / f'{unit_label}_PassIndex.png'
+                        plot_unit_summary(pos_xy, results, unit_label, png_path)
                         row['PrecessionTested'] = True
                         row.update({
                             'PassIndex_n_spikes': results['n_spikes'], 'rho': results['rho'],
                             'precession_p': results['p'],
+                            'p_rho_shuffle': results['p_rho_shuffle'],
+                            'p_slope_shuffle': results['p_slope_shuffle'],
                             'slope_deg_per_pass': results['slope_deg_per_pass'],
                             'r_squared': results['r_squared'],
                             'phase_range_deg': results['phase_range_deg'],
@@ -1539,11 +1546,9 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                             'is_recessing': results['is_recessing'],
                             'is_phase_locked': results['is_phase_locked'],
                             'PrecessionClass': results['precession_class'],
-                            'n_fit_lines': results['n_fit_lines'],
-                            'MultiLinesFit': results['fit_too_steep'],
                         })
                         print(f'  {unit_label}: PRECESSION rho={results["rho"]:.3f}  '
-                              f'p={results["p"]:.3g}  '
+                              f'p_rho_shuffle={results["p_rho_shuffle"]:.3g}  '
                               f'slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
                               f'class={results["precession_class"]}')
                     except Exception as exc:
@@ -1562,7 +1567,8 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     (number, percentage) items: total cells; SignificantThetaModulation;
     TMI_Significant (theta-modulated); PrecessionTested; and the three
     PrecessionClass outcomes (phase_precessing / phase_recessing /
-    phase_locked, from the asymptotic z-test p in kempter_lincirc) counted two ways -- out of all
+    phase_locked, from the circular-shuffle test in
+    shuffle_precession_significance) counted two ways -- out of all
     theta-modulated (TMI_Significant) cells, and out of only the subset that
     was actually precession-tested (some theta-modulated cells are skipped,
     e.g. no tracking file or too few overlapping spikes).
@@ -1607,45 +1613,6 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=['Metric', 'Count', 'Denominator', 'DenominatorLabel', 'Percent'])
 
 
-def save_metadata_csv(csv_path: Path) -> Path:
-    """Write the code name and every hard-coded analysis setting to a
-    Parameter,Value CSV (next to the results Excel file).
-
-    The configuration constants (the ALL_CAPS assignments between the imports
-    and the Neuralynx I/O section) are collected automatically from the module
-    namespace, so newly added settings are recorded without editing this
-    function; the constants hard-coded inside functions are listed explicitly.
-    """
-    code_path = Path(__file__).resolve()
-    rows = [
-        ('CodeName', code_path.name),
-        ('CodePath', str(code_path)),
-        ('RunTimestamp', pd.Timestamp.now().isoformat(timespec='seconds')),
-    ]
-    module_globals = globals()
-    config_names = [n for n in module_globals
-                    if n.isupper() and not n.startswith('_')
-                    and n not in ('ARENA_COMPARISON_METRICS', 'TMI_COMPARISON_METRICS', 'ARENA_COLORS')]
-    rows += [(n, repr(module_globals[n]) if not isinstance(module_globals[n], (str, Path))
-              else str(module_globals[n])) for n in config_names]
-    # constants hard-coded inside functions
-    rows += [
-        ('PASS_DENSITY_PASS_INDEX_BINS', 40),                 # compute_pass_index: linspace(-1, 1, 41)
-        ('PASS_DENSITY_PHASE_BINS', 100),                     # compute_pass_index: linspace(0, 2*pi, 101)
-        ('PASS_DENSITY_GAUSS_SIGMA_BINS', 1.5),               # compute_pass_index density smoothing
-        ('PASS_DENSITY_GAUSS_TRUNCATE', 2.0),
-        ('RATEMAP_GAUSS_TRUNCATE', 3.0),                      # rate-map smoothing
-        ('BANDPASS_FILTER_ORDER', 4),                         # bandpass_filter default
-        ('TMI_NUM_CYCLES', 5),                                # calc_tmi default
-        ('TMI_HIST_SMOOTH_KERNEL_N', 7),                      # calc_tmi histogram smoothing
-        ('TMI_HIST_SMOOTH_SIGMA', 0.5),
-        ('ACG_WELCH_WINDOW', 'hann'),
-        ('PRECESSION_SIGNIFICANCE_TEST', 'Kempter et al. (2012) asymptotic z-test, p < ALPHA'),
-    ]
-    pd.DataFrame(rows, columns=['Parameter', 'Value']).to_csv(csv_path, index=False)
-    return csv_path
-
-
 def main():
     if 360 % PHASE_BIN_SIZE_DEG != 0:
         raise ValueError('PHASE_BIN_SIZE_DEG must divide 360 evenly.')
@@ -1669,8 +1636,9 @@ def main():
                'n_spikes_theta', 'MRL', 'PreferredPhase_deg', 'Rayleigh_p',
                'SignificantThetaModulation', 'PhasePeak_deg', 'PhaseValley_deg', 'TMI',
                'TMI_shuffle_p', 'TMI_Significant', 'PrecessionTested', 'PassIndex_n_spikes',
-               'rho', 'r_squared', 'precession_p', 'slope_deg_per_pass', 'phase_range_deg',
-               'is_precessing', 'is_recessing', 'is_phase_locked', 'PrecessionClass', 'n_fit_lines',
+               'rho', 'r_squared', 'precession_p', 'p_rho_shuffle', 'p_slope_shuffle',
+               'slope_deg_per_pass', 'phase_range_deg',
+               'is_precessing', 'is_recessing', 'is_phase_locked', 'PrecessionClass',
                'PrecessionSkippedReason']
     df = pd.DataFrame(all_rows, columns=columns)
     summary_df = build_summary_stats(df)
@@ -1721,9 +1689,6 @@ def main():
         if not tmi_pairwise_df.empty:
             tmi_pairwise_df.to_excel(writer, sheet_name='ArenaComparison_TMI_Pairwise', index=False)
     print(f'\nDone. {len(df)} unit(s) processed. Summary saved to {excel_path}')
-
-    metadata_path = save_metadata_csv(excel_path.with_name(excel_path.stem + '_metadata.csv'))
-    print(f'Run metadata saved to {metadata_path}')
 
 
 if __name__ == '__main__':

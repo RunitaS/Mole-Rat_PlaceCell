@@ -60,10 +60,18 @@ SHUFFLING_SUBDIR = 'shuffling_Sir_Spar_AdptBin_Corrected'
 RATEMAPS_SUBDIR  = 'ratemaps_Sir_Spar_AdptBin_Corrected'
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
-# RAW (unsmoothed) ratemap : SIR, sparsity, peak_fr, mean_fr, and the SIR
-#                            bootstrap shuffles.
-# SMOOTHED ratemap         : coherence, split-half stability, the coherence
-#                            bootstrap shuffles, and place-field extraction.
+# OCCUPANCY-WEIGHTED ratemap : SIR, sparsity, and the SIR bootstrap shuffles.
+#                              smooth(spikes) / smooth(occupancy), see
+#                              _occ_weighted_smooth. Their pi weights are the
+#                              smoothed occupancy too; bins still enter the
+#                              sums by RAW occupancy (USE_SI_MIN_OCC).
+# RAW (unsmoothed) ratemap   : peak_fr, mean_fr.
+# SMOOTHED ratemap           : coherence, split-half stability, the coherence
+#                              bootstrap shuffles, and place-field extraction.
+#
+# USE_OCC_WEIGHTED_SI = False reverts SIR and sparsity (and their shuffles) to
+# the RAW ratemap, for comparison.
+USE_OCC_WEIGHTED_SI = True
 #
 # USE_SI_MIN_OCC = True restricts the SIR and sparsity sums to valid bins with
 # >= SI_MIN_OCC_S of occupancy (applied identically to the real data and every
@@ -299,7 +307,7 @@ _gpu_semaphore = threading.Semaphore(2)
 # bin size (target_bin_cm) this script is run with.
 GAUSSIAN_SIGMA_CM = 3 #1.5 * 2.1
 
-# (SIR / sparsity bin settings USE_SI_MIN_OCC / SI_MIN_OCC_S, and all
+# (SIR / sparsity settings USE_OCC_WEIGHTED_SI / USE_SI_MIN_OCC / SI_MIN_OCC_S, and all
 #  place-cell classification / place-field settings, are set at the top of the file)
 
 # Names of every hardcoded analysis setting above, in the order they should
@@ -320,7 +328,7 @@ RUN_CONFIG_VARS = [
     'MAX_GPU_UTIL_PCT', 'MAX_WORKERS',
     'COORD_UNITS',
     'GAUSSIAN_SIGMA_CM',
-    'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
+    'USE_OCC_WEIGHTED_SI', 'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
     'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
     'PLACE_FIELDS_MAX_TOTAL_AREA_PCT',
     'PLACE_CELL_MIN_SPIKES', 'PLACE_CELL_MIN_PEAK_FR', 'PLACE_CELL_MAX_PEAK_FR',
@@ -457,25 +465,63 @@ def _gaussian_smooth(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) 
     return smoothed
 
 
+def _occ_weighted_smooth(spike_map: np.ndarray, occ_map: np.ndarray,
+                         valid_mask: np.ndarray, bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Occupancy-weighted smoothed ratemap: smooth(spikes) / smooth(occupancy),
+    both restricted to valid bins. Each bin's contribution to its neighbours is
+    weighted by the time spent there, so low-occupancy bins cannot dominate.
+
+    Returns (rate, occ_smooth); occ_smooth is the smoothed occupancy map (s),
+    zeroed outside valid bins.
+    """
+    kernel = _gaussian_kernel(GAUSSIAN_SIGMA_CM / bin_cm)
+
+    spk_in = np.where(valid_mask, spike_map, 0.0)
+    occ_in = np.where(valid_mask, occ_map,   0.0)
+
+    spk_smooth, occ_smooth = _convolve_pair(spk_in, occ_in, kernel)
+
+    rate = np.zeros_like(spk_smooth)
+    ok = valid_mask & (occ_smooth > 0)
+    rate[ok] = spk_smooth[ok] / occ_smooth[ok]
+    occ_smooth[~valid_mask] = 0.0
+    return rate, occ_smooth
+
+
 def _si_bin_mask(occ_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-    """Bins entering the SIR / sparsity sums (see USE_SI_MIN_OCC)."""
+    """Bins entering the SIR / sparsity sums (see USE_SI_MIN_OCC). Always
+    selected on RAW occupancy, since SI_MIN_OCC_S is a raw-time threshold."""
     if USE_SI_MIN_OCC:
         return valid_mask & (occ_map >= SI_MIN_OCC_S)
     return valid_mask
 
 
-def _compute_sir(occ_map: np.ndarray, fr_raw: np.ndarray, valid_mask: np.ndarray) -> float:
-    """Skaggs spatial information (bits/spike): Σ pi (ri/r̄) log2(ri/r̄), on
-    the RAW (unsmoothed) ratemap. pi is occupancy normalised over the bins in
-    the sum (see _si_bin_mask). Shared by the real data and the bootstrap
-    shuffles.
+def _si_ratemap(spike_map: np.ndarray, occ_map: np.ndarray, fr_raw: np.ndarray,
+                valid_mask: np.ndarray, bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
+    """Ratemap and occupancy the SIR / sparsity sums are taken over (see
+    USE_OCC_WEIGHTED_SI). Returns (rate_map, pi_occ): the occupancy-weighted
+    ratemap with the smoothed occupancy as pi weights, or the RAW ratemap with
+    the raw occupancy."""
+    if USE_OCC_WEIGHTED_SI:
+        return _occ_weighted_smooth(spike_map, occ_map, valid_mask, bin_cm)
+    return fr_raw, occ_map
+
+
+def _compute_sir(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndarray,
+                 valid_mask: np.ndarray) -> float:
+    """Skaggs spatial information (bits/spike): Σ pi (ri/r̄) log2(ri/r̄), with
+    ri from `rate_map` and pi from `pi_occ` normalised over the bins in the
+    sum (see _si_ratemap). `occ_map` (raw occupancy) only selects which bins
+    enter the sum (see _si_bin_mask). Shared by the real data and the
+    bootstrap shuffles.
     """
     si_mask = _si_bin_mask(occ_map, valid_mask)
-    if not si_mask.any():
+    if not si_mask.any() or pi_occ[si_mask].sum() <= 0:
         return 0.0
 
-    pi_flat = occ_map[si_mask] / occ_map[si_mask].sum()
-    ri_flat = fr_raw[si_mask]
+    pi_flat = pi_occ[si_mask] / pi_occ[si_mask].sum()
+    ri_flat = rate_map[si_mask]
     r_mean  = float(np.sum(pi_flat * ri_flat))
     if r_mean <= 0:
         return 0.0
@@ -485,18 +531,18 @@ def _compute_sir(occ_map: np.ndarray, fr_raw: np.ndarray, valid_mask: np.ndarray
     return float(np.sum(pi_flat[nonzero] * ratio * np.log2(ratio)))
 
 
-def _compute_sparsity(occ_map: np.ndarray, fr_raw: np.ndarray,
+def _compute_sparsity(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndarray,
                       valid_mask: np.ndarray) -> float:
-    """Skaggs sparsity: (Σ pi ri)² / Σ pi ri² on the RAW (unsmoothed)
-    ratemap, over the same bins as the SIR sum (see _si_bin_mask). pi is
-    occupancy normalised over the bins in the sum.
+    """Skaggs sparsity: (Σ pi ri)² / Σ pi ri², with ri from `rate_map` and pi
+    from `pi_occ` normalised over the bins in the sum (see _si_ratemap), over
+    the same bins as the SIR sum (see _si_bin_mask).
     """
     sp_mask = _si_bin_mask(occ_map, valid_mask)
-    if not sp_mask.any():
+    if not sp_mask.any() or pi_occ[sp_mask].sum() <= 0:
         return 0.0
 
-    pi_flat  = occ_map[sp_mask] / occ_map[sp_mask].sum()
-    ri_flat  = fr_raw[sp_mask]
+    pi_flat  = pi_occ[sp_mask] / pi_occ[sp_mask].sum()
+    ri_flat  = rate_map[sp_mask]
     spar_num = float(np.sum(pi_flat * ri_flat))
     spar_den = float(np.sum(pi_flat * ri_flat ** 2))
     return float((spar_num ** 2) / spar_den) if spar_den > 0 else 0.0
@@ -1205,9 +1251,10 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
 
     Both metrics are derived from the single shuffled rate map built here so
     that each bootstrap iteration only needs one shuffled spike train: SIR is
-    computed on the RAW shuffled ratemap (matching the real-data SIR), while
-    coherence is computed on the Gaussian-SMOOTHED shuffled ratemap (matching
-    the real-data coherence).
+    computed on the shuffled occupancy-weighted ratemap (or RAW, per
+    USE_OCC_WEIGHTED_SI -- matching the real-data SIR), while coherence is
+    computed on the Gaussian-SMOOTHED shuffled ratemap (matching the real-data
+    coherence).
     """
     n_frames   = len(beh_bx)
     shuf_frame = (spike_frame_indices + rnd) % n_frames
@@ -1218,7 +1265,8 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     fr_raw = np.zeros_like(spike_map)
     np.divide(spike_map, occ_map, out=fr_raw, where=valid_mask)
 
-    sir = _compute_sir(occ_map, fr_raw, valid_mask)
+    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, valid_mask, bin_cm)
+    sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
     fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
     coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
@@ -1966,7 +2014,7 @@ def compute_metrics(csv_path: str, ntt_path: str,
                  'peak_fr': 0.0, 'mean_fr': 0.0, 'sir': 0.0,
                  'sparsity': 0.0, 'coherence': float('nan')}, ctx)
 
-    # Peak / mean firing rate, SIR, sparsity: RAW (unsmoothed) ratemap.
+    # Peak / mean firing rate: RAW (unsmoothed) ratemap.
     total_occ_s = occ_map[valid_mask].sum()
     pi_flat     = occ_map[valid_mask] / total_occ_s
     ri_flat     = fr_raw[valid_mask]
@@ -1975,10 +2023,13 @@ def compute_metrics(csv_path: str, ntt_path: str,
     peak_fr = float(fr_raw[valid_mask].max())
     mean_fr = r_mean
 
-    sir = _compute_sir(occ_map, fr_raw, valid_mask)
+    # SIR, sparsity: occupancy-weighted ratemap (or RAW, see USE_OCC_WEIGHTED_SI).
+    # pi weights: smoothed occupancy (or raw, matching the ratemap).
+    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, valid_mask, target_bin_cm)
+    sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
-    # Sparsity = (Σ pi ri)² / Σ pi ri²   (Skaggs et al. 1996), same bins as SIR
-    sparsity = _compute_sparsity(occ_map, fr_raw, valid_mask)
+    # Sparsity = (Σ pi ri)² / Σ pi ri²   (Skaggs et al. 1996), same map, pi and bins as SIR
+    sparsity = _compute_sparsity(occ_map, si_occ, si_rate, valid_mask)
 
     # Spatial coherence: SMOOTHED map vs 8-neighbour mean (Fisher Z)
     coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)

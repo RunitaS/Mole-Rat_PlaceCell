@@ -1,18 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-Mean Rate Map Analysis (after Muessig et al.) + KDE + Duong (2013) local test
+Mean Rate Map Analysis (after Muessig et al.) + KDE + METHOD 2 bin-shuffle bootstrap of the
+Duong (2013) local test
 
 PIPELINE (run_full_pipeline), per arena:
   1. MEAN MAPS -- the pooled maps of the recorded place cells (described below): overall mean
      field index, field-only mean field index and peak proportion.
   2. KDE -- a 2D Gaussian KDE (scipy gaussian_kde, Scott's rule, edge-corrected over the bins the
      cells validly sampled) of each of the three pooled maps.
-  3. DUONG TEST -- local significant differences between each real KDE and a null KDE (Duong 2013,
-     "Local significant differences from nonparametric two-sample tests", J. Nonparametric
-     Statistics 25:3, 635-645); see the DUONG section below. No null model is built in this
-     script, so the test is skipped until null KDEs are supplied to run_duong_tests. Clusters
-     where the real density is significantly above the null are drawn in GREEN_ABOVE, below in
-     MAGENTA_BELOW.
+  3. BIN-SHUFFLE BOOTSTRAP, METHOD 2 (run_shuffle_duong; described in detail directly below) --
+     each pooled map's bins shuffled N_SHUFFLE times, every shuffled map fitted with the same KDE
+     and compared with the real KDE by the Duong test (Duong 2013, "Local significant differences
+     from nonparametric two-sample tests", J. Nonparametric Statistics 25:3, 635-645; see the
+     DUONG section below). Regions where the real density is consistently significantly above
+     the shuffles are outlined in GREEN_ABOVE, consistently below in MAGENTA_BELOW.
+
+METHOD 2 -- BIN-SHUFFLE BOOTSTRAP OF THE DUONG TEST (stage 3), per map kind x arena:
+  Step 1 -- shuffle (shuffle_map_values): the values the KDE is fitted to (the pooled map inside
+     the KDE domain = the bins the cells validly sampled, unsampled field-only / peak bins = 0) are
+     randomly permuted across the domain bins. The value distribution and the domain are kept;
+     where each value sits is randomised.
+  Step 2 -- the shuffled map is fitted with exactly the real KDE (kde_density_map: Scott's rule,
+     same edge correction, same domain).
+  Step 3 -- Duong test, real KDE vs shuffled KDE (duong_compare_arena, Hochberg at DUONG_ALPHA):
+     every evaluation bin is significantly ABOVE, significantly BELOW or not different.
+  Step 4 -- repeat N_SHUFFLE (1000) times. Per bin: f_above = fraction of shuffles in which it was
+     significantly above, f_below likewise.
+  Step 5 -- consistency: a bin is consistently ABOVE (green) if f_above >= SHUFFLE_CONSISTENCY,
+     consistently BELOW (magenta) if f_below >= SHUFFLE_CONSISTENCY. The default 0.95 is "more than
+     95 % of the shuffles", per direction (two directions -> 2.5 % / 97.5 % if you read it as a
+     95 % interval of the sign that excludes "not different": set 0.975 for that stricter rule).
+     Consistent bins are split into 8-connected clusters (wrapping on the circular track).
+  Also reported: a pointwise percentile envelope, i.e. bins where the real (renormalised) density
+     lies above the 97.5th or below the 2.5th percentile of the N_SHUFFLE shuffled densities.
+What this null tests: shuffling removes all spatial structure but not occupancy -- the shuffled
+map is uniform in expectation over the sampled bins, whatever the animal's dwell time there. It
+therefore asks "is there more / less mass here than a spatially random map with the same values
+would give?" (clustering), not "more than occupancy would give" (see Method 1 for that).
 
 Fig S1H: overall mean field-index map per arena, fine spatial bins (2 x 2 cm; genuinely 2D for
 every arena, including the linear track's length x width). Each cell's map is first normalized
@@ -77,13 +101,16 @@ Outputs (OUTPUT_DIR/AllArenas):
                  AllArenas_Summary.xlsx
   KDE            KDE_<stem>.png / .npz, stem = FigS1H_MeanFieldIndex, FieldOnly_MeanFieldIndex,
                  PeakProportion_Map
-  Duong test     DuongTest_<kind>.png, DuongTest_Clusters.xlsx, DuongTest_Results.npz
-                 (only when null KDEs are supplied)
+  Method 2       ShuffleDuong_<kind>.png (rows = arenas; real KDE, one shuffled map, mean shuffled
+                 KDE, signed consistency f_above - f_below, consistent clusters, pointwise
+                 envelope), ShuffleDuong_Clusters.xlsx (sheets Tests, Clusters),
+                 ShuffleDuong_Results.npz
 """
 
 import os
 import hashlib
 import random
+import time
 import concurrent.futures
 import warnings
 
@@ -106,7 +133,7 @@ from matplotlib.lines import Line2D
 # ============================================================================
 
 ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected'
-OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_ObsNullRealFIelds')
+OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_M2_BinShuffle')
 
 USE_BIN_COVERAGE_CRITERION = False
 COVERAGE_FRACTION = 0.01
@@ -188,7 +215,14 @@ KDE_EDGE_CORRECTION = True
 
 COORD_UNITS = 'cm'
 
-# --- Duong (2013) local test, real KDE vs null KDE (stage 3) ---
+# --- Method 2 bin-shuffle bootstrap of the Duong test (stage 3; see the header) ---
+N_SHUFFLE           = 1000
+SHUFFLE_CONSISTENCY = 0.95     # fraction of shuffles a bin must be significant in, per direction
+SHUFFLE_ENVELOPE    = (2.5, 97.5)   # percentiles of the pointwise shuffle envelope
+SHUFFLE_SEED        = 20261006
+SHUFFLE_MAX_WORKERS = 4        # worker processes over the (map kind, arena) jobs (1 = serial)
+
+# --- Duong (2013) local test, real KDE vs null KDE ---
 DUONG_ALPHA            = 0.05     # family-wise level per (map kind, arena), Hochberg step-up
 DUONG_SAMPLE_SIZE_MODE = 'neff'   # 'neff' or 'cells' (see the DUONG section)
 DUONG_RENORMALISE_ON_COMMON_DOMAIN = True
@@ -1116,7 +1150,7 @@ def arena_kde(handler, results: list, map_kind: str) -> dict | None:
 
 
 # ============================================================================
-# STAGE 3 -- Duong (2013) local significant differences, real KDE vs null KDE
+# Duong (2013) local significant differences, real KDE vs null KDE (used by stage 3)
 # ============================================================================
 #
 # Per map kind x arena:
@@ -1225,15 +1259,93 @@ def duong_compare_arena(handler, real_kde: dict, null_kde: dict, n_real: float,
     return out
 
 
-def duong_cluster_rows(kind: str, arena: str, handler, res: dict) -> list:
+# ============================================================================
+# STAGE 3 -- METHOD 2 bin-shuffle bootstrap of the Duong test (see the header)
+# ============================================================================
+
+def shuffle_map_values(values: np.ndarray, domain: np.ndarray, rng) -> np.ndarray:
+    """Step 1. The values the KDE is fitted to (NaN -> 0 inside the domain) randomly permuted
+    across the domain bins."""
+    out = np.where(domain & np.isfinite(values), values, 0.0)
+    idx = np.flatnonzero(domain)
+    out[idx] = out[idx][rng.permutation(len(idx))]
+    return out
+
+
+def shuffle_duong_job(handler, values: np.ndarray, domain: np.ndarray, values_are_mass: bool,
+                      real_kde: dict, n_cells: float, seed, n_iter: int) -> dict:
+    """Steps 1-4 for one (map kind, arena): n_iter shuffled maps, their KDEs and their Duong tests
+    against the real KDE. Per bin: number of shuffles it was significantly above / below / in the
+    common domain, plus every shuffle's renormalised density and signed z (float32)."""
+    rng = np.random.default_rng(seed)
+    n_bins = handler.n_bins
+    n_above = np.zeros(n_bins, dtype=np.int64)
+    n_below = np.zeros(n_bins, dtype=np.int64)
+    n_common = np.zeros(n_bins, dtype=np.int64)
+    f_shuf = np.full((n_iter, n_bins), np.nan, dtype=np.float32)
+    z_shuf = np.full((n_iter, n_bins), np.nan, dtype=np.float32)
+    f_real = np.full(n_bins, np.nan)
+    n_rejected, factors, example = [], [], None
+    for it in range(n_iter):
+        sv = shuffle_map_values(values, domain, rng)
+        shuf_kde = kde_density_map(handler, sv, domain, values_are_mass)
+        if shuf_kde is None:
+            continue
+        if DUONG_SAMPLE_SIZE_MODE == 'neff':
+            n1, n2 = real_kde['neff'], shuf_kde['neff']
+        elif DUONG_SAMPLE_SIZE_MODE == 'cells':
+            n1 = n2 = n_cells
+        else:
+            raise ValueError(f'Unknown DUONG_SAMPLE_SIZE_MODE {DUONG_SAMPLE_SIZE_MODE!r}')
+        res = duong_compare_arena(handler, real_kde, shuf_kde, n1, n2)
+        common = res['common']
+        idx = np.flatnonzero(common)
+        n_common[common] += 1
+        n_above[idx[res['reject'] & (res['diff'] > 0)]] += 1
+        n_below[idx[res['reject'] & (res['diff'] < 0)]] += 1
+        f_shuf[it, common] = res['f_null']
+        z_shuf[it, common] = res['z']
+        f_real[common] = res['f_real']
+        n_rejected.append(int(res['reject'].sum()))
+        factors.append(shuf_kde['factor'])
+        if example is None:
+            example = sv
+    return dict(n_above=n_above, n_below=n_below, n_common=n_common, f_shuf=f_shuf, z_shuf=z_shuf,
+                f_real=f_real, n_rejected=np.asarray(n_rejected), factors=np.asarray(factors),
+                example=example, domain=domain, real_factor=real_kde['factor'])
+
+
+def summarise_shuffle(handler, job: dict) -> dict:
+    """Step 5. Fractions of shuffles significant in each direction, consistent bins and their
+    clusters, and the pointwise percentile envelope of the shuffled densities."""
+    seen = job['n_common'] > 0
+    f_above = np.where(seen, job['n_above'] / np.maximum(job['n_common'], 1), np.nan)
+    f_below = np.where(seen, job['n_below'] / np.maximum(job['n_common'], 1), np.nan)
+    cons_above = seen & (f_above >= SHUFFLE_CONSISTENCY)
+    cons_below = seen & (f_below >= SHUFFLE_CONSISTENCY)
+    lab_above, n_cl_above = _duong_cluster_labels(handler, cons_above)
+    lab_below, n_cl_below = _duong_cluster_labels(handler, cons_below)
+    with warnings.catch_warnings():   # bins outside every common domain are all-NaN, as intended
+        warnings.simplefilter('ignore', RuntimeWarning)
+        env_lo, env_hi = np.nanpercentile(job['f_shuf'], SHUFFLE_ENVELOPE, axis=0)
+        f_shuf_mean = np.nanmean(job['f_shuf'], axis=0)
+        z_lo, z_med, z_hi = np.nanpercentile(job['z_shuf'], (SHUFFLE_ENVELOPE[0], 50.0,
+                                                             SHUFFLE_ENVELOPE[1]), axis=0)
+    f_real = job['f_real']
+    return dict(job, seen=seen, f_above=f_above, f_below=f_below,
+                cons_above=cons_above, cons_below=cons_below,
+                lab_above=lab_above, n_above_cl=n_cl_above, lab_below=lab_below, n_below_cl=n_cl_below,
+                env_lo=env_lo, env_hi=env_hi, f_shuf_mean=f_shuf_mean, z_lo=z_lo, z_med=z_med, z_hi=z_hi,
+                env_above=seen & (f_real > env_hi), env_below=seen & (f_real < env_lo))
+
+
+def shuffle_cluster_rows(kind: str, arena: str, handler, s: dict) -> list:
     xy, area_all = handler.bin_centres_xy(), handler.bin_areas_cm2()
     rows = []
-    idx = np.flatnonzero(res['common'])
-    for direction, labels, n in (('real > null', res['lab_above'], res['n_above']),
-                                 ('real < null', res['lab_below'], res['n_below'])):
+    for direction, labels, n, frac in (('real > shuffle', s['lab_above'], s['n_above_cl'], s['f_above']),
+                                       ('real < shuffle', s['lab_below'], s['n_below_cl'], s['f_below'])):
         for k in range(n):
-            sel = labels[idx] == k                      # positions within the common domain
-            b = idx[sel]
+            b = np.flatnonzero(labels == k)
             a = area_all[b]
             dw = handler.dist_to_wall[b]
             row = dict(map_kind=kind, arena=arena, direction=direction, cluster=k + 1,
@@ -1243,12 +1355,12 @@ def duong_cluster_rows(kind: str, arena: str, handler, res: dict) -> list:
                        mean_dist_to_wall_cm=round(float(np.sum(dw * a) / a.sum()), 2),
                        min_dist_to_wall_cm=round(float(dw.min()), 2),
                        max_dist_to_wall_cm=round(float(dw.max()), 2),
-                       mean_real_density=float(np.mean(res['f_real'][sel])),
-                       mean_null_density=float(np.mean(res['f_null'][sel])),
-                       mean_ratio_real_over_null=round(float(np.mean(res['f_real'][sel] / res['f_null'][sel])), 4),
-                       excess_mass=round(float(np.sum((res['f_real'][sel] - res['f_null'][sel]) * a)), 5),
-                       peak_abs_z=round(float(np.max(np.abs(res['z'][sel]))), 3),
-                       min_p=float(np.min(res['p'][sel])))
+                       mean_frac_shuffles_significant=round(float(np.mean(frac[b])), 4),
+                       min_frac_shuffles_significant=round(float(np.min(frac[b])), 4),
+                       mean_real_density=float(np.mean(s['f_real'][b])),
+                       mean_shuffle_density=float(np.mean(s['f_shuf_mean'][b])),
+                       mean_ratio_real_over_shuffle=round(float(np.mean(s['f_real'][b] / s['f_shuf_mean'][b])), 4),
+                       median_z=round(float(np.median(s['z_med'][b])), 3))
             if isinstance(handler, CircularTrackHandler):
                 th = np.arctan2(xy[1, b] - handler.cy, xy[0, b] - handler.cx)
                 ang = np.arctan2(np.sum(np.sin(th) * a), np.sum(np.cos(th) * a))
@@ -1257,91 +1369,97 @@ def duong_cluster_rows(kind: str, arena: str, handler, res: dict) -> list:
     return rows
 
 
-def run_duong_tests(arena_handlers: dict, kdes: dict, real_results: dict, null_results: dict,
-                    out_dir: str):
-    """Duong test of every real KDE against its null KDE; figures, workbook and npz.
-    kdes = {'real': {kind: {arena: kde}}, 'null': {kind: {arena: kde}}}; a (kind, arena) missing
-    either KDE is skipped."""
+def _run_shuffle_jobs(jobs: dict) -> dict:
+    """Run every (map kind, arena) job in SHUFFLE_MAX_WORKERS processes; serial if a process pool
+    cannot start (e.g. in some interactive consoles) or SHUFFLE_MAX_WORKERS = 1."""
+    if SHUFFLE_MAX_WORKERS > 1 and len(jobs) > 1:
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=min(SHUFFLE_MAX_WORKERS, len(jobs))) as ex:
+                futures = {key: ex.submit(shuffle_duong_job, *args) for key, args in jobs.items()}
+                return {key: fut.result() for key, fut in futures.items()}
+        except Exception as e:
+            print(f'[shuffle] process pool failed ({type(e).__name__}: {e}); running serially')
+    return {key: shuffle_duong_job(*args) for key, args in jobs.items()}
+
+
+def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict, out_dir: str):
+    """Steps 1-5 for every map kind x arena with a real KDE; figures, workbook and npz.
+    real_kdes = {kind: {arena: kde}} as returned by plot_kde_maps."""
+    jobs = {}
+    for k_i, (kind, (pool_fn, *_)) in enumerate(_KDE_MAP_KINDS.items()):
+        for a_i, arena in enumerate(_ARENA_ORDER):
+            real_kde = real_kdes.get(kind, {}).get(arena)
+            if real_kde is None:
+                continue
+            handler, results = arena_handlers[arena], arena_results[arena]
+            values, values_are_mass = pool_fn(handler, results)
+            jobs[(kind, arena)] = (handler, values, _union_valid(handler, results), values_are_mass,
+                                   real_kde, float(len(results)), [SHUFFLE_SEED, k_i, a_i], N_SHUFFLE)
+    if not jobs:
+        print('[shuffle] skipped: no (map kind, arena) with a real KDE')
+        return
+    print(f'[shuffle] {len(jobs)} (map kind, arena) jobs x {N_SHUFFLE} shuffles')
+    t0 = time.time()
+    outputs = _run_shuffle_jobs(jobs)
+    print(f'[shuffle] done in {time.time() - t0:.0f} s')
+
     test_rows, cluster_rows, saved = [], [], {}
     for kind, (_, title, *_) in _KDE_MAP_KINDS.items():
-        results = {}
+        summaries = {}
         for arena in _ARENA_ORDER:
-            real_kde = kdes['real'].get(kind, {}).get(arena)
-            null_kde = kdes['null'].get(kind, {}).get(arena)
-            if real_kde is None or null_kde is None:
+            if (kind, arena) not in outputs:
                 continue
             handler = arena_handlers[arena]
-            if DUONG_SAMPLE_SIZE_MODE == 'neff':
-                n_real, n_null = real_kde['neff'], null_kde['neff']
-            elif DUONG_SAMPLE_SIZE_MODE == 'cells':
-                n_real, n_null = float(len(real_results[arena])), float(len(null_results[arena]))
-            else:
-                raise ValueError(f'Unknown DUONG_SAMPLE_SIZE_MODE {DUONG_SAMPLE_SIZE_MODE!r}')
-            res = duong_compare_arena(handler, real_kde, null_kde, n_real, n_null)
-            results[arena] = res
-
-            for side in ('real', 'null'):
-                if res[side]['corrected'] and res[side]['edge_check'] > 0.02:
-                    print(f'  [WARN] {kind}/{arena}/{side}: edge-correction mass here differs from '
-                          f'the KDE\'s by up to {100 * res[side]["edge_check"]:.1f} %')
-            print(f'[duong {kind}] {arena}: m = {res["common"].sum()}, rejected = '
-                  f'{res["reject"].sum()} (p cut-off {res["p_cut"]:.3g}), clusters above = '
-                  f'{res["n_above"]}, below = {res["n_below"]}')
-
+            s = summarise_shuffle(handler, outputs[(kind, arena)])
+            summaries[arena] = s
+            n_done = len(s['n_rejected'])
+            print(f'[shuffle {kind}] {arena}: {n_done} shuffles, {int(s["cons_above"].sum())} bins '
+                  f'consistently above ({s["n_above_cl"]} clusters), {int(s["cons_below"].sum())} below '
+                  f'({s["n_below_cl"]} clusters)')
             test_rows.append(dict(
-                map_kind=kind, arena=arena, alpha=DUONG_ALPHA, sample_size_mode=DUONG_SAMPLE_SIZE_MODE,
-                n1_real=round(res['real']['n'], 2), n2_null=round(res['null']['n'], 2),
-                H1=np.round(res['real']['H'], 3).tolist(), H2=np.round(res['null']['H'], 3).tolist(),
-                m_points=int(res['common'].sum()),
-                real_domain_bins=int(real_kde['domain'].sum()),
-                null_domain_bins=int(null_kde['domain'].sum()),
-                real_mass_outside_common=round(res['real']['mass_outside_common'], 4),
-                null_mass_outside_common=round(res['null']['mass_outside_common'], 4),
-                hochberg_j_star=res['j_star'], hochberg_p_cutoff=res['p_cut'],
-                n_rejected=int(res['reject'].sum()),
-                n_bins_real_above=int(np.sum(res['reject'] & (res['diff'] > 0))),
-                n_bins_real_below=int(np.sum(res['reject'] & (res['diff'] < 0))),
-                n_clusters_above=res['n_above'], n_clusters_below=res['n_below'],
-                min_p=float(res['p'].min()), max_abs_z=round(float(np.abs(res['z']).max()), 3),
-                edge_check_real=round(res['real']['edge_check'], 5),
-                edge_check_null=round(res['null']['edge_check'], 5)))
-            cluster_rows += duong_cluster_rows(kind, arena, handler, res)
+                map_kind=kind, arena=arena, n_shuffles=n_done, alpha=DUONG_ALPHA,
+                sample_size_mode=DUONG_SAMPLE_SIZE_MODE, consistency=SHUFFLE_CONSISTENCY,
+                m_points=int(s['seen'].sum()), n_cells=len(arena_results[arena]),
+                real_scott_factor=round(s['real_factor'], 4),
+                shuffle_scott_factor_mean=round(float(np.mean(s['factors'])), 4),
+                mean_rejected_per_shuffle=round(float(np.mean(s['n_rejected'])), 2),
+                frac_shuffles_any_rejection=round(float(np.mean(s['n_rejected'] > 0)), 4),
+                n_bins_consistent_above=int(s['cons_above'].sum()),
+                n_bins_consistent_below=int(s['cons_below'].sum()),
+                n_clusters_above=s['n_above_cl'], n_clusters_below=s['n_below_cl'],
+                n_bins_envelope_above=int(s['env_above'].sum()),
+                n_bins_envelope_below=int(s['env_below'].sum()),
+                max_frac_above=round(float(np.nanmax(s['f_above'])), 4),
+                max_frac_below=round(float(np.nanmax(s['f_below'])), 4)))
+            cluster_rows += shuffle_cluster_rows(kind, arena, handler, s)
 
             pre = f'{kind}_{arena}_'
-            for name, vals in (('f_real', res['f_real']), ('f_null', res['f_null']),
-                               ('var_real', res['real']['var']), ('var_null', res['null']['var']),
-                               ('z', res['z']), ('p', res['p'])):
-                arr = np.full(handler.n_bins, np.nan)
-                arr[res['common']] = vals
-                saved[pre + name] = arr
-            rej = np.zeros(handler.n_bins, dtype=bool)
-            rej[res['common']] = res['reject']
-            saved[pre + 'reject'] = rej
-            saved[pre + 'common_domain'] = res['common']
-            saved[pre + 'cluster_above'] = res['lab_above']
-            saved[pre + 'cluster_below'] = res['lab_below']
+            for name in ('f_real', 'f_shuf_mean', 'env_lo', 'env_hi', 'z_lo', 'z_med', 'z_hi',
+                         'f_above', 'f_below', 'cons_above', 'cons_below', 'lab_above', 'lab_below',
+                         'env_above', 'env_below', 'n_rejected', 'factors', 'example', 'domain'):
+                if s[name] is not None:
+                    saved[pre + name] = s[name]
+        if summaries:
+            plot_shuffle_kind(title, arena_handlers, summaries,
+                              os.path.join(out_dir, f'ShuffleDuong_{kind}.png'))
 
-        if results:
-            plot_duong_kind(title, arena_handlers, results,
-                            os.path.join(out_dir, f'DuongTest_{kind}.png'))
-
-    if not test_rows:
-        print('[duong] skipped: no (map kind, arena) with both a real and a null KDE')
-        return
     cluster_cols = ['map_kind', 'arena', 'direction', 'cluster', 'n_bins', 'area_cm2',
                     'centroid_x_cm', 'centroid_y_cm', 'centroid_angle_deg',
                     'mean_dist_to_wall_cm', 'min_dist_to_wall_cm', 'max_dist_to_wall_cm',
-                    'mean_real_density', 'mean_null_density', 'mean_ratio_real_over_null',
-                    'excess_mass', 'peak_abs_z', 'min_p']
-    xlsx = os.path.join(out_dir, 'DuongTest_Clusters.xlsx')
+                    'mean_frac_shuffles_significant', 'min_frac_shuffles_significant',
+                    'mean_real_density', 'mean_shuffle_density', 'mean_ratio_real_over_shuffle',
+                    'median_z']
+    xlsx = os.path.join(out_dir, 'ShuffleDuong_Clusters.xlsx')
     with pd.ExcelWriter(xlsx) as xw:
         pd.DataFrame(test_rows).to_excel(xw, sheet_name='Tests', index=False)
         pd.DataFrame(cluster_rows).reindex(columns=cluster_cols).to_excel(
             xw, sheet_name='Clusters', index=False)
     print(f'[SAVED] {xlsx}')
-    npz = os.path.join(out_dir, 'DuongTest_Results.npz')
+    npz = os.path.join(out_dir, 'ShuffleDuong_Results.npz')
     np.savez_compressed(npz, **saved)
     print(f'[SAVED] {npz}')
+
+
 
 
 # ============================================================================
@@ -1581,74 +1699,86 @@ def _draw_duong_clusters(ax, handler, res: dict):
             ax.add_collection(lc)
 
 
-def plot_duong_kind(title: str, arena_handlers: dict, results: dict, save_path: str):
-    """Rows = arenas; columns = real KDE, null KDE, difference, signed z, significant clusters.
-    Fluorescent green (outline, and fill in the last column) = real significantly ABOVE the null;
-    magenta = significantly BELOW."""
-    arenas = [a for a in _ARENA_ORDER if a in results]
+def plot_shuffle_kind(title: str, arena_handlers: dict, summaries: dict, save_path: str):
+    """Rows = arenas; columns = real KDE, one shuffled map, mean shuffled KDE, signed consistency
+    f_above - f_below, consistent clusters, pointwise percentile envelope. Outlines: fluorescent
+    green = consistently significantly ABOVE the shuffles, magenta = consistently BELOW."""
+    arenas = [a for a in _ARENA_ORDER if a in summaries]
     ratios = [_DUONG_ROW_HEIGHT[a] for a in arenas]
-    fig = plt.figure(figsize=(28, 1.2 + 5.6 * sum(ratios)))
-    gs = fig.add_gridspec(len(arenas), 5, height_ratios=ratios)
+    fig = plt.figure(figsize=(33, 1.2 + 5.6 * sum(ratios)))
+    gs = fig.add_gridspec(len(arenas), 6, height_ratios=ratios)
     dens_cmap = plt.get_cmap('Greys')
     div_cmap = plt.get_cmap('RdBu_r')
 
-    for r, arena in enumerate(arenas):
-        handler, res = arena_handlers[arena], results[arena]
-        common = res['common']
-        both = np.concatenate([res['f_real'], res['f_null']])
-        dens_norm = Normalize(vmin=float(both.min()), vmax=float(both.max()))
-        dmax = float(np.max(np.abs(res['diff']))) or 1e-12
-        zmax = float(np.max(np.abs(res['z']))) or 1.0
-        z_star = float(normal_dist.isf(res['p_cut'] / 2.0)) if np.isfinite(res['p_cut']) else float('nan')
+    def fills(ax, handler, shown, above, below):
+        colours = np.tile(to_rgba('0.88'), (handler.n_bins, 1))
+        colours[above] = to_rgba(GREEN_ABOVE)
+        colours[below] = to_rgba(MAGENTA_BELOW)
+        _draw_bins(ax, handler, shown, facecolors=colours)
 
-        panels = [
-            (res['f_real'], dens_cmap, dens_norm, 'density (cm$^{-2}$)',
-             f"{_ARENA_TITLES[arena]} -- REAL KDE\n"
-             f"n1 = {res['real']['n']:.1f}, H1 sd = {np.sqrt(res['real']['H'][0, 0]):.1f} x "
-             f"{np.sqrt(res['real']['H'][1, 1]):.1f} cm"),
-            (res['f_null'], dens_cmap, dens_norm, 'density (cm$^{-2}$)',
-             f"NULL KDE\n"
-             f"n2 = {res['null']['n']:.1f}, H2 sd = {np.sqrt(res['null']['H'][0, 0]):.1f} x "
-             f"{np.sqrt(res['null']['H'][1, 1]):.1f} cm"),
-            (res['diff'], div_cmap, TwoSlopeNorm(0.0, -dmax, dmax), 'real - null (cm$^{-2}$)',
-             'Difference  f$_{real}$ - f$_{null}$'),
-            (res['z'], div_cmap, TwoSlopeNorm(0.0, -zmax, zmax), 'signed z = (f$_1$ - f$_2$) / $\\sigma_U$',
-             f"Duong local test, Hochberg alpha = {DUONG_ALPHA:g}\n"
-             f"m = {common.sum()} points, {res['reject'].sum()} rejected "
-             + (f"(|z| >= {z_star:.2f})" if np.isfinite(z_star) else '(none)')
-             + f"; clusters: {res['n_above']} above, {res['n_below']} below"),
-        ]
-        for c, (vals, cmap, nrm, cbar_label, ttl) in enumerate(panels):
-            ax = fig.add_subplot(gs[r, c])
-            full = np.full(handler.n_bins, np.nan)
-            full[common] = vals
-            pc = _draw_bins(ax, handler, common, full, cmap, nrm)
-            _draw_duong_clusters(ax, handler, res)
-            ax.set_title(ttl, fontsize=9)
-            _hbar(fig, pc, ax, cbar_label)
+    for r, arena in enumerate(arenas):
+        handler, s = arena_handlers[arena], summaries[arena]
+        seen, n_done = s['seen'], len(s['n_rejected'])
+        both = np.concatenate([s['f_real'][seen], s['f_shuf_mean'][seen]])
+        dens_norm = Normalize(vmin=float(both.min()), vmax=float(both.max()))
+
+        ax = fig.add_subplot(gs[r, 0])
+        pc = _draw_bins(ax, handler, seen, s['f_real'], dens_cmap, dens_norm)
+        _draw_duong_clusters(ax, handler, s)
+        ax.set_title(f"{_ARENA_TITLES[arena]} -- REAL KDE\n(Scott factor {s['real_factor']:.3f})", fontsize=9)
+        _hbar(fig, pc, ax, 'density (cm$^{-2}$)')
+
+        ax = fig.add_subplot(gs[r, 1])
+        ex_shown = s['domain'] & np.isfinite(s['example'])
+        cmap, nrm = make_cmap_norm(s['example'][ex_shown])
+        pc = _draw_bins(ax, handler, ex_shown, s['example'], cmap, nrm)
+        ax.set_title('One shuffled pooled map\n(values permuted across the sampled bins)', fontsize=9)
+        _hbar(fig, pc, ax, 'shuffled map value')
+
+        ax = fig.add_subplot(gs[r, 2])
+        pc = _draw_bins(ax, handler, seen, s['f_shuf_mean'], dens_cmap, dens_norm)
+        _draw_duong_clusters(ax, handler, s)
+        ax.set_title(f"Mean SHUFFLED KDE ({n_done} shuffles)\n"
+                     f"(mean Scott factor {np.mean(s['factors']):.3f})", fontsize=9)
+        _hbar(fig, pc, ax, 'density (cm$^{-2}$)')
+
+        ax = fig.add_subplot(gs[r, 3])
+        pc = _draw_bins(ax, handler, seen, s['f_above'] - s['f_below'], div_cmap, TwoSlopeNorm(0.0, -1.0, 1.0))
+        _draw_duong_clusters(ax, handler, s)
+        ax.set_title(f"Fraction of shuffles significant: above - below\n"
+                     f"(Duong, Hochberg alpha = {DUONG_ALPHA:g}; outlined where >= {SHUFFLE_CONSISTENCY:g})",
+                     fontsize=9)
+        _hbar(fig, pc, ax, 'f$_{above}$ - f$_{below}$')
 
         ax = fig.add_subplot(gs[r, 4])
-        colours = np.tile(to_rgba('0.88'), (handler.n_bins, 1))
-        colours[res['lab_above'] >= 0] = to_rgba(GREEN_ABOVE)
-        colours[res['lab_below'] >= 0] = to_rgba(MAGENTA_BELOW)
-        _draw_bins(ax, handler, common, facecolors=colours)
-        ax.set_title(f"Significant clusters\n{res['n_above']} real > null (green), "
-                     f"{res['n_below']} real < null (magenta)", fontsize=9)
+        fills(ax, handler, seen, s['lab_above'] >= 0, s['lab_below'] >= 0)
+        ax.set_title(f"Consistent clusters (significant in >= {100 * SHUFFLE_CONSISTENCY:g} % of shuffles)\n"
+                     f"{s['n_above_cl']} real > shuffle (green), {s['n_below_cl']} real < shuffle (magenta)",
+                     fontsize=9)
+
+        ax = fig.add_subplot(gs[r, 5])
+        fills(ax, handler, seen, s['env_above'], s['env_below'])
+        lo, hi = SHUFFLE_ENVELOPE
+        ax.set_title(f"Pointwise envelope: real > {hi:g}th (green) / < {lo:g}th (magenta)\n"
+                     f"percentile of the shuffled densities ({int(s['env_above'].sum())} / "
+                     f"{int(s['env_below'].sum())} bins; not corrected for multiple bins)", fontsize=9)
 
     halo = [pe.Stroke(linewidth=OUTLINE_LW + 1.8, foreground='black'), pe.Normal()]
     handles = [Line2D([], [], color=GREEN_ABOVE, lw=OUTLINE_LW, path_effects=halo,
-                      label='Real significantly ABOVE null'),
+                      label='Real consistently significantly ABOVE shuffles'),
                Line2D([], [], color=MAGENTA_BELOW, lw=OUTLINE_LW, path_effects=halo,
-                      label='Real significantly BELOW null')]
+                      label='Real consistently significantly BELOW shuffles')]
     fig.legend(handles=handles, loc='upper right', ncol=2, frameon=False, fontsize=10)
     renorm = 'renormalised on the common domain' if DUONG_RENORMALISE_ON_COMMON_DOMAIN else 'as estimated'
-    fig.suptitle(f'{title}: real vs null KDE -- Duong (2013) local significant differences\n'
+    fig.suptitle(f'{title}: real vs bin-shuffled KDEs -- Duong (2013) test repeated over {N_SHUFFLE} shuffles\n'
                  f'(densities {renorm}; n = {DUONG_SAMPLE_SIZE_MODE}; blank = outside the common domain)',
                  x=0.01, ha='left', fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97 - 0.15 / (1.2 + 5.6 * sum(ratios))))
-    fig.savefig(save_path, dpi=200)
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f'[SAVED] {save_path}')
+
+
 
 
 # ============================================================================
@@ -1699,11 +1829,8 @@ def run_full_pipeline(out_dir: str) -> None:
         kdes['real'][kind] = plot_kde_maps(arena_handlers, arena_results, kind,
                                            os.path.join(out_dir, f'KDE_{stem}.png'))
 
-    # 3. Duong (2013) local test: real KDE vs null KDE. No null model is built here; fill
-    #    kdes['null'][kind] (arena -> KDE, e.g. from plot_kde_maps on null cells) and null_results
-    #    (arena -> null cells, used by DUONG_SAMPLE_SIZE_MODE = 'cells') to run it.
-    null_results = {}
-    run_duong_tests(arena_handlers, kdes, arena_results, null_results, out_dir)
+    # 3. Method 2: real KDE vs N_SHUFFLE bin-shuffled KDEs, Duong test per shuffle
+    run_shuffle_duong(arena_handlers, arena_results, kdes['real'], out_dir)
 
     export_excel(arena_handlers, arena_results, os.path.join(out_dir, 'AllArenas_Summary.xlsx'))
 

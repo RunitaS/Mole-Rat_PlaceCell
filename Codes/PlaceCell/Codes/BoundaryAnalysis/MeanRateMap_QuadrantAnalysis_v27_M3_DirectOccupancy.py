@@ -1,18 +1,40 @@
 # -*- coding: utf-8 -*-
 """
-Mean Rate Map Analysis (after Muessig et al.) + KDE + Duong (2013) local test
+Mean Rate Map Analysis (after Muessig et al.) + KDE + METHOD 3 direct occupancy comparison +
+Duong (2013) local test
 
 PIPELINE (run_full_pipeline), per arena:
   1. MEAN MAPS -- the pooled maps of the recorded place cells (described below): overall mean
      field index, field-only mean field index and peak proportion.
   2. KDE -- a 2D Gaussian KDE (scipy gaussian_kde, Scott's rule, edge-corrected over the bins the
      cells validly sampled) of each of the three pooled maps.
-  3. DUONG TEST -- local significant differences between each real KDE and a null KDE (Duong 2013,
-     "Local significant differences from nonparametric two-sample tests", J. Nonparametric
-     Statistics 25:3, 635-645); see the DUONG section below. No null model is built in this
-     script, so the test is skipped until null KDEs are supplied to run_duong_tests. Clusters
-     where the real density is significantly above the null are drawn in GREEN_ABOVE, below in
-     MAGENTA_BELOW.
+  3. MEAN OCCUPANCY MAP, METHOD 3 (described in detail directly below) -- every session's dwell
+     map, smoothed exactly like a rate map and normalised 0-1, averaged over sessions and fitted
+     with the same KDE.
+  4. DUONG TEST -- local significant differences between each real KDE and the occupancy KDE
+     (Duong 2013, "Local significant differences from nonparametric two-sample tests",
+     J. Nonparametric Statistics 25:3, 635-645); see the DUONG section below. Clusters where the
+     real density is significantly above the occupancy density are drawn in GREEN_ABOVE, below
+     in MAGENTA_BELOW.
+
+METHOD 3 -- DIRECT OCCUPANCY COMPARISON (stage 3, session_occupancy_maps), per arena:
+  Step 1 -- dwell map per session: seconds per bin on the frames that count toward the rate maps'
+     occupancy (on-arena, speed-filtered with SPEED_FILTER_OCCUPANCY), in the same bins as the
+     rate maps -- the occ_map every cell of the session was computed with.
+  Step 2 -- smoothing exactly as a rate map (handler.smooth: Gaussian, RATEMAP_SMOOTH_SIGMA_BINS,
+     normalised over the valid bins, wrap-around on the circular track). Valid bins
+     (OCC_VALID_MODE): 'arena' = every arena bin, an unvisited bin being 0 s of dwell; 'visited' =
+     bins with any dwell; 'rate_map' = bins with >= min_occ_s, the rate maps' own validity.
+  Step 3 -- normalised 0-1 per session (field_index_map: the longest-dwell bin 1, the shortest 0).
+  Step 4 -- mean occupancy map: mean of the normalised session maps per bin (one weight per
+     session), pooled with pool_fine_map exactly like the overall mean field-index map.
+  Step 5 -- KDE of the mean occupancy map (same KDE as the real maps), then the Duong test of each
+     of the three real KDEs against it (real > occupancy green, real < occupancy magenta).
+Reading: rate maps are already divided by dwell time, so a cell does not fire more in a bin just
+because the animal spent longer there. This comparison asks whether the place-cell representation
+is distributed like the animal's dwell time -- real ~ occupancy means the representation follows
+where the animal spent its time; real < occupancy where the animal lingered means those places are
+under-represented relative to the time spent there.
 
 Fig S1H: overall mean field-index map per arena, fine spatial bins (2 x 2 cm; genuinely 2D for
 every arena, including the linear track's length x width). Each cell's map is first normalized
@@ -77,8 +99,10 @@ Outputs (OUTPUT_DIR/AllArenas):
                  AllArenas_Summary.xlsx
   KDE            KDE_<stem>.png / .npz, stem = FigS1H_MeanFieldIndex, FieldOnly_MeanFieldIndex,
                  PeakProportion_Map
+  Occupancy      Occupancy_PerSession_<arena>.png, MeanOccupancy_Map.png,
+                 KDE_MeanOccupancy.png / .npz
   Duong test     DuongTest_<kind>.png, DuongTest_Clusters.xlsx, DuongTest_Results.npz
-                 (only when null KDEs are supplied)
+                 (each real KDE vs the mean occupancy KDE)
 """
 
 import os
@@ -106,7 +130,7 @@ from matplotlib.lines import Line2D
 # ============================================================================
 
 ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected'
-OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_ObsNullRealFIelds')
+OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_M3_DirectOccupancy')
 
 USE_BIN_COVERAGE_CRITERION = False
 COVERAGE_FRACTION = 0.01
@@ -188,7 +212,12 @@ KDE_EDGE_CORRECTION = True
 
 COORD_UNITS = 'cm'
 
-# --- Duong (2013) local test, real KDE vs null KDE (stage 3) ---
+# --- Method 3 direct occupancy comparison (stage 3; see the header) ---
+OCC_VALID_MODE = 'arena'   # bins of a session's dwell map that are smoothed / normalised:
+                           #   'arena' (unvisited = 0 s), 'visited' (dwell > 0) or 'rate_map'
+                           #   (dwell >= min_occ_s, as the rate maps)
+
+# --- Duong (2013) local test, real KDE vs occupancy KDE (stage 4) ---
 DUONG_ALPHA            = 0.05     # family-wise level per (map kind, arena), Hochberg step-up
 DUONG_SAMPLE_SIZE_MODE = 'neff'   # 'neff' or 'cells' (see the DUONG section)
 DUONG_RENORMALISE_ON_COMMON_DOMAIN = True
@@ -1116,7 +1145,33 @@ def arena_kde(handler, results: list, map_kind: str) -> dict | None:
 
 
 # ============================================================================
-# STAGE 3 -- Duong (2013) local significant differences, real KDE vs null KDE
+# STAGE 3 -- METHOD 3 mean occupancy map (see the header)
+# ============================================================================
+
+def session_occupancy_maps(handler, results: list) -> list:
+    """Steps 1-3. One normalised, smoothed dwell map per session that contributed cells, shaped
+    like a cell result (fi_map, valid) so the cell pooling and KDE functions apply unchanged."""
+    by_session = {}
+    for r in results:
+        by_session.setdefault(r['session'], r['occ_map'])
+    maps = []
+    for session, occ in sorted(by_session.items()):
+        if OCC_VALID_MODE == 'arena':
+            valid = handler.geom_valid.copy()
+        elif OCC_VALID_MODE == 'visited':
+            valid = (occ > 0) & handler.geom_valid
+        elif OCC_VALID_MODE == 'rate_map':
+            valid = (occ >= min_occ_s) & handler.geom_valid
+        else:
+            raise ValueError(f'Unknown OCC_VALID_MODE {OCC_VALID_MODE!r}')
+        occ_smooth = handler.smooth(np.where(valid, occ, 0.0), valid)
+        maps.append(dict(session=session, occ_map=occ, occ_smooth=occ_smooth, valid=valid,
+                         fi_map=field_index_map(occ_smooth, valid), total_s=float(occ.sum())))
+    return maps
+
+
+# ============================================================================
+# STAGE 4 -- Duong (2013) local significant differences, real KDE vs occupancy KDE
 # ============================================================================
 #
 # Per map kind x arena:
@@ -1145,8 +1200,9 @@ def arena_kde(handler, results: list, map_kind: str) -> dict | None:
 #              overall and field-only maps the weighted points are BINS of a smoothed map, which
 #              are spatially correlated, so neff overstates the independent information there ->
 #              the test is liberal for those two map kinds; check with 'cells'.
-#   'cells' -- n1 = number of real place cells pooled, n2 = number of null cells pooled.
-#              Conservative for the bin-weighted maps.
+#   'cells' -- n1 = number of real place cells pooled, n2 = number of sessions averaged into the
+#              mean occupancy map. Conservative for the bin-weighted maps.
+# Here the "null" KDE is the mean occupancy KDE (stage 3), the same for all three map kinds.
 
 def _duong_kde_side(handler, kde_out: dict, common: np.ndarray, n: float) -> dict:
     """Density and its asymptotic variance on the common evaluation points for one KDE."""
@@ -1229,8 +1285,8 @@ def duong_cluster_rows(kind: str, arena: str, handler, res: dict) -> list:
     xy, area_all = handler.bin_centres_xy(), handler.bin_areas_cm2()
     rows = []
     idx = np.flatnonzero(res['common'])
-    for direction, labels, n in (('real > null', res['lab_above'], res['n_above']),
-                                 ('real < null', res['lab_below'], res['n_below'])):
+    for direction, labels, n in (('real > occupancy', res['lab_above'], res['n_above']),
+                                 ('real < occupancy', res['lab_below'], res['n_below'])):
         for k in range(n):
             sel = labels[idx] == k                      # positions within the common domain
             b = idx[sel]
@@ -1508,13 +1564,72 @@ def plot_peak_proportion_maps(arena_handlers: dict, arena_results: dict, save_pa
     print(f'[SAVED] {save_path}')
 
 
+# --- Stage 3: occupancy figures ---
+
+def plot_session_occupancy(handler, arena_key: str, occ_maps: list, save_path: str):
+    """Every session's smoothed, 0-1 normalised dwell map of one arena."""
+    n = len(occ_maps)
+    if n == 0:
+        return
+    ncols = min(n, 5)
+    nrows = int(np.ceil(n / ncols))
+    row_h = 4.4 * _DUONG_ROW_HEIGHT[arena_key]
+    fig = plt.figure(figsize=(4.2 * ncols, 1.0 + row_h * nrows))
+    cmap, nrm = make_cmap_norm([0.0, 1.0])
+    for k, m in enumerate(occ_maps):
+        ax = fig.add_subplot(nrows, ncols, k + 1)
+        pc = _draw_bins(ax, handler, m['valid'], m['fi_map'], cmap, nrm)
+        ax.set_title(f"{m['session']}\n{m['total_s']:.0f} s, max dwell "
+                     f"{m['occ_smooth'][m['valid']].max():.1f} s/bin (smoothed)", fontsize=8)
+        _hbar(fig, pc, ax, 'normalised dwell (0-1)')
+    fig.suptitle(f'{_ARENA_TITLES[arena_key]} -- dwell maps per session (smoothed as the rate maps, '
+                 f'normalised 0-1; valid bins = {OCC_VALID_MODE!r})')
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
+
+
+def plot_mean_occupancy_maps(arena_handlers: dict, arena_occ: dict, save_path: str):
+    """Mean occupancy map per arena: figure and npz next to it (map, valid bins, bin centres,
+    sessions)."""
+    fig = plt.figure(figsize=(15, 5))
+    saved = {}
+    for i, key in enumerate(_ARENA_ORDER):
+        handler = arena_handlers[key]
+        mean_map, valid = pool_fine_map(handler, arena_occ[key])
+        saved[f'{key}_mean_map'] = mean_map
+        saved[f'{key}_valid'] = valid
+        saved[f'{key}_bin_xy'] = handler.bin_centres_xy()
+        saved[f'{key}_sessions'] = np.array([m['session'] for m in arena_occ[key]])
+        cmap, norm = make_cmap_norm(mean_map[valid])
+
+        proj = 'polar' if key == 'circular_track' else None
+        ax = fig.add_subplot(1, 3, i + 1, projection=proj)
+        pcm = handler.plot_fine(ax, mean_map, valid, cmap, norm)
+
+        ax.set_title(f'{_ARENA_TITLES[key]}\n(n={len(arena_occ[key])} sessions)')
+        fig.colorbar(pcm, ax=ax, shrink=0.7, label='Mean normalised dwell (a.u.)')
+
+    fig.suptitle('Mean occupancy maps (normalised 0-1 per session, averaged over sessions)')
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
+
+    npz_path = os.path.splitext(save_path)[0] + '.npz'
+    np.savez_compressed(npz_path, occ_valid_mode=OCC_VALID_MODE, **saved)
+    print(f'[SAVED] {npz_path}')
+
+
 # --- Stage 2: KDE figures (+ npz) ---
 
 def plot_kde_maps(arena_handlers: dict, arena_results: dict, map_kind: str, save_path: str,
-                  cell_label: str = 'place cells', title_prefix: str = '') -> dict:
+                  cell_label: str = 'place cells', title_prefix: str = '', title: str | None = None) -> dict:
     """KDE of one pooled map kind for every arena: figure, npz next to it, and the KDEs
     (arena -> kde_density_map output) for the Duong test."""
-    _, title, units, _, _ = _KDE_MAP_KINDS[map_kind]
+    _, kind_title, units, _, _ = _KDE_MAP_KINDS[map_kind]
+    title = kind_title if title is None else title
     fig = plt.figure(figsize=(17, 7.5))
     gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.7])
     arena_axes = {'open_field':     fig.add_subplot(gs[:, 0]),
@@ -1607,11 +1722,11 @@ def plot_duong_kind(title: str, arena_handlers: dict, results: dict, save_path: 
              f"n1 = {res['real']['n']:.1f}, H1 sd = {np.sqrt(res['real']['H'][0, 0]):.1f} x "
              f"{np.sqrt(res['real']['H'][1, 1]):.1f} cm"),
             (res['f_null'], dens_cmap, dens_norm, 'density (cm$^{-2}$)',
-             f"NULL KDE\n"
+             f"MEAN OCCUPANCY KDE\n"
              f"n2 = {res['null']['n']:.1f}, H2 sd = {np.sqrt(res['null']['H'][0, 0]):.1f} x "
              f"{np.sqrt(res['null']['H'][1, 1]):.1f} cm"),
-            (res['diff'], div_cmap, TwoSlopeNorm(0.0, -dmax, dmax), 'real - null (cm$^{-2}$)',
-             'Difference  f$_{real}$ - f$_{null}$'),
+            (res['diff'], div_cmap, TwoSlopeNorm(0.0, -dmax, dmax), 'real - occupancy (cm$^{-2}$)',
+             'Difference  f$_{real}$ - f$_{occupancy}$'),
             (res['z'], div_cmap, TwoSlopeNorm(0.0, -zmax, zmax), 'signed z = (f$_1$ - f$_2$) / $\\sigma_U$',
              f"Duong local test, Hochberg alpha = {DUONG_ALPHA:g}\n"
              f"m = {common.sum()} points, {res['reject'].sum()} rejected "
@@ -1632,17 +1747,17 @@ def plot_duong_kind(title: str, arena_handlers: dict, results: dict, save_path: 
         colours[res['lab_above'] >= 0] = to_rgba(GREEN_ABOVE)
         colours[res['lab_below'] >= 0] = to_rgba(MAGENTA_BELOW)
         _draw_bins(ax, handler, common, facecolors=colours)
-        ax.set_title(f"Significant clusters\n{res['n_above']} real > null (green), "
-                     f"{res['n_below']} real < null (magenta)", fontsize=9)
+        ax.set_title(f"Significant clusters\n{res['n_above']} real > occupancy (green), "
+                     f"{res['n_below']} real < occupancy (magenta)", fontsize=9)
 
     halo = [pe.Stroke(linewidth=OUTLINE_LW + 1.8, foreground='black'), pe.Normal()]
     handles = [Line2D([], [], color=GREEN_ABOVE, lw=OUTLINE_LW, path_effects=halo,
-                      label='Real significantly ABOVE null'),
+                      label='Real significantly ABOVE occupancy'),
                Line2D([], [], color=MAGENTA_BELOW, lw=OUTLINE_LW, path_effects=halo,
-                      label='Real significantly BELOW null')]
+                      label='Real significantly BELOW occupancy')]
     fig.legend(handles=handles, loc='upper right', ncol=2, frameon=False, fontsize=10)
     renorm = 'renormalised on the common domain' if DUONG_RENORMALISE_ON_COMMON_DOMAIN else 'as estimated'
-    fig.suptitle(f'{title}: real vs null KDE -- Duong (2013) local significant differences\n'
+    fig.suptitle(f'{title}: real vs mean occupancy KDE -- Duong (2013) local significant differences\n'
                  f'(densities {renorm}; n = {DUONG_SAMPLE_SIZE_MODE}; blank = outside the common domain)',
                  x=0.01, ha='left', fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97 - 0.15 / (1.2 + 5.6 * sum(ratios))))
@@ -1699,11 +1814,23 @@ def run_full_pipeline(out_dir: str) -> None:
         kdes['real'][kind] = plot_kde_maps(arena_handlers, arena_results, kind,
                                            os.path.join(out_dir, f'KDE_{stem}.png'))
 
-    # 3. Duong (2013) local test: real KDE vs null KDE. No null model is built here; fill
-    #    kdes['null'][kind] (arena -> KDE, e.g. from plot_kde_maps on null cells) and null_results
-    #    (arena -> null cells, used by DUONG_SAMPLE_SIZE_MODE = 'cells') to run it.
-    null_results = {}
-    run_duong_tests(arena_handlers, kdes, arena_results, null_results, out_dir)
+    # 3. Method 3: per-session dwell maps (smoothed as rate maps, normalised 0-1), their mean per
+    #    arena and its KDE (pooled and fitted exactly like the overall mean field-index map)
+    arena_occ = {key: session_occupancy_maps(arena_handlers[key], arena_results[key])
+                 for key in _ARENA_ORDER}
+    for key in _ARENA_ORDER:
+        plot_session_occupancy(arena_handlers[key], key, arena_occ[key],
+                               os.path.join(out_dir, f'Occupancy_PerSession_{key}.png'))
+    plot_mean_occupancy_maps(arena_handlers, arena_occ, os.path.join(out_dir, 'MeanOccupancy_Map.png'))
+    occ_kdes = plot_kde_maps(arena_handlers, arena_occ, 'overall',
+                             os.path.join(out_dir, 'KDE_MeanOccupancy.png'), cell_label='sessions',
+                             title='Mean occupancy map')
+
+    # 4. Duong (2013) local test: each real KDE vs the mean occupancy KDE (the same for all three
+    #    map kinds; for DUONG_SAMPLE_SIZE_MODE = 'cells' the occupancy n is the number of sessions)
+    for kind in _KDE_MAP_KINDS:
+        kdes['null'][kind] = occ_kdes
+    run_duong_tests(arena_handlers, kdes, arena_results, arena_occ, out_dir)
 
     export_excel(arena_handlers, arena_results, os.path.join(out_dir, 'AllArenas_Summary.xlsx'))
 

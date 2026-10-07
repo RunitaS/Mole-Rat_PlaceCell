@@ -1,5 +1,5 @@
 {
   "permissions": {
-    "deny": ["Read(./BoundaryAnalysis/OldVer/archive/**)"]
+    "deny": ["Read(./OldVer/archive/**)"]
   }
 }

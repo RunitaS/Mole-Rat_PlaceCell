@@ -74,13 +74,26 @@ cells (pooled across animals within each arena) are additionally compared
 across arenas on r^2 (rho^2 of the circular-linear fit), |slope|
 (deg/pass), and phase range (deg actually swept, |slope| times the
 observed pass-index extent), via Kruskal-Wallis + pairwise Mann-Whitney U
-tests. Plot saved to ROOT_FOLDER/ArenaComparison_PhasePrecession.png;
+tests (Holm-Bonferroni corrected within each metric). One plot per metric is
+saved to ROOT_FOLDER/ArenaComparison_PhasePrecession_<metric>.png (figure
+style matches ArenaType_StatsComparison_v7.py: arena-colored box plots, stars
+over significantly different pairs, stats panel underneath, 500 dpi);
 stats tables added as 'ArenaComparison_Omnibus' / 'ArenaComparison_Pairwise'
 sheets in the summary workbook. The same arena comparison (Kruskal-Wallis +
 pairwise Mann-Whitney U) is run on TMI for all significantly theta-modulated
 cells (TMI_Significant), pooled across animals within each arena, saved to
 ROOT_FOLDER/ArenaComparison_TMI.png with 'ArenaComparison_TMI_Omnibus' /
 'ArenaComparison_TMI_Pairwise' sheets.
+
+Theta phase at pass index 0 (field center) is also extracted per cell
+(phase_at_pi0_deg: the fitted phase line at pass index 0, i.e. its intercept,
+in [0, 360)) and labeled precession range (70-250 deg) or procession range
+(250-70 deg) in phase_at_pi0_range. For the PI0_PHASE_CLASSES cells it is
+compared across arenas with circular tests -- Mardia-Watson-Wheeler
+(nonparametric, permutation p) and Watson-Williams, omnibus + Holm-corrected
+pairwise -- plotted to ROOT_FOLDER/ArenaComparison_PhaseAtPassIndex0.png
+(green points = precession range, yellow = procession range) with
+'PhaseAtPI0_ByArena' / 'PhaseAtPI0_Omnibus' / 'PhaseAtPI0_Pairwise' sheets.
 
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 """
@@ -90,8 +103,10 @@ Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 
 from __future__ import annotations
 
+import functools
 import re
 import shutil
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +114,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 from scipy import signal, stats
 from scipy.ndimage import gaussian_filter, distance_transform_edt
 from scipy.optimize import minimize_scalar
@@ -189,6 +206,16 @@ DEFAULT_ADBITVOLTS = 0.000000195
 # .../Fa23BD/Open/Day1/1Cntrl -- the arena is read off whichever path
 # component (case-insensitively) matches one of these labels.
 ARENA_LABELS = ('Circle', 'Linear', 'Open')
+
+# --- Theta phase at pass index 0 (field center), compared across arenas ---
+# Phase at pass index 0 = the fitted line 2*pi*s*x + b evaluated at x = 0, i.e. the
+# intercept b, wrapped to [0, 360) deg. On the circle the precession range is
+# [70, 250) deg -- 70-250 and 430-610 deg on the double-cycle 0-720 plot axis; the
+# rest, 250-430 deg (= 250-360 + 0-70) and 610-720 deg, is the procession range.
+PI0_PRECESSION_RANGE_DEG = (70.0, 250.0)
+PI0_PHASE_CLASSES = ('phase_precessing', 'phase_succeeding', 'phase_locked')  # cells included
+N_PI0_PERMUTATIONS = 10000          # label permutations for the Mardia-Watson-Wheeler test
+PI0_RANGE_COLORS = {'precession': '#35B779', 'procession': '#FDE725'}   # viridis green (0.7) / yellow (1.0)
 
 
 # ============================================================================
@@ -862,6 +889,10 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     occ_density *= dt_lfp
     spk_density, _, _ = np.histogram2d(spk_pass_index, np.mod(spk_theta_phase, 2 * np.pi),
                                         bins=[pi_edges, ph_edges])
+    # Theta phase at pass index 0 (field center): the fitted line 2*pi*s*x + b at
+    # x = 0, i.e. the intercept b, wrapped to [0, 360) deg.
+    phase_at_pi0_deg = float(np.mod(np.rad2deg(b), 360)) if np.isfinite(b) else np.nan
+
     with np.errstate(invalid='ignore', divide='ignore'):
         density = spk_density / occ_density
     density[~np.isfinite(density)] = 0.0
@@ -875,6 +906,7 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
         'rho': rho, 'p': p, 's': s, 'b': b,
         'slope_deg_per_pass': slope_deg_per_pass,
         'r_squared': r_squared, 'phase_range_deg': phase_range_deg,
+        'phase_at_pi0_deg': phase_at_pi0_deg,
         'is_precessing': is_precessing, 'is_recessing': is_recessing,
         'is_phase_locked': is_phase_locked, 'precession_class': precession_class,
         'n_fit_lines': n_fit_lines, 'fit_too_steep': fit_too_steep,
@@ -905,6 +937,88 @@ def circ_rtest(alpha_rad):
     z = R ** 2 / n
     pval = np.exp(np.sqrt(1 + 4 * n + 4 * (n ** 2 - R ** 2)) - (1 + 2 * n))
     return float(pval), float(z)
+
+
+def circ_kappa(r):
+    """Von Mises concentration estimate from a mean resultant length r
+    (circ_kappa.m approximation, no small-sample correction)."""
+    if r < 0.53:
+        return 2 * r + r ** 3 + 5 * r ** 5 / 6
+    if r < 0.85:
+        return -0.4 + 1.39 * r + 0.43 / (1 - r)
+    if r >= 1:
+        return np.inf
+    return 1 / (r ** 3 - 4 * r ** 2 + 3 * r)
+
+
+def watson_williams_test(groups_rad):
+    """Watson-Williams k-sample test for equal mean direction (circ_wwtest.m).
+    Parametric: assumes von Mises samples sharing one concentration (the
+    approximation is poor when the pooled mean resultant length is < ~0.45).
+    Returns (F, p, kappa)."""
+    ns = np.array([len(g) for g in groups_rad])
+    k, n_total = len(groups_rad), int(ns.sum())
+    R_i = np.array([np.abs(np.sum(np.exp(1j * g))) for g in groups_rad])
+    R = np.abs(np.sum(np.exp(1j * np.concatenate(groups_rad))))
+    kappa = circ_kappa(R_i.sum() / n_total)
+    denom = n_total - R_i.sum()
+    if k < 2 or n_total <= k or kappa <= 0 or denom <= 0:
+        return np.nan, np.nan, kappa
+    beta = 1 + 3 / (8 * kappa)
+    F = beta * (n_total - k) / (k - 1) * (R_i.sum() - R) / denom
+    return float(F), float(stats.f.sf(F, k - 1, n_total - k)), kappa
+
+
+def _mww_statistic(cos_sc, sin_sc, labels, n_groups):
+    W = 0.0
+    for g in range(n_groups):
+        sel = labels == g
+        W += (cos_sc[sel].sum() ** 2 + sin_sc[sel].sum() ** 2) / sel.sum()
+    return 2 * W
+
+
+def mardia_watson_wheeler_test(groups_rad, rng, n_perm=N_PI0_PERMUTATIONS):
+    """Mardia-Watson-Wheeler uniform-scores k-sample test: nonparametric test
+    that the circular distributions are identical (sensitive to differences in
+    location or spread). The pooled angles are ranked and mapped to uniform
+    scores 2*pi*rank/N; W = 2 * sum_i (C_i^2 + S_i^2) / n_i. Returns
+    (W, p_chi2, p_perm): p_chi2 from the asymptotic chi^2(2(k-1)) distribution
+    (needs ~10+ cells per arena), p_perm from n_perm group-label permutations
+    (valid at any sample size)."""
+    k = len(groups_rad)
+    pooled = np.mod(np.concatenate(groups_rad), 2 * np.pi)
+    labels = np.repeat(np.arange(k), [len(g) for g in groups_rad])
+    scores = 2 * np.pi * stats.rankdata(pooled) / len(pooled)
+    cos_sc, sin_sc = np.cos(scores), np.sin(scores)
+
+    W = _mww_statistic(cos_sc, sin_sc, labels, k)
+    p_chi2 = float(stats.chi2.sf(W, 2 * (k - 1)))
+    perm_W = np.array([_mww_statistic(cos_sc, sin_sc, rng.permutation(labels), k)
+                       for _ in range(n_perm)])
+    p_perm = float((np.sum(perm_W >= W - 1e-12) + 1) / (n_perm + 1))
+    return float(W), p_chi2, p_perm
+
+
+def holm_adjust(pvals):
+    """Holm-Bonferroni step-down adjusted p-values (NaNs left as NaN)."""
+    p = np.asarray(pvals, dtype=float)
+    adj = np.full(len(p), np.nan)
+    finite_idx = np.flatnonzero(np.isfinite(p))
+    m = len(finite_idx)
+    running = 0.0
+    for rank, idx in enumerate(finite_idx[np.argsort(p[finite_idx])]):
+        running = max(running, min(1.0, (m - rank) * p[idx]))
+        adj[idx] = running
+    return adj
+
+
+def phase_range_label(phase_deg):
+    """'precession' if the phase (deg, any cycle) falls in PI0_PRECESSION_RANGE_DEG
+    on the circle, else 'procession'; None for NaN."""
+    if not np.isfinite(phase_deg):
+        return None
+    lo, hi = PI0_PRECESSION_RANGE_DEG
+    return 'precession' if lo <= np.mod(phase_deg, 360) < hi else 'procession'
 
 
 def _gauss_kernel(n=11, sigma=1.0):
@@ -1167,8 +1281,8 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
     # background gradient: theta peak (0/360/720 deg) -> trough (180/540 deg), light viridis
     ph_bg = np.linspace(0, 720, 721)
     peakness = 0.5 * (1 + np.cos(np.deg2rad(ph_bg)))  # 1 at peak, 0 at trough
-    vir = plt.get_cmap('viridis')(0.15 + 0.8 * peakness)[:, :3]
-    bg_alpha = 0.3  # viridis opacity: lower = lighter/more transparent
+    vir = plt.get_cmap('viridis')(0.35 + 0.65 * peakness)[:, :3]  # skip the darkest purples
+    bg_alpha = 0.18  # viridis opacity: lower = lighter/more transparent
     bg = bg_alpha * vir + (1 - bg_alpha) * 1.0  # blend with white for a lighter hue
     ax.imshow(bg[:, None, :], origin='lower', aspect='auto', extent=[-1, 1, 0, 720],
               zorder=0, interpolation='bilinear')
@@ -1210,6 +1324,8 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path):
         f"rho = {results['rho']:.3f}",
         f"p (asymptotic) = {results['p']:.4g}",
         f"slope = {results['slope_deg_per_pass']:.2f} deg/pass",
+        f"phase @ pass index 0 = {results['phase_at_pi0_deg']:.1f} deg "
+        f"({phase_range_label(results['phase_at_pi0_deg'])} range)",
         f"class = {results['precession_class']}",
     ]
     for i, line in enumerate(text_lines):
@@ -1288,12 +1404,223 @@ ARENA_COMPARISON_METRICS = {
 TMI_COMPARISON_METRICS = {
     'TMI': 'Theta Modulation Index (TMI)',
 }
-ARENA_COLORS = {'Circle': '#4C72B0', 'Linear': '#DD8452', 'Open': '#55A868'}
+
+# ---- Figure style for the arena-comparison plots, matching ArenaType_StatsComparison_v7.py
+# (the Figure 3 place-cell plots): Arial, bold axis labels, small plain tick labels, thin
+# black left/bottom axes with short outward ticks, arena-colored boxes with black outlines,
+# black-edged points, significance stars, and a stats panel underneath. Applied only to the
+# arena-comparison plots (via plt.rc_context in _arena_fig_style), so the per-unit
+# diagnostic plots keep matplotlib's defaults.
+PAL_MAGENTA = '#FA7FFA'
+PAL_CYAN = '#7FFAFA'
+PAL_BLUE = '#7FB3E5'
+PAL_GRAY = '#7F7F7F'
+PAL_GREEN = '#00C000'
+PAL_YELLOW = '#FFD700'
+PAL_BLACK = '#000000'
+FIG_FONT = ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans']
+
+FS_LABEL, FS_TITLE, FS_TICK, FS_LEGEND, FS_STATS = 14, 15, 11, 11, 9
+FIG_STATS_LINE_IN = 0.2     # panel height per line of stats text (inches)
+FIG_LEGEND_ROW_IN = 0.3     # panel height per row of legend entries (inches)
+FIG_DPI = 500
+FIG_AXIS_LW = 0.8           # spines, ticks, dashed lines
+FIG_BOX_LW = 1.0            # box outlines, whiskers, caps; significance lines
+FIG_MEDIAN_LW = 1.5         # box median
+FIG_GROUP_W = 1.1           # x-axis width per arena (inches)
+FIG_AXIS_PAD_W = 1.4        # extra width for the y-axis label/ticks
+FIG_STATS_CHARS_PER_IN = 15  # approx. characters of stats text per inch of width
+
+FIG_RC = {
+    'font.family': 'sans-serif',
+    'font.sans-serif': FIG_FONT,
+    'pdf.fonttype': 42,          # keep text editable in Illustrator
+    'ps.fonttype': 42,
+    'svg.fonttype': 'none',
+    'text.color': PAL_BLACK,
+    'axes.labelcolor': PAL_BLACK,
+    'axes.labelweight': 'bold',
+    'axes.titleweight': 'bold',
+    'axes.edgecolor': PAL_BLACK,
+    'axes.linewidth': FIG_AXIS_LW,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'xtick.color': PAL_BLACK,
+    'ytick.color': PAL_BLACK,
+    'xtick.direction': 'out',
+    'ytick.direction': 'out',
+    'xtick.major.width': FIG_AXIS_LW,
+    'ytick.major.width': FIG_AXIS_LW,
+    'xtick.major.size': 3.5,
+    'ytick.major.size': 3.5,
+    'axes.facecolor': 'white',
+    'figure.facecolor': 'white',
+    'savefig.facecolor': 'white',
+    'axes.grid': False,
+    'legend.frameon': False,
+}
+
+# magenta = circular track, cyan = linear track, blue = open arena
+ARENA_COLORS = {
+    'Open': {'face': PAL_BLUE, 'edge': PAL_BLACK},
+    'Linear': {'face': PAL_CYAN, 'edge': PAL_BLACK},
+    'Circle': {'face': PAL_MAGENTA, 'edge': PAL_BLACK},
+}
+_DEFAULT_COLOR = {'face': PAL_GRAY, 'edge': PAL_BLACK}
+_TEST_STAT_NAMES = {'Kruskal-Wallis': 'H', 'Mann-Whitney U': 'U',
+                    'Mardia-Watson-Wheeler': 'W', 'Watson-Williams': 'F'}
+
+
+def _arena_fig_style(func):
+    """Run a plotting function under the FIG_RC style."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with plt.rc_context(FIG_RC):
+            return func(*args, **kwargs)
+    return wrapper
+
+
+def _new_fig(figsize, legend_rows=0, stats_lines=None):
+    """Figure + main axes. If there is a legend and/or stats text, a second
+    borderless axes sits below the plot to hold them (legend on top, stats
+    underneath), so neither overlaps the data. The panel is sized to fit."""
+    w, h = figsize
+    panel_h = legend_rows * FIG_LEGEND_ROW_IN + len(stats_lines or []) * FIG_STATS_LINE_IN
+    if panel_h > 0:
+        panel_h += 0.2
+        fig, (ax, ax_info) = plt.subplots(2, 1, figsize=(w, h + panel_h),
+                                          gridspec_kw={'height_ratios': [h, panel_h]})
+        ax_info.axis('off')
+        return fig, ax, ax_info
+    fig, ax = plt.subplots(figsize=figsize)
+    return fig, ax, None
+
+
+def _bar_fig_width(n_groups: int) -> float:
+    """Fixed width per arena, so boxes keep their proportions whatever the number of arenas."""
+    return n_groups * FIG_GROUP_W + FIG_AXIS_PAD_W
+
+
+def _wrap_stats(stats_lines, fig_w: float) -> list:
+    width = max(40, int(fig_w * FIG_STATS_CHARS_PER_IN))
+    return [w for line in (stats_lines or []) for w in (textwrap.wrap(line, width) or [''])]
+
+
+def _draw_stats(ax_info, stats_lines):
+    """Stats text at the bottom of the panel below the plot (under any legend)."""
+    if ax_info is None or not stats_lines:
+        return
+    ax_info.text(0.5, 0.0, '\n'.join(stats_lines), transform=ax_info.transAxes,
+                 fontsize=FS_STATS, va='bottom', ha='center', linespacing=1.3)
+
+
+def _fmt_p(p) -> str:
+    if p is None or pd.isna(p):
+        return 'n/a'
+    return '< 0.001' if p < 0.001 else f'{p:.3f}'
+
+
+def _stars(p) -> str:
+    if p is None or pd.isna(p):
+        return ''
+    return '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < ALPHA else 'n.s.'
+
+
+def _desc_str(vals) -> str:
+    """'mean ± SD | median [Q1, Q3]' for an array of values."""
+    vals = np.asarray(vals, dtype=float)
+    if not len(vals):
+        return 'n/a'
+    sd = f'{np.std(vals, ddof=1):.3g}' if len(vals) > 1 else 'n/a'
+    return (f'mean {np.mean(vals):.3g} ± {sd} SD | median {np.median(vals):.3g} '
+            f'[Q1 {np.percentile(vals, 25):.3g}, Q3 {np.percentile(vals, 75):.3g}]')
+
+
+def _arena_test_lines(omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame) -> list:
+    """Omnibus test(s) (statistic, dof, p) and post-hoc pairwise tests
+    (statistic, raw p, Holm-corrected p) as text lines."""
+    lines = []
+    for _, r in omnibus_df.iterrows():
+        if not np.isfinite(r['Statistic']):
+            lines.append(f'{r["Test"]}: insufficient data')
+            continue
+        dof = r.get('dof')
+        dof_str = f', dof = {int(dof)}' if dof is not None and pd.notna(dof) else ''
+        p = r['p_value']
+        lines.append(f'{r["Test"]}: {_TEST_STAT_NAMES.get(r["Test"], "stat")} = {r["Statistic"]:.3f}'
+                     f'{dof_str}, p = {_fmt_p(p)} {_stars(p)}')
+    for test in pairwise_df['Test'].unique() if len(pairwise_df) else []:
+        stat_name = _TEST_STAT_NAMES.get(test, 'stat')
+        lines.append(f'Post-hoc ({test}, Holm-Bonferroni corrected):')
+        for _, r in pairwise_df[pairwise_df['Test'] == test].iterrows():
+            stat = r['Statistic']
+            stat_str = 'n/a' if not np.isfinite(stat) else f'{stat:{".1f" if stat_name == "U" else ".3f"}}'
+            lines.append(f'{r["Arena1"]} vs {r["Arena2"]}: {stat_name} = {stat_str}, '
+                         f'p = {_fmt_p(r["p_value"])}, p(Holm) = {_fmt_p(r["p_holm"])} {_stars(r["p_holm"])}')
+    return lines
+
+
+def _set_title(ax, text):
+    # ~7 bold title characters per inch of figure width
+    ax.set_title(textwrap.fill(text, max(20, int(ax.figure.get_figwidth() * 7))),
+                 fontsize=FS_TITLE - 2, pad=12)
+
+
+def _style_axes(ax):
+    ax.tick_params(axis='both', labelsize=FS_TICK)
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def _arena_boxplot(ax, data, positions, arenas):
+    """Arena-colored boxes with black outlines, black median, no fliers."""
+    bp = ax.boxplot(data, positions=positions, showfliers=False, patch_artist=True, widths=0.55,
+                    manage_ticks=False,
+                    boxprops=dict(linewidth=FIG_BOX_LW, color=PAL_BLACK),
+                    whiskerprops=dict(linewidth=FIG_BOX_LW, color=PAL_BLACK),
+                    capprops=dict(linewidth=FIG_BOX_LW, color=PAL_BLACK),
+                    medianprops=dict(linewidth=FIG_MEDIAN_LW, color=PAL_BLACK),
+                    zorder=2)
+    for patch, arena in zip(bp['boxes'], arenas):
+        patch.set_facecolor(ARENA_COLORS.get(arena, _DEFAULT_COLOR)['face'])
+        patch.set_edgecolor(PAL_BLACK)
+    return bp
+
+
+def _draw_sig_brackets(ax, pos_by_arena: dict, pairwise_df, y_base: float, y_step: float, y_text: float):
+    """For every pairwise comparison with Holm-corrected p < ALPHA, draw a
+    horizontal line above the two arenas with the stars (* p<0.05, ** p<0.01,
+    *** p<0.001) centered on it; narrower spans are stacked lowest. Returns the
+    y of the highest line drawn, or None if no comparison was significant."""
+    if pairwise_df is None or not len(pairwise_df):
+        return None
+    sig = []
+    for _, r in pairwise_df.iterrows():
+        p = r.get('p_holm')
+        if p is None or pd.isna(p) or p >= ALPHA:
+            continue
+        if r['Arena1'] not in pos_by_arena or r['Arena2'] not in pos_by_arena:
+            continue
+        x1, x2 = sorted((pos_by_arena[r['Arena1']], pos_by_arena[r['Arena2']]))
+        sig.append((x2 - x1, x1, x2, _stars(p)))
+    y = y_base
+    for _span, x1, x2, stars_str in sorted(sig):
+        ax.plot([x1, x2], [y, y], color=PAL_BLACK, linewidth=FIG_BOX_LW,
+                solid_capstyle='butt', clip_on=False, zorder=5)
+        ax.text((x1 + x2) / 2, y + y_text, stars_str, ha='center', va='center',
+                fontsize=FS_LABEL + 3, fontweight='bold', clip_on=False, zorder=5)
+        y += y_step
+    return y - y_step if sig else None
+
+
+def _save_fig(fig, out_path):
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches='tight')
+    plt.close(fig)
 
 
 def compare_arenas(df_sig: pd.DataFrame, metrics: dict = ARENA_COMPARISON_METRICS):
-    """Kruskal-Wallis omnibus test + pairwise Mann-Whitney U post-hoc tests,
-    one per metric, across whichever arenas are present in df_sig['Arena'].
+    """Kruskal-Wallis omnibus test + pairwise Mann-Whitney U post-hoc tests
+    (Holm-Bonferroni corrected within each metric), one per metric, across
+    whichever arenas are present in df_sig['Arena'].
     Returns (omnibus_df, pairwise_df)."""
     arenas_present = [a for a in ARENA_LABELS if (df_sig['Arena'] == a).sum() > 0]
 
@@ -1307,81 +1634,226 @@ def compare_arenas(df_sig: pd.DataFrame, metrics: dict = ARENA_COMPARISON_METRIC
         else:
             kw_stat, kw_p = np.nan, np.nan
         omnibus_rows.append(dict(
-            Metric=label, Test='Kruskal-Wallis', N_arenas=len(groups), Statistic=kw_stat, p_value=kw_p,
+            Metric=label, Test='Kruskal-Wallis', N_arenas=len(groups), Statistic=kw_stat,
+            dof=len(groups) - 1 if len(groups) >= 2 else np.nan, p_value=kw_p,
             N_per_arena=', '.join(f'{a}={len(v)}' for a, v in groups.items())))
 
+        metric_rows = []
         arena_names = list(groups.keys())
         for i in range(len(arena_names)):
             for j in range(i + 1, len(arena_names)):
                 a1, a2 = arena_names[i], arena_names[j]
                 v1, v2 = groups[a1], groups[a2]
                 u_stat, p_pair = stats.mannwhitneyu(v1, v2, alternative='two-sided')
-                pairwise_rows.append(dict(Metric=label, Arena1=a1, Arena2=a2, N1=len(v1), N2=len(v2),
-                                           Test='Mann-Whitney U', Statistic=u_stat, p_value=p_pair))
+                metric_rows.append(dict(Metric=label, Arena1=a1, Arena2=a2, N1=len(v1), N2=len(v2),
+                                        Test='Mann-Whitney U', Statistic=u_stat, p_value=p_pair))
+        # Holm-Bonferroni correction within each metric
+        for row, p_adj in zip(metric_rows, holm_adjust([r['p_value'] for r in metric_rows])):
+            row['p_holm'] = p_adj
+        pairwise_rows += metric_rows
 
     omnibus_df = pd.DataFrame(omnibus_rows,
-                               columns=['Metric', 'Test', 'N_arenas', 'Statistic', 'p_value', 'N_per_arena'])
+                               columns=['Metric', 'Test', 'N_arenas', 'Statistic', 'dof', 'p_value',
+                                        'N_per_arena'])
     pairwise_df = pd.DataFrame(pairwise_rows,
-                                columns=['Metric', 'Arena1', 'Arena2', 'N1', 'N2', 'Test', 'Statistic', 'p_value'])
+                                columns=['Metric', 'Arena1', 'Arena2', 'N1', 'N2', 'Test', 'Statistic',
+                                         'p_value', 'p_holm'])
     return omnibus_df, pairwise_df
 
 
-def plot_arena_comparison(df_sig: pd.DataFrame, pairwise_df: pd.DataFrame, out_path: Path,
-                           metrics: dict = ARENA_COMPARISON_METRICS):
-    """Boxplot + jittered points per arena for each metric, with pairwise
-    Mann-Whitney p-value brackets, one panel per metric."""
-    arenas_present = [a for a in ARENA_LABELS if (df_sig['Arena'] == a).sum() > 0]
+@_arena_fig_style
+def plot_arena_comparison(df_sig: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
+                           out_prefix: Path, metrics: dict = ARENA_COMPARISON_METRICS,
+                           population: str = '') -> list[Path]:
+    """One box plot + jittered points figure per metric (saved as
+    <out_prefix>_<metric>.png, or <out_prefix>.png for a single metric), with
+    stars over arena pairs whose Holm-corrected Mann-Whitney p < ALPHA, and
+    descriptives + test results in a panel underneath. Returns the saved paths."""
     rng = np.random.default_rng(0)
+    saved = []
+    for col, label in metrics.items():
+        present = [a for a in ARENA_LABELS if df_sig.loc[df_sig['Arena'] == a, col].notna().any()]
+        if not present:
+            continue
+        data = [df_sig.loc[df_sig['Arena'] == a, col].dropna().to_numpy(dtype=float) for a in present]
+        positions = np.arange(1, len(present) + 1)
+        post = pairwise_df[pairwise_df['Metric'] == label]
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(5.5 * len(metrics), 5.5), squeeze=False)
-    axes = axes[0]
+        stats_lines = [f'Cells: {population}'] if population else []
+        stats_lines += [f'{a} (n={len(v)}): {_desc_str(v)}' for a, v in zip(present, data)]
+        stats_lines += _arena_test_lines(omnibus_df[omnibus_df['Metric'] == label], post)
+        fig_w = _bar_fig_width(len(present))
+        stats_lines = _wrap_stats(stats_lines, fig_w)
+        fig, ax, ax_info = _new_fig((fig_w, 5.5), stats_lines=stats_lines)
 
-    for ax, (col, label) in zip(axes, metrics.items()):
-        data = [df_sig.loc[df_sig['Arena'] == a, col].dropna().to_numpy() for a in arenas_present]
-
-        bp = ax.boxplot(data, positions=range(len(arenas_present)), widths=0.5,
-                         patch_artist=True, showfliers=False)
-        for patch, arena in zip(bp['boxes'], arenas_present):
-            patch.set_facecolor(ARENA_COLORS.get(arena, '#999999'))
-            patch.set_alpha(0.5)
-
-        for i, (arena, vals) in enumerate(zip(arenas_present, data)):
+        _arena_boxplot(ax, data, positions, present)
+        for pos, arena, vals in zip(positions, present, data):
+            c = ARENA_COLORS.get(arena, _DEFAULT_COLOR)
             jitter = rng.uniform(-0.12, 0.12, size=len(vals))
-            ax.scatter(np.full(len(vals), i) + jitter, vals, color=ARENA_COLORS.get(arena, '#999999'),
-                       edgecolor='black', linewidth=0.3, s=25, zorder=3)
+            ax.scatter(np.full(len(vals), pos) + jitter, vals, s=22, facecolors=c['face'],
+                       edgecolors=c['edge'], linewidths=0.5, zorder=3)
 
-        ax.set_xticks(range(len(arenas_present)))
-        ax.set_xticklabels([f'{a}\n(n={len(v)})' for a, v in zip(arenas_present, data)])
-        ax.set_ylabel(label)
-        ax.set_title(label)
+        # Significance lines above significantly different pairs of arenas.
+        y_lo, y_hi = ax.get_ylim()
+        span = y_hi - y_lo
+        top = _draw_sig_brackets(ax, dict(zip(present, positions)), post,
+                                 y_base=max(v.max() for v in data) + 0.06 * span,
+                                 y_step=0.10 * span, y_text=0.03 * span)
+        if top is not None:
+            ax.set_ylim(y_lo, max(y_hi, top + 0.08 * span))
+        _draw_stats(ax_info, stats_lines)
 
-        finite_vals = [v for v in data if len(v) > 0]
-        y_max = max((v.max() for v in finite_vals), default=1.0)
-        y_min = min((v.min() for v in finite_vals), default=0.0)
-        y_span = (y_max - y_min) if y_max > y_min else max(abs(y_max), 1.0)
-        step = y_span * 0.12
+        ax.set_xticks(positions)
+        ax.set_xticklabels([f'{a}\n(n={len(v)})' for a, v in zip(present, data)])
+        ax.set_xlim(0.4, len(present) + 0.6)
+        ax.set_ylabel(textwrap.fill(label, 30), fontsize=FS_LABEL, labelpad=8)
+        _set_title(ax, label)
+        _style_axes(ax)
+        fig.tight_layout()
 
-        sub = pairwise_df[pairwise_df['Metric'] == label]
-        level = 0
-        for _, row in sub.iterrows():
-            if row['Arena1'] not in arenas_present or row['Arena2'] not in arenas_present:
-                continue
-            i1, i2 = arenas_present.index(row['Arena1']), arenas_present.index(row['Arena2'])
-            y = y_max + step * (level + 1)
-            ax.plot([i1, i1, i2, i2], [y - step * 0.2, y, y, y - step * 0.2], color='black', linewidth=1)
-            p = row['p_value']
-            p_str = 'n/a' if not np.isfinite(p) else (f'p={p:.3g}' if p >= 0.001 else 'p<0.001')
-            ax.text((i1 + i2) / 2, y + step * 0.05, p_str, ha='center', va='bottom', fontsize=9)
-            level += 1
-        if level > 0:
-            ax.set_ylim(y_min - y_span * 0.05, y_max + step * (level + 1.5))
+        out_path = (out_prefix.with_name(f'{out_prefix.name}.png') if len(metrics) == 1
+                    else out_prefix.with_name(f'{out_prefix.name}_{col}.png'))
+        _save_fig(fig, out_path)
+        saved.append(out_path)
+    return saved
 
-    fig.suptitle('Phase precession/recession by arena (Circle vs Linear vs Open)\n'
-                  'significantly precessing/recessing cells, animals pooled within arena',
-                  fontsize=11, fontweight='bold')
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
+
+def compare_arenas_pi0_phase(df_pi0: pd.DataFrame, rng):
+    """Theta phase at pass index 0 across arenas, with circular statistics
+    (a linear Kruskal-Wallis would treat 359 and 1 deg as far apart).
+    Primary: Mardia-Watson-Wheeler uniform-scores test (nonparametric, tests
+    for any difference in the circular distributions), permutation p. Also
+    reported: Watson-Williams test (equal mean direction, von Mises
+    assumption). Omnibus over all arenas, then pairwise with Holm correction
+    per test. Returns (descriptive_df, omnibus_df, pairwise_df)."""
+    arenas_present = [a for a in ARENA_LABELS if (df_pi0['Arena'] == a).sum() > 0]
+    groups = {a: np.deg2rad(df_pi0.loc[df_pi0['Arena'] == a, 'phase_at_pi0_deg'].dropna().to_numpy())
+              for a in arenas_present}
+    groups = {a: v for a, v in groups.items() if len(v) > 0}
+
+    desc_rows = []
+    for a, v in groups.items():
+        n_prec = int(sum(phase_range_label(x) == 'precession' for x in np.rad2deg(v)))
+        rayleigh_p, _ = circ_rtest(v)
+        desc_rows.append(dict(
+            Arena=a, N=len(v), CircMean_deg=float(np.mod(np.rad2deg(circ_mean(v)), 360)),
+            MRL=circ_r(v), Rayleigh_p=rayleigh_p,
+            N_precession_range=n_prec, N_procession_range=len(v) - n_prec,
+            Pct_precession_range=100.0 * n_prec / len(v)))
+    desc_df = pd.DataFrame(desc_rows, columns=['Arena', 'N', 'CircMean_deg', 'MRL', 'Rayleigh_p',
+                                               'N_precession_range', 'N_procession_range',
+                                               'Pct_precession_range'])
+
+    def run_tests(group_list):
+        W, p_chi2, p_perm = mardia_watson_wheeler_test(group_list, rng)
+        F, p_ww, kappa = watson_williams_test(group_list)
+        return [dict(Test='Mardia-Watson-Wheeler', Statistic=W, p_value=p_perm, p_chi2_asymptotic=p_chi2),
+                dict(Test='Watson-Williams', Statistic=F, p_value=p_ww, kappa=kappa)]
+
+    omnibus_rows = []
+    if len(groups) >= 2:
+        for res in run_tests(list(groups.values())):
+            omnibus_rows.append(dict(Metric='Theta phase at field center (deg)', N_arenas=len(groups),
+                                     N_per_arena=', '.join(f'{a}={len(v)}' for a, v in groups.items()),
+                                     **res))
+    omnibus_df = pd.DataFrame(omnibus_rows, columns=['Metric', 'Test', 'N_arenas', 'Statistic', 'p_value',
+                                                     'p_chi2_asymptotic', 'kappa', 'N_per_arena'])
+
+    pairwise_rows = []
+    arena_names = list(groups.keys())
+    for i in range(len(arena_names)):
+        for j in range(i + 1, len(arena_names)):
+            a1, a2 = arena_names[i], arena_names[j]
+            for res in run_tests([groups[a1], groups[a2]]):
+                pairwise_rows.append(dict(Arena1=a1, Arena2=a2, N1=len(groups[a1]), N2=len(groups[a2]), **res))
+    pairwise_df = pd.DataFrame(pairwise_rows, columns=['Arena1', 'Arena2', 'N1', 'N2', 'Test', 'Statistic',
+                                                       'p_value', 'p_holm', 'p_chi2_asymptotic', 'kappa'])
+    for test in pairwise_df['Test'].unique():
+        sel = pairwise_df['Test'] == test
+        pairwise_df.loc[sel, 'p_holm'] = holm_adjust(pairwise_df.loc[sel, 'p_value'].to_numpy())
+    return desc_df, omnibus_df, pairwise_df
+
+
+@_arena_fig_style
+def plot_pi0_phase_by_arena(df_pi0: pd.DataFrame, desc_df: pd.DataFrame, omnibus_df: pd.DataFrame,
+                             pairwise_df: pd.DataFrame, out_path: Path):
+    """Box plot + jittered points per arena of the theta phase at field center,
+    on a single-cycle 0-360 deg axis, in the same style as plot_arena_comparison.
+    Points are green in the precession range, yellow in the procession range
+    (faint matching background bands). Because phase is circular, each arena's
+    box is computed on its phases unwrapped to within +/-180 deg of the arena's
+    circular mean (so a cluster straddling 0/360 deg is not split), then drawn
+    at -360/0/+360 deg offsets clipped to 0-360 so such a box wraps around.
+    Stars: pairs whose Holm-corrected Mardia-Watson-Wheeler p < ALPHA."""
+    present = [a for a in ARENA_LABELS if df_pi0.loc[df_pi0['Arena'] == a, 'phase_at_pi0_deg'].notna().any()]
+    if not present:
+        return
+    phases = [np.mod(df_pi0.loc[df_pi0['Arena'] == a, 'phase_at_pi0_deg'].dropna().to_numpy(dtype=float), 360)
+              for a in present]
+    positions = np.arange(1, len(present) + 1)
+    lo, hi = PI0_PRECESSION_RANGE_DEG
+
+    stats_lines = [f'Cells: {", ".join(PI0_PHASE_CLASSES)}; animals pooled within arena']
+    for _, r in desc_df.iterrows():
+        stats_lines.append(f'{r["Arena"]} (n={int(r["N"])}): circular mean {r["CircMean_deg"]:.1f}°, '
+                           f'MRL {r["MRL"]:.2f} | precession range {int(r["N_precession_range"])}/'
+                           f'{int(r["N"])} ({r["Pct_precession_range"]:.1f} %)')
+    stats_lines += _arena_test_lines(omnibus_df, pairwise_df)
+    stats_lines.append('Mardia-Watson-Wheeler p from label permutations; '
+                       'Watson-Williams assumes von Mises phases with a common concentration')
+    fig_w = _bar_fig_width(len(present))
+    stats_lines = _wrap_stats(stats_lines, fig_w)
+    fig, ax, ax_info = _new_fig((fig_w, 7.0), legend_rows=2, stats_lines=stats_lines)
+
+    ax.axhspan(lo, hi, color=PI0_RANGE_COLORS['precession'], alpha=0.08, lw=0, zorder=0)
+    for y0, y1 in ((0, lo), (hi, 360)):
+        ax.axhspan(y0, y1, color=PI0_RANGE_COLORS['procession'], alpha=0.12, lw=0, zorder=0)
+
+    # boxes are repeated every 360 deg and clipped to the 0-360 phase axis, so a
+    # box straddling 0/360 deg wraps around instead of being cut off
+    clip_rect = Rectangle((0, 0), len(present) + 1, 360, transform=ax.transData)
+    for pos, arena, ph in zip(positions, present, phases):
+        mu = np.mod(np.rad2deg(circ_mean(np.deg2rad(ph))), 360)
+        unwrapped = mu + (np.mod(ph - mu + 180, 360) - 180)
+        for off in (-360, 0, 360):
+            bp = _arena_boxplot(ax, [unwrapped + off], [pos], [arena])
+            for artist in (*bp['boxes'], *bp['whiskers'], *bp['caps'], *bp['medians']):
+                artist.set_clip_path(clip_rect)
+
+    rng = np.random.default_rng(0)
+    for pos, ph in zip(positions, phases):
+        jitter = rng.uniform(-0.12, 0.12, size=len(ph))
+        faces = [PI0_RANGE_COLORS[phase_range_label(p)] for p in ph]
+        ax.scatter(pos + jitter, ph, s=22, facecolors=faces, edgecolors=PAL_BLACK,
+                   linewidths=0.5, zorder=3)
+
+    ax.set_ylim(0, 360)
+    top = _draw_sig_brackets(ax, dict(zip(present, positions)),
+                             pairwise_df[pairwise_df['Test'] == 'Mardia-Watson-Wheeler'],
+                             y_base=360 + 0.05 * 360, y_step=0.08 * 360, y_text=0.025 * 360)
+    if top is not None:
+        ax.set_ylim(0, top + 0.06 * 360)
+    ax.set_yticks(np.arange(0, 361, 90))
+
+    handles = [Line2D([0], [0], marker='o', linestyle='None', markersize=8,
+                      markerfacecolor=PI0_RANGE_COLORS['precession'], markeredgecolor=PAL_BLACK,
+                      markeredgewidth=0.5,
+                      label=f'precession range ({lo:g}–{hi:g}°)'),
+               Line2D([0], [0], marker='o', linestyle='None', markersize=8,
+                      markerfacecolor=PI0_RANGE_COLORS['procession'], markeredgecolor=PAL_BLACK,
+                      markeredgewidth=0.5,
+                      label=f'procession range (0–{lo:g}°, {hi:g}–360°)')]
+    ax_info.legend(handles=handles, loc='upper center', fontsize=FS_LEGEND - 2, ncol=1)
+    _draw_stats(ax_info, stats_lines)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f'{a}\n(n={len(ph)})' for a, ph in zip(present, phases)])
+    ax.set_xlim(0.4, len(present) + 0.6)
+    ax.set_ylabel(textwrap.fill('Theta phase at field center (deg)', 30), fontsize=FS_LABEL, labelpad=8)
+    _set_title(ax, 'Theta phase at field center (field center)')
+    _style_axes(ax)
+    fig.tight_layout()
+    _save_fig(fig, out_path)
 
 
 def process_session(data_folder: Path, rng) -> list[dict]:
@@ -1535,6 +2007,8 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                             'slope_deg_per_pass': results['slope_deg_per_pass'],
                             'r_squared': results['r_squared'],
                             'phase_range_deg': results['phase_range_deg'],
+                            'phase_at_pi0_deg': results['phase_at_pi0_deg'],
+                            'phase_at_pi0_range': phase_range_label(results['phase_at_pi0_deg']),
                             'is_precessing': results['is_precessing'],
                             'is_recessing': results['is_recessing'],
                             'is_phase_locked': results['is_phase_locked'],
@@ -1624,8 +2098,9 @@ def save_metadata_csv(csv_path: Path) -> Path:
     ]
     module_globals = globals()
     config_names = [n for n in module_globals
-                    if n.isupper() and not n.startswith('_')
-                    and n not in ('ARENA_COMPARISON_METRICS', 'TMI_COMPARISON_METRICS', 'ARENA_COLORS')]
+                    if n.isupper() and not n.startswith(('_', 'PAL_', 'FS_', 'FIG_'))  # skip figure style
+                    and n not in ('ARENA_COMPARISON_METRICS', 'TMI_COMPARISON_METRICS', 'ARENA_COLORS',
+                                  'PI0_RANGE_COLORS')]
     rows += [(n, repr(module_globals[n]) if not isinstance(module_globals[n], (str, Path))
               else str(module_globals[n])) for n in config_names]
     # constants hard-coded inside functions
@@ -1670,7 +2145,7 @@ def main():
                'SignificantThetaModulation', 'PhasePeak_deg', 'PhaseValley_deg', 'TMI',
                'TMI_shuffle_p', 'TMI_Significant', 'PrecessionTested', 'PassIndex_n_spikes',
                'rho', 'r_squared', 'precession_p', 'slope_deg_per_pass', 'phase_range_deg',
-               'is_precessing', 'is_recessing', 'is_phase_locked', 'PrecessionClass', 'n_fit_lines',
+               'phase_at_pi0_deg', 'phase_at_pi0_range', 'is_precessing', 'is_recessing', 'is_phase_locked', 'PrecessionClass', 'n_fit_lines',
                'PrecessionSkippedReason']
     df = pd.DataFrame(all_rows, columns=columns)
     summary_df = build_summary_stats(df)
@@ -1686,9 +2161,11 @@ def main():
     arenas_with_data = sorted(df_sig['Arena'].unique()) if not df_sig.empty else []
     if len(arenas_with_data) >= 2:
         arena_omnibus_df, arena_pairwise_df = compare_arenas(df_sig)
-        arena_plot_path = ROOT_FOLDER / 'ArenaComparison_PhasePrecession.png'
-        plot_arena_comparison(df_sig, arena_pairwise_df, arena_plot_path)
-        print(f'\nArena comparison ({", ".join(arenas_with_data)}) plot saved to {arena_plot_path}')
+        arena_plot_paths = plot_arena_comparison(
+            df_sig, arena_omnibus_df, arena_pairwise_df, ROOT_FOLDER / 'ArenaComparison_PhasePrecession',
+            population='significantly precessing/recessing cells; animals pooled within arena')
+        print(f'\nArena comparison ({", ".join(arenas_with_data)}) plots saved: '
+              f'{", ".join(p.name for p in arena_plot_paths)}')
     else:
         print(f'\nFewer than 2 arenas with significantly precessing/recessing cells found '
               f'({arenas_with_data}) -- skipping arena comparison plot.')
@@ -1701,12 +2178,34 @@ def main():
     arenas_with_tmi_data = sorted(df_tmi_sig['Arena'].unique()) if not df_tmi_sig.empty else []
     if len(arenas_with_tmi_data) >= 2:
         tmi_omnibus_df, tmi_pairwise_df = compare_arenas(df_tmi_sig, TMI_COMPARISON_METRICS)
-        tmi_plot_path = ROOT_FOLDER / 'ArenaComparison_TMI.png'
-        plot_arena_comparison(df_tmi_sig, tmi_pairwise_df, tmi_plot_path, TMI_COMPARISON_METRICS)
-        print(f'\nArena TMI comparison ({", ".join(arenas_with_tmi_data)}) plot saved to {tmi_plot_path}')
+        tmi_plot_paths = plot_arena_comparison(
+            df_tmi_sig, tmi_omnibus_df, tmi_pairwise_df, ROOT_FOLDER / 'ArenaComparison_TMI',
+            TMI_COMPARISON_METRICS,
+            population='significantly theta-modulated cells (TMI shuffle); animals pooled within arena')
+        print(f'\nArena TMI comparison ({", ".join(arenas_with_tmi_data)}) plot saved: '
+              f'{", ".join(p.name for p in tmi_plot_paths)}')
     else:
         print(f'\nFewer than 2 arenas with significantly theta-modulated cells found '
               f'({arenas_with_tmi_data}) -- skipping TMI arena comparison plot.')
+
+    # ---- Arena comparison of theta phase at field center (field center) ----
+    df_pi0 = df.loc[df['PrecessionClass'].isin(PI0_PHASE_CLASSES) & df['Arena'].notna()
+                    & df['phase_at_pi0_deg'].notna()].copy()
+
+    pi0_desc_df = pd.DataFrame()
+    pi0_omnibus_df = pd.DataFrame()
+    pi0_pairwise_df = pd.DataFrame()
+    arenas_with_pi0_data = sorted(df_pi0['Arena'].unique()) if not df_pi0.empty else []
+    if len(arenas_with_pi0_data) >= 2:
+        pi0_desc_df, pi0_omnibus_df, pi0_pairwise_df = compare_arenas_pi0_phase(
+            df_pi0, np.random.default_rng(RANDOM_SEED))
+        pi0_plot_path = ROOT_FOLDER / 'ArenaComparison_PhaseAtPassIndex0.png'
+        plot_pi0_phase_by_arena(df_pi0, pi0_desc_df, pi0_omnibus_df, pi0_pairwise_df, pi0_plot_path)
+        print(f'\nArena phase-at-pass-index-0 comparison ({", ".join(arenas_with_pi0_data)}) '
+              f'plot saved to {pi0_plot_path}')
+    else:
+        print(f'\nFewer than 2 arenas with {"/".join(PI0_PHASE_CLASSES)} cells found '
+              f'({arenas_with_pi0_data}) -- skipping phase-at-pass-index-0 arena comparison.')
 
     excel_path = ROOT_FOLDER / OUTPUT_EXCEL_NAME
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
@@ -1720,6 +2219,12 @@ def main():
             tmi_omnibus_df.to_excel(writer, sheet_name='ArenaComparison_TMI_Omnibus', index=False)
         if not tmi_pairwise_df.empty:
             tmi_pairwise_df.to_excel(writer, sheet_name='ArenaComparison_TMI_Pairwise', index=False)
+        if not pi0_desc_df.empty:
+            pi0_desc_df.to_excel(writer, sheet_name='PhaseAtPI0_ByArena', index=False)
+        if not pi0_omnibus_df.empty:
+            pi0_omnibus_df.to_excel(writer, sheet_name='PhaseAtPI0_Omnibus', index=False)
+        if not pi0_pairwise_df.empty:
+            pi0_pairwise_df.to_excel(writer, sheet_name='PhaseAtPI0_Pairwise', index=False)
     print(f'\nDone. {len(df)} unit(s) processed. Summary saved to {excel_path}')
 
     metadata_path = save_metadata_csv(excel_path.with_name(excel_path.stem + '_metadata.csv'))
