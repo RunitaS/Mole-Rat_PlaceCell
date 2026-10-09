@@ -4,10 +4,10 @@ Combined theta-modulation + phase-precession pipeline, run sequentially per
 unit (one .ntt file = one already-isolated unit):
 
   Step 1 (visualization only): polar plot of spike counts vs. theta phase,
-    phase estimated by linear interpolation between consecutive peaks of the
-    bandpass-filtered LFP (0 deg at a peak, 360 deg at the next; see
-    peak_interp_phase, after AditiPrecessionUtils.getPhase). The same
-    peak-to-peak interpolation is used for Step 3's spatial pass-index phase.
+    phase estimated by direct Hilbert transform of the bandpass-filtered LFP
+    (angle of the analytic signal, 0 deg at a peak; see hilbert_phase -- no
+    Generalized Phase correction). The same Hilbert phase is used for
+    Step 3's spatial pass-index phase.
   Step 2: Theta Modulation Index (TMI) for that unit (Frank et al. 2001:
     TMI = 1 - the minimum of the smoothed, normalized theta-phase
     histogram), tested for significance via that paper's shuffling
@@ -152,7 +152,7 @@ from scipy.special import erf
 ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected") 
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
 RESULTS_FOLDER = ROOT_FOLDER / 'PhasePrec_Results'
-OUTPUT_EXCEL_NAME = 'theta_phase_Interp.xlsx'   # written to RESULTS_FOLDER
+OUTPUT_EXCEL_NAME = 'theta_phase_Hilbert.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 CLASS_PLOT_FOLDERS = {
     'phase_precessing': 'PhasePrecessing_Plots',
@@ -622,25 +622,56 @@ def times_in_ok_epochs(t_s, t0_s, epoch_ok):
 
 
 # ============================================================================
-# Theta phase by peak-to-peak linear interpolation (AditiPrecessionUtils.getPhase).
+# Theta phase by direct Hilbert transform.
 #
-# The bandpass-filtered signal's peaks are located; phase is 0 deg at each peak
-# and rises linearly to 360 deg at the next one, so a time point t falling
-# between peaks (t_k, t_k+1) has phase 360*(t - t_k)/(t_k+1 - t_k). Points
-# before the first or after the last peak have no defined phase (NaN).
+# Phase = angle of the analytic signal of the bandpass-filtered trace
+# (np.angle(signal.hilbert(x))): 0 at a peak, +/-pi at a trough. The raw
+# Hilbert phase is used as is -- the Generalized Phase correction (Davis,
+# Muller et al. 2020) for low/negative-frequency epochs is deliberately NOT
+# applied here.
 # ============================================================================
 
-def peak_interp_phase(x, t, query_t=None):
-    """Unwrapped phase (rad, 2*pi per cycle, 0 at the first peak) of the
-    filtered signal `x` sampled at times `t`, evaluated at `query_t` (defaults
-    to `t`) by linear interpolation between consecutive peaks. NaN outside the
-    [first peak, last peak] span (or everywhere if fewer than 2 peaks)."""
-    t = np.asarray(t, dtype=np.float64)
-    q = t if query_t is None else np.asarray(query_t, dtype=np.float64)
-    pk_idx, _ = signal.find_peaks(x)
-    if len(pk_idx) < 2:
-        return np.full(q.shape, np.nan)
-    return np.interp(q, t[pk_idx], 2 * np.pi * np.arange(len(pk_idx)),
+def hilbert_phase(x, fs):
+    """Instantaneous phase (rad, wrapped to (-pi, pi], 0 at a peak) and
+    instantaneous frequency (in units of fs, per sample) of the already
+    bandpass-filtered real signal `x`, from its Hilbert analytic signal.
+    Returns (ph, wt); ph is all NaN if the analytic signal is."""
+    x = np.asarray(x, dtype=np.float64)
+    npts = x.shape[0]
+    dt = 1.0 / fs
+
+    def _inst_freq(xo):
+        wt = np.zeros(npts)
+        wt[:-1] = np.angle(xo[1:] * np.conj(xo[:-1])) / (2 * np.pi * dt)
+        return wt
+
+    # analytic signal representation (scipy.signal.hilbert already implements
+    # the single-sided FFT approach of Marple 1999 used by the MATLAB original)
+    xo = signal.hilbert(x)
+    ph = np.angle(xo)
+    md = np.abs(xo)
+    wt_raw = _inst_freq(xo)
+
+    # rectify rotation direction so instantaneous frequency is positive
+    finite_wt = wt_raw[np.isfinite(wt_raw)]
+    sign_if = np.sign(np.mean(finite_wt)) if finite_wt.size else 1.0
+    if sign_if == -1:
+        xo = md * np.exp(1j * (sign_if * ph))
+        ph = np.angle(xo)
+        md = np.abs(xo)
+        wt_raw = _inst_freq(xo)
+
+    if np.all(np.isnan(ph)):
+        return np.full(npts, np.nan), wt_raw
+    return ph, wt_raw
+
+
+def phase_at(t, phase_unwrapped, query_t):
+    """Unwrapped phase (rad) of a trace sampled at times `t`, linearly
+    interpolated at `query_t`. Interpolating the unwrapped phase (not the
+    wrapped angle) keeps the 2*pi wraparound from corrupting values between
+    samples. NaN outside [t[0], t[-1]]."""
+    return np.interp(np.asarray(query_t, dtype=np.float64), t, phase_unwrapped,
                      left=np.nan, right=np.nan)
 
 
@@ -846,11 +877,14 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
                         method='place', binside='auto', smth_width='auto',
                         filter_band='auto', lfp_filter_band=(3.0, 7.0),
                         slope_bnds=None,
-                        phase_spk_ts=None, lfp_theta_mask=None):
+                        phase_spk_ts=None, lfp_theta_mask=None, lfp_phase_unwrapped=None):
     """`spk_ts` (all spikes) defines the rate map / place field. If `phase_spk_ts`
     is given (ACG theta-positive spikes), only those spikes enter the pass-index /
     theta-phase analysis and shuffles. `lfp_theta_mask` (bool per LFP sample), if
-    given, restricts the density-map occupancy to theta-positive samples."""
+    given, restricts the density-map occupancy to theta-positive samples.
+    `lfp_phase_unwrapped` (per LFP sample), if given, is the precomputed unwrapped
+    Hilbert theta phase of `lfp_sig` filtered to `lfp_filter_band`; otherwise it
+    is computed here."""
     n_dims = pos_xy.shape[1]
     if binside == 'auto':
         binside = 2.0 * n_dims
@@ -873,20 +907,22 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     fs_arc = 1.0 / np.mean(np.diff(cc))
     filtered_field_index = bandpass_filter(resampled, filter_band[0], filter_band[1], fs_arc)
 
-    # Spatial pass-index phase: peak-to-peak interpolation of the filtered field-index
-    # trace (0 at a field-index peak, wrapped to [-1, 1) x pi). NaN before the first /
-    # after the last peak.
+    # Spatial pass-index phase: Hilbert phase of the filtered field-index trace
+    # (0 at a field-index peak, wrapped to [-1, 1) x pi).
     def _wrap_pm_pi(u):
         return np.mod(u + np.pi, 2 * np.pi) - np.pi
 
-    pass_index_trace = _wrap_pm_pi(peak_interp_phase(filtered_field_index, ts2)) / np.pi
-    spk_pass_index = _wrap_pm_pi(peak_interp_phase(filtered_field_index, ts2, spk_ts)) / np.pi
+    field_phase_unwrapped = np.unwrap(hilbert_phase(filtered_field_index, fs_arc)[0])
+    pass_index_trace = _wrap_pm_pi(field_phase_unwrapped) / np.pi
+    spk_pass_index = _wrap_pm_pi(phase_at(ts2, field_phase_unwrapped, spk_ts)) / np.pi
 
-    filtered_lfp = bandpass_filter(lfp_sig, lfp_filter_band[0], lfp_filter_band[1], lfp_fs)
-    lfp_phase = _wrap_pm_pi(peak_interp_phase(filtered_lfp, lfp_ts))
-    spk_theta_phase = _wrap_pm_pi(peak_interp_phase(filtered_lfp, lfp_ts, spk_ts))
+    if lfp_phase_unwrapped is None:
+        filtered_lfp = bandpass_filter(lfp_sig, lfp_filter_band[0], lfp_filter_band[1], lfp_fs)
+        lfp_phase_unwrapped = np.unwrap(hilbert_phase(filtered_lfp, lfp_fs)[0])
+    lfp_phase = _wrap_pm_pi(lfp_phase_unwrapped)
+    spk_theta_phase = _wrap_pm_pi(phase_at(lfp_ts, lfp_phase_unwrapped, spk_ts))
 
-    # Spikes outside either phase's first/last-peak span have no defined phase: drop them.
+    # Spikes outside the position / LFP time range, or in an LFP gap, have no defined phase: drop them.
     spk_theta_phase[~spikes_with_lfp_sample(spk_ts, lfp_ts, lfp_fs)] = np.nan
     spk_valid = np.isfinite(spk_pass_index) & np.isfinite(spk_theta_phase)
     spk_ts, spk_xy = spk_ts[spk_valid], spk_xy[spk_valid]
@@ -954,7 +990,7 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     pi_edges = np.linspace(-1, 1, 41)
     ph_edges = np.linspace(0, 2 * np.pi, 101)
     dt_lfp = float(np.mean(np.diff(lfp_ts)))
-    occ_sel = np.isfinite(lfp_pass_index) & np.isfinite(lfp_phase)   # phase is NaN outside first/last peak
+    occ_sel = np.isfinite(lfp_pass_index) & np.isfinite(lfp_phase)
     if lfp_theta_mask is not None:
         occ_sel &= lfp_theta_mask
     occ_density, _, _ = np.histogram2d(lfp_pass_index[occ_sel], np.mod(lfp_phase, 2 * np.pi)[occ_sel],
@@ -1164,13 +1200,13 @@ def spikes_with_lfp_sample(spk_ts, lfp_ts, lfp_fs, jitter_factor=LFP_MATCH_JITTE
     return nearest_dt <= 1.0 / (jitter_factor * lfp_fs)
 
 
-def assign_spike_phase(spk_ts, lfp_ts, filtered_lfp, lfp_fs):
-    """Theta phase (rad, [0, 2*pi), 0 at an LFP theta peak) at each spike
-    time, by linear interpolation between the consecutive filtered-LFP peaks
-    bracketing the spike (AditiPrecessionUtils.getPhase). NaN for spikes
-    before the first or after the last LFP peak, or with no LFP sample within
-    one inter-sample interval (see spikes_with_lfp_sample)."""
-    phase = np.mod(peak_interp_phase(filtered_lfp, lfp_ts, spk_ts), 2 * np.pi)
+def assign_spike_phase(spk_ts, lfp_ts, lfp_phase_unwrapped, lfp_fs):
+    """Hilbert theta phase (rad, [0, 2*pi), 0 at an LFP theta peak) at each
+    spike time, interpolated from the unwrapped per-sample Hilbert phase of
+    the filtered LFP (see hilbert_phase / phase_at). NaN for spikes outside
+    the LFP's time range, or with no LFP sample within one inter-sample
+    interval (see spikes_with_lfp_sample)."""
+    phase = np.mod(phase_at(lfp_ts, lfp_phase_unwrapped, spk_ts), 2 * np.pi)
     phase[~spikes_with_lfp_sample(spk_ts, lfp_ts, lfp_fs)] = np.nan
     return phase
 
@@ -1220,16 +1256,16 @@ def shuffle_tmi_significance(spk_ts, phase_deg, observed_tmi, rng, n_shuffles=N_
     return pval, shuffle_tmis
 
 
-def compute_theta_modulation(spk_ts, lfp_ts, filtered_lfp, lfp_fs, rng):
-    """Steps 1 & 2 for one unit: peak-interpolated theta-phase polar-plot
-    statistics (MRL, preferred phase, Rayleigh test) plus the Theta Modulation
-    Index and its shuffle-test significance. Spikes with no defined phase
-    (outside the LFP's first/last peak) are dropped.
+def compute_theta_modulation(spk_ts, lfp_ts, lfp_phase_unwrapped, lfp_fs, rng):
+    """Steps 1 & 2 for one unit: Hilbert theta-phase polar-plot statistics
+    (MRL, preferred phase, Rayleigh test) plus the Theta Modulation Index and
+    its shuffle-test significance. Spikes with no defined phase (outside the
+    LFP's time range or in an LFP gap) are dropped.
 
     Returns (metrics dict, phase_deg array of per-spike theta phase, for
     plotting the Step 1 polar histogram).
     """
-    phase_rad = assign_spike_phase(spk_ts, lfp_ts, filtered_lfp, lfp_fs)
+    phase_rad = assign_spike_phase(spk_ts, lfp_ts, lfp_phase_unwrapped, lfp_fs)
     has_phase = np.isfinite(phase_rad)
     spk_ts, phase_rad = spk_ts[has_phase], phase_rad[has_phase]
     phase_deg = np.degrees(phase_rad)
@@ -1265,7 +1301,7 @@ def compute_theta_modulation(spk_ts, lfp_ts, filtered_lfp, lfp_fs, rng):
 def plot_polar_theta(phase_deg, mrl, pref_phase_deg, rayleigh_p, is_sig, title, out_path: Path,
                       bin_size_deg=PHASE_BIN_SIZE_DEG):
     """Step 1 (visualization only): polar histogram of spike counts vs.
-    peak-interpolated theta phase, with the MRL/preferred-phase vector."""
+    Hilbert theta phase, with the MRL/preferred-phase vector."""
     fig = plt.figure(figsize=(5, 5))
     ax = fig.add_subplot(1, 1, 1, projection='polar')
     edges_deg = np.arange(0, 360 + bin_size_deg, bin_size_deg)
@@ -1298,7 +1334,7 @@ def plot_polar_theta(phase_deg, mrl, pref_phase_deg, rayleigh_p, is_sig, title, 
 
 def plot_phase_histogram(phase_deg, is_sig, title, out_path: Path,
                           bin_size_deg=PHASE_BIN_SIZE_DEG):
-    """Linear histogram of spike counts vs. peak-interpolated theta phase
+    """Linear histogram of spike counts vs. Hilbert theta phase
     bin (same phase data and bin width as plot_polar_theta, shown over two
     repeated 360-degree cycles for readability)."""
     edges_deg = np.arange(0, 360 + bin_size_deg, bin_size_deg)
@@ -2157,6 +2193,8 @@ def process_session(data_folder: Path, rng) -> list[dict]:
             print(f'  Using LFP file: {theta_ncs.name}')
             lfp_sig, lfp_ts, lfp_fs = load_ncs(theta_ncs)
             filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
+            lfp_phase_unwrapped = np.unwrap(hilbert_phase(filtered_lfp, lfp_fs)[0])
+            del filtered_lfp
 
             t_start = t_stop = None
             if pos_ts is not None:
@@ -2174,13 +2212,13 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                       f'({n_fit} passed delta/theta + artifact screening)')
 
             lfp_cache[theta_ncs] = dict(lfp_sig=lfp_sig, lfp_ts=lfp_ts, lfp_fs=lfp_fs,
-                                         filtered_lfp=filtered_lfp,
+                                         lfp_phase_unwrapped=lfp_phase_unwrapped,
                                          t_start=t_start, t_stop=t_stop,
                                          acg_epoch_ok=acg_epoch_ok, lfp_theta_mask=lfp_theta_mask)
 
         lfp_data = lfp_cache[theta_ncs]
         lfp_sig, lfp_ts, lfp_fs = lfp_data['lfp_sig'], lfp_data['lfp_ts'], lfp_data['lfp_fs']
-        filtered_lfp = lfp_data['filtered_lfp']
+        lfp_phase_unwrapped = lfp_data['lfp_phase_unwrapped']
         t_start, t_stop = lfp_data['t_start'], lfp_data['t_stop']
         acg_epoch_ok, lfp_theta_mask = lfp_data['acg_epoch_ok'], lfp_data['lfp_theta_mask']
 
@@ -2202,7 +2240,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                                                else np.nan)
 
             # ---- Steps 1 & 2: theta phase-locking polar plot + TMI shuffle test ----
-            metrics, phase_deg = compute_theta_modulation(spk_ts, lfp_ts, filtered_lfp, lfp_fs, rng)
+            metrics, phase_deg = compute_theta_modulation(spk_ts, lfp_ts, lfp_phase_unwrapped, lfp_fs, rng)
             row.update(metrics)
 
             if metrics['n_spikes_theta'] >= MIN_SPIKES_FOR_TMI:
@@ -2246,6 +2284,7 @@ def process_session(data_folder: Path, rng) -> list[dict]:
                             slope_bnds=SLOPE_BNDS,
                             phase_spk_ts=spk_ts_overlap,
                             lfp_theta_mask=lfp_theta_mask,
+                            lfp_phase_unwrapped=lfp_phase_unwrapped,
                         )
                         png_path = output_dir / f'{file_prefix}_PassIndex.png'
                         plot_unit_summary(pos_xy, results, plot_label, png_path)

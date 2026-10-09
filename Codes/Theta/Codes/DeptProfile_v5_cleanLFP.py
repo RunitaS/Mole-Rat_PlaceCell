@@ -109,6 +109,8 @@ one additional "average" figure across all of them (`compute_average_profile` /
     (or a comparable) anatomical landmark across recordings.
 """
 
+!!! Remove aperiod component. Use FOOOF !!!
+
 import os
 import re
 import sys

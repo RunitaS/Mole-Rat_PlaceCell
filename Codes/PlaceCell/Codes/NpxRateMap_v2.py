@@ -56,6 +56,13 @@ The notebook port that previously lived in this file is saved as
 NpxRateMap_v2_notebookport_backup.py.
 """
 
+
+!!! Failed to extract hippocampal place cells !!!
+Probable causes for failure:
+1. Tracking timestamps are off.
+2. Old spatial info method had bugs
+3. Wrong spieks sorting (get help from Anoushka)
+
 #%%############################################################################
 # USER SETTINGS ###############################################################
 ###############################################################################
