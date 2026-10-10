@@ -5,6 +5,8 @@ Concatenate spike-sorted NTT files by tetrode, preserving cluster identity.
 Files named  TT1_SS_01.ntt, TT1_SS_02.ntt, ..., TT1_SS_N.ntt
 are merged into  TT1.ntt  where every spike carries the cluster number
 extracted from the source filename (_SS_01 → cluster 1, _SS_02 → cluster 2, …).
+Spikes whose original CellNumber is 0 (unsorted/discarded) are dropped, and
+_SS_00 files are skipped entirely, so no cluster 0 spikes reach the output.
 
 Usage
 -----
@@ -25,14 +27,15 @@ Running the script twice is safe: existing output files are skipped.
 
 import os
 import re
-import struct
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 # ── configuration ──────────────────────────────────────X:\NMR_group_data\Runita\Data\Ephys_Data\AllSortedData\Tetrode───────────────────────
-INPUT_ROOT  = r"X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode"
-OUTPUT_ROOT = r"X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Concat"
+INPUT_ROOT  = r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt"
+OUTPUT_ROOT = r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFiltConcat"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Neuralynx NTT binary layout ──────────────────────────────────────────────
@@ -43,7 +46,14 @@ RECORD_BYTES   = 304     # bytes per spike record
 #   offset 12 :  4 bytes  uint32   CellNumber (cluster id)  ← we rewrite this
 #   offset 16 : 32 bytes  uint32×8 Features
 #   offset 48 :256 bytes  int16×128 Waveforms (4 ch × 32 samples)
-CELLNUM_OFFSET = 12
+NTT_DTYPE = np.dtype([
+    ('timestamp',   '<u8'),
+    ('sc_number',   '<u4'),
+    ('cell_number', '<u4'),
+    ('params',      '<u4', (8,)),
+    ('waveforms',   '<i2', (32, 4)),
+])
+assert NTT_DTYPE.itemsize == RECORD_BYTES
 # ─────────────────────────────────────────────────────────────────────────────
 
 SS_PATTERN = re.compile(r'^(.+)_[Ss][Ss]_(\d+)$')  # matches TT1_SS_01, etc.
@@ -63,13 +73,16 @@ def parse_ss_name(filename: str):
     return None, None
 
 
-def rewrite_cell_numbers(raw: bytes, cluster_id: int) -> bytes:
-    """Return a copy of *raw* (N × RECORD_BYTES) with CellNumber set to cluster_id."""
-    buf = bytearray(raw)
-    n_records = len(buf) // RECORD_BYTES
-    for i in range(n_records):
-        struct.pack_into('<I', buf, i * RECORD_BYTES + CELLNUM_OFFSET, cluster_id)
-    return bytes(buf)
+def drop_cluster0_and_relabel(raw: bytes, cluster_id: int) -> tuple[bytes, int]:
+    """
+    Drop records of *raw* (N × RECORD_BYTES) whose original CellNumber is 0,
+    then set CellNumber to cluster_id on the rest.
+    Returns (kept records as bytes, number of records dropped).
+    """
+    records = np.frombuffer(raw, dtype=NTT_DTYPE)
+    kept = records[records['cell_number'] != 0]  # drop unsorted/discarded cluster 0
+    kept['cell_number'] = cluster_id
+    return kept.tobytes(), len(records) - len(kept)
 
 
 # ── core logic ────────────────────────────────────────────────────────────────
@@ -92,29 +105,46 @@ def concatenate_group(entries: list, output_path: Path) -> None:
 
     combined = bytearray()
     total_spikes = 0
+    total_dropped = 0
+    n_clusters = 0
 
     for cluster_id, filepath in entries:
+        if cluster_id == 0:
+            print(f"    [SKIP] {filepath.name} is cluster 0 (unsorted), skipping.")
+            continue
+
         with open(filepath, 'rb') as fh:
             fh.seek(HEADER_BYTES)
             raw = fh.read()
 
-        n_spikes = len(raw) // RECORD_BYTES
-        if n_spikes == 0:
+        n_records = len(raw) // RECORD_BYTES
+        if n_records == 0:
             print(f"    [WARN] {filepath.name} is empty, skipping.")
             continue
 
         # Trim any trailing incomplete record
-        raw = raw[: n_spikes * RECORD_BYTES]
-        combined.extend(rewrite_cell_numbers(raw, cluster_id))
+        raw = raw[: n_records * RECORD_BYTES]
+        kept, n_dropped = drop_cluster0_and_relabel(raw, cluster_id)
+        n_spikes = n_records - n_dropped
+        total_dropped += n_dropped
+        if n_spikes == 0:
+            print(f"    [WARN] {filepath.name} has only cluster 0 spikes "
+                  f"({n_dropped:,} dropped), skipping.")
+            continue
+
+        combined.extend(kept)
         total_spikes += n_spikes
-        print(f"    cluster {cluster_id:3d}  →  {n_spikes:7,d} spikes   ({filepath.name})")
+        n_clusters += 1
+        print(f"    cluster {cluster_id:3d}  →  {n_spikes:7,d} spikes   "
+              f"({n_dropped:,} cluster-0 dropped)   ({filepath.name})")
 
     with open(output_path, 'wb') as fh:
         fh.write(header)
         fh.write(combined)
 
     print(f"  ✓  {output_path.name}  "
-          f"[{len(entries)} clusters, {total_spikes:,} spikes total]\n")
+          f"[{n_clusters} clusters, {total_spikes:,} spikes total, "
+          f"{total_dropped:,} cluster-0 spikes dropped]\n")
 
 
 def session_label(dirpath: Path) -> str:

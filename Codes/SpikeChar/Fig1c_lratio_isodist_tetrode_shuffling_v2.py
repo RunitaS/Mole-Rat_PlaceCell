@@ -146,6 +146,8 @@ from openpyxl.utils import get_column_letter # type: ignore
 import matplotlib # type: ignore
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt # type: ignore
+from matplotlib.patches import Patch # type: ignore
+from matplotlib.ticker import MaxNLocator # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -174,14 +176,50 @@ NTT_DTYPE = np.dtype([
 ])
 
 # ── Summary histogram styling ────────────────────────────────────────────────
+# Matches the place-cell figures (SessionType_StatsComparison_v6.py): Arial,
+# bold axis labels, small plain tick labels, thin black left/bottom axes with
+# short outward ticks, solid-filled bars separated by thin white gaps, and a
+# dashed threshold line labelled in the top-right corner.
 
-HIST_COLOR_PASS = '#0ca30c'   # shuffle-significant (p<SIG_ALPHA both metrics)
-HIST_COLOR_FAIL = '#898781'   # failed shuffle criteria (or undeterminable)
-HIST_SURFACE    = '#fcfcfb'
-HIST_INK        = '#0b0b0b'
-HIST_INK_MUTED  = '#52514e'
-HIST_GRID       = '#e1e0d9'
-HIST_AXIS       = '#c3c2b7'
+HIST_COLOR_PASS = '#b18cbf'   # magma(0.30) tinted 50% to white (light purple) — shuffle-significant (p<SIG_ALPHA both metrics)
+HIST_COLOR_FAIL = '#fde7a9'   # magma(0.95) (light yellow) — failed shuffle criteria (or undeterminable)
+PAL_BLACK       = '#000000'
+FIG_FONT        = ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans']
+
+FS_LABEL, FS_TITLE, FS_TICK, FS_LEGEND, FS_STATS, FS_MED = 14, 15, 11, 11, 9, 10
+FIG_DPI     = 500
+AXIS_LW     = 0.8      # spines, ticks and the dashed threshold line
+BAR_EDGE    = 'white'  # thin white gap between bars
+BAR_EDGE_LW = 0.6
+
+plt.rcParams.update({
+    'font.family':        'sans-serif',
+    'font.sans-serif':    FIG_FONT,
+    'pdf.fonttype':       42,       # keep text editable in Illustrator
+    'ps.fonttype':        42,
+    'svg.fonttype':       'none',
+    'text.color':         PAL_BLACK,
+    'axes.labelcolor':    PAL_BLACK,
+    'axes.labelweight':   'bold',
+    'axes.titleweight':   'bold',
+    'axes.edgecolor':     PAL_BLACK,
+    'axes.linewidth':     AXIS_LW,
+    'axes.spines.top':    False,
+    'axes.spines.right':  False,
+    'xtick.color':        PAL_BLACK,
+    'ytick.color':        PAL_BLACK,
+    'xtick.direction':    'out',
+    'ytick.direction':    'out',
+    'xtick.major.width':  AXIS_LW,
+    'ytick.major.width':  AXIS_LW,
+    'xtick.major.size':   3.5,
+    'ytick.major.size':   3.5,
+    'axes.facecolor':     'white',
+    'figure.facecolor':   'white',
+    'savefig.facecolor':  'white',
+    'axes.grid':          False,
+    'legend.frameon':     False,
+})
 
 # ── Excel styling ──────────────────────────────────────────────────────────────
 
@@ -660,7 +698,7 @@ def plot_summary_histograms(all_results: list, root_dir: str):
     nearest-neighbour shuffle significance test (p_lratio < SIG_ALPHA AND
     p_isodist < SIG_ALPHA). Clusters that failed, or for which the shuffle
     test was undeterminable (e.g. too small a neighbour pool), are pooled
-    together and shown in gray.
+    together and shown in light magma (passed clusters in dark magma).
     """
     lr_pass, lr_fail = [], []
     iso_pass, iso_fail = [], []
@@ -691,53 +729,57 @@ def plot_summary_histograms(all_results: list, root_dir: str):
     n_pass = len(lr_pass)
     n_fail = len(lr_fail)
 
-    fig, (ax_lr, ax_iso) = plt.subplots(1, 2, figsize=(12, 5))
-    fig.patch.set_facecolor(HIST_SURFACE)
+    fig, (ax_lr, ax_iso) = plt.subplots(1, 2, figsize=(9, 4.2))
 
     panels = [
-        (ax_lr, np.array(lr_fail), np.array(lr_pass), 'L-Ratio', L_RATIO_THRESHOLD),
-        (ax_iso, np.array(iso_fail), np.array(iso_pass), 'Isolation Distance (d²)', ISO_DIST_THRESHOLD),
+        (ax_lr, np.array(lr_fail), np.array(lr_pass), 'L-Ratio', 'L-Ratio', L_RATIO_THRESHOLD),
+        (ax_iso, np.array(iso_fail), np.array(iso_pass), 'Isolation Distance',
+         'Isolation Distance (d²)', ISO_DIST_THRESHOLD),
     ]
 
-    for ax, fail_vals, pass_vals, label, quality_thresh in panels:
-        ax.set_facecolor(HIST_SURFACE)
+    stats_lines = [f'n = {n_cells} cells from {len(all_results)} .ntt files: '
+                   f'{n_pass} passed / {n_fail} failed NN-shuffle '
+                   f'(p < {SIG_ALPHA} for both metrics; undeterminable counted as failed)']
+
+    for ax, fail_vals, pass_vals, title, xlabel, quality_thresh in panels:
         combined = np.concatenate([fail_vals, pass_vals])
         clipped, ceiling = _clip_for_display(combined, upper_pct=99.0)
         fail_clipped = clipped[:len(fail_vals)]
         pass_clipped = clipped[len(fail_vals):]
 
         bins = np.histogram_bin_edges(clipped, bins=30)
-        ax.hist([fail_clipped, pass_clipped], bins=bins, stacked=True,
-                 color=[HIST_COLOR_FAIL, HIST_COLOR_PASS],
-                 label=[f'Failed shuffle (n={n_fail})', f'Passed shuffle (n={n_pass})'],
-                 edgecolor=HIST_SURFACE, linewidth=1.2)
+        counts, _, _ = ax.hist([fail_clipped, pass_clipped], bins=bins, stacked=True,
+                               color=[HIST_COLOR_FAIL, HIST_COLOR_PASS],
+                               edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+        ax.set_ylim(0, max(np.max(counts), 1) * 1.15)
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
         if quality_thresh <= ceiling or not np.isfinite(ceiling):
-            ax.axvline(quality_thresh, color=HIST_INK_MUTED, linestyle='--',
-                       linewidth=1.2, label=f'Quality threshold ({quality_thresh})')
+            ax.axvline(quality_thresh, color=PAL_BLACK, linestyle=(0, (3, 2)),
+                       linewidth=AXIS_LW, zorder=4)
+            ax.text(0.98, 0.99, f'thr={quality_thresh:g}', transform=ax.transAxes,
+                    ha='right', va='top', fontsize=FS_MED)
 
-        ax.set_xlabel(label + (f'  (clipped at 99th pct = {ceiling:.2f})'
-                                if np.isfinite(ceiling) else ''),
-                      color=HIST_INK, fontsize=10)
-        ax.set_ylabel('Number of cells', color=HIST_INK, fontsize=10)
-        ax.set_title(label, color=HIST_INK, fontsize=12, fontweight='bold')
-        ax.tick_params(colors=HIST_INK_MUTED, labelsize=9)
-        for spine in ('top', 'right'):
-            ax.spines[spine].set_visible(False)
-        for spine in ('left', 'bottom'):
-            ax.spines[spine].set_color(HIST_AXIS)
-        ax.grid(axis='y', color=HIST_GRID, linewidth=0.8, zorder=0)
-        ax.set_axisbelow(True)
-        ax.legend(frameon=False, fontsize=8.5, labelcolor=HIST_INK_MUTED)
+        if np.isfinite(ceiling):
+            stats_lines.append(f'{title}: values clipped at 99th percentile = {ceiling:.3g}')
 
-    fig.suptitle(f'L-Ratio & Isolation Distance across all cells (n={n_cells} cells, '
-                 f'{len(all_results)} .ntt files)\ncolor = passed NN-shuffle criteria '
-                 f'(p<{SIG_ALPHA} both metrics), gray = failed / undeterminable',
-                 color=HIST_INK, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
+        ax.set_title(title, fontsize=FS_LABEL, pad=10)
+        ax.set_xlabel(xlabel, fontsize=FS_LABEL, labelpad=6)
+        ax.tick_params(axis='both', labelsize=FS_TICK)
+    ax_lr.set_ylabel('Count', fontsize=FS_LABEL, labelpad=6)
+
+    handles = [Patch(facecolor=HIST_COLOR_PASS, edgecolor='none',
+                     label=f'Passed shuffle (n={n_pass})'),
+               Patch(facecolor=HIST_COLOR_FAIL, edgecolor='none',
+                     label=f'Failed shuffle (n={n_fail})')]
+    fig.legend(handles=handles, loc='lower center', ncol=2, fontsize=FS_LEGEND,
+               bbox_to_anchor=(0.5, 1.0))
+    fig.text(0.5, -0.02, '\n'.join(stats_lines), ha='center', va='top',
+             fontsize=FS_STATS, linespacing=1.3)
+    fig.tight_layout()
 
     out_path = os.path.join(root_dir, 'LRatio_IsoDist_Summary_Histogram.png')
-    fig.savefig(out_path, dpi=200, facecolor=HIST_SURFACE)
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches='tight')
     plt.close(fig)
     print(f'\nSaved summary histogram: {out_path}')
 

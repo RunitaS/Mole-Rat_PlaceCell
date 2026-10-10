@@ -38,31 +38,38 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
 root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SirSparADptBin_Corrected.xlsx'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SirSparADptBinGauss.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected2'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SirSparGauss'
 
 
 # Per-unit figure subfolders, created next to each .ntt file
-SPEED_MOD_SUBDIR = 'speed modulation_Sir_Spar_AdptBin_Corrected'
-SHUFFLING_SUBDIR = 'shuffling_Sir_Spar_AdptBin_Corrected'
-RATEMAPS_SUBDIR  = 'ratemaps_Sir_Spar_AdptBin_Corrected'
+SPEED_MOD_SUBDIR = 'speed modulation_Sir_Spar_Gauss'
+SHUFFLING_SUBDIR = 'shuffling_Sir_Spar_Gauss'
+RATEMAPS_SUBDIR  = 'ratemaps_Sir_Spar_Gauss'
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
-# OCCUPANCY-WEIGHTED ratemap : SIR, sparsity, and the SIR bootstrap shuffles.
-#                              smooth(spikes) / smooth(occupancy), see
-#                              _occ_weighted_smooth. Their pi weights are the
-#                              smoothed occupancy too; bins still enter the
+# SI_RATEMAP_TYPE ratemap    : SIR, sparsity, and the SIR bootstrap shuffles
+#                              (see the options below). Bins always enter the
 #                              sums by RAW occupancy (USE_SI_MIN_OCC).
 # RAW (unsmoothed) ratemap   : peak_fr, mean_fr.
 # SMOOTHED ratemap           : coherence, split-half stability, the coherence
 #                              bootstrap shuffles, and place-field extraction.
 #
-# USE_OCC_WEIGHTED_SI = False reverts SIR and sparsity (and their shuffles) to
-# the RAW ratemap, for comparison.
-USE_OCC_WEIGHTED_SI = True
+# SI_RATEMAP_TYPE options (ratemap used for SIR and sparsity, and their shuffles):
+#   'raw'                 : RAW (unsmoothed) ratemap spikes / occupancy;
+#                           pi weights = raw occupancy.
+#   'occ_weighted_smooth' : smooth(spikes) / smooth(occupancy), see
+#                           _occ_weighted_smooth; pi weights = smoothed occupancy.
+#   'gaussian_smooth'     : Gaussian-SMOOTHED ratemap (same map as coherence,
+#                           see _gaussian_smooth); pi weights = raw occupancy.
+SI_RATEMAP_TYPE = 'gaussian_smooth'
+_SI_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth')
+if SI_RATEMAP_TYPE not in _SI_RATEMAP_TYPES:
+    raise ValueError(f"SI_RATEMAP_TYPE must be one of {_SI_RATEMAP_TYPES}, "
+                     f"got {SI_RATEMAP_TYPE!r}")
 #
 # USE_SI_MIN_OCC = True restricts the SIR and sparsity sums to valid bins with
 # >= SI_MIN_OCC_S of occupancy (applied identically to the real data and every
@@ -298,7 +305,7 @@ _gpu_semaphore = threading.Semaphore(2)
 # bin size (target_bin_cm) this script is run with.
 GAUSSIAN_SIGMA_CM = 3 #1.5 * 2.1
 
-# (SIR / sparsity settings USE_OCC_WEIGHTED_SI / USE_SI_MIN_OCC / SI_MIN_OCC_S, and all
+# (SIR / sparsity settings SI_RATEMAP_TYPE / USE_SI_MIN_OCC / SI_MIN_OCC_S, and all
 #  place-cell classification / place-field settings, are set at the top of the file)
 
 # Names of every hardcoded analysis setting above, in the order they should
@@ -319,7 +326,7 @@ RUN_CONFIG_VARS = [
     'MAX_GPU_UTIL_PCT', 'MAX_WORKERS',
     'COORD_UNITS',
     'GAUSSIAN_SIGMA_CM',
-    'USE_OCC_WEIGHTED_SI', 'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
+    'SI_RATEMAP_TYPE', 'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
     'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
     'PLACE_FIELDS_MAX_TOTAL_AREA_PCT',
     'PLACE_CELL_MIN_SPIKES', 'PLACE_CELL_MIN_PEAK_FR', 'PLACE_CELL_MAX_PEAK_FR',
@@ -489,13 +496,16 @@ def _si_bin_mask(occ_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
 
 
 def _si_ratemap(spike_map: np.ndarray, occ_map: np.ndarray, fr_raw: np.ndarray,
-                valid_mask: np.ndarray, bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
+                fr_smooth: np.ndarray, valid_mask: np.ndarray,
+                bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
     """Ratemap and occupancy the SIR / sparsity sums are taken over (see
-    USE_OCC_WEIGHTED_SI). Returns (rate_map, pi_occ): the occupancy-weighted
-    ratemap with the smoothed occupancy as pi weights, or the RAW ratemap with
-    the raw occupancy."""
-    if USE_OCC_WEIGHTED_SI:
+    SI_RATEMAP_TYPE). Returns (rate_map, pi_occ): the occupancy-weighted
+    ratemap with the smoothed occupancy as pi weights, or the Gaussian-smoothed
+    / RAW ratemap with the raw occupancy."""
+    if SI_RATEMAP_TYPE == 'occ_weighted_smooth':
         return _occ_weighted_smooth(spike_map, occ_map, valid_mask, bin_cm)
+    if SI_RATEMAP_TYPE == 'gaussian_smooth':
+        return fr_smooth, occ_map
     return fr_raw, occ_map
 
 
@@ -1242,10 +1252,9 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
 
     Both metrics are derived from the single shuffled rate map built here so
     that each bootstrap iteration only needs one shuffled spike train: SIR is
-    computed on the shuffled occupancy-weighted ratemap (or RAW, per
-    USE_OCC_WEIGHTED_SI -- matching the real-data SIR), while coherence is
-    computed on the Gaussian-SMOOTHED shuffled ratemap (matching the real-data
-    coherence).
+    computed on the shuffled ratemap chosen by SI_RATEMAP_TYPE (matching the
+    real-data SIR), while coherence is computed on the Gaussian-SMOOTHED
+    shuffled ratemap (matching the real-data coherence).
     """
     n_frames   = len(beh_bx)
     shuf_frame = (spike_frame_indices + rnd) % n_frames
@@ -1256,10 +1265,11 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     fr_raw = np.zeros_like(spike_map)
     np.divide(spike_map, occ_map, out=fr_raw, where=valid_mask)
 
-    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, valid_mask, bin_cm)
+    fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
+
+    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, bin_cm)
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
-    fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
     coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
 
     return sir, coherence
@@ -2014,9 +2024,10 @@ def compute_metrics(csv_path: str, ntt_path: str,
     peak_fr = float(fr_raw[valid_mask].max())
     mean_fr = r_mean
 
-    # SIR, sparsity: occupancy-weighted ratemap (or RAW, see USE_OCC_WEIGHTED_SI).
-    # pi weights: smoothed occupancy (or raw, matching the ratemap).
-    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, valid_mask, target_bin_cm)
+    # SIR, sparsity: raw / occupancy-weighted / Gaussian-smoothed ratemap (see
+    # SI_RATEMAP_TYPE). pi weights: smoothed occupancy for occ_weighted_smooth,
+    # raw occupancy otherwise.
+    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, target_bin_cm)
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
     # Sparsity = (Σ pi ri)² / Σ pi ri²   (Skaggs et al. 1996), same map, pi and bins as SIR
