@@ -21,6 +21,7 @@ import shutil
 import threading
 import time
 import concurrent.futures
+import functools
 import types
 import random
 from datetime import datetime
@@ -38,17 +39,17 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
 root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiOcWgh_CI99.xlsx'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiAdptBin_CI99.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiOcWgh_CI99'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99'
 
 
 # Per-unit figure subfolders, created next to each .ntt file
-SPEED_MOD_SUBDIR = 'speed modulation_SiOcWgh_CI99'
-SHUFFLING_SUBDIR = 'shuffling_SiOcWgh_CI99'
-RATEMAPS_SUBDIR  = 'ratemaps_SiOcWgh_CI99'
+SPEED_MOD_SUBDIR = 'speed modulation_SiAdptBin_CI99'
+SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_CI99'
+RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CI99'
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
 # SI_RATEMAP_TYPE ratemap    : SIR, sparsity, and the SIR bootstrap shuffles
@@ -65,11 +66,25 @@ RATEMAPS_SUBDIR  = 'ratemaps_SiOcWgh_CI99'
 #                           _occ_weighted_smooth; pi weights = smoothed occupancy.
 #   'gaussian_smooth'     : Gaussian-SMOOTHED ratemap (same map as coherence,
 #                           see _gaussian_smooth); pi weights = raw occupancy.
-SI_RATEMAP_TYPE = 'occ_weighted_smooth'
-_SI_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth')
+#   'adaptive_binned'     : adaptive-binned ratemap (Yartsev & Ulanovsky 2013
+#                           occupancy criterion, see _adaptive_binned_ratemap);
+#                           pi weights = raw occupancy.
+SI_RATEMAP_TYPE = 'adaptive_binned'  # 'raw', 'occ_weighted_smooth', 'gaussian_smooth', 'adaptive_binned'
+_SI_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth', 'adaptive_binned')
 if SI_RATEMAP_TYPE not in _SI_RATEMAP_TYPES:
     raise ValueError(f"SI_RATEMAP_TYPE must be one of {_SI_RATEMAP_TYPES}, "
                      f"got {SI_RATEMAP_TYPE!r}")
+#
+# Adaptive-binning settings (used only when SI_RATEMAP_TYPE = 'adaptive_binned').
+# Yartsev method (Yartsev & Ulanovsky 2013; Grieves rate_mapper.m 'yadaptive'):
+# for each valid bin a disc (radius in BIN units) grows until
+#     occ_in_disc >= ADAPTIVE_DISC_OCC_S,
+# independent of spikes. Larger ADAPTIVE_DISC_OCC_S -> larger discs -> more
+# smoothing. Because r is in bins, the effective smoothing depends on target_bin_cm.
+ADAPTIVE_DISC_OCC_S = 1.0     # occupancy (s) a disc must enclose (Yartsev / Grieves: 1 s)
+ADAPTIVE_MAX_RSQ    = 200     # disc stops growing at r^2 = ADAPTIVE_MAX_RSQ - 1 (bins^2)
+ADAPTIVE_MIN_OCC_S  = 0.5     # bins whose final disc holds < this occupancy (s) get rate 0
+                              # and pi weight 0 (MATLAB params(2))
 #
 # USE_SI_MIN_OCC = True restricts the SIR and sparsity sums to valid bins with
 # >= SI_MIN_OCC_S of occupancy (applied identically to the real data and every
@@ -327,6 +342,7 @@ RUN_CONFIG_VARS = [
     'COORD_UNITS',
     'GAUSSIAN_SIGMA_CM',
     'SI_RATEMAP_TYPE', 'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
+    'ADAPTIVE_DISC_OCC_S', 'ADAPTIVE_MAX_RSQ', 'ADAPTIVE_MIN_OCC_S',
     'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
     'PLACE_FIELDS_MAX_TOTAL_AREA_PCT',
     'PLACE_CELL_MIN_SPIKES', 'PLACE_CELL_MIN_PEAK_FR', 'PLACE_CELL_MAX_PEAK_FR',
@@ -487,6 +503,84 @@ def _occ_weighted_smooth(spike_map: np.ndarray, occ_map: np.ndarray,
     return rate, occ_smooth
 
 
+@functools.lru_cache(maxsize=16)
+def _adaptive_disc_geometry(n_bins_x: int, n_bins_y: int,
+                            max_rsq: int) -> tuple[int, np.ndarray, np.ndarray]:
+    """Grid geometry for _adaptive_binned_ratemap, cached per grid shape.
+
+    Returns (pad, gather_idx, n_enclosed):
+      pad        : zero-padding width (bins) so every disc fits inside the map.
+      gather_idx : (n_offsets, n_bins) flat indices into the padded map; row k
+                   is every bin shifted by the k-th offset, offsets sorted by
+                   squared distance (so a cumsum over rows = disc sums).
+      n_enclosed : (max_rsq,) number of offsets with d^2 <= rsq, rsq = 0..max_rsq-1.
+    """
+    pad = int(np.floor(np.sqrt(max_rsq - 1)))
+    ax  = np.arange(-pad, pad + 1)
+    dx, dy = np.meshgrid(ax, ax, indexing='ij')
+    dx, dy = dx.ravel(), dy.ravel()
+    d2     = dx ** 2 + dy ** 2
+    keep   = d2 <= max_rsq - 1
+    order  = np.argsort(d2[keep], kind='stable')
+    dx, dy, d2 = dx[keep][order], dy[keep][order], d2[keep][order]
+
+    bx, by = np.meshgrid(np.arange(n_bins_x), np.arange(n_bins_y), indexing='ij')
+    px = bx.ravel()[None, :] + pad + dx[:, None]
+    py = by.ravel()[None, :] + pad + dy[:, None]
+    gather_idx = px * (n_bins_y + 2 * pad) + py
+
+    n_enclosed = np.searchsorted(d2, np.arange(max_rsq), side='right')
+    return pad, gather_idx, n_enclosed
+
+
+def _adaptive_binned_ratemap(spike_map: np.ndarray, occ_map: np.ndarray,
+                             valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Adaptive-binned ratemap, Yartsev method (Yartsev & Ulanovsky 2013;
+    Grieves rate_mapper.m 'yadaptive').
+
+    For every valid bin, a disc (radius in bin units, r^2 = 0, 1, 2, ...) grows
+    until  occ_disc >= ADAPTIVE_DISC_OCC_S,  or r^2 reaches
+    ADAPTIVE_MAX_RSQ - 1. The bin's rate is spikes_disc / occ_disc at that
+    radius; bins whose final occ_disc < ADAPTIVE_MIN_OCC_S get rate 0. Only
+    valid bins contribute to and receive a disc (as in _occ_weighted_smooth).
+
+    Vectorised over bins: all candidate radii are evaluated at once from
+    cumulative disc sums, then the first radius meeting the criterion is taken
+    -- identical to growing r^2 one step at a time as the MATLAB loop does.
+
+    Returns (rate, pi_occ): pi_occ is the RAW occupancy (overlapping disc
+    occupancies would over-weight sparsely sampled bins), zeroed outside valid
+    bins and where the disc never reached ADAPTIVE_MIN_OCC_S.
+    """
+    n_bins_x, n_bins_y = occ_map.shape
+    rate   = np.zeros_like(occ_map, dtype=np.float64)
+    pi_occ = np.where(valid_mask, occ_map, 0.0)
+    if not valid_mask.any() or spike_map[valid_mask].sum() <= 0:
+        return rate, pi_occ
+
+    pad, gather_idx, n_enclosed = _adaptive_disc_geometry(n_bins_x, n_bins_y,
+                                                          ADAPTIVE_MAX_RSQ)
+    spk_pad = np.pad(np.where(valid_mask, spike_map, 0.0), pad).ravel()
+    occ_pad = np.pad(pi_occ, pad).ravel()
+
+    # (max_rsq, n_bins): spikes / occupancy enclosed within r^2 = rsq of each bin
+    spk_disc = np.cumsum(spk_pad[gather_idx], axis=0)[n_enclosed - 1]
+    occ_disc = np.cumsum(occ_pad[gather_idx], axis=0)[n_enclosed - 1]
+
+    # First radius whose disc encloses >= ADAPTIVE_DISC_OCC_S of occupancy.
+    satisfied = occ_disc >= ADAPTIVE_DISC_OCC_S
+    k = np.where(satisfied.any(axis=0), satisfied.argmax(axis=0), ADAPTIVE_MAX_RSQ - 1)
+
+    cols    = np.arange(n_bins_x * n_bins_y)
+    spk_fin = spk_disc[k, cols].reshape(n_bins_x, n_bins_y)
+    occ_fin = occ_disc[k, cols].reshape(n_bins_x, n_bins_y)
+
+    ok = valid_mask & (occ_fin >= ADAPTIVE_MIN_OCC_S)
+    rate[ok] = spk_fin[ok] / occ_fin[ok]
+    pi_occ[~ok] = 0.0
+    return rate, pi_occ
+
+
 def _si_bin_mask(occ_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     """Bins entering the SIR / sparsity sums (see USE_SI_MIN_OCC). Always
     selected on RAW occupancy, since SI_MIN_OCC_S is a raw-time threshold."""
@@ -500,10 +594,12 @@ def _si_ratemap(spike_map: np.ndarray, occ_map: np.ndarray, fr_raw: np.ndarray,
                 bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
     """Ratemap and occupancy the SIR / sparsity sums are taken over (see
     SI_RATEMAP_TYPE). Returns (rate_map, pi_occ): the occupancy-weighted
-    ratemap with the smoothed occupancy as pi weights, or the Gaussian-smoothed
-    / RAW ratemap with the raw occupancy."""
+    ratemap with the smoothed occupancy as pi weights, or the adaptive-binned /
+    Gaussian-smoothed / RAW ratemap with the raw occupancy."""
     if SI_RATEMAP_TYPE == 'occ_weighted_smooth':
         return _occ_weighted_smooth(spike_map, occ_map, valid_mask, bin_cm)
+    if SI_RATEMAP_TYPE == 'adaptive_binned':
+        return _adaptive_binned_ratemap(spike_map, occ_map, valid_mask)
     if SI_RATEMAP_TYPE == 'gaussian_smooth':
         return fr_smooth, occ_map
     return fr_raw, occ_map
@@ -2024,9 +2120,9 @@ def compute_metrics(csv_path: str, ntt_path: str,
     peak_fr = float(fr_raw[valid_mask].max())
     mean_fr = r_mean
 
-    # SIR, sparsity: raw / occupancy-weighted / Gaussian-smoothed ratemap (see
-    # SI_RATEMAP_TYPE). pi weights: smoothed occupancy for occ_weighted_smooth,
-    # raw occupancy otherwise.
+    # SIR, sparsity: raw / occupancy-weighted / Gaussian-smoothed / adaptive-
+    # binned ratemap (see SI_RATEMAP_TYPE). pi weights: smoothed occupancy for
+    # occ_weighted_smooth, raw occupancy otherwise.
     si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, target_bin_cm)
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 

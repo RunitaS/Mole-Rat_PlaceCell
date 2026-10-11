@@ -42,6 +42,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_hex
 
 # ── User settings ─────────────────────────────────────────────────────────────
 
@@ -52,8 +53,11 @@ KEY_COLS   = ['session', 'unit']
 
 # ── Plot style (fixed colour per file, in file order; never cycled) ───────────
 
-FILE_COLORS    = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100',
-                  '#e87ba4', '#008300', '#6250d6', '#e34948']
+# File colours are equidistant on the magma colormap: n files sit at
+# k/(n+1), k = 1..n (e.g. 0.2, 0.4, 0.6, 0.8 for 4 files), so the gaps between
+# colours and to both ends of the map are equal and the near-black /
+# near-white ends are never used.
+FILE_CMAP      = 'magma'
 REJECT_COLOR   = '#e1e0d9'
 COMMON_COLOR   = '#52514e'
 INK_PRIMARY    = '#0b0b0b'
@@ -231,9 +235,9 @@ def main(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR):
     os.makedirs(output_dir, exist_ok=True)
 
     labels = _file_labels(paths)
-    colors = FILE_COLORS[:len(paths)]
-    if len(paths) > len(FILE_COLORS):
-        raise SystemExit(f'At most {len(FILE_COLORS)} files supported (one fixed colour each).')
+    cmap = matplotlib.colormaps[FILE_CMAP]
+    colors = [to_hex(cmap(v))
+              for v in np.linspace(0, 1, len(paths) + 2)[1:-1]]
 
     print(f'Comparing {len(paths)} files in {input_dir}:')
     dfs = []
