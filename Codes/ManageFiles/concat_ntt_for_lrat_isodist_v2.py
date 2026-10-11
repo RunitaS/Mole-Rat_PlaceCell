@@ -14,6 +14,11 @@ is purely by leading "TTn" prefix, and every file in the group gets a
 brand-new sequential cluster number (1, 2, 3, ...) based on a natural
 sort of the filenames — the original embedded numbers are not reused.
 
+Before concatenation, spikes whose original CellNumber is 0 (unsorted /
+discarded) are dropped from every file. Files left with no spikes after
+this filter are skipped and do not consume a cluster number, so no
+cluster 0 spikes reach the output and the new numbering has no gaps.
+
 Usage
 -----
   python concat_ntt.py     # INPUT_ROOT / OUTPUT_ROOT below are used as-is
@@ -35,14 +40,15 @@ Running the script twice is safe: existing output files are skipped.
 
 import os
 import re
-import struct
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 # ── configuration ──────────────────────────────────────X:\NMR_group_data\Runita\Data\Ephys_Data\AllSortedData\Tetrode───────────────────────
-INPUT_ROOT  = r"X:\NMR_group_data\Runita\Analysis\Fa23BD_SpikeSorting\spikesorted\Klustakwik_Day6_Linear\Klustawik_Day6_Linear\LinTT8_Concat"
-OUTPUT_ROOT = r"X:\NMR_group_data\Runita\Analysis\Fa23BD_SpikeSorting\spikesorted\Klustakwik_Day6_Linear\Klustawik_Day6_Linear\LinTT8_Concat\Concat"
+INPUT_ROOT  = r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt"
+OUTPUT_ROOT = r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFiltConcat"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Neuralynx NTT binary layout ──────────────────────────────────────────────
@@ -53,7 +59,14 @@ RECORD_BYTES   = 304     # bytes per spike record
 #   offset 12 :  4 bytes  uint32   CellNumber (cluster id)  ← we rewrite this
 #   offset 16 : 32 bytes  uint32×8 Features
 #   offset 48 :256 bytes  int16×128 Waveforms (4 ch × 32 samples)
-CELLNUM_OFFSET = 12
+NTT_DTYPE = np.dtype([
+    ('timestamp',   '<u8'),
+    ('sc_number',   '<u4'),
+    ('cell_number', '<u4'),
+    ('params',      '<u4', (8,)),
+    ('waveforms',   '<i2', (32, 4)),
+])
+assert NTT_DTYPE.itemsize == RECORD_BYTES
 # ─────────────────────────────────────────────────────────────────────────────
 
 TETRODE_PATTERN = re.compile(r'^([Tt][Tt]\d+)')  # leading TT<number>, e.g. TT1, TT10
@@ -79,28 +92,31 @@ def natural_sort_key(filepath: Path):
     return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
-def rewrite_cell_numbers(raw: bytes, cluster_id: int) -> bytes:
-    """Return a copy of *raw* (N × RECORD_BYTES) with CellNumber set to cluster_id."""
-    buf = bytearray(raw)
-    n_records = len(buf) // RECORD_BYTES
-    for i in range(n_records):
-        struct.pack_into('<I', buf, i * RECORD_BYTES + CELLNUM_OFFSET, cluster_id)
-    return bytes(buf)
+def drop_cluster0(raw: bytes) -> np.ndarray:
+    """
+    Parse *raw* (N × RECORD_BYTES) and return a writable copy of the records
+    whose original CellNumber is non-zero (cluster 0 = unsorted/discarded).
+    """
+    records = np.frombuffer(raw, dtype=NTT_DTYPE)
+    return records[records['cell_number'] != 0]  # boolean indexing → copy
 
 
 # ── core logic ────────────────────────────────────────────────────────────────
 
-def concatenate_group(entries: list, output_path: Path) -> None:
+def concatenate_group(filepaths: list, output_path: Path) -> None:
     """
-    Merge a list of (cluster_id, Path) entries into output_path.
+    Merge *filepaths* into output_path, dropping cluster-0 spikes from each
+    file first. Files that still have spikes are given brand-new sequential
+    cluster numbers (1, 2, 3, ...) in the order given, so numbering has no
+    gaps from empty or all-cluster-0 files.
 
     Parameters
     ----------
-    entries     : sorted list of (cluster_id, filepath)
+    filepaths   : sorted list of source .ntt paths
     output_path : destination .ntt file
     """
     # Borrow the header from the first file
-    first_path = entries[0][1]
+    first_path = filepaths[0]
     with open(first_path, 'rb') as fh:
         header = fh.read(HEADER_BYTES)
         if len(header) < HEADER_BYTES:
@@ -108,29 +124,48 @@ def concatenate_group(entries: list, output_path: Path) -> None:
 
     combined = bytearray()
     total_spikes = 0
+    total_dropped = 0
+    n_clusters = 0
 
-    for cluster_id, filepath in entries:
+    for filepath in filepaths:
         with open(filepath, 'rb') as fh:
             fh.seek(HEADER_BYTES)
             raw = fh.read()
 
-        n_spikes = len(raw) // RECORD_BYTES
-        if n_spikes == 0:
+        n_records = len(raw) // RECORD_BYTES
+        if n_records == 0:
             print(f"    [WARN] {filepath.name} is empty, skipping.")
             continue
 
         # Trim any trailing incomplete record
-        raw = raw[: n_spikes * RECORD_BYTES]
-        combined.extend(rewrite_cell_numbers(raw, cluster_id))
+        raw = raw[: n_records * RECORD_BYTES]
+        kept = drop_cluster0(raw)
+        n_spikes = len(kept)
+        n_dropped = n_records - n_spikes
+        total_dropped += n_dropped
+        if n_spikes == 0:
+            print(f"    [WARN] {filepath.name} has only cluster 0 spikes "
+                  f"({n_dropped:,} dropped), skipping.")
+            continue
+
+        n_clusters += 1
+        kept['cell_number'] = n_clusters
+        combined.extend(kept.tobytes())
         total_spikes += n_spikes
-        print(f"    cluster {cluster_id:3d}  →  {n_spikes:7,d} spikes   ({filepath.name})")
+        print(f"    cluster {n_clusters:3d}  →  {n_spikes:7,d} spikes   "
+              f"({n_dropped:,} cluster-0 dropped)   ({filepath.name})")
+
+    if n_clusters == 0:
+        print(f"  [SKIP] no non-zero-cluster spikes; {output_path.name} not written.\n")
+        return
 
     with open(output_path, 'wb') as fh:
         fh.write(header)
         fh.write(combined)
 
     print(f"  ✓  {output_path.name}  "
-          f"[{len(entries)} clusters, {total_spikes:,} spikes total]\n")
+          f"[{n_clusters} clusters, {total_spikes:,} spikes total, "
+          f"{total_dropped:,} cluster-0 spikes dropped]\n")
 
 
 def session_label(dirpath: Path) -> str:
@@ -190,11 +225,10 @@ def process_tree(root: str | Path, output_root: str | Path = OUTPUT_ROOT) -> Non
                 print(f"  [SKIP] {output_path.name} already exists.\n")
                 continue
 
-            # Order the source files deterministically, then hand out brand-new
-            # sequential cluster numbers (1, 2, 3, ...) in that order.
+            # Order the source files deterministically; concatenate_group hands
+            # out brand-new sequential cluster numbers (1, 2, 3, ...) in that order.
             filepaths.sort(key=natural_sort_key)
-            entries = [(i + 1, fp) for i, fp in enumerate(filepaths)]
-            concatenate_group(entries, output_path)
+            concatenate_group(filepaths, output_path)
 
     if not found_any:
         print("No TT-prefixed .ntt files were found.")

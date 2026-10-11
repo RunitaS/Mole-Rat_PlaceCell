@@ -38,17 +38,17 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
 root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SirSparADptBinGauss.xlsx'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiOcWgh_CI99.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SirSparGauss'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiOcWgh_CI99'
 
 
 # Per-unit figure subfolders, created next to each .ntt file
-SPEED_MOD_SUBDIR = 'speed modulation_Sir_Spar_Gauss'
-SHUFFLING_SUBDIR = 'shuffling_Sir_Spar_Gauss'
-RATEMAPS_SUBDIR  = 'ratemaps_Sir_Spar_Gauss'
+SPEED_MOD_SUBDIR = 'speed modulation_SiOcWgh_CI99'
+SHUFFLING_SUBDIR = 'shuffling_SiOcWgh_CI99'
+RATEMAPS_SUBDIR  = 'ratemaps_SiOcWgh_CI99'
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
 # SI_RATEMAP_TYPE ratemap    : SIR, sparsity, and the SIR bootstrap shuffles
@@ -65,7 +65,7 @@ RATEMAPS_SUBDIR  = 'ratemaps_Sir_Spar_Gauss'
 #                           _occ_weighted_smooth; pi weights = smoothed occupancy.
 #   'gaussian_smooth'     : Gaussian-SMOOTHED ratemap (same map as coherence,
 #                           see _gaussian_smooth); pi weights = raw occupancy.
-SI_RATEMAP_TYPE = 'gaussian_smooth'
+SI_RATEMAP_TYPE = 'occ_weighted_smooth'
 _SI_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth')
 if SI_RATEMAP_TYPE not in _SI_RATEMAP_TYPES:
     raise ValueError(f"SI_RATEMAP_TYPE must be one of {_SI_RATEMAP_TYPES}, "
@@ -1356,7 +1356,7 @@ def _run_bootstrap(spike_frame_indices: np.ndarray, t: np.ndarray,
     bs_av = f"Bootstrap mean SIR = {bootstrap_mean:.3f} bits/spike"
     up_ci = f"Upper 95% CI = {ci95:.3f} bits/spike"
     bs_p  = (f"Cell SIR = {real_sir:.3f} bits/spike "
-             f"({'p < 0.05' if bootstrap_sig else 'ns'})")
+             f"({'p < 0.01' if bootstrap_sig else 'ns'})")
     ax.set_title(bs_av + '\n' + up_ci + '\n' + bs_p, multialignment='center')
 
     ax.set_yticks([0, max_count * 0.25, max_count * 0.5,
