@@ -6,7 +6,8 @@ SAME data set with different smoothing / place-cell criteria.
 
 Only the 'Full' sheet of each file is used.
 
-Cell identity = (session, unit).  Cells that are NOT present in every file are
+Cell identity = (session, unit), with a leading 'QualFiltData_AllCells\' removed
+from session so runs with / without that prefix match.  Cells NOT present in every file are
 removed from all analyses below and listed in a separate Excel file
 (Cells_Not_In_All_Files.xlsx) with the files they are present in / absent from.
 
@@ -46,10 +47,13 @@ from matplotlib.colors import to_hex
 
 # ── User settings ─────────────────────────────────────────────────────────────
 
-INPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\PC_Res'
+INPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\PC_Res\CI95_Bin4'
 OUTPUT_DIR = os.path.join(INPUT_DIR, 'Compare_Output')
 SHEET      = 'Full'
 KEY_COLS   = ['session', 'unit']
+# Leading directory removed from 'session' before matching cells across files
+# (some runs store 'QualFiltData_AllCells\Fa1059\...', others 'Fa1059\...')
+SESSION_STRIP_PREFIX = 'QualFiltData_AllCells'
 
 # ── Plot style (fixed colour per file, in file order; never cycled) ───────────
 
@@ -98,7 +102,8 @@ def _file_labels(paths):
 def _load_full(path):
     df = pd.read_excel(path, sheet_name=SHEET,
                        usecols=KEY_COLS + ['place_cell', 'speed_cell', 'n_fields_detected'])
-    df['session'] = df['session'].astype(str)
+    df['session'] = (df['session'].astype(str).str.strip()
+                     .str.replace(rf'^{SESSION_STRIP_PREFIX}[\\/]+', '', regex=True))
     df['unit']    = df['unit'].astype(str)
     dups = df.duplicated(KEY_COLS).sum()
     if dups:

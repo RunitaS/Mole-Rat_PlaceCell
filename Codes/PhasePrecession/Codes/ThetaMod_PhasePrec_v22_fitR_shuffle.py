@@ -158,7 +158,7 @@ from scipy.special import erf
 # ============================================================================
 #ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
 
-ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected") 
+ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99_Bin2") 
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
 RESULTS_FOLDER = ROOT_FOLDER / 'PhasePrec_Results_FitRShuffle'
 OUTPUT_EXCEL_NAME = 'theta_phase_Hilbert.xlsx'   # written to RESULTS_FOLDER
@@ -207,6 +207,12 @@ ACG_REJECT_DELTA_OVER_THETA = True   # drop epochs whose 1-3 Hz power exceeds 3-
 ACG_DELTA_BAND = (1.0, 3.0)
 ACG_REJECT_MAD_ARTIFACTS = True      # drop epochs with outlier peak-to-peak amplitude
 ACG_MAD_THRESH = 5.0
+ACG_PEAK_PROMINENCE = 0.05           # reference-ACG peak/trough prominence (findMinMax(refxc, 0.05, 'fixed'));
+                                     # only used for the ED_min QC plot's normalised peak range
+# ED_min QC plot (ED_min vs. normalised ACG peak range of every fitted epoch, coloured by animal,
+# ED_min-rejected epochs highlighted) and its per-epoch table, both written to RESULTS_FOLDER
+EDMIN_PLOT_NAME = 'ACG_EDmin_vs_PeakRange.png'
+EDMIN_EPOCHS_CSV_NAME = 'ACG_EDmin_epochs.csv'
 
 # --- Step 3: Pass Index phase-precession parameters ---
 METHOD = 'place'              # 'place' (recommended for place cells) or 'grid'
@@ -234,7 +240,7 @@ N_FIT_R_SHUFFLES = 1000             # burst-preserving phase permutations; each 
 # --- Step 1/2: theta phase-locking / modulation parameters ---
 PHASE_BIN_SIZE_DEG = 36             # degrees per polar-histogram bin (360 must be divisible by this);
                                      # matches calc_tmi's bin_width_deg for consistency
-ALPHA = 0.05                        # Rayleigh-test / TMI-shuffle significance threshold
+ALPHA = 0.01                        # Rayleigh-test / TMI-shuffle significance threshold
 MIN_SPIKES_FOR_TMI = 50              # min spikes required to run the polar-plot / TMI battery
 N_TMI_SHUFFLES = 1000               # number of surrogate random-phase draws for the TMI shuffle test
 TMI_BURST_MAX_GAP_SEC = 0.05        # consecutive spikes closer than this (Frank et al. 2001: 50 ms) AND
@@ -597,13 +603,57 @@ def _acg_reference_bank(ref_freqs, datsize, fs):
     return refXC, np.linalg.norm(refXC, axis=0)
 
 
-def acg_theta_epoch_mask(lfp_clean):
+def _zero_crossings(x):
+    """Fractional (linearly interpolated) sample indices where x crosses zero."""
+    s = np.sign(x)
+    s[s == 0] = 1.0
+    idx = np.flatnonzero(np.diff(s) != 0)
+    return idx - x[idx] / (x[idx + 1] - x[idx])
+
+
+def _acg_reference_windows(refXC, datsize):
+    """Peak-range search windows of each reference autocorrelogram, as in
+    create_sine_ref_xcorrs.m (ported from
+    ACG_theta_continuity_TT_ThetaVsSpeed_v4_FerretOLS.py).
+
+    Returns (refRange, p1, t1, t2): refRange is each reference's own peak range
+    (first side peak minus mean of its flanking troughs); p1/t1/t2 are (2, n_freqs)
+    [lo, hi] sample-index windows bracketing that side peak and the troughs before
+    and after it, used to find the matching peak/troughs in a data autocorrelogram.
+    """
+    center = datsize - 1
+    n_freqs = refXC.shape[1]
+    refRange = np.empty(n_freqs)
+    p1, t1, t2 = (np.empty((2, n_freqs), dtype=int) for _ in range(3))
+    for n in range(n_freqs):
+        refxc = refXC[:, n]
+        max_idx, _ = signal.find_peaks(refxc, prominence=ACG_PEAK_PROMINENCE)
+        min_idx, _ = signal.find_peaks(-refxc, prominence=ACG_PEAK_PROMINENCE)
+        peak1 = max_idx[max_idx > center][0]
+        trough1 = min_idx[min_idx < peak1][-1]
+        trough2 = min_idx[min_idx > peak1][0]
+        refRange[n] = refxc[peak1] - (refxc[trough1] + refxc[trough2]) / 2
+
+        zc = _zero_crossings(refxc)
+        below_p1 = int(round(zc[zc < peak1][-1]))
+        above_p1 = int(round(zc[zc > peak1][0]))
+        p1[:, n] = [below_p1, above_p1]
+        t1[:, n] = [int(round(zc[zc < trough1][-1])), below_p1]
+        t2[:, n] = [above_p1, int(round(zc[zc > trough2][0]))]
+    return refRange, p1, t1, t2
+
+
+def acg_theta_epoch_mask(lfp_clean, return_peakrange=False):
     """Per-epoch theta-positive mask for one LFP trace, already cleaned by
     clean_lfp (resampled to ACG_FS, notched, detrended).
 
     Epoch i spans [t0 + i*ACG_EPOCH_SEC, t0 + (i+1)*ACG_EPOCH_SEC) where t0 is
     the first LFP sample's time. Returns (ok, ed_min): boolean mask and ED_min
     per epoch (NaN where the epoch was rejected before/without an ACG fit).
+    With return_peakrange=True, returns (ok, ed_min, peakrangenorm), adding each
+    fitted epoch's autocorrelogram peak range normalised by its matched reference
+    sinusoid's own peak range (Dunn et al. 2022 Supp. Fig. 5; 1 = clean sinusoid,
+    0 = flat) -- used only for the ED_min QC plot, the mask is unchanged.
     """
     x = lfp_clean
     b, a = signal.butter(ACG_LOWPASS_ORDER, ACG_LOWPASS_CUTOFF_HZ / (ACG_FS / 2.0), btype='low')
@@ -612,7 +662,8 @@ def acg_theta_epoch_mask(lfp_clean):
     nperseg = int(round(ACG_FS * ACG_EPOCH_SEC))
     n_total = len(x) // nperseg
     if n_total == 0:
-        return np.zeros(0, dtype=bool), np.zeros(0)
+        empty = (np.zeros(0, dtype=bool), np.zeros(0))
+        return (*empty, np.zeros(0)) if return_peakrange else empty
     epochs = x[:n_total * nperseg].reshape(n_total, nperseg)
 
     keep = np.ones(n_total, dtype=bool)
@@ -632,8 +683,11 @@ def acg_theta_epoch_mask(lfp_clean):
 
     ref_freqs = np.arange(ACG_FREQ_RANGE[0], ACG_FREQ_RANGE[1] + ACG_FREQ_RES / 2, ACG_FREQ_RES)
     refXC, refED = _acg_reference_bank(ref_freqs, nperseg, ACG_FS)
+    if return_peakrange:
+        refRange, p1, t1, t2 = _acg_reference_windows(refXC, nperseg)
 
     ed_min = np.full(n_total, np.nan)
+    peakrangenorm = np.full(n_total, np.nan)
     for i in np.flatnonzero(keep):
         xc = signal.correlate(epochs[i], epochs[i], mode='full', method='auto')
         peak = np.max(xc)
@@ -641,10 +695,16 @@ def acg_theta_epoch_mask(lfp_clean):
             continue
         xc = xc / peak
         ed = np.sqrt(np.sum((refXC - xc[:, None]) ** 2, axis=0)) / refED
-        ed_min[i] = ed.min()
+        mi = int(np.argmin(ed))
+        ed_min[i] = ed[mi]
+        if return_peakrange:
+            pk = xc[p1[0, mi]:p1[1, mi] + 1].max()
+            tr1 = xc[t1[0, mi]:t1[1, mi] + 1].min()
+            tr2 = xc[t2[0, mi]:t2[1, mi] + 1].min()
+            peakrangenorm[i] = (pk - (tr1 + tr2) / 2) / refRange[mi]
 
     ok = np.isfinite(ed_min) & (ed_min < ACG_ED_MIN_THRESH)
-    return ok, ed_min
+    return (ok, ed_min, peakrangenorm) if return_peakrange else (ok, ed_min)
 
 
 def times_in_ok_epochs(t_s, t0_s, epoch_ok):
@@ -2369,7 +2429,99 @@ def _comparison_sheet_name(group_col: str, key: str) -> str:
     return key if key.startswith('PhaseAt') else f'ArenaComparison_{key}'
 
 
-def process_session(data_folder: Path, rng) -> list[dict]:
+PAL_EDMIN_REJECT = '#C44E52'
+
+
+@_arena_fig_style
+def plot_edmin_epochs(edmin_df: pd.DataFrame, out_path: Path):
+    """ED_min vs. normalised ACG peak range for every epoch that got an ACG fit
+    (i.e. passed the delta/theta + MAD artifact screening), pooled across all
+    sessions -- style of plot_edmin_vs_peakrangenorm in
+    ACG_theta_continuity_TT_ThetaVsSpeed_v4_FerretOLS.py. Each point is coloured
+    by its animal; epochs rejected by the ED_min gate (ED_min >= ACG_ED_MIN_THRESH)
+    get a red outline and sit in a red-shaded region right of the dashed threshold.
+    Pearson r / Spearman rho and a least-squares line are computed over all fitted
+    epochs (not filtered on the threshold, which would truncate the high-ED_min
+    epochs). The panel underneath gives, per animal and pooled, the percentage of
+    fitted epochs accepted and rejected.
+    """
+    fitted = edmin_df[edmin_df['Status'] != 'rejected_prescreen']
+    if fitted.empty:
+        print('No epochs with an ACG fit -- ED_min plot skipped.')
+        return None
+    thr = ACG_ED_MIN_THRESH
+    animals = sorted(fitted['Animal'].unique())
+    cmap = plt.get_cmap('tab10' if len(animals) <= 10 else 'tab20')
+    colors = {a: cmap(i % cmap.N) for i, a in enumerate(animals)}
+
+    def _acc_rej_line(label, sub):
+        n = len(sub)
+        n_acc = int((sub['Status'] == 'accepted').sum())
+        n_rej = n - n_acc
+        return (f'{label}: accepted {100 * n_acc / n:.1f}% ({n_acc}/{n}) | '
+                f'rejected {100 * n_rej / n:.1f}% ({n_rej}/{n})')
+
+    stats_lines = [f'Epochs with an ACG fit (passed delta/theta + artifact screening); '
+                   f'rejected = ED_min ≥ {thr:g}']
+    stats_lines += [_acc_rej_line(a, fitted[fitted['Animal'] == a]) for a in animals]
+    if len(animals) > 1:
+        stats_lines.append(_acc_rej_line('All animals', fitted))
+    stats_lines = _wrap_stats(stats_lines, 7.0)
+
+    fig, ax, ax_info = _new_fig((7.0, 5.5), stats_lines=stats_lines)
+    for a in animals:
+        sub = fitted[fitted['Animal'] == a]
+        acc = sub[sub['Status'] == 'accepted']
+        rej = sub[sub['Status'] == 'rejected_EDmin']
+        ax.scatter(acc['ED_min'], acc['peakrangenorm'], s=10, color=colors[a], alpha=0.4,
+                   edgecolor='none', zorder=2)
+        ax.scatter(rej['ED_min'], rej['peakrangenorm'], s=18, color=colors[a], alpha=0.8,
+                   edgecolor=PAL_EDMIN_REJECT, linewidth=0.8, zorder=3)
+
+    xy = fitted.dropna(subset=['ED_min', 'peakrangenorm'])
+    x, y = xy['ED_min'].to_numpy(float), xy['peakrangenorm'].to_numpy(float)
+    has_fit = len(x) >= 3 and np.ptp(x) > 0 and np.ptp(y) > 0
+    if has_fit:
+        slope, intercept = np.polyfit(x, y, 1)
+        x_line = np.array([x.min(), x.max()])
+        ax.plot(x_line, slope * x_line + intercept, color=PAL_BLACK, lw=FIG_BOX_LW * 1.5, zorder=4)
+        r_p, p_p = stats.pearsonr(x, y)
+        r_s, p_s = stats.spearmanr(x, y)
+        ax.text(0.02, 0.02, f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
+                            f'Spearman ρ = {r_s:.3f} (p = {p_s:.2e})\nn = {len(x)} epochs',
+                transform=ax.transAxes, ha='left', va='bottom', fontsize=FS_STATS,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'), zorder=5)
+
+    x_lo, x_hi = ax.get_xlim()
+    ax.axvspan(thr, max(x_hi, thr), color=PAL_EDMIN_REJECT, alpha=0.08, lw=0, zorder=0)
+    ax.axvline(thr, color=PAL_EDMIN_REJECT, ls='--', lw=FIG_AXIS_LW, zorder=1)
+    ax.set_xlim(x_lo, max(x_hi, thr))
+
+    handles = [Line2D([], [], ls='', marker='o', markersize=6, color=colors[a],
+                      label=f'{a} (n={int((fitted["Animal"] == a).sum())})') for a in animals]
+    handles += [Line2D([], [], ls='', marker='o', markersize=6, markerfacecolor='white',
+                       markeredgecolor=PAL_EDMIN_REJECT, markeredgewidth=1.2,
+                       label=f'ED_min rejected (≥ {thr:g})'),
+                Line2D([], [], color=PAL_EDMIN_REJECT, ls='--', lw=FIG_AXIS_LW,
+                       label=f'ED_min threshold ({thr:g})')]
+    if has_fit:
+        handles.append(Line2D([], [], color=PAL_BLACK, lw=FIG_BOX_LW * 1.5, label='linear fit'))
+    ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=FS_LEGEND - 2)
+
+    ax.set_xlabel('ED_min (distance to closest reference sinusoid)', fontsize=FS_LABEL - 2)
+    ax.set_ylabel('ACG peak range (norm.)', fontsize=FS_LABEL - 2)
+    ax.tick_params(labelsize=FS_TICK)
+    _set_title(ax, 'ACG theta epochs: ED_min vs. peak range')
+    _draw_stats(ax_info, stats_lines)
+    _save_fig(fig, out_path)
+    return out_path
+
+
+def process_session(data_folder: Path, rng, edmin_records: list | None = None) -> list[dict]:
+    """Run Steps 1-3 on every unit in one session; returns one row per unit.
+    If `edmin_records` is given (and USE_ACG_THETA_EPOCHS), one dict per ACG
+    epoch of each LFP file used (Animal, Session, lfp_file, epoch_index, ED_min,
+    peakrangenorm, Status) is appended to it, for the pooled ED_min QC plot."""
     output_dir = data_folder / 'ThetaMod_PhasePrecession_LFPshuffle'
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2426,12 +2578,22 @@ def process_session(data_folder: Path, rng) -> list[dict]:
             acg_epoch_ok = None
             lfp_theta_mask = None
             if USE_ACG_THETA_EPOCHS:
-                acg_epoch_ok, acg_ed_min = acg_theta_epoch_mask(lfp_sig)
+                acg_epoch_ok, acg_ed_min, acg_peakrange = acg_theta_epoch_mask(
+                    lfp_sig, return_peakrange=True)
                 lfp_theta_mask = times_in_ok_epochs(lfp_ts, lfp_ts[0], acg_epoch_ok)
                 n_fit = int(np.isfinite(acg_ed_min).sum())
                 print(f'  ACG theta-positive epochs (ED_min < {ACG_ED_MIN_THRESH:g}): '
                       f'{int(acg_epoch_ok.sum())}/{len(acg_epoch_ok)} '
                       f'({n_fit} passed delta/theta + artifact screening)')
+                if edmin_records is not None:
+                    status = np.where(acg_epoch_ok, 'accepted',
+                                      np.where(np.isfinite(acg_ed_min), 'rejected_EDmin',
+                                               'rejected_prescreen'))
+                    edmin_records.extend(
+                        dict(Animal=animal_id, Session=session_label, FolderPath=str(data_folder),
+                             lfp_file=theta_ncs.name, epoch_index=i, ED_min=acg_ed_min[i],
+                             peakrangenorm=acg_peakrange[i], Status=status[i])
+                        for i in range(len(acg_epoch_ok)))
 
             lfp_cache[theta_ncs] = dict(lfp_sig=lfp_sig, lfp_ts=lfp_ts, lfp_fs=lfp_fs,
                                          lfp_phase_unwrapped=lfp_phase_unwrapped,
@@ -2699,13 +2861,24 @@ def main():
         raise FileNotFoundError(f'No folders with both .ncs and .ntt files found under {ROOT_FOLDER}')
 
     all_rows = []
+    edmin_records: list[dict] = []
     for data_folder in session_folders:
         print(f'\n=== Session: {data_folder} ===')
         try:
-            all_rows.extend(process_session(data_folder, rng))
+            all_rows.extend(process_session(data_folder, rng, edmin_records))
         except Exception as exc:
             print(f'ERROR processing {data_folder}: {exc}')
             continue
+
+    # ---- ACG ED_min QC: per-epoch table + ED_min vs. peak range plot, all sessions pooled ----
+    if edmin_records:
+        edmin_df = pd.DataFrame(edmin_records)
+        edmin_csv = RESULTS_FOLDER / EDMIN_EPOCHS_CSV_NAME
+        edmin_df.to_csv(edmin_csv, index=False)
+        print(f'\nACG per-epoch ED_min table saved to {edmin_csv}')
+        edmin_png = plot_edmin_epochs(edmin_df, RESULTS_FOLDER / EDMIN_PLOT_NAME)
+        if edmin_png is not None:
+            print(f'ED_min vs. peak range plot saved to {edmin_png}')
 
     columns = ['Session', 'FolderPath', 'Unit', 'ntt_file', 'lfp_file', 'cell_number', 'n_spikes_total',
                'n_spikes_theta', 'MRL', 'PreferredPhase_deg', 'Rayleigh_p',

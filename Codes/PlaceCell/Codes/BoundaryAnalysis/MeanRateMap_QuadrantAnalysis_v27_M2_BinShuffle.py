@@ -132,7 +132,7 @@ from matplotlib.lines import Line2D
 # CONFIGURATION -- edit root folder + geometry below
 # ============================================================================
 
-ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_irSparADptBin_Corrected'
+ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99_Bin2'
 OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_M2_BinShuffle')
 
 USE_BIN_COVERAGE_CRITERION = False
