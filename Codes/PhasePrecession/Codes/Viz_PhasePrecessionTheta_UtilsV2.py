@@ -1,31 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-Interactive viewer: scroll through a unit's raw LFP + theta-band trace with
-its spikes overlaid, and a second panel showing the instantaneous theta
+Interactive viewer: scroll through a unit's cleaned LFP + theta-band trace
+with its spikes overlaid, and a second panel showing the instantaneous theta
 phase at which each spike fired. A time slider and a window-length slider
 let you scrub through the whole recording at an adjustable zoom (default
 ~5 s); "Save snapshot" writes the currently visible window to PNG.
 
+V3: in-field epochs come from the PASS INDEX of ThetaMod_PhasePrec_v22_fitR_shuffle
+(Climer et al. 2013), computed exactly as that pipeline's compute_pass_index does:
+rate map from all spikes -> field index map -> field index along the
+trajectory -> resampled along arc length -> spatially bandpass-filtered
+(auto_filter_band) -> Hilbert phase. Pass index = that phase / pi, in [-1, 1):
+-1 field entry, 0 field-index peak (field center), +1 field exit. Each cycle of
+pass index from -1 to +1 is one pass; with INFIELD_EPOCH_MODE = 'pass' a whole
+pass is IN THE PLACE FIELD when the (unfiltered) field index reaches
+FIELD_PEAK_FRACTION of the cell's peak rate during it (0.2 = auto_filter_band's
+own field definition); with 'field_index' only the part of the pass where the
+field index is above that fraction counts. In-field epochs are shaded light red
+in both panels, and a spike is "in field" if it fires during one of them. The in-field spike timestamps (with their pass index and theta
+phase) and the in-field epochs are written per cell to
+<session>/ThetaSpikeViewer_Snapshots/<unit>_InFieldSpikes.csv / _InFieldEpochs.csv.
+
 Two ways to pick which cell(s) to look at:
 
-  1. EXCEL_SUMMARY_PATH set to a theta_phase.xlsx produced by
-     ThetaMod_PhasePrecession_v2.py -- the viewer builds a list of every
+  1. EXCEL_SUMMARY_PATH set to the theta_phase xlsx produced by
+     ThetaMod_PhasePrec_v22_fitR_shuffle.py -- the viewer builds a list of every
      unit flagged is_precessing / is_recessing (per PRECESSION_FILTER) and
      you page through them with the Prev/Next cell buttons ('p' / 'n').
-  2. EXCEL_SUMMARY_PATH = None -- the viewer opens exactly one cell, given
-     by NTT_FILE / CELL_NUMBER (same convention as
-     Understanding_PassIndex/Viz_PassIndex_AllSteps.py).
+  2. EXCEL_SUMMARY_PATH = None (or missing) -- the viewer opens exactly one
+     cell, given by NTT_FILE / CELL_NUMBER.
 
-All Neuralynx I/O and theta-phase math (load_ncs, load_ntt_spike_times,
-bandpass_filter, assign_spike_phase) are imported unchanged from
-ThetaMod_PhasePrecession_v2.py so the phase values shown here match the
-batch pipeline exactly.
+All Neuralynx I/O, LFP cleaning, theta-phase and pass-index math are imported
+unchanged from ThetaMod_PhasePrec_v22_fitR_shuffle.py so the values shown
+here match the batch pipeline exactly.
 
-By default (IN_FIELD_ONLY = True) only spikes fired inside the place field
-are shown/counted -- "in field" defined the same way
-ThetaMod_PhasePrecession_v2.auto_filter_band defines it for the 'place'
-method: a rate-map bin with occupancy-normalized rate > FIELD_PEAK_FRACTION
-(10%) of the cell's peak rate. Set IN_FIELD_ONLY = False to see all spikes.
+IN_FIELD_ONLY = True shows/counts only in-field spikes; False shows all spikes
+(out-of-field ones in grey).
 
 Keyboard shortcuts (figure must have focus): Left/Right = prev/next window,
 Up/Down = widen/narrow window, ','/'.' = prev/next spike, 's' = save
@@ -55,16 +65,23 @@ if _INTERACTIVE_BACKEND is None:
     )
 
 import pandas as pd
-from scipy import signal
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from matplotlib.patches import Patch
 from matplotlib.widgets import Slider, Button, TextBox
 
 # Reused unchanged from the batch pipeline so numbers match exactly.
-from ThetaMod_PhasePrecession_v2 import (
-    load_ncs, load_ntt_spike_times, bandpass_filter, assign_spike_phase,
-    _natural_key, LFP_FILTER_BAND as _PIPELINE_LFP_BAND,
-    load_tracking, spk_pos, rate_map, _find_tracking_file,
+from ThetaMod_PhasePrec_v22_fitR_shuffle import (
+    load_ncs, load_ntt_spike_times, clean_lfp, bandpass_filter, hilbert_phase,
+    assign_spike_phase, phase_at, _natural_key, match_ncs_to_ntt,
+    load_tracking, spk_pos, rate_map, field_index_map, field_index_per_position,
+    sample_along_arc, auto_filter_band, _find_tracking_file,
+    LFP_FILTER_BAND as _PIPELINE_LFP_BAND, METHOD as _PIPELINE_METHOD,
     BINSIDE as _PIPELINE_BINSIDE, SMTH_WIDTH as _PIPELINE_SMTH_WIDTH,
+    FILTER_BAND as _PIPELINE_FILTER_BAND,
     TRACKING_TIME_UNIT as _PIPELINE_TRACKING_TIME_UNIT,
+    MATCH_SPIKE_LFP_FILE as _PIPELINE_MATCH_SPIKE_LFP_FILE,
+    RESULTS_FOLDER as _PIPELINE_RESULTS_FOLDER, OUTPUT_EXCEL_NAME as _PIPELINE_EXCEL_NAME,
 )
 
 # Importing the pipeline module force-switches matplotlib to 'Agg' (it's
@@ -78,7 +95,7 @@ import matplotlib.pyplot as plt
 # ============================================================================
 
 # --- Option 1: page through every flagged unit from a batch run ---
-EXCEL_SUMMARY_PATH = Path(r"C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True/Fa8477/theta_phase.xlsx")
+EXCEL_SUMMARY_PATH = _PIPELINE_RESULTS_FOLDER / _PIPELINE_EXCEL_NAME
 PRECESSION_FILTER = 'precessing_or_recessing'  # 'precessing' | 'recessing' | 'precessing_or_recessing'
 
 # --- Option 2: view exactly one cell (used when EXCEL_SUMMARY_PATH is None
@@ -88,11 +105,20 @@ CELL_NUMBER = None  # None = auto-pick the sorted cluster with the most spikes
 
 LFP_FILTER_BAND = _PIPELINE_LFP_BAND  # Hz, theta band for the phase panel
 
-# Restrict displayed spikes to the place field, defined exactly as in
-# ThetaMod_PhasePrecession_v2.auto_filter_band: rate-map bins with firing
-# rate > FIELD_PEAK_FRACTION * peak rate (10% of peak, "place" method).
-IN_FIELD_ONLY = True
-FIELD_PEAK_FRACTION = 0.1
+# A pass (one -1 -> +1 cycle of pass index) is in the place field if the field
+# index (rate map normalized to the cell's peak) reaches this fraction during it.
+# 0.2 = the field definition of ThetaMod_PhasePrec_v22's auto_filter_band.
+FIELD_PEAK_FRACTION = 0.2
+# 'pass': the whole pass (pass index -1 -> +1, trough to trough of the filtered field
+#         index) is in field -- wider than the field itself, as the troughs lie outside it.
+# 'field_index': only the part of each pass where the field index >= FIELD_PEAK_FRACTION.
+INFIELD_EPOCH_MODE = 'pass'
+IN_FIELD_ONLY = True        # True: show only in-field spikes; False: all (out-of-field in grey)
+INFIELD_COLOR = '#FF9999'   # background of in-field epochs
+INFIELD_ALPHA = 0.25
+SAVE_INFIELD_CSV = True     # write <unit>_InFieldSpikes.csv / _InFieldEpochs.csv on loading a cell
+PASS_INDEX_CMAP = 'Spectral'  # diverging colormap of the pass-index strip (-1 entry, 0 center, +1 exit)
+PASS_INDEX_PLOT_SAMPLES = 2000  # pass-index samples per visible window
 
 DEFAULT_WINDOW_SEC = 5.0
 MIN_WINDOW_SEC = 0.5
@@ -149,6 +175,91 @@ def build_cell_list_manual(ntt_file: Path, cell_number) -> list[dict]:
 
 
 # ============================================================================
+# In-field epochs from the pass index
+# ============================================================================
+
+def _wrap_pm_pi(u):
+    return np.mod(u + np.pi, 2 * np.pi) - np.pi
+
+
+def compute_infield_epochs(pos_ts, pos_xy, spk_ts, field_peak_fraction=FIELD_PEAK_FRACTION,
+                           mode=INFIELD_EPOCH_MODE):
+    """Pass-index trace and in-field passes for one unit, computed as in
+    ThetaMod_PhasePrec_v22's compute_pass_index (same rate map, field index,
+    arc-length resampling, spatial filter and Hilbert phase). `spk_ts` (all of
+    the unit's spikes in the tracking/LFP overlap) defines the rate map.
+
+    Passes are the runs of constant pass number floor((phase + pi) / 2pi) of the
+    unwrapped field phase (its running max, so backward phase jitter can't split
+    a pass), i.e. one pass index cycle from -1 (entry) through 0
+    (field-index peak) to +1 (exit); together they tile the tracked time.
+    mode='pass': a whole pass is in field if the unfiltered field index reaches
+    field_peak_fraction in it. mode='field_index': only the stretches of each pass
+    where the field index is >= field_peak_fraction are in field.
+
+    Returns (epochs DataFrame [pass_id, t_start, t_end, peak_field_index, in_field],
+    pass_index_at(t) and field_index_at(t), functions giving the pass index and
+    the unfiltered field index at arbitrary times; NaN outside the tracking).
+    """
+    n_dims = pos_xy.shape[1]
+    binside = 2.0 * n_dims if _PIPELINE_BINSIDE == 'auto' else _PIPELINE_BINSIDE
+    smth_width = 3.0 * binside if _PIPELINE_SMTH_WIDTH == 'auto' else _PIPELINE_SMTH_WIDTH
+
+    spk_xy, _ = spk_pos(pos_ts, pos_xy, spk_ts)
+    rmap, occupancy, x_edges, y_edges = rate_map(pos_ts, pos_xy, spk_xy, binside, smth_width)
+    fi_map = field_index_map(rmap, occupancy, _PIPELINE_METHOD)
+    field_index = field_index_per_position(pos_xy, fi_map, x_edges, y_edges)
+
+    cc, ts2, resampled = sample_along_arc(pos_ts, pos_xy, field_index)
+    filter_band = (auto_filter_band(_PIPELINE_METHOD, rmap, occupancy, binside, n_dims)
+                   if _PIPELINE_FILTER_BAND == 'auto' else _PIPELINE_FILTER_BAND)
+    fs_arc = 1.0 / np.mean(np.diff(cc))
+    filtered_field_index = bandpass_filter(resampled, filter_band[0], filter_band[1], fs_arc)
+    field_phase_unwrapped = np.unwrap(hilbert_phase(filtered_field_index, fs_arc)[0])
+
+    # running max: a brief backward step of the Hilbert phase across a pass
+    # boundary must not split one pass into several
+    pass_id = np.floor((np.maximum.accumulate(field_phase_unwrapped) + np.pi) / (2 * np.pi)).astype(np.int64)
+    above = resampled >= field_peak_fraction
+    if mode == 'pass':
+        seg_key = pass_id
+    elif mode == 'field_index':
+        seg_key = 2 * pass_id + above  # split each pass into its above/below-threshold stretches
+    else:
+        raise ValueError(f"INFIELD_EPOCH_MODE must be 'pass' or 'field_index', not {mode!r}")
+    change = np.flatnonzero(np.diff(seg_key) != 0) + 1
+    starts = np.concatenate(([0], change))
+    stops = np.concatenate((change, [len(seg_key)]))  # exclusive
+    peak_fi = np.maximum.reduceat(resampled, starts)
+    epochs = pd.DataFrame(dict(
+        pass_id=pass_id[starts],
+        t_start=ts2[starts],
+        t_end=ts2[np.minimum(stops, len(ts2) - 1)],
+        peak_field_index=peak_fi,
+        in_field=peak_fi >= field_peak_fraction if mode == 'pass' else above[starts],
+    ))
+
+    def pass_index_at(t):
+        return _wrap_pm_pi(phase_at(ts2, field_phase_unwrapped, t)) / np.pi
+
+    def field_index_at(t):
+        return np.interp(np.asarray(t, dtype=np.float64), ts2, resampled, left=np.nan, right=np.nan)
+
+    return epochs, pass_index_at, field_index_at
+
+
+def times_in_epochs(t, epochs: pd.DataFrame):
+    """Boolean mask over times `t` falling inside any of `epochs` (t_start <= t < t_end)."""
+    t = np.asarray(t, dtype=np.float64)
+    starts, ends = epochs['t_start'].to_numpy(), epochs['t_end'].to_numpy()
+    idx = np.searchsorted(starts, t, side='right') - 1
+    ok = idx >= 0
+    out = np.zeros(len(t), dtype=bool)
+    out[ok] = t[ok] < ends[idx[ok]]
+    return out
+
+
+# ============================================================================
 # Viewer
 # ============================================================================
 
@@ -156,20 +267,25 @@ class ThetaSpikeViewer:
     def __init__(self, cells: list[dict]):
         self.cells = cells
         self.cell_idx = 0
-        self._lfp_cache = {}  # folder (str) -> (lfp_sig, lfp_ts, lfp_fs, filtered_lfp, lfp_phase_unwrapped)
+        self._lfp_cache = {}  # .ncs path (str) -> dict(lfp_sig, lfp_ts, lfp_fs, filtered_lfp, lfp_phase_unwrapped)
         self._tracking_cache = {}  # folder (str) -> (pos_ts, pos_xy) or None if no tracking file
 
         self.window_sec = DEFAULT_WINDOW_SEC
         self.t_start = 0.0
 
-        self.fig = plt.figure(figsize=(14, 7.5))
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[1.2, 1],
-                                    left=0.08, right=0.97, top=0.90, bottom=0.30, hspace=0.15)
+        self.fig = plt.figure(figsize=(14, 8.5))
+        gs = self.fig.add_gridspec(3, 1, height_ratios=[1.2, 1, 0.3],
+                                    left=0.08, right=0.92, top=0.90, bottom=0.30, hspace=0.15)
         self.ax_lfp = self.fig.add_subplot(gs[0])
         self.ax_phase = self.fig.add_subplot(gs[1], sharex=self.ax_lfp)
+        self.ax_pi = self.fig.add_subplot(gs[2], sharex=self.ax_lfp)
+        pos = self.ax_pi.get_position()
+        cax = self.fig.add_axes([0.93, pos.y0, 0.01, pos.height])
+        cbar = self.fig.colorbar(ScalarMappable(norm=Normalize(-1, 1), cmap=PASS_INDEX_CMAP), cax=cax)
+        cbar.set_ticks([-1, 0, 1])
+        cbar.ax.tick_params(labelsize=8)
         self.ax_phase.set_ylim(0, 360)
         self.ax_phase.set_yticks([0, 90, 180, 270, 360])
-        self.ax_phase.set_xlabel('Time (s)')
         self.ax_phase.set_ylabel('Theta phase (deg)')
         self.ax_lfp.set_ylabel('LFP (uV)')
 
@@ -240,42 +356,76 @@ class ThetaSpikeViewer:
 
     # -- data loading -----------------------------------------------------
 
+    def _load_lfp(self, cell):
+        """Cleaned LFP + unwrapped Hilbert theta phase, as in v22's process_session."""
+        ncs_files = sorted(cell['folder'].glob('*.ncs'), key=_natural_key)
+        if not ncs_files:
+            raise FileNotFoundError(f'No .ncs file found in {cell["folder"]}')
+        ncs_path = (match_ncs_to_ntt(cell['folder'] / cell['ntt_file'], ncs_files)
+                    if _PIPELINE_MATCH_SPIKE_LFP_FILE else ncs_files[0])
+        key = str(ncs_path)
+        if key not in self._lfp_cache:
+            print(f'Loading LFP: {ncs_path}')
+            lfp_sig, lfp_ts, lfp_fs = clean_lfp(*load_ncs(ncs_path))
+            filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
+            lfp_phase_unwrapped = np.unwrap(hilbert_phase(filtered_lfp, lfp_fs)[0])
+            self._lfp_cache[key] = dict(
+                lfp_sig=lfp_sig, lfp_ts=lfp_ts, lfp_fs=lfp_fs, lfp_file=ncs_path.name,
+                filtered_lfp=filtered_lfp, lfp_phase_unwrapped=lfp_phase_unwrapped,
+            )
+        return self._lfp_cache[key]
+
+    def _load_tracking(self, folder):
+        folder_key = str(folder)
+        if folder_key not in self._tracking_cache:
+            try:
+                tracking_path = _find_tracking_file(folder)
+                self._tracking_cache[folder_key] = load_tracking(tracking_path, _PIPELINE_TRACKING_TIME_UNIT)
+            except FileNotFoundError:
+                print(f'No tracking file found in {folder} -- no pass index / place-field epochs.')
+                self._tracking_cache[folder_key] = None
+        return self._tracking_cache[folder_key]
+
     def _load_cell(self, idx):
         self.cell_idx = idx % len(self.cells)
         cell = self.cells[self.cell_idx]
-
-        folder_key = str(cell['folder'])
-        if folder_key not in self._lfp_cache:
-            ncs_files = sorted(cell['folder'].glob('*.ncs'), key=_natural_key)
-            if not ncs_files:
-                raise FileNotFoundError(f'No .ncs file found in {cell["folder"]}')
-            lfp_sig, lfp_ts, lfp_fs = load_ncs(ncs_files[0])
-            filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
-            lfp_phase_unwrapped = np.unwrap(np.angle(signal.hilbert(filtered_lfp)))
-            self._lfp_cache[folder_key] = dict(
-                lfp_sig=lfp_sig, lfp_ts=lfp_ts, lfp_fs=lfp_fs,
-                filtered_lfp=filtered_lfp, lfp_phase_unwrapped=lfp_phase_unwrapped,
-            )
-        lfp = self._lfp_cache[folder_key]
+        lfp = self._load_lfp(cell)
+        lfp_ts = lfp['lfp_ts']
 
         units = load_ntt_spike_times(cell['folder'] / cell['ntt_file'])
         spk_ts_all = units.get(cell['cell_number'], np.array([]))
 
-        if IN_FIELD_ONLY and len(spk_ts_all):
-            spk_ts = self._filter_infield(cell['folder'], spk_ts_all)
-            n_dropped = len(spk_ts_all) - len(spk_ts)
-            if n_dropped:
-                print(f"{cell['unit_label']}: {n_dropped}/{len(spk_ts_all)} spike(s) outside the "
-                      f"place field (rate < {FIELD_PEAK_FRACTION:.0%} of peak) excluded")
-        else:
-            spk_ts = spk_ts_all
+        # ---- in-field epochs (pass index) and in-field spikes ----
+        epochs = pass_index_at = field_index_at = None
+        spk_in_field = np.ones(len(spk_ts_all), dtype=bool)
+        spk_pass_index = np.full(len(spk_ts_all), np.nan)
+        tracking = self._load_tracking(cell['folder'])
+        if tracking is not None and len(spk_ts_all):
+            pos_ts, pos_xy = tracking
+            t_lo, t_hi = max(pos_ts.min(), lfp_ts.min()), min(pos_ts.max(), lfp_ts.max())
+            overlap = (spk_ts_all >= t_lo) & (spk_ts_all <= t_hi)
+            epochs, pass_index_at, field_index_at = compute_infield_epochs(pos_ts, pos_xy, spk_ts_all[overlap])
+            spk_in_field = times_in_epochs(spk_ts_all, epochs[epochs['in_field']]) & overlap
+            spk_pass_index = pass_index_at(spk_ts_all)
+            n_pass = epochs.loc[epochs['in_field'], 'pass_id'].nunique()
+            print(f"{cell['unit_label']}: {n_pass} in-field pass(es) "
+                  f"(field index >= {FIELD_PEAK_FRACTION:g}, mode={INFIELD_EPOCH_MODE!r}), "
+                  f"{int(spk_in_field.sum())}/{len(spk_ts_all)} spike(s) in field")
 
-        spk_phase_deg = np.degrees(assign_spike_phase(spk_ts, lfp['lfp_ts'], lfp['lfp_phase_unwrapped'])) \
-            if len(spk_ts) else np.array([])
+        spk_phase_deg = (np.degrees(assign_spike_phase(spk_ts_all, lfp_ts, lfp['lfp_phase_unwrapped'],
+                                                       lfp['lfp_fs']))
+                         if len(spk_ts_all) else np.array([]))
 
-        self.cur = dict(cell=cell, spk_ts=spk_ts, spk_phase_deg=spk_phase_deg, **lfp)
+        if epochs is not None and SAVE_INFIELD_CSV:
+            self._save_infield_csv(cell, epochs, spk_ts_all, spk_in_field, spk_pass_index, spk_phase_deg)
 
-        t_min, t_max = float(lfp['lfp_ts'][0]), float(lfp['lfp_ts'][-1])
+        keep = spk_in_field if IN_FIELD_ONLY else np.ones(len(spk_ts_all), dtype=bool)
+        self.cur = dict(cell=cell, spk_ts=spk_ts_all[keep], spk_phase_deg=spk_phase_deg[keep],
+                        spk_in_field=spk_in_field[keep],
+                        infield_epochs=None if epochs is None else epochs[epochs['in_field']],
+                        pass_index_at=pass_index_at, field_index_at=field_index_at, **lfp)
+
+        t_min, t_max = float(lfp_ts[0]), float(lfp_ts[-1])
         self.t_min, self.t_max = t_min, t_max
         self.window_sec = min(self.window_sec, max(MIN_WINDOW_SEC, t_max - t_min))
         self._set_slider_range(self.slider_w, MIN_WINDOW_SEC, min(MAX_WINDOW_SEC, t_max - t_min))
@@ -283,41 +433,26 @@ class ThetaSpikeViewer:
         self.set_window_start(t_min, redraw=False)
         self._redraw()
 
+    def _save_infield_csv(self, cell, epochs, spk_ts, spk_in_field, spk_pass_index, spk_phase_deg):
+        """In-field spike timestamps (+ pass index, theta phase, pass number) and
+        the in-field epochs, one CSV each, in the session's OUTPUT_SUBDIR."""
+        out_dir = cell['folder'] / OUTPUT_SUBDIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        infield = epochs[epochs['in_field']].reset_index(drop=True)
+        spk = spk_ts[spk_in_field]
+        epoch_idx = np.searchsorted(infield['t_start'].to_numpy(), spk, side='right') - 1
+        pd.DataFrame(dict(
+            spike_ts_s=spk,
+            pass_index=spk_pass_index[spk_in_field],
+            theta_phase_deg=spk_phase_deg[spk_in_field],
+            pass_id=infield['pass_id'].to_numpy()[epoch_idx] if len(spk) else np.array([], dtype=int),
+        )).to_csv(out_dir / f"{cell['unit_label']}_InFieldSpikes.csv", index=False)
+        infield.drop(columns='in_field').to_csv(out_dir / f"{cell['unit_label']}_InFieldEpochs.csv",
+                                                index=False)
+        print(f'  In-field spikes / epochs saved to {out_dir}')
+
     def load_relative_cell(self, step):
         self._load_cell(self.cell_idx + step)
-
-    def _filter_infield(self, folder, spk_ts):
-        """Keep only spikes fired while the animal was inside the place
-        field, i.e. in a rate-map bin with rate > FIELD_PEAK_FRACTION * peak
-        rate -- the same definition ThetaMod_PhasePrecession_v2.auto_filter_band
-        uses to estimate field diameter for the 'place' method. Falls back to
-        returning all spikes unchanged if no tracking file is found.
-        """
-        folder_key = str(folder)
-        if folder_key not in self._tracking_cache:
-            try:
-                tracking_path = _find_tracking_file(folder)
-                self._tracking_cache[folder_key] = load_tracking(tracking_path, _PIPELINE_TRACKING_TIME_UNIT)
-            except FileNotFoundError:
-                print(f'No tracking file found in {folder} -- showing all spikes unfiltered.')
-                self._tracking_cache[folder_key] = None
-        tracking = self._tracking_cache[folder_key]
-        if tracking is None:
-            return spk_ts
-
-        pos_ts, pos_xy = tracking
-        n_dims = pos_xy.shape[1]
-        binside = 2.0 * n_dims if _PIPELINE_BINSIDE == 'auto' else _PIPELINE_BINSIDE
-        smth_width = 3.0 * binside if _PIPELINE_SMTH_WIDTH == 'auto' else _PIPELINE_SMTH_WIDTH
-
-        spk_xy, _ = spk_pos(pos_ts, pos_xy, spk_ts)
-        rmap, _, x_edges, y_edges = rate_map(pos_ts, pos_xy, spk_xy, binside, smth_width)
-        peak = np.nanmax(rmap)
-        field_mask = rmap > FIELD_PEAK_FRACTION * peak
-
-        xi = np.clip(np.digitize(spk_xy[:, 0], x_edges) - 1, 0, len(x_edges) - 2)
-        yi = np.clip(np.digitize(spk_xy[:, 1], y_edges) - 1, 0, len(y_edges) - 2)
-        return spk_ts[field_mask[xi, yi]]
 
     # -- window navigation --------------------------------------------------
 
@@ -373,6 +508,40 @@ class ThetaSpikeViewer:
 
     # -- rendering --------------------------------------------------------
 
+    def _draw_infield_epochs(self, t0, t1):
+        epochs = self.cur['infield_epochs']
+        if epochs is None:
+            return
+        vis = epochs[(epochs['t_end'] > t0) & (epochs['t_start'] < t1)]
+        for ax in (self.ax_lfp, self.ax_phase):
+            for start, end in zip(vis['t_start'], vis['t_end']):
+                ax.axvspan(max(start, t0), min(end, t1), color=INFIELD_COLOR, alpha=INFIELD_ALPHA,
+                           linewidth=0, zorder=0)
+
+    def _draw_pass_index(self, t0, t1):
+        """Place-field pass index over time as a PASS_INDEX_CMAP color strip
+        (-1 entry, 0 center, +1 exit) with the pass-index trace on top. Only
+        pass-index values while the animal is inside the place field (field
+        index >= FIELD_PEAK_FRACTION) are shown, whatever INFIELD_EPOCH_MODE."""
+        ax = self.ax_pi
+        pass_index_at, field_index_at = self.cur['pass_index_at'], self.cur['field_index_at']
+        if pass_index_at is None:
+            ax.text(0.5, 0.5, 'no tracking file -- no pass index', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=8, color='0.4')
+        else:
+            tt = np.linspace(t0, t1, PASS_INDEX_PLOT_SAMPLES)
+            pi = pass_index_at(tt)
+            pi[~(field_index_at(tt) >= FIELD_PEAK_FRACTION)] = np.nan
+            ax.imshow(pi[None, :], aspect='auto', cmap=PASS_INDEX_CMAP, vmin=-1, vmax=1,
+                      extent=(t0, t1, -1, 1), origin='lower', interpolation='nearest', zorder=0)
+            pi_line = pi.copy()
+            pi_line[1:][np.abs(np.diff(pi)) > 1] = np.nan  # don't draw the +1 -> -1 wrap
+            ax.plot(tt, pi_line, color='k', linewidth=0.8, zorder=2)
+        ax.axhline(0, color='0.5', linewidth=0.5, linestyle=':', zorder=1)
+        ax.set_ylim(-1, 1)
+        ax.set_yticks([-1, 0, 1])
+        ax.set_ylabel('Pass\nindex')
+
     def _redraw(self):
         t0, t1 = self.t_start, self.t_start + self.window_sec
         lfp_ts, lfp_sig = self.cur['lfp_ts'], self.cur['lfp_sig']
@@ -385,12 +554,19 @@ class ThetaSpikeViewer:
 
         self.ax_lfp.cla()
         self.ax_phase.cla()
+        self.ax_pi.cla()
+        self._draw_infield_epochs(t0, t1)
+        self._draw_pass_index(t0, t1)
 
         if len(ts_win) > 1:
-            self.ax_lfp.plot(ts_win, lfp_sig[i0:i1], color='0.7', linewidth=0.7, label='raw LFP')
+            self.ax_lfp.plot(ts_win, lfp_sig[i0:i1], color='0.7', linewidth=0.7, label='cleaned LFP')
             self.ax_lfp.plot(ts_win, filtered_lfp[i0:i1], color='tab:blue', linewidth=1.2,
                               label=f'theta {LFP_FILTER_BAND[0]:g}-{LFP_FILTER_BAND[1]:g} Hz')
-            self.ax_lfp.legend(loc='upper right', fontsize=8)
+            handles, _ = self.ax_lfp.get_legend_handles_labels()
+            if self.cur['infield_epochs'] is not None:
+                handles.append(Patch(color=INFIELD_COLOR, alpha=INFIELD_ALPHA,
+                                     label='in place field (pass index)'))
+            self.ax_lfp.legend(handles=handles, loc='upper right', fontsize=8)
 
             phase_deg_win = np.degrees(np.mod(lfp_phase_unwrapped[i0:i1], 2 * np.pi))
             plot_phase = phase_deg_win.copy()
@@ -403,11 +579,13 @@ class ThetaSpikeViewer:
 
         spk_mask = (spk_ts >= t0) & (spk_ts <= t1)
         spk_win, spk_phase_win = spk_ts[spk_mask], spk_phase_deg[spk_mask]
+        in_win = self.cur['spk_in_field'][spk_mask]
         if len(spk_win):
             ylo, yhi = self.ax_lfp.get_ylim() if len(ts_win) > 1 else (-1, 1)
-            self.ax_lfp.vlines(spk_win, ylo, yhi, colors='crimson', linewidth=1.0, alpha=0.7, zorder=5)
+            colors = np.where(in_win, 'crimson', '0.5')
+            self.ax_lfp.vlines(spk_win, ylo, yhi, colors=colors, linewidth=1.0, alpha=0.7, zorder=5)
             self.ax_lfp.set_ylim(ylo, yhi)
-            self.ax_phase.scatter(spk_win, spk_phase_win, s=28, color='crimson',
+            self.ax_phase.scatter(spk_win, spk_phase_win, s=28, c=colors,
                                    edgecolors='k', linewidths=0.3, zorder=5)
 
         self.ax_lfp.set_xlim(t0, t1)
@@ -415,7 +593,10 @@ class ThetaSpikeViewer:
         self.ax_phase.set_yticks([0, 90, 180, 270, 360])
         self.ax_lfp.set_ylabel('LFP (uV)')
         self.ax_phase.set_ylabel('Theta phase (deg)')
-        self.ax_phase.set_xlabel('Time (s)')
+        self.ax_phase.tick_params(labelbottom=False)
+        self.ax_lfp.tick_params(labelbottom=False)
+        self.ax_pi.set_xlabel('Time (s)')
+        self.ax_pi.set_xlim(t0, t1)
 
         cell = self.cur['cell']
         flag = ''
@@ -426,7 +607,7 @@ class ThetaSpikeViewer:
         self.ax_lfp.set_title(
             f"[{self.cell_idx + 1}/{len(self.cells)}] {cell['unit_label']}{flag}\n"
             f"t = {t0:.2f}-{t1:.2f} s ({self.window_sec:.2f} s window) | "
-            f"{len(spk_win)} spike(s) shown", fontsize=10)
+            f"{int(in_win.sum())} in-field / {len(spk_win)} spike(s) shown", fontsize=10)
 
         self.fig.canvas.draw_idle()
 

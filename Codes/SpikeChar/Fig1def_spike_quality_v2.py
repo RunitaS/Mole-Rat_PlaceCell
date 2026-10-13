@@ -30,8 +30,10 @@ Multi-trigger (bursting) review
   after the main peak and exceed both MULTI_TRIGGER_AMP_FRAC × that spike's main peak and
   MULTI_TRIGGER_NOISE_K × baseline σ are counted as secondary triggers. Units with more than
   MULTI_TRIGGER_MIN_PEAKS such peaks are held back and shown in a GUI after the scan, where
-  each can be manually accepted or rejected. The manual decision overrides the automatic
-  one (for copying and for the accepted/rejected colouring in every histogram).
+  each can be manually accepted, rejected, or accepted with its multi-trigger spikes moved
+  to cluster 0 (the copy in the accepted tree is rewritten so those spikes have
+  cell_number = 0; the original .ntt is never modified). The manual decision overrides the
+  automatic one (for copying and for the accepted/rejected colouring in every histogram).
 
 Accepted units' .ntt files, plus every .csv and .ncs file found alongside them,
 are copied into a sibling '<ROOT_FOLDER>_Accepted' tree that mirrors the
@@ -53,6 +55,7 @@ import pandas as pd # type: ignore
 import matplotlib # type: ignore
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt # type: ignore
+from matplotlib.colors import to_hex # type: ignore
 from openpyxl import load_workbook # type: ignore
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side # type: ignore
 from openpyxl.utils import get_column_letter # type: ignore
@@ -66,52 +69,68 @@ OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data\QUALITY_METR
 # Sibling folder that receives accepted units' .ntt files plus every .csv/.ncs
 # file found in the same session folder (mirrors ROOT_FOLDER's subfolder tree).
 ACCEPTED_ROOT_FOLDER = ROOT_FOLDER.rstrip('\\/') + '_SpkQltyFilt'
+# True: copy accepted units (+ session .csv/.ncs files) into ACCEPTED_ROOT_FOLDER.
+# False: compute metrics/figures only, no files are copied.
+SAVE_ACCEPTED_COPY = True
 
 # ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
 # OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
 
 N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
-WAVEFORM_DURATION_MS = 5.0       # total duration spanned by the 32-sample waveform snippet
+WAVEFORM_DURATION_MS = 1.0       # 32 samples @ 32 kHz (NTT header SamplingFrequency 32000)
 SAMPLE_INTERVAL_MS   = WAVEFORM_DURATION_MS / N_SAMPLES
 
-# ── Figure palette (sampled from the reference c-Fos / MoBI-DisC figure) ──────
-PAL_MAGENTA  = '#FA7FFA'   # "Increased in CMF" points
-PAL_CYAN     = '#7FFAFA'   # "Increased in HMF" points
-PAL_BLUE     = '#7FB3E5'   # light blue: HMF box fill (c-Fos figure)
-PAL_DKBLUE   = '#0066CC'   # dark blue: HMF data points (c-Fos figure)
-PAL_GRAY     = '#7F7F7F'   # gray: CMF box fill (c-Fos figure)
-PAL_LTGRAY   = '#D4D4D4'   # "Excluded clusters"
-PAL_GREEN    = '#00C000'   # inclination trace
-PAL_ORANGE   = '#FF8000'   # azimuth trace
-PAL_RED      = '#FF0000'   # highlighted labels
-PAL_BLACK    = '#000000'
-FIG_FONT     = ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans']   # c-Fos figure uses Arial/Helvetica
+# ── Figure palette (magma colormap + neutral inks, as in PlaceCell_CompareRuns.py) ──
+# Data colours are equidistant on the magma colormap: n colours sit at
+# k/(n+1), k = 1..n (here 0.2, 0.4, 0.6, 0.8), so the gaps between colours
+# and to both ends of the map are equal and the near-black / near-white ends
+# are never used.
+FIG_CMAP = 'magma'
+MAGMA_1, MAGMA_2, MAGMA_3, MAGMA_4 = [to_hex(matplotlib.colormaps[FIG_CMAP](v))
+                                      for v in np.linspace(0, 1, 6)[1:-1]]
+REJECT_COLOR   = '#e1e0d9'
+INK_PRIMARY    = '#0b0b0b'
+INK_SECONDARY  = '#52514e'
+INK_MUTED      = '#898781'
+GRID_COLOR     = '#e1e0d9'
+SURFACE        = '#fcfcfb'
 
-plt.rcParams.update({
-    'font.family':        'sans-serif',
-    'font.sans-serif':    FIG_FONT,
-    'text.color':         PAL_BLACK,
-    'axes.labelcolor':    PAL_BLACK,
-    'axes.edgecolor':     PAL_BLACK,
-    'axes.linewidth':     1.5,
-    'xtick.color':        PAL_BLACK,
-    'ytick.color':        PAL_BLACK,
-    'xtick.direction':    'out',
-    'ytick.direction':    'out',
-    'xtick.major.width':  1.5,
-    'ytick.major.width':  1.5,
-    'axes.facecolor':     'white',
-    'figure.facecolor':   'white',
-    'savefig.facecolor':  'white',
-    'axes.grid':          False,
-    'legend.frameon':     False,
-})
+
+def _style_axes(ax):
+    ax.set_facecolor(SURFACE)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color(INK_MUTED)
+    ax.tick_params(colors=INK_SECONDARY, labelsize=9)
+    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8)
+    ax.set_axisbelow(True)
+
+
+def _save(fig, path_base, exts=('png', 'svg')):
+    """Save fig as <path_base>.<ext> for each ext, then close it."""
+    for ext in exts:
+        fig.savefig(f'{path_base}.{ext}', dpi=300, bbox_inches='tight', facecolor=SURFACE)
+    plt.close(fig)
+
+
+def _legend_outside(ax, handles=None, labels=None):
+    if handles is None:
+        handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK_PRIMARY,
+              loc='upper left', bbox_to_anchor=(1.0, 1.0))
+
 
 # ── Waveform plot colours ──────────────────────────────────────────────────────
-COLOR_WAVEFORM = PAL_GRAY
-COLOR_PEAK     = PAL_MAGENTA
-COLOR_TROUGH   = PAL_DKBLUE
-COLOR_DURATION = PAL_GREEN
+COLOR_WAVEFORM = INK_SECONDARY
+COLOR_PEAK     = MAGMA_3
+COLOR_TROUGH   = MAGMA_1
+COLOR_DURATION = MAGMA_4
+
+# ── Histogram threshold-line colours (same meaning in every histogram) ────────
+COLOR_THR_GOOD     = MAGMA_1
+COLOR_THR_BAD      = MAGMA_3
+COLOR_THR_MARGINAL = MAGMA_4
 
 # ── SNR quality thresholds ─────────────────────────────────────────────────────
 SNR_LOW_BAD   = 1.5
@@ -124,8 +143,8 @@ ISI_MARGIN_PCT = 5.0   # 1–5 %  → YELLOW, > 5 % → RED
 
 # ── Unit acceptance thresholds (ISI + SNR + template correlation) ─────────────
 TEMPLATE_CORR_ACCEPT_MIN = 0.5   # template correlation must exceed this
-ACCEPTED_COLOR = PAL_BLUE        # color used for accepted units in stacked plots
-REJECTED_COLOR = PAL_GRAY        # gray used for rejected units in stacked plots
+ACCEPTED_COLOR = MAGMA_2         # color used for accepted units in stacked plots
+REJECTED_COLOR = REJECT_COLOR    # gray used for rejected units in stacked plots
 
 # ── Spike duration onset/offset threshold ──────────────────────────────────────
 # Onset (depolarization begin) / offset (hyperpolarization end) are taken as the
@@ -437,39 +456,38 @@ def compute_pt(waveforms: np.ndarray) -> dict:
 def plot_waveform(wf: np.ndarray, result: dict, out_path: str, title: str):
     time_axis = np.arange(N_SAMPLES) * SAMPLE_INTERVAL_MS
 
-    fig, ax = plt.subplots(figsize=(6, 4.2))
+    fig, ax = plt.subplots(figsize=(6, 4), facecolor=SURFACE)
+    _style_axes(ax)
 
     ax.plot(time_axis, wf, color=COLOR_WAVEFORM, linewidth=1.8, zorder=3)
     ax.scatter([result['peak_time_ms']], [result['peak_amp_uV']],
-               facecolor=COLOR_PEAK, edgecolor=PAL_BLACK, linewidths=1.0, s=60, zorder=5,
-               label=f"Peak  {result['peak_amp_uV']:.1f} uV")
+               facecolor=COLOR_PEAK, edgecolor=SURFACE, linewidths=1.0, s=50, zorder=5,
+               label=f"Peak  {result['peak_amp_uV']:.1f} µV")
     ax.scatter([result['trough_time_ms']], [result['trough_amp_uV']],
-               facecolor=COLOR_TROUGH, edgecolor=PAL_BLACK, linewidths=1.0, s=60, zorder=5,
-               label=f"Trough  {result['trough_amp_uV']:.1f} uV")
+               facecolor=COLOR_TROUGH, edgecolor=SURFACE, linewidths=1.0, s=50, zorder=5,
+               label=f"Trough  {result['trough_amp_uV']:.1f} µV")
 
     start_t = result['spike_start_time_ms']
     end_t   = result['spike_end_time_ms']
     ax.scatter([start_t, end_t], [wf[result['spike_start_idx']], wf[result['spike_end_idx']]],
-               color=COLOR_DURATION, marker='|', s=220, linewidths=2.2, zorder=6,
+               color=COLOR_DURATION, marker='|', s=180, linewidths=2.0, zorder=6,
                label='Spike start/end')
-    ax.axvspan(start_t, end_t, color=PAL_BLUE, alpha=0.25, linewidth=0, zorder=1)
+    ax.axvspan(start_t, end_t, color=COLOR_DURATION, alpha=0.18, linewidth=0, zorder=1)
 
-    ax.set_xlabel('Time (ms)', fontsize=14, labelpad=6)
-    ax.set_ylabel('Amplitude (µV)', fontsize=14, labelpad=6)
-    ax.set_title(title, fontsize=15, pad=10)
-    ax.tick_params(labelsize=12)
-    ax.spines[['top', 'right']].set_visible(False)
-    ax.legend(fontsize=11, loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=3)
+    ax.set_xlabel('Time (ms)', color=INK_PRIMARY)
+    ax.set_ylabel('Amplitude (µV)', color=INK_PRIMARY)
+    ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
+    _legend_outside(ax)
 
-    note = (f"Ch {result['best_channel']}  |  "
-            f"P-T time = {result['pt_time_ms']:.3f} ms  |  "
-            f"P/T ratio = {result['pt_ratio']:.3f}  |  "
+    note = (f"Ch {result['best_channel']}\n"
+            f"P-T time = {result['pt_time_ms']:.3f} ms\n"
+            f"P/T ratio = {result['pt_ratio']:.3f}\n"
             f"Spike duration = {result['spike_duration_ms']:.3f} ms")
-    ax.text(0.5, -0.34, note, transform=ax.transAxes, fontsize=11, ha='center')
+    ax.text(1.02, 0.0, note, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY,
+            ha='left', va='bottom')
 
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=500, bbox_inches='tight')
-    plt.close(fig)
+    # PNG only: one figure per unit, embedded in the Excel workbook
+    _save(fig, os.path.splitext(out_path)[0], exts=('png',))
 
 
 
@@ -532,6 +550,24 @@ def detect_multi_triggers(waveforms: np.ndarray, best_ch: int, peak_idx: int,
     return is_peak.sum(axis=1)
 
 
+def write_cleaned_ntt(src_path: str, dst_path: str, best_ch: int, peak_idx: int) -> int:
+    """
+    Copy `src_path` to `dst_path`, then set cell_number = 0 in the copy for
+    every non-cluster-0 spike that has ≥ 1 secondary trigger (the same spikes
+    drawn in red in the review GUI). Returns the number of spikes moved.
+    """
+    shutil.copy2(src_path, dst_path)
+    uv_scale = _parse_adbitvolts(src_path) * 1e6
+    data = np.memmap(dst_path, dtype=NTT_DTYPE, mode='r+', offset=NTT_HEADER_BYTES)
+    kept = np.flatnonzero(data['cell_number'] != 0)  # type: ignore[index]
+    waveforms = data['waveforms'][kept].astype(np.float64) * uv_scale  # type: ignore[index]
+    moved = kept[detect_multi_triggers(waveforms, best_ch, peak_idx) > 0]
+    data['cell_number'][moved] = 0  # type: ignore[index]
+    data.flush()
+    del data
+    return int(len(moved))
+
+
 # ── Manual review GUI for multi-trigger units ────────────────────────────────
 
 def review_multi_trigger_units(candidates: list) -> dict:
@@ -541,10 +577,11 @@ def review_multi_trigger_units(candidates: list) -> dict:
     triggers in red, mean waveform in black; the dashed line on the best
     channel marks where the secondary-peak search starts.
 
-    Keys: A = accept, R = reject (both advance), ←/→ = previous/next.
+    Keys: A = accept, R = reject, M = accept but move the red (multi-trigger)
+    spikes to cluster 0 (all three advance), ←/→ = previous/next.
     Units left undecided keep their automatic decision.
 
-    Returns {candidate_index: True (accept) / False (reject)}.
+    Returns {candidate_index: 'accept' / 'reject' / 'clean'}.
     """
     try:
         import tkinter as tk
@@ -560,7 +597,8 @@ def review_multi_trigger_units(candidates: list) -> dict:
     time_axis = np.arange(N_SAMPLES) * SAMPLE_INTERVAL_MS
 
     root = tk.Tk()
-    root.title('Multi-trigger unit review  —  A: accept   R: reject   ←/→: navigate')
+    root.title('Multi-trigger unit review  —  A: accept   R: reject   '
+               'M: accept, multi-trigger spikes → cluster 0   ←/→: navigate')
     root.geometry('1500x900')
 
     left = tk.Frame(root)
@@ -573,7 +611,7 @@ def review_multi_trigger_units(candidates: list) -> dict:
 
     right = tk.Frame(root)
     right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    fig    = Figure(figsize=(11, 7.5))
+    fig    = Figure(figsize=(11, 7.5), facecolor=SURFACE)
     canvas = FigureCanvasTkAgg(fig, master=right)
     canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -581,10 +619,15 @@ def review_multi_trigger_units(candidates: list) -> dict:
     btns.pack(fill=tk.X, pady=4)
     status_var = tk.StringVar()
 
+    DECISION_TAG    = {'accept': 'ACCEPT', 'reject': 'REJECT', 'clean': 'ACC-MT0'}
+    DECISION_COLOUR = {'accept': 'forest green', 'reject': 'red3', 'clean': 'dark orange3'}
+    DECISION_TEXT   = {'accept': 'ACCEPTED', 'reject': 'REJECTED',
+                       'clean': 'ACCEPTED, multi-trigger spikes → cluster 0'}
+
     def list_label(k):
         c = candidates[k]
         if k in decisions:
-            tag = 'ACCEPT' if decisions[k] else 'REJECT'
+            tag = DECISION_TAG[decisions[k]]
         else:
             tag = 'auto:acc' if c['auto_accepted'] else 'auto:rej'
         return f'[{tag:>8s}] {c["session"]} | {c["unit"]}'
@@ -592,10 +635,7 @@ def review_multi_trigger_units(candidates: list) -> dict:
     def refresh_item(k):
         listbox.delete(k)
         listbox.insert(k, list_label(k))
-        colour = 'black'
-        if k in decisions:
-            colour = 'forest green' if decisions[k] else 'red3'
-        listbox.itemconfig(k, fg=colour)
+        listbox.itemconfig(k, fg=DECISION_COLOUR[decisions[k]] if k in decisions else 'black')
 
     def draw(k):
         c = candidates[k]
@@ -616,22 +656,22 @@ def review_multi_trigger_units(candidates: list) -> dict:
 
         axes = fig.subplots(2, 2, sharex=True, sharey=True)
         for ch, ax in enumerate(axes.flat):
+            _style_axes(ax)
             if len(idx_ok):
-                ax.plot(time_axis, waveforms[idx_ok, :, ch].T, color=PAL_LTGRAY, lw=0.5, alpha=0.6)
+                ax.plot(time_axis, waveforms[idx_ok, :, ch].T, color=INK_MUTED, lw=0.5, alpha=0.3)
             if len(idx_mt):
-                ax.plot(time_axis, waveforms[idx_mt, :, ch].T, color=PAL_RED, lw=0.6, alpha=0.35)
-            ax.plot(time_axis, waveforms[:, :, ch].mean(axis=0), color=PAL_BLACK, lw=2.2)
+                ax.plot(time_axis, waveforms[idx_mt, :, ch].T, color=MAGMA_3, lw=0.6, alpha=0.35)
+            ax.plot(time_axis, waveforms[:, :, ch].mean(axis=0), color=INK_PRIMARY, lw=2.0)
             is_best = ch == c['best_ch']
             if is_best:
                 ax.axvline((c['peak_idx'] + MULTI_TRIGGER_OFFSET_SAMPLES) * SAMPLE_INTERVAL_MS,
-                           color=PAL_DKBLUE, lw=1.2, ls='--')
-            ax.set_title(f'Ch {ch}' + ('  (best)' if is_best else ''),
-                         fontsize=11, fontweight='bold' if is_best else 'normal')
-            ax.spines[['top', 'right']].set_visible(False)
+                           color=MAGMA_1, lw=1.2, ls='--')
+            ax.set_title(f'Ch {ch}' + ('  (best)' if is_best else ''), color=INK_PRIMARY,
+                         fontsize=10, loc='left', fontweight='bold' if is_best else 'normal')
             if ch >= 2:
-                ax.set_xlabel('Time (ms)')
+                ax.set_xlabel('Time (ms)', color=INK_PRIMARY)
             if ch % 2 == 0:
-                ax.set_ylabel('Amplitude (µV)')
+                ax.set_ylabel('Amplitude (µV)', color=INK_PRIMARY)
 
         def fmt(v):
             return 'nan' if v is None or (isinstance(v, float) and np.isnan(v)) else f'{v:.3f}'
@@ -641,12 +681,12 @@ def review_multi_trigger_units(candidates: list) -> dict:
             f'in {int((counts > 0).sum())} spikes (red)   |   '
             f'SNR = {fmt(c["snr"])}   ISI viol = {fmt(c["isi"])} %   TmplCorr = {fmt(c["tmpl_corr"])}   |   '
             f'auto: {"ACCEPTED" if c["auto_accepted"] else "REJECTED"}',
-            fontsize=11)
+            fontsize=10, color=INK_PRIMARY)
         fig.tight_layout(rect=(0, 0, 1, 0.92))
         canvas.draw()
 
         n_done = len(decisions)
-        current = ('ACCEPTED' if decisions[k] else 'REJECTED') if k in decisions else 'undecided'
+        current = DECISION_TEXT[decisions[k]] if k in decisions else 'undecided'
         status_var.set(f'This unit: {current}     |     reviewed {n_done}/{len(candidates)}')
 
     def select(k):
@@ -673,9 +713,11 @@ def review_multi_trigger_units(candidates: list) -> dict:
 
     tk.Button(btns, text='◀ Prev', width=10, command=lambda: select(state['i'] - 1)).pack(side=tk.LEFT, padx=4)
     tk.Button(btns, text='Accept (A)', width=14, bg='#99FF99',
-              command=lambda: decide(True)).pack(side=tk.LEFT, padx=4)
+              command=lambda: decide('accept')).pack(side=tk.LEFT, padx=4)
+    tk.Button(btns, text='Accept, red → cluster 0 (M)', width=26, bg='#FFCC80',
+              command=lambda: decide('clean')).pack(side=tk.LEFT, padx=4)
     tk.Button(btns, text='Reject (R)', width=14, bg='#FF9999',
-              command=lambda: decide(False)).pack(side=tk.LEFT, padx=4)
+              command=lambda: decide('reject')).pack(side=tk.LEFT, padx=4)
     tk.Button(btns, text='Next ▶', width=10, command=lambda: select(state['i'] + 1)).pack(side=tk.LEFT, padx=4)
     tk.Label(btns, textvariable=status_var, font=('Calibri', 11)).pack(side=tk.LEFT, padx=16)
     tk.Button(btns, text='Done — apply decisions', width=24,
@@ -684,10 +726,12 @@ def review_multi_trigger_units(candidates: list) -> dict:
     for k in range(len(candidates)):
         listbox.insert(tk.END, list_label(k))
     listbox.bind('<<ListboxSelect>>', on_list_select)
-    root.bind('<KeyPress-a>', lambda _e: decide(True))
-    root.bind('<KeyPress-A>', lambda _e: decide(True))
-    root.bind('<KeyPress-r>', lambda _e: decide(False))
-    root.bind('<KeyPress-R>', lambda _e: decide(False))
+    root.bind('<KeyPress-a>', lambda _e: decide('accept'))
+    root.bind('<KeyPress-A>', lambda _e: decide('accept'))
+    root.bind('<KeyPress-r>', lambda _e: decide('reject'))
+    root.bind('<KeyPress-R>', lambda _e: decide('reject'))
+    root.bind('<KeyPress-m>', lambda _e: decide('clean'))
+    root.bind('<KeyPress-M>', lambda _e: decide('clean'))
     root.bind('<Left>',  lambda _e: select(state['i'] - 1))
     root.bind('<Right>', lambda _e: select(state['i'] + 1))
     root.protocol('WM_DELETE_WINDOW', root.destroy)
@@ -767,7 +811,7 @@ for dirpath, _, filenames in os.walk(ROOT_FOLDER):
     # any individual unit's acceptance (they describe the recording session,
     # not a single cluster).
     support_files = sorted(f for f in filenames if f.lower().endswith(('.csv', '.ncs')))
-    if support_files:
+    if SAVE_ACCEPTED_COPY and support_files:
         os.makedirs(dest_dir, exist_ok=True)
         for support_file in support_files:
             shutil.copy2(os.path.join(dirpath, support_file), os.path.join(dest_dir, support_file))
@@ -802,7 +846,7 @@ for dirpath, _, filenames in os.walk(ROOT_FOLDER):
                     'isi':           metrics.get('isi_violation_pct'),
                     'tmpl_corr':     metrics.get('template_correlation'),
                 })
-            elif accepted:
+            elif accepted and SAVE_ACCEPTED_COPY:
                 os.makedirs(dest_dir, exist_ok=True)
                 shutil.copy2(ntt_path, os.path.join(dest_dir, ntt_file))
                 n_units_copied += 1
@@ -827,31 +871,48 @@ for dirpath, _, filenames in os.walk(ROOT_FOLDER):
 # The manual decision overrides the automatic one, so manually accepted units
 # are copied to ACCEPTED_ROOT_FOLDER and coloured as accepted in all histograms.
 
-n_manual_accepted = n_manual_rejected = 0
+n_manual_accepted = n_manual_rejected = n_manual_cleaned = 0
 if review_candidates:
     print(f'\n{len(review_candidates)} unit(s) with > {MULTI_TRIGGER_MIN_PEAKS} secondary peaks '
           f'-> opening manual review GUI...')
     decisions = review_multi_trigger_units(review_candidates)
     for k, cand in enumerate(review_candidates):
         rec = records[cand['record_idx']]
-        if k in decisions:
-            rec['accepted']      = decisions[k]
-            rec['manual_review'] = 'accepted' if decisions[k] else 'rejected'
-            if decisions[k]:
+        decision = decisions.get(k)
+        if decision is None:
+            rec['manual_review'] = 'not reviewed'
+        else:
+            rec['accepted'] = decision in ('accept', 'clean')
+            rec['manual_review'] = {'accept': 'accepted', 'reject': 'rejected',
+                                    'clean': 'accepted, MT spikes -> cl 0'}[decision]
+            if decision == 'accept':
                 n_manual_accepted += 1
+            elif decision == 'clean':
+                n_manual_cleaned += 1
             else:
                 n_manual_rejected += 1
-        else:
-            rec['manual_review'] = 'not reviewed'
-        if rec['accepted']:
+        if rec['accepted'] and SAVE_ACCEPTED_COPY:
             os.makedirs(cand['dest_dir'], exist_ok=True)
-            shutil.copy2(cand['ntt_path'], os.path.join(cand['dest_dir'], cand['unit']))
+            dst_path = os.path.join(cand['dest_dir'], cand['unit'])
+            if decision == 'clean':
+                n_moved = write_cleaned_ntt(cand['ntt_path'], dst_path,
+                                            cand['best_ch'], cand['peak_idx'])
+                rec['manual_review'] = f'accepted, {n_moved} MT spikes -> cl 0'
+                print(f'  {cand["session"]} | {cand["unit"]}: {n_moved} multi-trigger '
+                      f'spike(s) moved to cluster 0 in the accepted copy')
+            else:
+                shutil.copy2(cand['ntt_path'], dst_path)
             n_units_copied += 1
-    print(f'Manual review: {n_manual_accepted} accepted, {n_manual_rejected} rejected, '
+    print(f'Manual review: {n_manual_accepted} accepted, '
+          f'{n_manual_cleaned} accepted with multi-trigger spikes -> cluster 0, '
+          f'{n_manual_rejected} rejected, '
           f'{len(review_candidates) - len(decisions)} not reviewed (automatic decision kept)')
 
-print(f'\nAccepted units copied: {n_units_copied}  |  Support files (.csv/.ncs) copied: {n_support_files_copied}')
-print(f'Accepted-unit tree: {ACCEPTED_ROOT_FOLDER}')
+if SAVE_ACCEPTED_COPY:
+    print(f'\nAccepted units copied: {n_units_copied}  |  Support files (.csv/.ncs) copied: {n_support_files_copied}')
+    print(f'Accepted-unit tree: {ACCEPTED_ROOT_FOLDER}')
+else:
+    print('\nSAVE_ACCEPTED_COPY = False -> no files copied.')
 
 # ── Build DataFrame ───────────────────────────────────────────────────────────
 
@@ -878,7 +939,7 @@ COL_WIDTHS = {
     'pt_ratio':             12,
     'spike_start_time_ms':  16, 'spike_end_time_ms':     16, 'spike_duration_ms':    16,
     'csi':                  10,
-    'n_multi_trigger_peaks': 20, 'multi_trigger':        14, 'manual_review':        16,
+    'n_multi_trigger_peaks': 20, 'multi_trigger':        14, 'manual_review':        30,
 }
 for col_idx, col_name in enumerate(COLUMN_ORDER, start=1):
     ws.column_dimensions[get_column_letter(col_idx)].width = COL_WIDTHS.get(col_name, 14)
@@ -977,11 +1038,10 @@ def make_histogram(values, accepted, title, xlabel,
     vals     = values[valid]
     acc      = accepted[valid] if len(accepted) == len(values) else np.zeros(vals.shape, dtype=bool)
 
-    # Plot on top; legend + statistics live in a separate panel below so they
-    # never overlap the bars.
-    fig, (ax, ax_info) = plt.subplots(2, 1, figsize=(8, 8),
-                                      gridspec_kw={'height_ratios': [5, 2.6]})
-    ax_info.axis('off')
+    # Legend + statistics sit outside the axes on the right so they never
+    # overlap the bars.
+    fig, ax = plt.subplots(figsize=(8, 4.5), facecolor=SURFACE)
+    _style_axes(ax)
 
     if len(vals) > 0:
         bin_edges    = np.histogram_bin_edges(vals, bins=n_bins)
@@ -990,12 +1050,11 @@ def make_histogram(values, accepted, title, xlabel,
         n_rejected, _ = np.histogram(vals[~acc], bins=bin_edges)
         n_accepted, _ = np.histogram(vals[acc],  bins=bin_edges)
 
-        # Box-style bars (gray / light blue fill, black edge) like the c-Fos reference
         ax.bar(bin_centers, n_rejected, width=bin_widths, color=REJECTED_COLOR,
-               edgecolor=PAL_BLACK, linewidth=1.2, zorder=3,
-               label=f'Discarded (n={int(n_rejected.sum())})')
+               edgecolor=SURFACE, linewidth=1.0, zorder=3,
+               label=f'Rejected (n={int(n_rejected.sum())})')
         ax.bar(bin_centers, n_accepted, width=bin_widths, bottom=n_rejected,
-               color=bar_color, edgecolor=PAL_BLACK, linewidth=1.2, zorder=3,
+               color=bar_color, edgecolor=SURFACE, linewidth=1.0, zorder=3,
                label=f'Accepted (n={int(n_accepted.sum())})')
 
         for xv, col, lbl in zip(thresholds, threshold_colors, threshold_labels):
@@ -1003,28 +1062,29 @@ def make_histogram(values, accepted, title, xlabel,
 
         mean_v   = float(np.mean(vals))
         median_v = float(np.median(vals))
-        ax.axvline(mean_v,   color=PAL_BLACK, linewidth=1.8, linestyle='-',  zorder=5,
+        ax.axvline(mean_v,   color=INK_PRIMARY, linewidth=1.5, linestyle='-',  zorder=5,
                    label=f'Mean   {mean_v:.3f}')
-        ax.axvline(median_v, color=PAL_BLACK, linewidth=1.8, linestyle=':', zorder=5,
+        ax.axvline(median_v, color=INK_PRIMARY, linewidth=1.5, linestyle=':', zorder=5,
                    label=f'Median {median_v:.3f}')
 
-        summary = (f'n = {len(vals)}     '
-                   f'Mean ± SD = {mean_v:.3f} ± {float(np.std(vals)):.3f}     '
-                   f'Median = {median_v:.3f}')
         handles, labels = ax.get_legend_handles_labels()
-        ax_info.legend(handles, labels, fontsize=12, loc='upper center', ncol=2)
-        ax_info.text(0.5, 0.0, summary, transform=ax_info.transAxes, fontsize=12,
-                     va='bottom', ha='center')
+        # Accepted, Rejected first, then threshold / mean / median lines
+        bars  = [i for l in ('Accepted', 'Rejected') for i, s in enumerate(labels) if s.startswith(l)]
+        order = bars + [i for i in range(len(labels)) if i not in bars]
+        _legend_outside(ax, [handles[i] for i in order], [labels[i] for i in order])
+
+        summary = (f'n = {len(vals)}\n'
+                   f'Mean ± SD = {mean_v:.3f} ± {float(np.std(vals)):.3f}\n'
+                   f'Median = {median_v:.3f}')
+        ax.text(1.02, 0.0, summary, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY,
+                ha='left', va='bottom')
     else:
         ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
-                ha='center', va='center', fontsize=14)
+                ha='center', va='center', fontsize=10, color=INK_MUTED)
 
-    ax.set_xlabel(xlabel, fontsize=15, labelpad=8)
-    ax.set_ylabel('Number of units', fontsize=15, labelpad=8)
-    ax.set_title(title, fontsize=17, pad=12)
-    ax.tick_params(labelsize=13)
-    ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
+    ax.set_xlabel(xlabel, color=INK_PRIMARY)
+    ax.set_ylabel('Number of units', color=INK_PRIMARY)
+    ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
     return fig
 
 
@@ -1034,13 +1094,13 @@ base = os.path.splitext(OUTPUT_EXCEL)[0]
 
 histogram_specs = [
     # (sheet_name,  png_suffix,        df_col,               title,                            xlabel,                          thresholds,                     thr_colors,                               thr_labels,                                              bar_color)
-    ('Hist_SNR',     '_hist_SNR',       'snr',                'SNR Distribution',               'SNR  (A_peak / σ_noise)',       (SNR_LOW_BAD, SNR_LOW_OK, SNR_HIGH_GOOD), (PAL_RED, PAL_ORANGE, PAL_GREEN), (f'Too low {SNR_LOW_BAD}', f'Marginal {SNR_LOW_OK}', f'High {SNR_HIGH_GOOD}'), ACCEPTED_COLOR),
-    ('Hist_ISI',     '_hist_ISI',       'isi_violation_pct',  'ISI Violation Distribution',     'ISI violations  (%)',           (ISI_GOOD_PCT, ISI_MARGIN_PCT),  (PAL_GREEN, PAL_ORANGE),                 (f'Good < {ISI_GOOD_PCT}%', f'Marginal < {ISI_MARGIN_PCT}%'),                 ACCEPTED_COLOR),
-    ('Hist_TmplCorr','_hist_TmplCorr',  'template_correlation','Waveform Template Correlation', 'Mean Pearson r  (spike vs template)', (0.90,),                    (PAL_GREEN,),                           ('r = 0.90',),                                                                   ACCEPTED_COLOR),
+    ('Hist_SNR',     '_hist_SNR',       'snr',                'SNR Distribution',               'SNR  (A_peak / σ_noise)',       (SNR_LOW_BAD, SNR_LOW_OK, SNR_HIGH_GOOD), (COLOR_THR_BAD, COLOR_THR_MARGINAL, COLOR_THR_GOOD), (f'Too low {SNR_LOW_BAD}', f'Marginal {SNR_LOW_OK}', f'High {SNR_HIGH_GOOD}'), ACCEPTED_COLOR),
+    ('Hist_ISI',     '_hist_ISI',       'isi_violation_pct',  'ISI Violation Distribution',     'ISI violations  (%)',           (ISI_GOOD_PCT, ISI_MARGIN_PCT),  (COLOR_THR_GOOD, COLOR_THR_MARGINAL),    (f'Good < {ISI_GOOD_PCT}%', f'Marginal < {ISI_MARGIN_PCT}%'),                 ACCEPTED_COLOR),
+    ('Hist_TmplCorr','_hist_TmplCorr',  'template_correlation','Waveform Template Correlation', 'Mean Pearson r  (spike vs template)', (0.90,),                    (COLOR_THR_GOOD,),                      ('r = 0.90',),                                                                   ACCEPTED_COLOR),
     ('Hist_PTTime',  '_hist_PTTime',    'pt_time_ms',         'Peak-to-Trough Time',            'PT time  (ms)',                 (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
     ('Hist_SpikeDur','_hist_SpikeDur',  'spike_duration_ms',  'Spike Duration',                 'Spike duration  (ms)',          (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
-    ('Hist_PTRatio', '_hist_PTRatio',   'pt_ratio',           'Peak-to-Trough Ratio',           '|peak| / |trough|  (a.u.)',     (1.0,),                          (PAL_GRAY,),                            ('ratio = 1.0',),                                                                ACCEPTED_COLOR),
-    ('Hist_CSI',     '_hist_CSI',       'csi',                'Complex Spike Index (CSI)',       'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)', (10.0,), (PAL_RED,),                             ('CSI = 10%',),                                                                  ACCEPTED_COLOR),
+    ('Hist_PTRatio', '_hist_PTRatio',   'pt_ratio',           'Peak-to-Trough Ratio',           '|peak| / |trough|  (a.u.)',     (1.0,),                          (INK_MUTED,),                           ('ratio = 1.0',),                                                                ACCEPTED_COLOR),
+    ('Hist_CSI',     '_hist_CSI',       'csi',                'Complex Spike Index (CSI)',       'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)', (10.0,), (COLOR_THR_BAD,),                       ('CSI = 10%',),                                                                  ACCEPTED_COLOR),
 ]
 
 png_paths = {}
@@ -1053,8 +1113,7 @@ for sheet_name, suffix, col, title, xlabel, thresholds, thr_colors, thr_labels, 
                           threshold_labels=thr_labels,
                           bar_color=bar_color)
     png  = base + suffix + '.png'
-    fig.savefig(png, dpi=500, bbox_inches='tight')
-    plt.close(fig)
+    _save(fig, base + suffix)    # .png (embedded in Excel) + .svg
     png_paths[sheet_name] = png
     print(f'Histogram saved: {png}')
 
@@ -1119,5 +1178,6 @@ print(f'\n{"="*50}')
 print(f'Cells accepted (ISI<1%, SNR>2.5, TmplCorr>0.5): {n_accepted}')
 print(f'Cells rejected: {n_rejected}')
 print(f'Multi-trigger units reviewed manually: {n_manual_accepted} accepted, '
+      f'{n_manual_cleaned} accepted with MT spikes -> cluster 0, '
       f'{n_manual_rejected} rejected (of {len(review_candidates)} flagged)')
 print(f'{"="*50}')

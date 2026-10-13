@@ -36,17 +36,23 @@ ANIMALS = {
 
 OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP'  # saved plots go here
 
-# Color palette cycled across however many animals are in ANIMALS (repeats past 8).
-_PALETTE = [
-    '#1A56DB',  # blue
-    '#4DAF4A',  # green
-    '#E41A1C',  # red
-    '#FF7F0E',  # orange
-    '#9467BD',  # purple
-    '#17BECF',  # cyan
-    '#BCBD22',  # olive
-    '#E377C2',  # pink
-]
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
 
 
 def _lighten(hex_color, amount=0.55):
@@ -57,8 +63,8 @@ def _lighten(hex_color, amount=0.55):
 
 # {label: (line_color, fill_color)} — auto-built from ANIMALS, one entry per animal.
 STYLES = {
-    label: (_PALETTE[i % len(_PALETTE)], _lighten(_PALETTE[i % len(_PALETTE)]))
-    for i, label in enumerate(ANIMALS)
+    label: (animal_color(label), _lighten(animal_color(label)))
+    for label in ANIMALS
 }
 
 fs      = 32000  # original sampling rate (Hz)

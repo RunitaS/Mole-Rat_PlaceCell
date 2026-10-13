@@ -30,28 +30,24 @@ from fooof import FOOOF
 #%% Settings
 
 # Root directories — one per animal.
-# Add/remove/rename animals ONLY here — plot colors, filenames, and legends
-# below are all derived automatically from this dict's keys.
+# Add/remove/rename animals here (and give each one a color in ANIMAL_COLORS) —
+# filenames and legends below are derived automatically from this dict's keys.
 ANIMALS = {
     'Fa8477': r'X:/NMR_group_data/Runita/Data/Ephys_Data/AllSortedData/Tetrode/Fa8477',
-    #'FaDDE42': r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/LFP/Main/DDE42',
+    'Fa5834': r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/LFP/Main/DDE42',
     'Fa23BD': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/23BDTest',
     'Fa1059' : r'C:/Runita/NMR/analysis/AllSort_Results/LFP/1059Test',
 }
 
 OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP'  # saved plots go here
 
-# Color palette cycled across however many animals are in ANIMALS (repeats past 8).
-_PALETTE = [
-    '#1A56DB',  # blue
-    '#4DAF4A',  # green
-    '#E41A1C',  # red
-    '#FF7F0E',  # orange
-    '#9467BD',  # purple
-    '#17BECF',  # cyan
-    '#BCBD22',  # olive
-    '#E377C2',  # pink
-]
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
 
 
 def _lighten(hex_color, amount=0.55):
@@ -62,8 +58,8 @@ def _lighten(hex_color, amount=0.55):
 
 # {label: (line_color, fill_color)} — auto-built from ANIMALS, one entry per animal.
 STYLES = {
-    label: (_PALETTE[i % len(_PALETTE)], _lighten(_PALETTE[i % len(_PALETTE)]))
-    for i, label in enumerate(ANIMALS)
+    label: (ANIMAL_COLORS[label], _lighten(ANIMAL_COLORS[label]))
+    for label in ANIMALS
 }
 
 fs      = 32000  # original sampling rate (Hz)
@@ -502,7 +498,7 @@ plt.rcParams.update({
     'axes.facecolor'   : 'white',
 })
 
-#%% ED_min vs. normalised peak range — points coloured by animal (STYLES / _PALETTE)
+#%% ED_min vs. normalised peak range — points coloured by animal (STYLES / ANIMAL_COLORS)
 
 def plot_edmin_vs_peakrangenorm(df, title='ED_min vs. normalised peak range', ax=None,
                                 figsize=(6, 5), point_size=10, alpha=0.3, seed=0):

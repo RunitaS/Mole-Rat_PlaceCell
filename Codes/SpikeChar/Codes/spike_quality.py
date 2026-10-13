@@ -42,7 +42,7 @@ ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test
 OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
 
 N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
-WAVEFORM_DURATION_MS = 5.0       # total duration spanned by the 32-sample waveform snippet
+WAVEFORM_DURATION_MS = 1.0       # 32 samples @ 32 kHz (NTT header SamplingFrequency 32000)
 SAMPLE_INTERVAL_MS   = WAVEFORM_DURATION_MS / N_SAMPLES
 
 # ── Waveform plot colours ──────────────────────────────────────────────────────

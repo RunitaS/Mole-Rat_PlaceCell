@@ -119,17 +119,23 @@ ncs_dtype = np.dtype([
     ('samples'    , '<i2', (512,)),
 ])
 
-# ---- Plot palette (auto-cycled across however many animals are in ANIMALS) ----
-_PALETTE = [
-    '#1A56DB',  # blue
-    '#4DAF4A',  # green
-    '#E41A1C',  # red
-    '#FF7F0E',  # orange
-    '#9467BD',  # purple
-    '#17BECF',  # cyan
-    '#BCBD22',  # olive
-    '#E377C2',  # pink
-]
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
 
 
 def _lighten(hex_color, amount=0.55):
@@ -140,13 +146,12 @@ def _lighten(hex_color, amount=0.55):
 
 # {label: (line_color, fill_color)} -- auto-built from ANIMALS, one entry per animal.
 STYLES = {
-    label: (_PALETTE[i % len(_PALETTE)], _lighten(_PALETTE[i % len(_PALETTE)]))
-    for i, label in enumerate(ANIMALS)
+    label: (animal_color(label), _lighten(animal_color(label)))
+    for label in ANIMALS
 }
 
-# convenience: a simple list of line colors in ANIMALS order (used by notebook plots)
+# convenience: list of animal labels in ANIMALS order (used by notebook plots)
 animals = list(ANIMALS.keys())
-ANIMAL_COLORS = [STYLES[a][0] for a in animals]
 
 
 # %% ==================== Signal-processing helpers (from reference) ============
@@ -757,7 +762,7 @@ def plot_band_shaded_spectra(freqs, master_psds_dict, animals_list, bands=None,
     for a in animals_list:
         freqs_trim, spec_trim = trim_spectrum(freqs, master_psds_dict[a][0], list(freq_range))
         spectra.append(spec_trim)
-    colors  = [ANIMAL_COLORS[i % len(ANIMAL_COLORS)] for i in range(len(animals_list))]
+    colors  = [animal_color(a) for a in animals_list]
     shade_colors = sns.color_palette('Pastel2', n_colors=len(bands.definitions))
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -790,7 +795,7 @@ def plot_flattened_spectra_shaded(mean_fms, animals_list, bands=None,
     bands = bands or BANDS
     freqs = next(iter(mean_fms.values())).freqs
     flat_spectra = [mean_fms[a].get_data('peak', space='log') for a in animals_list]
-    colors = [ANIMAL_COLORS[i % len(ANIMAL_COLORS)] for i in range(len(animals_list))]
+    colors = [animal_color(a) for a in animals_list]
     shade_colors = sns.color_palette('Pastel2', n_colors=len(bands.definitions))
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -920,7 +925,7 @@ def plot_band_by_band_comparison(df_bands, save=False, save_path=None):
     with the band above it)."""
     band_order   = list(dict.fromkeys(df_bands['band']))  # preserve first-seen order
     animal_order = sorted(df_bands['animal'].unique())
-    palette = {a: ANIMAL_COLORS[i % len(ANIMAL_COLORS)] for i, a in enumerate(animal_order)}
+    palette = {a: animal_color(a) for a in animal_order}
 
     n_bands = len(band_order)
     fig, axes = plt.subplots(3, n_bands, figsize=(3.2 * n_bands, 8), squeeze=False)
@@ -1023,7 +1028,7 @@ def plot_theta_properties(df, props=None, save=False, save_dir=None):
             for i, animal in enumerate(animals_here):
                 vals = data_df.loc[data_df['animal'] == animal, key].dropna()
                 ax.hist(vals, bins=20, range=meta['xlim'],
-                        alpha=0.6, color=ANIMAL_COLORS[i % len(ANIMAL_COLORS)],
+                        alpha=0.6, color=animal_color(animal),
                         edgecolor='white', lw=0.5, label=str(animal))
             ax.legend(fontsize=7)
         else:
@@ -1087,11 +1092,11 @@ def plot_fit_quality(df, group_col="animal", metrics="both", mode="box",
     plot_df = df[[group_col, *metrics_list]].copy()
     order = sorted(plot_df[group_col].dropna().unique())
 
-    try:
-        palette_list = ANIMAL_COLORS
-    except NameError:
-        palette_list = sns.color_palette("colorblind", n_colors=len(order))
-    color_map = {g: palette_list[i % len(palette_list)] for i, g in enumerate(order)}
+    palette_list = sns.color_palette("colorblind", n_colors=len(order))
+
+    color_map = {g: animal_color(g, default=palette_list[i % len(palette_list)])
+
+                 for i, g in enumerate(order)}
 
     n_metrics = len(metrics_list)
     if figsize is None:
@@ -1169,7 +1174,7 @@ def plot_mean_psds_all_animals_on_ax(ax, freqs, master_psds_dict, animals_list,
                                      file_counts=None, xlim=(2, 20)):
     for i, animal in enumerate(animals_list):
         mean, sem = master_psds_dict[animal]
-        color = ANIMAL_COLORS[i % len(ANIMAL_COLORS)]
+        color = animal_color(animal)
         if file_counts is not None:
             label = f"{animal} ({file_counts.get(animal, '?')} files)"
         else:
@@ -1243,8 +1248,7 @@ def plot_sample_psd_and_fooof_on_ax(ax, freqs, psd, fooof_kwargs=None,
 def plot_theta_prop_hist_on_ax(ax, df, prop, xlim=None, xlabel=None, title=None):
     df_theta = df[df["has_theta"]].copy()
     animals_here = sorted(df_theta["animal"].unique())
-    palette = {a: ANIMAL_COLORS[i % len(ANIMAL_COLORS)]
-               for i, a in enumerate(animals_here)}
+    palette = {a: animal_color(a) for a in animals_here}
 
     all_vals = df_theta[prop].dropna()
     if xlim is not None:
@@ -1305,8 +1309,7 @@ def plot_master_summary(results, master_psds_dict, expanded_fooof_df,
     # C1 / C2: fit quality
     def _quality_ax(ax, col, ylim, title):
         order_animals = sorted(expanded_fooof_df["animal"].unique())
-        palette = {a: ANIMAL_COLORS[i % len(ANIMAL_COLORS)]
-                   for i, a in enumerate(order_animals)}
+        palette = {a: animal_color(a) for a in order_animals}
         long_df = expanded_fooof_df[["animal", col]].dropna()
         sns.boxplot(data=long_df, x="animal", y=col, ax=ax,
                     palette=palette, fliersize=0, linewidth=0.8)

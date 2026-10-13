@@ -127,17 +127,23 @@ ncs_dtype = np.dtype([
     ('samples'    , '<i2', (512,)),
 ])
 
-# ---- Plot palette (auto-cycled across however many animals are in ANIMALS) ----
-_PALETTE = [
-    '#1A56DB',  # blue
-    '#4DAF4A',  # green
-    '#E41A1C',  # red
-    '#FF7F0E',  # orange
-    '#9467BD',  # purple
-    '#17BECF',  # cyan
-    '#BCBD22',  # olive
-    '#E377C2',  # pink
-]
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
 
 
 def _lighten(hex_color, amount=0.55):
@@ -148,13 +154,12 @@ def _lighten(hex_color, amount=0.55):
 
 # {label: (line_color, fill_color)} -- auto-built from ANIMALS, one entry per animal.
 STYLES = {
-    label: (_PALETTE[i % len(_PALETTE)], _lighten(_PALETTE[i % len(_PALETTE)]))
-    for i, label in enumerate(ANIMALS)
+    label: (animal_color(label), _lighten(animal_color(label)))
+    for label in ANIMALS
 }
 
-# convenience: a simple list of line colors in ANIMALS order (used by notebook plots)
+# convenience: list of animal labels in ANIMALS order (used by notebook plots)
 animals = list(ANIMALS.keys())
-ANIMAL_COLORS = [STYLES[a][0] for a in animals]
 
 
 # %% ==================== Signal-processing helpers (from reference) ============
@@ -837,7 +842,7 @@ def plot_aperiodic_properties(df, props=None, save=True, save_dir=None):
             for i, animal in enumerate(animals_here):
                 vals = df.loc[df['animal'] == animal, key].dropna()
                 ax.hist(vals, bins=20, range=xlim,
-                        alpha=0.6, color=ANIMAL_COLORS[i % len(ANIMAL_COLORS)],
+                        alpha=0.6, color=animal_color(animal),
                         edgecolor='white', lw=0.5, label=str(animal))
             ax.legend(fontsize=7)
         else:

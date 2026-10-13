@@ -42,6 +42,7 @@ from scipy.stats import pearsonr, spearmanr
 
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.colorbar import make_axes
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -51,10 +52,10 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed.
-ROOT_DIR = r'F:/Temp/Theta/fBOSC_Res'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99_Bin2'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_v2_EDminThresh')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_EDminThresh')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 
 # ---- Acquisition ----
@@ -1048,7 +1049,7 @@ def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
 def compute_group_centroids(df, group_col='movement', freq_col='freq',
                             peakrange_col='peakrangenorm'):
     """Mean frequency and mean normalised peak range per movement group --
-    the green diamond markers in Dunn et al. Fig. 4e/h."""
+    the centroid diamond markers in Dunn et al. Fig. 4e/h."""
     clean = df[~df['skipped']]
     out = (clean.groupby(group_col)[[freq_col, peakrange_col]]
                 .mean()
@@ -1127,17 +1128,24 @@ def plot_example_epoch(row, epoch_waveform, ax_trace=None, ax_acg=None,
 
 def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  mode='both', speed_vmax=50.0, moving_cmap='viridis',
-                                 moving_alpha=0.5, immobile_color='black',
+                                 moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
+                                 immobile_cmap='magma', immobile_alpha=1.0,
                                  immobile_edgecolor='#FFB3BA', immobile_edgewidth=0.8,
+                                 moving_centroid_cmap_pos=0.8, immobile_centroid_color='#FF1493',
                                  n_bins=25, log_counts=True, show_edmin_annotation=True):
     """Shared drawing routine for the Fig. 4e/h-style scatter: frequency vs.
-    normalised autocorrelogram peak range. Immobile epochs (speed doesn't
-    meaningfully vary) are drawn solid jet-black with a pastel-red outline;
-    moving epochs are drawn in `moving_cmap` (coloured by per-epoch running
-    speed) at `moving_alpha` opacity, layered on top -- this two-tone scheme
-    keeps the two heavily-overlapping point clouds visually distinguishable.
-    Marginal count histograms follow the same colouring, and moving/immobile
-    centroids are marked as green diamonds. An annotation in `ax_main`
+    normalised autocorrelogram peak range. Immobile epochs are drawn in
+    `immobile_cmap` (coloured by per-epoch running speed over
+    0-`immobile_speed_vmax`, i.e. the immobile speed range) with a pastel-red
+    outline; moving epochs are drawn in `moving_cmap` (coloured by per-epoch
+    running speed over 0-`speed_vmax`) at `moving_alpha` opacity, layered on
+    top -- the two distinct colormaps keep the heavily-overlapping point
+    clouds visually distinguishable. Marginal count histograms follow the
+    same colouring (each bar coloured by its epochs' mean speed), and
+    moving/immobile centroids are marked as diamonds in a bright colour
+    (green from viridis for moving, at position `moving_centroid_cmap_pos`
+    along the colormap; bright pink `immobile_centroid_color` for immobile).
+    An annotation in `ax_main`
     reports the percentage of epochs (within `animal`'s scope, if given)
     excluded by the ED_min fit-quality threshold (ACG_ED_MIN_THRESH) -- these
     never reach the scatter/centroids since they're filtered out via
@@ -1149,6 +1157,10 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     stay directly comparable to the merged one. Used by
     plot_freq_peakrange_summary(), plot_figure4_style(), and
     plot_freq_peakrange_by_movement().
+
+    Returns (sc_moving, sc_immobile, centroids) -- either scatter handle is
+    None when that group isn't drawn (see `mode`); pass them to
+    _add_speed_colorbars.
     """
     scope = df if animal is None else df[df['animal'] == animal]
     n_edmin_rejected = int(scope['skipped_edmin'].sum())
@@ -1164,12 +1176,15 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     immobile = sub[sub['movement'] == 'immobile'] if show_immobile else sub.iloc[0:0]
     moving = sub[sub['movement'] == 'moving'] if show_moving else sub.iloc[0:0]
 
-    # immobile first (solid, opaque) so the semi-transparent moving layer
+    # immobile first (opaque by default) so the semi-transparent moving layer
     # sits visibly on top rather than being hidden underneath it
+    sc_imm = None
     if show_immobile:
-        ax_main.scatter(immobile['freq'], immobile['peakrangenorm'], color=immobile_color,
-                        s=16, edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-                        alpha=1.0, label='immobile', zorder=2)
+        imm_speed = np.clip(immobile['median_speed_cms'].to_numpy(), 0, immobile_speed_vmax)
+        sc_imm = ax_main.scatter(immobile['freq'], immobile['peakrangenorm'], c=imm_speed,
+                                 cmap=immobile_cmap, vmin=0, vmax=immobile_speed_vmax, s=16,
+                                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+                                 alpha=immobile_alpha, label='immobile', zorder=2)
     sc = None
     if show_moving:
         speed = np.clip(moving['median_speed_cms'].to_numpy(), 0, speed_vmax)
@@ -1181,9 +1196,13 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     shown = {g for g, show in (('moving', show_moving), ('immobile', show_immobile)) if show}
     centroids = centroids_all[centroids_all['movement'].isin(shown)]
     marker_labels = {'moving': 'moving centroid', 'immobile': 'immobile centroid'}
+    # centroid diamonds: bright green from `moving_cmap` (viridis) for moving,
+    # bright pink (`immobile_centroid_color`) for immobile
+    marker_colors = {'moving': plt.get_cmap(moving_cmap)(moving_centroid_cmap_pos),
+                     'immobile': immobile_centroid_color}
     for _, crow in centroids.iterrows():
         ax_main.scatter(crow['freq_centroid'], crow['peakrangenorm_centroid'],
-                        marker='D', s=90, facecolor='limegreen',
+                        marker='D', s=90, facecolor=marker_colors.get(crow['movement'], 'limegreen'),
                         edgecolor='black', linewidth=1, zorder=5,
                         label=marker_labels.get(crow['movement'], crow['movement']))
     ax_main.set_xlabel('Frequency (Hz)')
@@ -1197,32 +1216,40 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                      transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
                      color='0.3')
 
-    cmap_obj = plt.get_cmap(moving_cmap)
+    moving_cmap_obj = plt.get_cmap(moving_cmap)
+    immobile_cmap_obj = plt.get_cmap(immobile_cmap)
+
+    def _speed_colored_counts(group, value_col, bin_edges, cmap_obj, vmax):
+        """Per-bin epoch count of `group`, plus each bin's colour from the
+        mean running speed of the epochs that fall in it."""
+        n = len(bin_edges) - 1
+        idx = np.clip(np.digitize(group[value_col], bin_edges) - 1, 0, n - 1)
+        counts = np.zeros(n)
+        colors = np.zeros((n, 4))
+        for b in range(n):
+            m = idx == b
+            counts[b] = m.sum()
+            if m.any():
+                mean_speed = np.clip(group.loc[m, 'median_speed_cms'].mean(), 0, vmax)
+                colors[b] = cmap_obj(mean_speed / vmax)
+        return counts, colors
 
     def _movement_hist(value_col, bin_edges):
         centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         widths = np.diff(bin_edges)
-
-        imm_idx = np.clip(np.digitize(immobile[value_col], bin_edges) - 1, 0, len(bin_edges) - 2)
-        imm_counts = np.array([(imm_idx == b).sum() for b in range(len(bin_edges) - 1)])
-
-        mov_idx = np.clip(np.digitize(moving[value_col], bin_edges) - 1, 0, len(bin_edges) - 2)
-        mov_counts = np.zeros(len(bin_edges) - 1)
-        mov_colors = np.zeros((len(bin_edges) - 1, 4))
-        for b in range(len(bin_edges) - 1):
-            m = mov_idx == b
-            mov_counts[b] = m.sum()
-            if m.any():
-                mean_speed = np.clip(moving.loc[m, 'median_speed_cms'].mean(), 0, speed_vmax)
-                mov_colors[b] = cmap_obj(mean_speed / speed_vmax)
-        return centers, widths, imm_counts, mov_counts, mov_colors
+        imm_counts, imm_colors = _speed_colored_counts(
+            immobile, value_col, bin_edges, immobile_cmap_obj, immobile_speed_vmax)
+        mov_counts, mov_colors = _speed_colored_counts(
+            moving, value_col, bin_edges, moving_cmap_obj, speed_vmax)
+        return centers, widths, imm_counts, imm_colors, mov_counts, mov_colors
 
     # bins always span the FULL (both-group) range, so mode='moving' /
     # 'immobile' single-group panels stay axis-comparable with the merged one
     freq_bins = np.linspace(sub['freq'].min(), sub['freq'].max(), n_bins)
-    centers_f, widths_f, imm_f, mov_f, colors_f = _movement_hist('freq', freq_bins)
-    ax_top.bar(centers_f, imm_f, width=widths_f, color=immobile_color,
-              edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth, alpha=1.0, zorder=2)
+    centers_f, widths_f, imm_f, imm_colors_f, mov_f, colors_f = _movement_hist('freq', freq_bins)
+    ax_top.bar(centers_f, imm_f, width=widths_f, color=imm_colors_f,
+              edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+              alpha=immobile_alpha, zorder=2)
     ax_top.bar(centers_f, mov_f, width=widths_f, color=colors_f,
               edgecolor='none', alpha=moving_alpha, zorder=3)
     ax_top.set_ylabel('Count')
@@ -1231,9 +1258,10 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
         ax_top.set_yscale('log')
 
     pr_bins = np.linspace(0, 1, n_bins)
-    centers_p, widths_p, imm_p, mov_p, colors_p = _movement_hist('peakrangenorm', pr_bins)
-    ax_right.barh(centers_p, imm_p, height=widths_p, color=immobile_color,
-                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth, alpha=1.0, zorder=2)
+    centers_p, widths_p, imm_p, imm_colors_p, mov_p, colors_p = _movement_hist('peakrangenorm', pr_bins)
+    ax_right.barh(centers_p, imm_p, height=widths_p, color=imm_colors_p,
+                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+                 alpha=immobile_alpha, zorder=2)
     ax_right.barh(centers_p, mov_p, height=widths_p, color=colors_p,
                  edgecolor='none', alpha=moving_alpha, zorder=3)
     ax_right.set_xlabel('Count')
@@ -1244,17 +1272,49 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     if animal:
         ax_top.set_title(animal)
 
-    return sc, centroids
+    return sc, sc_imm, centroids
+
+
+def _add_speed_colorbars(fig, ax_right, sc_moving, sc_immobile, fraction=0.2, pad=0.35,
+                         label_fontsize=None):
+    """Speed colorbar(s) to the right of `ax_right` for whichever of the
+    moving (`sc_moving`) / immobile (`sc_immobile`) scatters were drawn.
+    Space is taken from `ax_right` once (same as a single fig.colorbar call
+    with `fraction`/`pad`) and split vertically when both are present --
+    moving on top, immobile below -- so the panel doesn't shrink twice.
+    """
+    mappables = [(sc, label) for sc, label in (
+        (sc_moving, 'moving speed (cm s$^{-1}$)'),
+        (sc_immobile, 'immobile speed (cm s$^{-1}$)')) if sc is not None]
+    if not mappables:
+        return []
+
+    cax, _kw = make_axes(ax_right, fraction=fraction, pad=pad)
+    pos = cax.get_position()
+    cax.remove()
+
+    n = len(mappables)
+    gap = 0.1 * pos.height if n > 1 else 0.0
+    height = (pos.height - gap * (n - 1)) / n
+    cbars = []
+    for i, (sc, label) in enumerate(mappables):
+        y0 = pos.y1 - (i + 1) * height - i * gap
+        cbar = fig.colorbar(sc, cax=fig.add_axes([pos.x0, y0, pos.width, height]))
+        cbar.set_label(label, fontsize=label_fontsize)
+        cbars.append(cbar)
+    return cbars
 
 
 def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
-                                moving_alpha=0.5, immobile_color='black',
+                                moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
+                                immobile_cmap='magma', immobile_alpha=1.0,
                                 immobile_edgecolor='#FFB3BA', figsize=(5.5, 5)):
     """Frequency vs. normalised autocorrelogram peak range. Immobile epochs
-    are solid jet-black with a pastel-red outline; moving epochs are
-    coloured by per-epoch running speed (`moving_cmap`) at `moving_alpha`
-    opacity, so the two heavily-overlapping point clouds stay
-    distinguishable. Includes marginal count histograms and moving/immobile
+    are coloured by per-epoch running speed in `immobile_cmap` with a
+    pastel-red outline; moving epochs are coloured by per-epoch running
+    speed in `moving_cmap` at `moving_alpha` opacity, so the two
+    heavily-overlapping point clouds stay distinguishable. Includes marginal
+    count histograms, one speed colorbar per group, and moving/immobile
     centroid markers -- reproduces Dunn et al. Fig. 4e/h.
 
     Returns (fig, axes_dict, centroids_df).
@@ -1266,25 +1326,27 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
     ax_top = fig.add_subplot(gs[0, 0], sharex=ax_main)
     ax_right = fig.add_subplot(gs[1, 1], sharey=ax_main)
 
-    sc, centroids = _draw_freq_peakrange_scatter(
+    sc, sc_imm, centroids = _draw_freq_peakrange_scatter(
         df, ax_main, ax_top, ax_right, animal=animal, speed_vmax=speed_vmax,
         moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-        immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor)
+        immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
+        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
 
-    cbar = fig.colorbar(sc, ax=ax_right, fraction=0.2, pad=0.35) # type: ignore
-    cbar.set_label('moving speed (cm s$^{-1}$)')
+    _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
 
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
 
 def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
-                                    moving_alpha=0.5, immobile_color='black',
+                                    moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
+                                    immobile_cmap='magma', immobile_alpha=1.0,
                                     immobile_edgecolor='#FFB3BA', figsize=(15, 5)):
     """Three side-by-side Fig. 4e/h-style panels -- mobility only, immobility
     only, and both merged -- sharing the same frequency/peak-range axes and
     bins so the two point clouds can first be inspected on their own, then
-    compared for overlap in the merged panel. Immobile epochs are drawn with
-    a pastel-red outline in every panel.
+    compared for overlap in the merged panel. Moving epochs are coloured by
+    speed in `moving_cmap`, immobile epochs by speed in `immobile_cmap` (with
+    a pastel-red outline) in every panel.
 
     A footer below the panels reports the ED_min fit-quality rejection rate
     (within `animal`'s scope, if given): the overall percentage of epochs
@@ -1308,15 +1370,15 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
         ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
         ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
 
-        sc, c = _draw_freq_peakrange_scatter(
+        sc, sc_imm, c = _draw_freq_peakrange_scatter(
             df, ax_main, ax_top, ax_right, animal=animal, mode=mode,
             speed_vmax=speed_vmax, moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-            immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor,
+            immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
+            immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
             show_edmin_annotation=False)
         ax_top.set_title(title)
-        if sc is not None:
-            cbar = fig.colorbar(sc, ax=ax_right, fraction=0.25, pad=0.45)
-            cbar.set_label('moving speed (cm s$^{-1}$)', fontsize=7)
+        _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.25, pad=0.45,
+                             label_fontsize=7)
         if mode == 'both':
             centroids = c
 
@@ -1358,7 +1420,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
 
 def plot_figure4_style(df, animal=None, trace_color='tab:blue',
                        speed_vmax=50.0, moving_cmap='viridis',
-                       moving_alpha=0.5, immobile_color='black',
+                       moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
+                       immobile_cmap='magma', immobile_alpha=1.0,
                        immobile_edgecolor='#FFB3BA',
                        moving_row=None, immobile_row=None, figsize=(9, 4)):
     """Full Dunn et al. Fig. 4-style panel group: an example moving epoch
@@ -1400,13 +1463,13 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
     ax_main = fig.add_subplot(sub_gs[1, 0])
     ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
     ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
-    sc, centroids = _draw_freq_peakrange_scatter(
+    sc, sc_imm, centroids = _draw_freq_peakrange_scatter(
         df, ax_main, ax_top, ax_right, animal=animal, speed_vmax=speed_vmax,
         moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-        immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor)
+        immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
+        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
 
-    cbar = fig.colorbar(sc, ax=ax_right, fraction=0.2, pad=0.35) # type: ignore
-    cbar.set_label('moving speed (cm s$^{-1}$)')
+    _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
 
     if animal:
         fig.suptitle(animal)

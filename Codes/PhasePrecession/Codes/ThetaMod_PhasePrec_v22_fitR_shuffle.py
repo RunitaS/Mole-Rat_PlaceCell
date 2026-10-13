@@ -213,6 +213,13 @@ ACG_PEAK_PROMINENCE = 0.05           # reference-ACG peak/trough prominence (fin
 # ED_min-rejected epochs highlighted) and its per-epoch table, both written to RESULTS_FOLDER
 EDMIN_PLOT_NAME = 'ACG_EDmin_vs_PeakRange.png'
 EDMIN_EPOCHS_CSV_NAME = 'ACG_EDmin_epochs.csv'
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
 
 # --- Step 3: Pass Index phase-precession parameters ---
 METHOD = 'place'              # 'place' (recommended for place cells) or 'grid'
@@ -2452,7 +2459,7 @@ def plot_edmin_epochs(edmin_df: pd.DataFrame, out_path: Path):
     thr = ACG_ED_MIN_THRESH
     animals = sorted(fitted['Animal'].unique())
     cmap = plt.get_cmap('tab10' if len(animals) <= 10 else 'tab20')
-    colors = {a: cmap(i % cmap.N) for i, a in enumerate(animals)}
+    colors = {a: ANIMAL_COLORS.get(a, cmap(i % cmap.N)) for i, a in enumerate(animals)}
 
     def _acc_rej_line(label, sub):
         n = len(sub)
