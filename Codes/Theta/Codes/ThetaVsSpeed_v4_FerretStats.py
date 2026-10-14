@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
-from scipy.stats import norm, linregress
+from scipy.stats import norm, linregress, ttest_1samp, wilcoxon
 import matplotlib.pyplot as plt
 import statsmodels.formula.api as smf
 import openpyxl
@@ -40,12 +40,12 @@ import openpyxl
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed, paired with the
 # single tracking .csv that lives in the same folder.
-ROOT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/PlaceCell/Data/PlaceCell_True'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99_Bin2'
 
 OUTPUT_PARQUET = os.path.join(ROOT_DIR, 'ThetaVsSpeed_out.parquet')
 
 # Speed vs. theta stats (mixed-model plots + summary) are written here.
-OUTPUT_DIR = Path(ROOT_DIR) / 'Output_ThetaVsSpeed'
+OUTPUT_DIR = Path(ROOT_DIR) / 'ThetaVsSpeed_ACG'
 
 # ---- Acquisition (Neuralynx .ncs) ----
 NATIVE_FS = 32000  # native .ncs sampling rate (Hz)
@@ -114,6 +114,31 @@ SPEED_BIN_WIDTH_CMS = 1.0
 # x in cm (col D), y in cm (col E).
 POS_JUMP_THRESH_CMS = 80.0
 POS_SMOOTH_SIGMA_SMP = 1.0
+
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
+
+
+def ordered_animals(labels):
+    """Unique animal labels in ANIMAL_COLORS order (unknown labels last, sorted)."""
+    labels = list(pd.unique(pd.Series(labels).dropna()))
+    known = [a for a in ANIMAL_COLORS if a in labels]
+    return known + sorted(a for a in labels if a not in known)
 
 
 # %% ==================== .ncs / tracking data import ==============================
@@ -564,7 +589,9 @@ def process_ncs_session(fpath):
 def process_root_directory(root_dir):
     """Recursively find every .ncs under `root_dir`, run process_ncs_session
     on each, and concatenate the per-bin results, tagging each row with a
-    session id derived from the file's path (relative to `root_dir`)."""
+    session id derived from the file's path (relative to `root_dir`), plus the
+    recording folder it came from (channels in the same folder were recorded
+    simultaneously) and the animal (first path component)."""
     ncs_files = []
     for root, _dirs, files in os.walk(root_dir):
         for fname in files:
@@ -576,9 +603,12 @@ def process_root_directory(root_dir):
     for fpath in ncs_files:
         rel = os.path.relpath(fpath, root_dir)
         ses_id = os.path.splitext(rel)[0].replace(os.sep, '_')
+        rel_dir = os.path.dirname(rel)
         try:
             df_session = process_ncs_session(fpath)
             df_session['Session'] = ses_id
+            df_session['Recording'] = rel_dir.replace(os.sep, '/')
+            df_session['Animal'] = rel_dir.split(os.sep)[0]
             print(f'  OK: {rel}  [{len(df_session)} bins]')
             all_results.append(df_session)
         except Exception as e:
@@ -607,7 +637,9 @@ def aggregate_by_speed_bin(df, speed_bin_width=SPEED_BIN_WIDTH_CMS, group="Sessi
     """
     d = df.copy()
     d["SpeedBin"] = np.floor(d["Speed"] / speed_bin_width)
-    agg = (d.groupby([group, "SpeedBin"])
+    # Recording/Animal are constant within a session -- carried through for plotting
+    carry = [c for c in ("Recording", "Animal") if c in d.columns]
+    agg = (d.groupby([group, *carry, "SpeedBin"])
             .agg(Frequency=("Frequency", agg_method),
                  Power=("Power", agg_method),
                  Speed=("Speed", agg_method),
@@ -627,7 +659,9 @@ def fit_mixed_model(df, response, predictor="Speed", group="Session"):
 
 
 def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, out_path):
-    """Scatter the binned data plus the mixed model's fixed-effect fit and its 95% CI band."""
+    """Scatter the binned data plus the mixed model's fixed-effect fit and its 95% CI band.
+    Points are coloured by animal (ANIMAL_COLORS) when `df` has an Animal
+    column, otherwise all drawn in `color`."""
     intercept = result.params["Intercept"]
     slope = result.params[predictor]
     pvalue = result.pvalues[predictor]
@@ -645,7 +679,13 @@ def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, 
     y_ci_high = y_pred + z * se
 
     plt.figure(figsize=(7, 5))
-    plt.scatter(df[predictor], df[response], color=color, edgecolor='k', alpha=0.6, s=25)
+    if "Animal" in df.columns:
+        for a in ordered_animals(df["Animal"]):
+            sub = df[df["Animal"] == a]
+            plt.scatter(sub[predictor], sub[response], color=animal_color(a, default=color),
+                        edgecolor='k', linewidth=0.5, alpha=0.8, s=25, label=a)
+    else:
+        plt.scatter(df[predictor], df[response], color=color, edgecolor='k', alpha=0.6, s=25)
     plt.plot(x_range, y_pred, color="black", linewidth=2, label="Mixed Linear Fit")
     plt.fill_between(x_range, y_ci_low, y_ci_high, color="grey", alpha=0.5, label="95% CI")
     plt.xlabel(f"{predictor} (cm/s)", fontsize=12)
@@ -750,6 +790,80 @@ def fit_per_session_ols(df, response, predictor="Speed", group="Session"):
     return pd.DataFrame(rows)
 
 
+def summarise_slopes_across_recordings(fits, meta, group="Session"):
+    """Group-level test of the per-session OLS slopes (two-stage /
+    summary-statistics approach): each recording's fitted beta1 is one data
+    point, tested against 0 across recordings.
+
+    Channels in the same recording folder share the same running-speed trace
+    and aren't independent, so their slopes are averaged first to one beta1
+    per recording. The recording-level slopes are then tested with a
+    one-sample t-test and a Wilcoxon signed-rank test (H0: mean/median slope
+    = 0). Per-animal mean slopes are returned too, since recordings from the
+    same animal aren't fully independent either.
+    """
+    fits = fits.merge(meta, on=group, how="left")
+    per_rec = (fits.groupby(["Animal", "Recording"], as_index=False)
+                   .agg(beta1=("beta1", "mean"), n_channels=("beta1", "size")))
+    per_animal = (per_rec.groupby("Animal", as_index=False)
+                     .agg(beta1_mean=("beta1", "mean"), beta1_sd=("beta1", "std"),
+                          n_recordings=("beta1", "size")))
+    per_animal = (per_animal.set_index("Animal")
+                     .loc[ordered_animals(per_animal["Animal"])].reset_index())
+
+    slopes = per_rec["beta1"].to_numpy()
+    n = len(slopes)
+    t_res = ttest_1samp(slopes, 0.0) if n >= 2 else None
+    try:
+        w_res = wilcoxon(slopes)
+    except ValueError:  # n too small or all slopes exactly 0
+        w_res = None
+
+    stats = {
+        "n_recordings": n,
+        "n_animals": per_rec["Animal"].nunique(),
+        "beta1_mean": slopes.mean() if n else np.nan,
+        "beta1_sem": slopes.std(ddof=1) / np.sqrt(n) if n >= 2 else np.nan,
+        "t": t_res.statistic if t_res else np.nan,
+        "t_pvalue": t_res.pvalue if t_res else np.nan,
+        "wilcoxon_W": w_res.statistic if w_res else np.nan,
+        "wilcoxon_pvalue": w_res.pvalue if w_res else np.nan,
+        "n_positive": int((slopes > 0).sum()),
+    }
+    return stats, per_rec, per_animal
+
+
+def plot_recording_slopes(per_rec, grp, ylabel, title, out_path):
+    """One dot per recording (its OLS slope, channels averaged), grouped and
+    coloured by animal (ANIMAL_COLORS), with each animal's mean as a black bar
+    and the group-level test result annotated."""
+    rng = np.random.default_rng(0)
+    animals_here = ordered_animals(per_rec["Animal"])
+
+    fig, ax = plt.subplots(figsize=(1.4 * len(animals_here) + 2, 4.5))
+    for i, a in enumerate(animals_here):
+        vals = per_rec.loc[per_rec["Animal"] == a, "beta1"].to_numpy()
+        x = i + rng.uniform(-0.12, 0.12, len(vals))
+        ax.scatter(x, vals, s=45, color=animal_color(a), edgecolor='k', linewidth=0.6, zorder=3)
+        ax.hlines(vals.mean(), i - 0.25, i + 0.25, color='black', lw=2, zorder=4)
+    ax.axhline(0, color='grey', ls='--', lw=1)
+    ax.set_xticks(range(len(animals_here)))
+    ax.set_xticklabels(animals_here)
+    ax.set_xlim(-0.6, len(animals_here) - 0.4)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.grid(True, axis='y', linestyle='--', alpha=0.4)
+    # stats go under the title rather than inside the axes, so they can't hide points
+    fig.suptitle(title, fontsize=13, weight='bold')
+    ax.set_title(
+        f"mean = {grp['beta1_mean']:.3g} ± {grp['beta1_sem']:.2g} SEM;  "
+        f"t({grp['n_recordings'] - 1}) = {grp['t']:.2f}, p = {grp['t_pvalue']:.3g};  "
+        f"n = {grp['n_recordings']} recordings, {grp['n_animals']} animals",
+        fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def run_speed_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
     """Reproduce Dunn et al.'s Fig. 3 speed-theta statistics: bin each session's
     data into FIG3_SPEED_BIN_WIDTH_CMS-wide speed bins (median Frequency/Power per
@@ -764,15 +878,18 @@ def run_speed_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
     """
     df_clean = df.dropna(subset=["Frequency", "Power", "Speed"]).copy()
 
-    def _trim_top_pctile(g):
-        thresh = np.percentile(g["Speed"], FIG3_SPEED_UPPER_PCTILE)
-        return g[g["Speed"] <= thresh]
-    df_clean = df_clean.groupby("Session", group_keys=False).apply(_trim_top_pctile)
+    # per-session speed threshold; transform keeps the "Session" column, which
+    # groupby.apply drops in pandas >= 3.0 (include_groups=False by default)
+    thresh = df_clean.groupby("Session")["Speed"].transform(
+        lambda s: np.percentile(s, FIG3_SPEED_UPPER_PCTILE))
+    df_clean = df_clean[df_clean["Speed"] <= thresh]
 
     df_binned = aggregate_by_speed_bin(df_clean, speed_bin_width=FIG3_SPEED_BIN_WIDTH_CMS)
     df_binned.to_excel(OUTPUT_DIR / "Fig3_speed_binned_medians.xlsx", index=False)
 
     alpha_bonf = 0.05 / n_channels_for_bonferroni
+
+    meta = df[["Session", "Recording", "Animal"]].drop_duplicates("Session")
 
     summary_lines = []
     for response in ("Frequency", "Power"):
@@ -780,11 +897,36 @@ def run_speed_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
         fits.to_excel(OUTPUT_DIR / f"Fig3_persession_OLS_{response}.xlsx", index=False)
 
         n_sig = int((fits["pvalue"] < alpha_bonf).sum())
-        line = (f"{response} vs Speed (per-session OLS, n={len(fits)} sessions): "
-                f"beta1 = {fits['beta1'].mean():.4g} +/- {fits['beta1'].std():.4g} (mean +/- SD), "
-                f"{n_sig}/{len(fits)} sessions significant at Bonferroni p < {alpha_bonf:.4g}")
-        print(line)
-        summary_lines.append(line)
+        lines = [(f"{response} vs Speed (per-session OLS, n={len(fits)} sessions): "
+                  f"beta1 = {fits['beta1'].mean():.4g} +/- {fits['beta1'].std():.4g} (mean +/- SD), "
+                  f"{n_sig}/{len(fits)} sessions significant at Bonferroni p < {alpha_bonf:.4g}")]
+
+        # group-level result across all recordings
+        grp, per_rec, per_animal = summarise_slopes_across_recordings(fits, meta)
+        with pd.ExcelWriter(OUTPUT_DIR / f"Fig3_group_slopes_{response}.xlsx") as xw:
+            per_rec.to_excel(xw, sheet_name="per_recording", index=False)
+            per_animal.to_excel(xw, sheet_name="per_animal", index=False)
+            pd.DataFrame([grp]).to_excel(xw, sheet_name="group_test", index=False)
+        unit = "Hz" if response == "Frequency" else "µV²"
+        plot_recording_slopes(
+            per_rec, grp, ylabel=f"β₁ ({unit} per cm/s)",
+            title=f"Theta {response} vs. Speed slope",
+            out_path=OUTPUT_DIR / f"Fig3_recording_slopes_{response}.png")
+
+        lines.append(
+            f"  Group level (n={grp['n_recordings']} recordings from {grp['n_animals']} animals, "
+            f"channels averaged within recording): beta1 = {grp['beta1_mean']:.4g} +/- "
+            f"{grp['beta1_sem']:.4g} (mean +/- SEM); one-sample t({grp['n_recordings'] - 1}) = "
+            f"{grp['t']:.3f}, p = {grp['t_pvalue']:.3g}; Wilcoxon W = {grp['wilcoxon_W']:.4g}, "
+            f"p = {grp['wilcoxon_pvalue']:.3g}; {grp['n_positive']}/{grp['n_recordings']} "
+            f"recordings with positive slope")
+        for _, r in per_animal.iterrows():
+            lines.append(f"    {r['Animal']}: beta1 = {r['beta1_mean']:.4g} +/- {r['beta1_sd']:.4g} "
+                         f"(mean +/- SD, n={r['n_recordings']} recordings)")
+
+        for line in lines:
+            print(line)
+        summary_lines.extend(lines)
 
     with open(OUTPUT_DIR / "Fig3_persession_OLS_summary.txt", "w") as f:
         f.write("\n".join(summary_lines) + "\n")

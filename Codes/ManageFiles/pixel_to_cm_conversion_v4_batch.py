@@ -24,8 +24,11 @@ subfolders), one per file:
     y_cm = y_px * scale_cm_per_px
 
 arena_size_cm is the real-world length of the longer axis of the tracked
-area (e.g. arena diameter/side). It differs between sessions (60 cm vs
-80 cm in some cases), so it is configurable per-folder below.
+area (e.g. arena diameter/side). It differs between arenas (60 cm open field,
+80 cm linear track, 80 cm circular track outer diameter), so it is picked from
+the arena folder named anywhere in the file's path below ROOT_DIR
+(e.g. ROOT_DIR/Fa1059/Linear/Day10/1_0 -> 'linear' -> 80 cm), using the same
+folder keywords as the MeanRateMap analysis (ARENA_FOLDER_KEYWORDS there).
 """
 
 import os
@@ -34,13 +37,20 @@ import pandas as pd
 
 # ── USER INPUT ──────────────────────────────────────────────────────────────
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\OccupancyMaps\OccCor'  # root folder containing subfolders with .xlsx tracking files
-# Real-world size (cm) of the longer tracked axis, used as the default for
-# any subfolder not listed in ARENA_SIZE_CM_BY_FOLDER below.
+# Real-world size (cm) of the longer tracked axis, keyed by arena folder name
+# (matched case-insensitively against every folder in the path below ROOT_DIR).
+# Must match ARENA_CONFIGS in the MeanRateMap analysis scripts.
+ARENA_SIZE_CM_BY_KEYWORD = {
+    'open':     60,  # open field diameter
+    'linear':   80,  # linear track length
+    'circle':   80,  # circular track outer diameter
+    'circular': 80,
+}
+# Used (with a warning) for any folder whose path names none of the arenas above.
 DEFAULT_ARENA_SIZE_CM = 60
 
-# Per-folder overrides: {subfolder_name: arena_size_cm}
-# Add an entry here for any session whose arena size differs from the default
-# (e.g. 80 cm arenas).
+# Per-session overrides: {session_folder_name: arena_size_cm}; take precedence
+# over ARENA_SIZE_CM_BY_KEYWORD.
 ARENA_SIZE_CM_BY_FOLDER = {
     # 'ExperimentDay10_NestBuild': 80,
 }
@@ -56,8 +66,20 @@ OUTPUT_SUFFIX = '_cm'  # output saved as <original_name>_cm.csv in the same subf
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_arena_size_cm(folder_name):
-    return ARENA_SIZE_CM_BY_FOLDER.get(folder_name, DEFAULT_ARENA_SIZE_CM)
+def get_arena_size_cm(folder):
+    folder_name = os.path.basename(folder)
+    if folder_name in ARENA_SIZE_CM_BY_FOLDER:
+        return ARENA_SIZE_CM_BY_FOLDER[folder_name]
+
+    rel_path = os.path.relpath(folder, ROOT_DIR)
+    for part in os.path.normpath(rel_path).split(os.sep):
+        size = ARENA_SIZE_CM_BY_KEYWORD.get(part.strip().lower())
+        if size is not None:
+            return size
+
+    print(f"  WARNING: no arena folder ({', '.join(ARENA_SIZE_CM_BY_KEYWORD)}) in "
+          f"{rel_path}; using DEFAULT_ARENA_SIZE_CM={DEFAULT_ARENA_SIZE_CM}")
+    return DEFAULT_ARENA_SIZE_CM
 
 
 def prompt_delete_existing_csvs(root_dir):
@@ -197,7 +219,7 @@ def main():
         if not xlsx_files:
             continue
 
-        arena_size_cm = get_arena_size_cm(folder_name)
+        arena_size_cm = get_arena_size_cm(folder)
         for xlsx_path in xlsx_files:
             print(f"[{folder_name}] Converting {os.path.basename(xlsx_path)} "
                   f"(arena_size_cm={arena_size_cm})")

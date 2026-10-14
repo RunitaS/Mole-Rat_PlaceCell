@@ -27,6 +27,24 @@ increasing the number of bins, how do I do this?
 for bimodality. BEcause some of my plots have a bimodal distribution. Give stats results for a Rayleigh test 
 for unimodal distributuion and bimodal distribution.
 
+## Modified Rayleigh algo for all arenas:
+
+Add a rayleigh test on the mean rate maps for open field data. In total there will be 3 rate maps compared (Overall mean rate map, proportion of peaks rate map, 
+field only mean rate map).
+
+The algorithm to carry out the test is as follows:
+
+1. Normalize the distance from the center of the open field to the walls, with 0 at the center of the 
+60cm diameter field and 1 at the periphery/walls. So the bins around the center will get a multiplier 
+factor of 0 and the bins near the wall will get a multiplier factor of 1. 
+
+2. For the type of rate map being analyzed, whichever bin is being considerd, use the multiplier obtained 
+for that bin with respect to distance from the wall. Multiple the firing rate with this multiplier factor.
+
+3. Divide all three mean rate maps is angular bins, 12 degrees wide. Distribute all the x,y position bins into these angular bins, make sure that no bin is repeated in more than 1 angular bin. Calculate the average magnitude value obtained from each bin considered in that angular bin post modification of firing rate value that incorporates the distance to wall multiplier. I would like to control for higher number of samples as we move towards the wall just because the area increases as we move from cener towards the wall, hence increasing the number of bins, how do I do this?
+
+4. On the magnitude values for each angular bin, perform a Rayleigh vector test. Make sure you also test 
+for bimodality. BEcause some of my plots have a bimodal distribution. Give stats results for a Rayleigh test for unimodal distributuion and bimodal distribution.
 
 # CORRECT OBSERVED NULL ALGO:
 

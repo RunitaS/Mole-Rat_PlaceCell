@@ -47,7 +47,7 @@ from matplotlib.colors import to_hex
 
 # ── User settings ─────────────────────────────────────────────────────────────
 
-INPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\PC_Res\CI95_Bin4'
+INPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\PC_Res\CI99_Bin2'
 OUTPUT_DIR = os.path.join(INPUT_DIR, 'Compare_Output')
 SHEET      = 'Full'
 KEY_COLS   = ['session', 'unit']

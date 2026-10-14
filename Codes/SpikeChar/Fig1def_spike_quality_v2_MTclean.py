@@ -29,7 +29,8 @@ import pandas as pd # type: ignore
 import matplotlib # type: ignore
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt # type: ignore
-from matplotlib.colors import to_hex # type: ignore
+from matplotlib.colors import to_hex, ListedColormap, Normalize, TwoSlopeNorm # type: ignore
+from matplotlib.cm import ScalarMappable # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -43,7 +44,7 @@ PLOT_DIR    = os.path.join(os.path.dirname(OUTPUT_EXCEL), 'quality_plots_MTclean
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
-WAVEFORM_DURATION_MS = 1.0       # 32 samples @ 32 kHz (NTT header SamplingFrequency 32000)
+WAVEFORM_DURATION_MS = 1.0       # 32 samples @ 32 kHz (NTT header SamplingFrequey 32000)
 SAMPLE_INTERVAL_MS   = WAVEFORM_DURATION_MS / N_SAMPLES
 
 # Must match Fig1def_spike_quality_v2.py so the same spikes are excluded
@@ -73,6 +74,14 @@ MT_COLOR           = MAGMA_3     # multi-trigger units (rug marks, "clean" value
 COLOR_THR_GOOD     = MAGMA_1
 COLOR_THR_BAD      = MAGMA_3
 COLOR_THR_MARGINAL = MAGMA_4
+
+# Accepted units in the histograms are coloured by peak amplitude (low → high along magma).
+# Magma is trimmed symmetrically so its very light top end is avoided and the colormap's
+# centre stays magma(0.5), which is placed on the median peak amplitude.
+AMP_CMAP_RANGE = (0.20, 0.80)
+AMP_CMAP = ListedColormap(matplotlib.colormaps[FIG_CMAP](np.linspace(*AMP_CMAP_RANGE, 256)), name='magma_amp')
+AMP_CMAP.set_bad(INK_MUTED)
+AMP_CLIP_PCT = (2, 98)           # colour scale ends = these percentiles of accepted peak amplitudes
 
 
 def _style_axes(ax):
@@ -376,17 +385,24 @@ print(f'\nCorrected metrics saved: {CLEAN_EXCEL}')
 # ── Histograms of all quality metrics ─────────────────────────────────────────
 
 def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_colors=(), thr_labels=(),
-                   n_bins=30, legend=True):
+                   n_bins=30, legend=True, amp=None, amp_norm=None):
     """
     Stacked histogram (rejected in gray at the bottom, accepted in colour on top),
     with multi-trigger units (values re-computed on clean spikes) marked as a rug
     below the bars.
+    If `amp` is given, every accepted unit is drawn as its own unit-height block,
+    coloured by its peak amplitude (AMP_CMAP / amp_norm) and stacked low → high
+    amplitude within each bin.
     """
     values   = np.asarray(values, dtype=float)
     valid    = ~np.isnan(values)
     vals     = values[valid]
     acc      = np.asarray(accepted, dtype=bool)[valid]
     mt       = np.asarray(is_mt, dtype=bool)[valid]
+    if amp is not None:
+        amp = np.asarray(amp, dtype=float)[valid]
+        if amp_norm is None:
+            amp_norm = Normalize(np.nanmin(amp), np.nanmax(amp))
 
     if len(vals) == 0:
         ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
@@ -402,8 +418,21 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
 
     ax.bar(bin_centers, n_rej, width=bin_widths, color=REJECTED_COLOR, edgecolor=SURFACE,
            linewidth=1.0, zorder=3, label=f'Rejected (n={int(n_rej.sum())})')
-    ax.bar(bin_centers, n_acc, width=bin_widths, bottom=n_rej, color=ACCEPTED_COLOR,
-           edgecolor=SURFACE, linewidth=1.0, zorder=3, label=f'Accepted (n={int(n_acc.sum())})')
+    if amp is None:
+        ax.bar(bin_centers, n_acc, width=bin_widths, bottom=n_rej, color=ACCEPTED_COLOR,
+               edgecolor=SURFACE, linewidth=1.0, zorder=3, label=f'Accepted (n={int(n_acc.sum())})')
+    else:
+        b   = np.clip(np.digitize(vals[acc], bin_edges) - 1, 0, len(bin_widths) - 1)
+        order = np.lexsort((amp[acc], b))
+        b_s, amp_s = b[order], amp[acc][order]
+        rank = np.arange(len(b_s)) - np.searchsorted(b_s, b_s)   # position within its bin
+        block_colors = AMP_CMAP(amp_norm(amp_s))
+        # Edges in the block's own colour hide hairline seams between stacked blocks
+        ax.bar(bin_centers[b_s], 1.0, width=bin_widths[b_s], bottom=n_rej[b_s] + rank,
+               color=block_colors, edgecolor=block_colors, linewidth=0.3, zorder=3)
+        # Outline restores the gap between bins drawn by the SURFACE edges elsewhere
+        ax.bar(bin_centers, n_acc, width=bin_widths, bottom=n_rej, fill=False,
+               edgecolor=SURFACE, linewidth=1.0, zorder=3.5)
     if mt.any():
         # Rug in its own strip below the bars so it never hides low bins
         top = max(float((n_rej + n_acc).max()), 1.0)
@@ -425,7 +454,16 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
     ax.set_ylabel('Number of units', color=INK_PRIMARY)
 
     if legend:
-        _legend_outside(ax)
+        handles, labels = ax.get_legend_handles_labels()
+        # Bars first (matplotlib lists lines before bars)
+        bars  = [i for i, l in enumerate(labels) if l.startswith(('Rejected', 'Accepted'))]
+        order = bars + [i for i in range(len(labels)) if i not in bars]
+        handles, labels = [handles[i] for i in order], [labels[i] for i in order]
+        if amp is not None:
+            # Proxy patch for the per-unit blocks (legend entry 2, after "Rejected")
+            handles.insert(1, plt.Rectangle((0, 0), 1, 1, color=AMP_CMAP(0.5)))
+            labels.insert(1, f'Accepted (n={int(n_acc.sum())}), colour = peak amplitude')
+        _legend_outside(ax, handles, labels)
         summary = (f'n = {len(vals)}\n'
                    f'Mean ± SD = {mean_v:.3f} ± {float(np.std(vals)):.3f}\n'
                    f'Median = {median_v:.3f}')
@@ -461,15 +499,41 @@ accepted_flags = df['accepted'].values
 mt_flags       = df.index.isin(recomputed_ok)
 excel_base     = os.path.splitext(os.path.basename(OUTPUT_EXCEL))[0]
 
+# Peak-amplitude colour scale shared by all histograms (accepted units only):
+# AMP_CLIP_PCT[0] → median → AMP_CLIP_PCT[1] map onto the lower and upper halves of AMP_CMAP
+peak_amps = pd.to_numeric(df['peak_amp_uV'], errors='coerce').values
+acc_amps  = peak_amps[accepted_flags.astype(bool)]
+amp_lo, amp_hi = np.nanpercentile(acc_amps, AMP_CLIP_PCT)
+amp_med   = float(np.nanmedian(acc_amps))
+amp_norm  = TwoSlopeNorm(vmin=amp_lo, vcenter=amp_med, vmax=amp_hi)
+AMP_LABEL = (f'Peak amplitude  (µV; centre = median {amp_med:.0f} µV, '
+             f'ends = percentiles {AMP_CLIP_PCT[0]} / {AMP_CLIP_PCT[1]})')
+
+
+def _amp_colorbar(cbar):
+    cbar.set_label(AMP_LABEL, color=INK_PRIMARY, fontsize=9)
+    cbar.set_ticks([amp_lo, (amp_lo + amp_med) / 2, amp_med, (amp_med + amp_hi) / 2, amp_hi])
+    cbar.ax.xaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter('%.0f'))
+    cbar.ax.axvline(amp_med, color=SURFACE, linewidth=1.2)
+    cbar.ax.tick_params(colors=INK_SECONDARY, labelsize=8)
+    cbar.outline.set_edgecolor(INK_MUTED)
+
+
 for suffix, col, title, xlabel, thr, thr_c, thr_l in histogram_specs:
     if col not in df.columns:
         print(f'Column "{col}" not in sheet, skipped')
         continue
+    color_by_amp = col != 'peak_amp_uV'
     fig, ax = plt.subplots(figsize=(8, 4.5), facecolor=SURFACE)
     _style_axes(ax)
     draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags, mt_flags,
-                   xlabel, thr, thr_c, thr_l)
+                   xlabel, thr, thr_c, thr_l,
+                   amp=peak_amps if color_by_amp else None, amp_norm=amp_norm)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
+    if color_by_amp:
+        _amp_colorbar(fig.colorbar(ScalarMappable(norm=amp_norm, cmap=AMP_CMAP), ax=ax,
+                                   orientation='horizontal', location='bottom', extend='both',
+                                   pad=0.18, fraction=0.05, aspect=45))
     _save(fig, os.path.join(PLOT_DIR, f'{excel_base}_MTclean_hist_{suffix}'))
     print(f'Histogram saved: {suffix}')
 
@@ -482,19 +546,25 @@ axes = np.atleast_1d(axes).ravel()
 for ax, (suffix, col, title, xlabel, thr, thr_c, thr_l) in zip(axes, specs_present):
     _style_axes(ax)
     draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags, mt_flags,
-                   xlabel, thr, thr_c, thr_l, legend=False)
+                   xlabel, thr, thr_c, thr_l, legend=False,
+                   amp=peak_amps if col != 'peak_amp_uV' else None, amp_norm=amp_norm)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
 for ax in axes[len(specs_present):]:
     ax.set_visible(False)
-grid_handles = [plt.Rectangle((0, 0), 1, 1, color=ACCEPTED_COLOR),
+grid_handles = [plt.Rectangle((0, 0), 1, 1, color=AMP_CMAP(0.5)),
                 plt.Rectangle((0, 0), 1, 1, color=REJECTED_COLOR),
                 plt.Line2D([], [], linestyle='none', marker='|', markersize=7,
                            markeredgewidth=0.8, color=MT_COLOR),
                 plt.Line2D([], [], color=INK_PRIMARY, lw=1.5),
                 plt.Line2D([], [], color=INK_PRIMARY, lw=1.5, ls=':')]
-fig.legend(grid_handles, ['Accepted', 'Rejected', 'Multi-trigger (MT spikes excluded)', 'Mean', 'Median'],
+fig.legend(grid_handles, ['Accepted (colour = peak amplitude; solid in the peak-amplitude panel)',
+                          'Rejected', 'Multi-trigger (MT spikes excluded)', 'Mean', 'Median'],
            loc='lower center', ncol=5, frameon=False, fontsize=9, labelcolor=INK_PRIMARY)
-fig.tight_layout(rect=(0, 0.04, 1, 1))
+fig.tight_layout(rect=(0, 0.11, 1, 1))
+grid_cax = fig.add_axes((0.35, 0.065, 0.30, 0.012))
+_amp_colorbar(fig.colorbar(ScalarMappable(norm=amp_norm, cmap=AMP_CMAP), cax=grid_cax,
+                           orientation='horizontal', extend='both'))
+grid_cax.xaxis.set_label_position('top')
 _save(fig, os.path.join(PLOT_DIR, f'{excel_base}_MTclean_all_metrics'))
 print('All-metrics grid saved')
 
