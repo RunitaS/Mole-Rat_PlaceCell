@@ -5,16 +5,20 @@ Duong (2013) local test
 
 PIPELINE (run_full_pipeline), per arena:
   1. MEAN MAPS -- the pooled maps of the recorded place cells (described below): overall mean
-     field index, field-only mean field index and peak proportion.
+     field index, field-only mean field index and peak proportion; and (v27_6) the MEAN OCCUPANCY
+     map of the sessions those cells came from (per-session dwell map smoothed with sigma
+     OCC_SMOOTH_SIGMA_BINS, normalised 0-1, averaged over sessions; see the OCCUPANCY section).
+     The occupancy map is a 4th map kind and goes through stages 2-5 exactly like the other three
+     (green / magenta = significantly over- / under-occupied).
   2. KDE -- a 2D Gaussian KDE (scipy gaussian_kde, Scott's rule, edge-corrected over the bins the
-     cells validly sampled) of each of the three pooled maps.
+     cells validly sampled) of each of the four pooled maps.
   3. BIN-SHUFFLE BOOTSTRAP, METHOD 2 (run_shuffle_duong; described in detail directly below) --
      each pooled map's bins shuffled N_SHUFFLE times, every shuffled map fitted with the same KDE
      and compared with the real KDE by the Duong test (Duong 2013, "Local significant differences
      from nonparametric two-sample tests", J. Nonparametric Statistics 25:3, 635-645; see the
      DUONG section below). Regions where the real density is consistently significantly above
      the shuffles are outlined in GREEN_ABOVE, consistently below in MAGENTA_BELOW.
-  4. RAYLEIGH (v27_5; open field and circular track; run right after stage 1) -- each of the three
+  4. RAYLEIGH (v27_5; open field and circular track; run right after stage 1) -- each of the four
      pooled maps is averaged in 12 deg sectors and the sector magnitudes are tested with a unimodal
      and a bimodal (axial) Rayleigh test. Open field: the map is first multiplied by a wall
      multiplier (0 at the centre, 1 at the wall) and sectors are averaged with an area correction
@@ -27,16 +31,23 @@ PIPELINE (run_full_pipeline), per arena:
      topographic index (left - right or top - down) and magnetic north index (mN side - mS side),
      each / number of significant bins, in the raw tracking frame. See the ARM PREFERENCE section.
      Outputs OUTPUT_DIR/SessionType/Linear_ArmPreference_<kind>.png and Linear_ArmPreference.xlsx.
+     The same two indices are computed on the pointwise ENVELOPE bins (real density above the
+     97.5th = higher firing, green / below the 2.5th percentile of the shuffles = lower firing,
+     magenta), one figure per map kind x direction: Linear_ArmPreference_Envelope_<kind>_<Higher|
+     Lower>.png and Linear_ArmPreference_Envelope.xlsx.
 
 METHOD 2 -- BIN-SHUFFLE BOOTSTRAP OF THE DUONG TEST (stage 3), per map kind x arena:
   Step 1 -- shuffle (shuffle_map_values): the values the KDE is fitted to (the pooled map inside
      the KDE domain = the bins the cells validly sampled, unsampled field-only / peak bins = 0) are
      randomly permuted across the domain bins. The value distribution and the domain are kept;
      where each value sits is randomised.
-  Step 2 -- the shuffled map is fitted with exactly the real KDE (kde_density_map: Scott's rule,
-     same edge correction, same domain).
+  Step 2 -- the shuffled map is fitted with exactly the real KDE (kde_density_map: same edge
+     correction, same domain and, with DUONG_COMMON_BANDWIDTH, the real KDE's Scott bandwidth
+     matrix H, so both sides are smoothed identically; else its own Scott H).
   Step 3 -- Duong test, real KDE vs shuffled KDE (duong_compare_arena, Hochberg at DUONG_ALPHA):
-     every evaluation bin is significantly ABOVE, significantly BELOW or not different.
+     every evaluation bin with ESS >= DUONG_MIN_ESS on both sides is significantly ABOVE,
+     significantly BELOW or not different; bins below the ESS floor are not tested (= not
+     significant in that shuffle).
   Step 4 -- repeat N_SHUFFLE (1000) times. Per bin: f_above = fraction of shuffles in which it was
      significantly above, f_below likewise.
   Step 5 -- consistency: a bin is consistently ABOVE (green) if f_above >= SHUFFLE_CONSISTENCY,
@@ -135,9 +146,11 @@ only the coordinate transform, adaptive-disc wrap-around and plotting differ per
 Outputs (OUTPUT_DIR/AllArenas, and the same files, for that one arena, in every
 OUTPUT_DIR/SessionType/<Arena>_<type> folder):
   Mean maps      WholeRM_MeanFieldIndex.png, FieldOnly_MeanFieldIndex.png, PeakProportion_Map.png,
+                 Occupancy_MeanMap.png,
                  AllArenas_Summary.xlsx (<Arena>_<type>_Summary.xlsx in a session-type folder)
   KDE            KDE_<stem>.png / .npz, stem = FigS1H_MeanFieldIndex, FieldOnly_MeanFieldIndex,
-                 PeakProportion_Map
+                 PeakProportion_Map, Occupancy_MeanMap
+  Rayleigh       Rayleigh_OpenField / _CircularTrack .png / .xlsx (one column / rows per map kind)
   Method 2       ShuffleDuong_<kind>.png (rows = arenas; real KDE, one shuffled map, mean shuffled
                  KDE, signed consistency f_above - f_below, consistent clusters, pointwise
                  envelope), ShuffleDuong_Clusters.xlsx (sheets Tests, Clusters),
@@ -156,7 +169,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.sparse import csr_matrix
 from scipy.stats import chi2, gaussian_kde, norm as normal_dist
 
@@ -173,8 +186,9 @@ from matplotlib.lines import Line2D
 # CONFIGURATION -- edit root folder + geometry below
 # ============================================================================
 
-ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99_Bin2'
-OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_M2_BinShuffle_AdptBin')
+ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiAdptBin_CI99_Bin2'
+#ROOT_DIRECTORY = r'C:\Runita\NMR\analysis\AllSort_Results\PlaceCell\Data'
+OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_M2_BinShuffle_AdptBin_LinCorr')
 
 USE_BIN_COVERAGE_CRITERION = False
 COVERAGE_FRACTION = 0.01
@@ -307,6 +321,9 @@ SPEED_FILTER_OCCUPANCY = True
 FIELD_PEAK_FRAC = 0.20
 MIN_FIELD_BINS  = 9
 
+# --- Mean occupancy map (4th map kind; see the OCCUPANCY section) ---
+OCC_SMOOTH_SIGMA_BINS = 1.5   # Gaussian smoothing of each session's dwell map, in bins (0 = none)
+
 KDE_BW_METHOD = 'scott'
 KDE_EDGE_CORRECTION = True
 
@@ -323,6 +340,8 @@ SHUFFLE_MAX_WORKERS = 4        # worker processes over the (map kind, arena) job
 DUONG_ALPHA            = 0.05     # family-wise level per (map kind, arena), Hochberg step-up
 DUONG_SAMPLE_SIZE_MODE = 'neff'   # 'neff' or 'cells' (see the DUONG section)
 DUONG_RENORMALISE_ON_COMMON_DOMAIN = True
+DUONG_COMMON_BANDWIDTH = True     # shuffled KDEs use the real KDE's bandwidth matrix H (False = own Scott H)
+DUONG_MIN_ESS          = 5.0      # bins tested only where both KDEs have ESS >= this (0 = no filter)
 DUONG_MIN_CLUSTER_BINS = 1        # clusters smaller than this are not outlined / reported
 GREEN_ABOVE   = '#39FF14'         # fluorescent green: real significantly ABOVE null
 MAGENTA_BELOW = '#FF00FF'         # fluorescent magenta: real significantly BELOW null
@@ -338,7 +357,7 @@ RAYLEIGH_N_PERM          = 10000   # sector-permutation null of the mean resulta
 RAYLEIGH_ALPHA           = 0.05    # on p_perm, for the unimodal / bimodal / none pattern call
 RAYLEIGH_SEED            = 20261013
 
-# --- Linear track arm preference of the Duong-consistent bins (see the ARM PREFERENCE section) ---
+# --- Linear track arm preference of the Duong-consistent and envelope bins (see the ARM PREFERENCE section) ---
 RUN_LINEAR_ARM_PREFERENCE = True    # needs RUN_SESSION_TYPES
 # Arm of the + maze and magnetic-north side of every linear session type, in the raw tracking
 # frame (x to the right, y UP): 0 / 180 = horizontal (-) arm, 90 / 270 = vertical (|) arm.
@@ -1265,6 +1284,74 @@ def _union_valid(handler, results: list) -> np.ndarray:
     return visited
 
 
+# ============================================================================
+# OCCUPANCY -- mean occupancy map (4th map kind, analysed exactly like the three rate maps)
+# ============================================================================
+# Built as in batch_occupancy_maps_v2.py (dwell time per 2 x 2 cm bin, Gaussian smoothing with
+# sigma OCC_SMOOTH_SIGMA_BINS = 1.5 bins, > 90 cm/s jumps removed), on this script's bins and
+# trajectory, so it is sampled exactly like the rate maps:
+#   1. dwell map (s) of every session that contributed cells -- the speed-filtered occ_map every
+#      cell of that session was computed with (one map per session, not per cell, so a session
+#      with many cells is not over-weighted);
+#   2. smoothed inside the arena (normalised convolution: bins outside the arena neither give nor
+#      take dwell, so wall occupancy does not leak out of the open field; wraps on the circular
+#      track). An unvisited arena bin is 0 s of dwell, not missing;
+#   3. normalised 0-1 per session (field_index_map: longest-dwell bin 1, shortest 0), so a long
+#      session does not outweigh a short one, as the field index does for a high-rate cell;
+#   4. mean over sessions per bin.
+# Downstream (KDE, Method 2 shuffle, Rayleigh, arm preference) uses the same domain as the rate
+# maps (bins the cells validly sampled). 'Higher' / 'lower' = significantly over- / under-occupied.
+
+def _gaussian_smooth_2d(values: np.ndarray, valid_mask: np.ndarray, sigma: float,
+                        wrap_x: bool = False) -> np.ndarray:
+    """Gaussian smoothing restricted to valid_mask (normalised convolution); 0 outside it."""
+    if sigma <= 0:
+        return np.where(valid_mask, values, 0.0)
+    mode = ('wrap' if wrap_x else 'constant', 'constant')
+    num = gaussian_filter(np.where(valid_mask, values, 0.0), sigma=sigma, mode=mode, cval=0.0)
+    den = gaussian_filter(valid_mask.astype(np.float64), sigma=sigma, mode=mode, cval=0.0)
+    out = np.zeros_like(num)
+    ok = valid_mask & (den > 0)
+    out[ok] = num[ok] / den[ok]
+    return out
+
+
+def session_occupancy_maps(handler, results: list) -> list:
+    """Steps 1-3: one smoothed, 0-1 normalised dwell map per session in results."""
+    by_session = {}
+    for r in results:
+        by_session.setdefault(r['session'], r['occ_map'])
+    arena = handler.geom_valid
+    maps = []
+    for session, occ in sorted(by_session.items()):
+        occ_smooth = _gaussian_smooth_2d(np.where(arena, occ, 0.0).reshape(handler.nx, handler.ny),
+                                         arena.reshape(handler.nx, handler.ny),
+                                         OCC_SMOOTH_SIGMA_BINS, wrap_x=handler.wrap_x).ravel()
+        maps.append(dict(session=session, occ_smooth=occ_smooth,
+                         occ_norm=field_index_map(occ_smooth, arena), total_s=float(occ[arena].sum())))
+    return maps
+
+
+def pool_occupancy_map(handler, results: list) -> tuple:
+    """Step 4. (mean normalised occupancy, NaN outside the arena; arena bins any session visited;
+    number of sessions)."""
+    sessions = session_occupancy_maps(handler, results)
+    mean_map = np.full(handler.n_bins, np.nan)
+    visited = np.zeros(handler.n_bins, dtype=bool)
+    for r in results:
+        visited |= r['occ_map'] > 0
+    visited &= handler.geom_valid
+    if sessions:
+        mean_map[handler.geom_valid] = np.mean([m['occ_norm'][handler.geom_valid] for m in sessions],
+                                               axis=0)
+    return mean_map, visited, len(sessions)
+
+
+def _n_pooled(kind: str, results: list) -> int:
+    """Number of maps pooled into one mean map: sessions for the occupancy map, cells otherwise."""
+    return len({r['session'] for r in results}) if kind == 'occupancy' else len(results)
+
+
 # map kind -> (pool fn -> (values, values_are_mass), title, KDE 'scaled' units, map colourbar
 #              label, file stem: KDE figure = KDE_<stem>)
 _KDE_MAP_KINDS = {
@@ -1277,7 +1364,15 @@ _KDE_MAP_KINDS = {
     'peak': (lambda h, res: (pool_peak_proportion_map(h, res)[0], True),
              'Peak proportion map', '% of cells per bin', '% of cells with peak in bin',
              'PeakProportion_Map'),
+    # Last, so the seeds of the three rate-map kinds (indexed by position) are unchanged.
+    'occupancy': (lambda h, res: (pool_occupancy_map(h, res)[0], False),
+                  'Mean occupancy map', 'normalised occupancy',
+                  'Mean normalised occupancy (a.u.)', 'Occupancy_MeanMap'),
 }
+
+# What 'higher' / 'lower' (green / magenta) bins mean for each map kind, in figure titles.
+_KIND_QUANTITY = {'overall': 'firing', 'field_only': 'firing', 'peak': 'firing',
+                  'occupancy': 'occupancy'}
 
 
 # ============================================================================
@@ -1296,7 +1391,10 @@ def _kernel_mass_in_domain(eval_pts: np.ndarray, dom_pts: np.ndarray, dom_area: 
 
 
 def kde_density_map(handler, values_flat: np.ndarray, domain_flat: np.ndarray,
-                    values_are_mass: bool = False) -> dict | None:
+                    values_are_mass: bool = False, cov: np.ndarray | None = None) -> dict | None:
+    """Weighted 2D Gaussian KDE of a map over its domain. Bandwidth matrix H: KDE_BW_METHOD
+    (Scott's rule) from these data if cov is None, else H = cov as given (the shuffled maps with
+    DUONG_COMMON_BANDWIDTH; 'factor' is then NaN, as no rule was applied)."""
     domain_flat = domain_flat.astype(bool)
     pts  = handler.bin_centres_xy()
     area = handler.bin_areas_cm2()
@@ -1307,16 +1405,23 @@ def kde_density_map(handler, values_flat: np.ndarray, domain_flat: np.ndarray,
     fit = mass > 0
     if fit.sum() < 3:
         return None
-    try:
-        kde = gaussian_kde(pts[:, fit], bw_method=KDE_BW_METHOD, weights=mass[fit])
-    except (np.linalg.LinAlgError, ValueError) as e:
-        return None
 
     ev = pts[:, domain_flat]
-    dens_raw = kde(ev)
+    if cov is None:
+        try:
+            kde = gaussian_kde(pts[:, fit], bw_method=KDE_BW_METHOD, weights=mass[fit])
+        except (np.linalg.LinAlgError, ValueError) as e:
+            return None
+        H, factor, neff = kde.covariance, float(kde.factor), float(kde.neff)
+        dens_raw = kde(ev)
+    else:
+        w = mass[fit] / mass[fit].sum()
+        H, factor, neff = np.asarray(cov, dtype=float), float('nan'), float(1.0 / np.sum(w ** 2))
+        # sum_i w_i N(x - y_i; 0, H) = the weighted KDE with bandwidth matrix H
+        dens_raw = _kernel_mass_in_domain(ev, pts[:, fit], w, H)
     dens = dens_raw
     if KDE_EDGE_CORRECTION:
-        kmass = _kernel_mass_in_domain(ev, ev, area[domain_flat], kde.covariance)
+        kmass = _kernel_mass_in_domain(ev, ev, area[domain_flat], H)
         dens = np.where(kmass > 0, dens_raw / np.where(kmass > 0, kmass, 1.0), np.nan)
 
     density_raw = np.full(handler.n_bins, np.nan)
@@ -1328,8 +1433,7 @@ def kde_density_map(handler, values_flat: np.ndarray, domain_flat: np.ndarray,
     scaled = density * total * (area if values_are_mass else 1.0)
 
     return dict(density=density, density_raw=density_raw, scaled=scaled,
-                factor=float(kde.factor), neff=float(kde.neff), cov=kde.covariance,
-                domain=domain_flat)
+                factor=factor, neff=neff, cov=H, domain=domain_flat)
 
 
 def arena_kde(handler, results: list, map_kind: str) -> dict | None:
@@ -1359,9 +1463,14 @@ def arena_kde(handler, results: list, map_kind: str) -> dict | None:
 #      term multiplied by m_{H/2}(x) / m_H(x)^2 -- 1 in the interior, > 1 at a wall. For an
 #      uncorrected KDE the factor reduces to m_{H/2}(x). The m_H computed here is checked against
 #      the correction kde_density_map applied (density / density_raw) as a geometry sanity check.
-#   3. p_j = P(chi^2_1 >= X^2_j); Hochberg (1988) step-up over all m evaluation points of the
-#      (kind, arena) family: j* = max{ j : p_(j) <= alpha / (m - j + 1) }, reject p_(1..j*).
-#   4. Rejected points with f1 > f2: real density significantly ABOVE the null;
+#   3. Minimum effective sample size (Duong's ks::kde.local.test min.ESS / feature::featureSignif
+#      ESS >= 5): ESS_i(x) = n_i f_i(x) / K_H(0) = n_i f_i(x) 2 pi |H_i|^1/2, the effective number of
+#      data points under the kernel at x (f_i = raw KDE, before edge correction / renormalisation).
+#      Only points with min(ESS_1, ESS_2) >= DUONG_MIN_ESS are tested; where the kernel holds too
+#      few points the chi^2 approximation fails. Untested points are never rejected.
+#   4. p_j = P(chi^2_1 >= X^2_j); Hochberg (1988) step-up over the m TESTED evaluation points of
+#      the (kind, arena) family: j* = max{ j : p_(j) <= alpha / (m - j + 1) }, reject p_(1..j*).
+#   5. Rejected points with f1 > f2: real density significantly ABOVE the null;
 #      f1 < f2: significantly BELOW. Each sign is split into 8-connected clusters of bins
 #      (wrapping around the circular track).
 #
@@ -1373,6 +1482,11 @@ def arena_kde(handler, results: list, map_kind: str) -> dict | None:
 #              the test is liberal for those two map kinds; check with 'cells'.
 #   'cells' -- n1 = number of real place cells pooled, n2 = number of null cells pooled.
 #              Conservative for the bin-weighted maps.
+#
+# Bandwidth (DUONG_COMMON_BANDWIDTH): True -> every shuffled KDE uses the real KDE's Scott H, so
+# H1 = H2 and the smoothing bias 1/2 tr(H D^2 f) is the same on both sides (with mean.adj = FALSE,
+# as in ks, a bandwidth difference would otherwise show up as a density difference). False -> each
+# shuffled KDE gets its own Scott H, as ks::kde.local.test does by default (with Hpi).
 
 def _duong_kde_side(handler, kde_out: dict, common: np.ndarray, n: float) -> dict:
     """Density and its asymptotic variance on the common evaluation points for one KDE."""
@@ -1392,11 +1506,12 @@ def _duong_kde_side(handler, kde_out: dict, common: np.ndarray, n: float) -> dic
 
     f_true = f_raw / m_H                             # boundary-unbiased estimate of f(x)
     var = c ** 2 * R_K_GAUSS_2D / (n * np.sqrt(np.linalg.det(H))) * f_true * m_H2
+    ess = n * f_raw * 2.0 * np.pi * np.sqrt(np.linalg.det(H))   # n f(x) / K_H(0)
 
     scale = 1.0
     if DUONG_RENORMALISE_ON_COMMON_DOMAIN:
         scale = 1.0 / float(np.sum(f * area[common]))
-    return dict(f=f * scale, var=var * scale ** 2, scale=scale, H=H, n=n,
+    return dict(f=f * scale, var=var * scale ** 2, ess=ess, scale=scale, H=H, n=n,
                 corrected=corrected, edge_check=edge_check,
                 mass_outside_common=float(1.0 - np.sum(dens[common] * area[common])
                                           / np.nansum(dens[own] * area[own])))
@@ -1439,11 +1554,13 @@ def duong_compare_arena(handler, real_kde: dict, null_kde: dict, n_real: float,
     diff = real['f'] - null['f']
     z = diff / np.sqrt(real['var'] + null['var'])
     x2 = z ** 2
-    p = chi2.sf(x2, df=1)
-    reject, p_cut, j_star = hochberg_reject(p, DUONG_ALPHA)
+    tested = np.minimum(real['ess'], null['ess']) >= DUONG_MIN_ESS
+    p = np.where(tested, chi2.sf(x2, df=1), np.nan)
+    reject = np.zeros(len(p), dtype=bool)
+    reject[tested], p_cut, j_star = hochberg_reject(p[tested], DUONG_ALPHA)
 
     out = dict(common=common, real=real, null=null, f_real=real['f'], f_null=null['f'],
-               diff=diff, z=z, x2=x2, p=p, reject=reject, p_cut=p_cut, j_star=j_star)
+               diff=diff, z=z, x2=x2, p=p, tested=tested, reject=reject, p_cut=p_cut, j_star=j_star)
     for tag, sel in (('above', reject & (diff > 0)), ('below', reject & (diff < 0))):
         mask = np.zeros(handler.n_bins, dtype=bool)
         mask[np.flatnonzero(common)[sel]] = True
@@ -1468,7 +1585,8 @@ def shuffle_duong_job(handler, values: np.ndarray, domain: np.ndarray, values_ar
                       real_kde: dict, n_cells: float, seed, n_iter: int) -> dict:
     """Steps 1-4 for one (map kind, arena): n_iter shuffled maps, their KDEs and their Duong tests
     against the real KDE. Per bin: number of shuffles it was significantly above / below / in the
-    common domain, plus every shuffle's renormalised density and signed z (float32)."""
+    common domain (a bin failing the ESS filter in a shuffle counts as not significant there), plus
+    every shuffle's renormalised density and signed z (float32)."""
     rng = np.random.default_rng(seed)
     n_bins = handler.n_bins
     n_above = np.zeros(n_bins, dtype=np.int64)
@@ -1477,10 +1595,11 @@ def shuffle_duong_job(handler, values: np.ndarray, domain: np.ndarray, values_ar
     f_shuf = np.full((n_iter, n_bins), np.nan, dtype=np.float32)
     z_shuf = np.full((n_iter, n_bins), np.nan, dtype=np.float32)
     f_real = np.full(n_bins, np.nan)
-    n_rejected, factors, example = [], [], None
+    shuf_cov = real_kde['cov'] if DUONG_COMMON_BANDWIDTH else None
+    n_rejected, n_tested, factors, example = [], [], [], None
     for it in range(n_iter):
         sv = shuffle_map_values(values, domain, rng)
-        shuf_kde = kde_density_map(handler, sv, domain, values_are_mass)
+        shuf_kde = kde_density_map(handler, sv, domain, values_are_mass, cov=shuf_cov)
         if shuf_kde is None:
             continue
         if DUONG_SAMPLE_SIZE_MODE == 'neff':
@@ -1499,12 +1618,14 @@ def shuffle_duong_job(handler, values: np.ndarray, domain: np.ndarray, values_ar
         z_shuf[it, common] = res['z']
         f_real[common] = res['f_real']
         n_rejected.append(int(res['reject'].sum()))
+        n_tested.append(int(res['tested'].sum()))
         factors.append(shuf_kde['factor'])
         if example is None:
             example = sv
     return dict(n_above=n_above, n_below=n_below, n_common=n_common, f_shuf=f_shuf, z_shuf=z_shuf,
-                f_real=f_real, n_rejected=np.asarray(n_rejected), factors=np.asarray(factors),
-                example=example, domain=domain, real_factor=real_kde['factor'])
+                f_real=f_real, n_rejected=np.asarray(n_rejected), n_tested=np.asarray(n_tested),
+                factors=np.asarray(factors), example=example, domain=domain,
+                real_factor=real_kde['factor'])
 
 
 def summarise_shuffle(handler, job: dict) -> dict:
@@ -1577,8 +1698,8 @@ def _run_shuffle_jobs(jobs: dict) -> dict:
 def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict, out_dir: str,
                       title_prefix: str = '') -> dict:
     """Steps 1-5 for every map kind x arena with a real KDE; figures, workbook and npz.
-    real_kdes = {kind: {arena: kde}} as returned by plot_kde_maps. Returns the consistent bins,
-    {(kind, arena): {'cons_above', 'cons_below'}}."""
+    real_kdes = {kind: {arena: kde}} as returned by plot_kde_maps. Returns the consistent and the
+    envelope bins, {(kind, arena): {'cons_above', 'cons_below', 'env_above', 'env_below'}}."""
     jobs = {}
     for k_i, (kind, (pool_fn, *_)) in enumerate(_KDE_MAP_KINDS.items()):
         for a_i, arena in enumerate(_ARENA_ORDER):
@@ -1588,7 +1709,8 @@ def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict
             handler, results = arena_handlers[arena], arena_results[arena]
             values, values_are_mass = pool_fn(handler, results)
             jobs[(kind, arena)] = (handler, values, _union_valid(handler, results), values_are_mass,
-                                   real_kde, float(len(results)), [SHUFFLE_SEED, k_i, a_i], N_SHUFFLE)
+                                   real_kde, float(_n_pooled(kind, results)), [SHUFFLE_SEED, k_i, a_i],
+                                   N_SHUFFLE)
     if not jobs:
         print('[shuffle] skipped: no (map kind, arena) with a real KDE')
         return {}
@@ -1606,7 +1728,8 @@ def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict
             handler = arena_handlers[arena]
             s = summarise_shuffle(handler, outputs[(kind, arena)])
             summaries[arena] = s
-            consistent[(kind, arena)] = dict(cons_above=s['cons_above'], cons_below=s['cons_below'])
+            consistent[(kind, arena)] = {tag: s[tag] for tag in ('cons_above', 'cons_below',
+                                                                  'env_above', 'env_below')}
             n_done = len(s['n_rejected'])
             print(f'[shuffle {kind}] {arena}: {n_done} shuffles, {int(s["cons_above"].sum())} bins '
                   f'consistently above ({s["n_above_cl"]} clusters), {int(s["cons_below"].sum())} below '
@@ -1615,8 +1738,12 @@ def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict
                 map_kind=kind, arena=arena, n_shuffles=n_done, alpha=DUONG_ALPHA,
                 sample_size_mode=DUONG_SAMPLE_SIZE_MODE, consistency=SHUFFLE_CONSISTENCY,
                 m_points=int(s['seen'].sum()), n_cells=len(arena_results[arena]),
+                n_maps_pooled=_n_pooled(kind, arena_results[arena]),
                 real_scott_factor=round(s['real_factor'], 4),
+                shuffle_bandwidth='real KDE H' if DUONG_COMMON_BANDWIDTH else 'own Scott H',
                 shuffle_scott_factor_mean=round(float(np.mean(s['factors'])), 4),
+                min_ess=DUONG_MIN_ESS,
+                mean_tested_per_shuffle=round(float(np.mean(s['n_tested'])), 2),
                 mean_rejected_per_shuffle=round(float(np.mean(s['n_rejected'])), 2),
                 frac_shuffles_any_rejection=round(float(np.mean(s['n_rejected'] > 0)), 4),
                 n_bins_consistent_above=int(s['cons_above'].sum()),
@@ -1631,7 +1758,8 @@ def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict
             pre = f'{kind}_{arena}_'
             for name in ('f_real', 'f_shuf_mean', 'env_lo', 'env_hi', 'z_lo', 'z_med', 'z_hi',
                          'f_above', 'f_below', 'cons_above', 'cons_below', 'lab_above', 'lab_below',
-                         'env_above', 'env_below', 'n_rejected', 'factors', 'example', 'domain'):
+                         'env_above', 'env_below', 'n_rejected', 'n_tested', 'factors', 'example',
+                         'domain'):
                 if s[name] is not None:
                     saved[pre + name] = s[name]
         if summaries:
@@ -1659,8 +1787,8 @@ def run_shuffle_duong(arena_handlers: dict, arena_results: dict, real_kdes: dict
 # ============================================================================
 # STAGE 4 -- RAYLEIGH test of the mean maps (open field: wall-weighted; circular track)
 # ============================================================================
-# Per map kind (overall, field-only, peak proportion), on the pooled map inside the bins the cells
-# validly sampled (unsampled field-only bins = 0, as for the KDE).
+# Per map kind (overall, field-only, peak proportion, mean occupancy), on the pooled map inside the
+# bins the cells validly sampled (unsampled field-only bins = 0, as for the KDE).
 # CIRCULAR TRACK: no multiplier and no area correction (the track is 4 cm wide, so there is no
 #   centre-to-wall growth in bin number): every bin goes, by the angle of its centre, into exactly
 #   one RAYLEIGH_SECTOR_DEG sector (4 angular x 2 radial bins per 12 deg sector), the sector value
@@ -1815,7 +1943,8 @@ def run_rayleigh(arena: str, handler, results: list, out_dir: str, title_prefix:
         for method in methods:
             st = rayleigh_test(prof['centres'], prof[method], [RAYLEIGH_SEED, k_i])
             stats[method] = st
-            row = dict(map_kind=kind, arena=arena, n_cells=len(results), sector_mean=method,
+            row = dict(map_kind=kind, arena=arena, n_cells=len(results),
+                       n_maps_pooled=_n_pooled(kind, results), sector_mean=method,
                        primary=method == primary)
             if open_field:
                 row.update(n_rings=prof['n_rings'] if method == 'ring_equalised' else None,
@@ -1856,21 +1985,33 @@ def run_rayleigh(arena: str, handler, results: list, out_dir: str, title_prefix:
 #   vertical arm:   topographic index = (n top   - n down)  / n significant
 #   both:           magnetic index    = (n mN side - n mS side) / n significant
 # i.e. the magnetic index is +topographic when mN is on the left / top side and -topographic
-# otherwise. Undefined (NaN) without significant bins.
+# otherwise. Undefined (NaN) without significant bins. For the mean occupancy map, higher / lower =
+# significantly over- / under-occupied bins.
 # Positions are those of the raw tracking (x to the right, y up). Horizontal sessions are not
 # rotated, so left = the lower half of the map's x. Vertical sessions are rotated on loading
 # (LinearTrackHandler.orient: map x = max(y) - y), a rigid relabelling of the bins that does not
 # change the Duong result, so top (high y) = the lower half of the map's x; the bins are mapped
 # back to their real side, not re-tested on a rotated map.
+# ENVELOPE bins: the same two indices on the pointwise-envelope bins of the same Method 2 run --
+# higher firing (green) = real density above the SHUFFLE_ENVELOPE[1] percentile of the shuffled
+# densities, lower firing (magenta) = below the SHUFFLE_ENVELOPE[0] percentile. The envelope is per
+# bin with no multiple-comparison correction and no consistency criterion, so it usually marks more
+# bins than the Duong test; read it as the descriptive counterpart of the Duong index.
+
+# Bin set -> (higher firing, lower firing) masks in run_shuffle_duong's returned dict.
+ARM_BIN_SETS = {'duong': ('cons_above', 'cons_below'), 'envelope': ('env_above', 'env_below')}
+
 
 def _first_half_label(arm: str) -> tuple:
     """Real sides of the lower / upper half of the map's x for this arm."""
     return ('left', 'right') if arm == 'horizontal' else ('top', 'bottom')
 
 
-def linear_arm_preference(handler, consistent_by_type: dict) -> list:
-    """consistent_by_type = {session type: {(kind, 'linear_track'): {'cons_above', 'cons_below'}}};
-    one row per session type x map kind x direction."""
+def linear_arm_preference(handler, consistent_by_type: dict, bin_set: str = 'duong') -> list:
+    """consistent_by_type = {session type: {(kind, 'linear_track'): {'cons_above', 'cons_below',
+    'env_above', 'env_below'}}}; bin_set picks the masks (ARM_BIN_SETS). One row per session type x
+    map kind x direction."""
+    tag_higher, tag_lower = ARM_BIN_SETS[bin_set]
     first_half = handler.bin_centres_xy()[0] < handler.length / 2.0
     rows = []
     for stype in ARENA_SESSION_TYPES['linear_track']:
@@ -1886,12 +2027,13 @@ def linear_arm_preference(handler, consistent_by_type: dict) -> list:
             c = cons.get((kind, 'linear_track'))
             if c is None:
                 continue
-            for direction, tag in (('higher', 'cons_above'), ('lower', 'cons_below')):
+            for direction, tag in (('higher', tag_higher), ('lower', tag_lower)):
                 sig = c[tag]
                 n_a, n_b = int(np.sum(sig & first_half)), int(np.sum(sig & ~first_half))
                 n = n_a + n_b
                 topo = (n_a - n_b) / n if n else np.nan
-                rows.append(dict(session_type=stype, arm=arm, map_kind=kind, duong_bins=direction,
+                rows.append(dict(bin_set=bin_set, session_type=stype, arm=arm, map_kind=kind,
+                                 direction=direction,
                                  n_significant=n, side_1=side_a, n_side_1=n_a, side_2=side_b, n_side_2=n_b,
                                  mN_side=mn_side, n_mN=n_a if mn_sign > 0 else n_b,
                                  n_mS=n_b if mn_sign > 0 else n_a,
@@ -1900,18 +2042,32 @@ def linear_arm_preference(handler, consistent_by_type: dict) -> list:
 
 
 def run_linear_arm_preference(handler, consistent_by_type: dict, out_dir: str):
-    rows = linear_arm_preference(handler, consistent_by_type)
-    if not rows:
-        print('[arm preference] skipped: no linear session type with Duong results')
-        return
-    df = pd.DataFrame(rows)
-    for kind, (_, title, *_) in _KDE_MAP_KINDS.items():
-        sub = df[df['map_kind'] == kind]
-        if len(sub):
-            plot_linear_arm_preference(sub, title, os.path.join(out_dir, f'Linear_ArmPreference_{kind}.png'))
-    xlsx = os.path.join(out_dir, 'Linear_ArmPreference.xlsx')
-    df.to_excel(xlsx, index=False)
-    print(f'[SAVED] {xlsx}')
+    """Duong bins: one figure per map kind (rows higher | lower), Linear_ArmPreference.xlsx.
+    Envelope bins: one figure per map kind x direction, Linear_ArmPreference_Envelope.xlsx."""
+    for bin_set in ARM_BIN_SETS:
+        rows = linear_arm_preference(handler, consistent_by_type, bin_set)
+        if not rows:
+            print('[arm preference] skipped: no linear session type with Method 2 results')
+            return
+        df = pd.DataFrame(rows)
+        suffix = '' if bin_set == 'duong' else '_Envelope'
+        for kind, (_, title, *_) in _KDE_MAP_KINDS.items():
+            sub = df[df['map_kind'] == kind]
+            if not len(sub):
+                continue
+            quantity = _KIND_QUANTITY[kind]
+            if bin_set == 'duong':
+                plot_linear_arm_preference(sub, title, os.path.join(out_dir, f'Linear_ArmPreference_{kind}.png'),
+                                           quantity)
+            else:
+                for direction in ('higher', 'lower'):
+                    plot_linear_arm_preference_envelope(
+                        sub, title, direction,
+                        os.path.join(out_dir, f'Linear_ArmPreference{suffix}_{kind}_{direction.capitalize()}.png'),
+                        quantity)
+        xlsx = os.path.join(out_dir, f'Linear_ArmPreference{suffix}.xlsx')
+        df.to_excel(xlsx, index=False)
+        print(f'[SAVED] {xlsx}')
 
 
 
@@ -2103,6 +2259,32 @@ def plot_peak_proportion_maps(arena_handlers: dict, arena_results: dict, save_pa
     print(f'[SAVED] {save_path}')
 
 
+def plot_mean_occupancy_maps(arena_handlers: dict, arena_results: dict, save_path: str,
+                             title_prefix: str = ''):
+    """Mean occupancy map per arena (see the OCCUPANCY section); white = never visited."""
+    arenas = _arenas_in(arena_results)
+    fig = plt.figure(figsize=(max(5 * len(arenas), 7), 5))
+    for i, key in enumerate(arenas):
+        handler = arena_handlers[key]
+        mean_map, visited, n_sessions = pool_occupancy_map(handler, arena_results[key])
+        cmap, norm = make_cmap_norm(mean_map[visited])
+
+        proj = 'polar' if key == 'circular_track' else None
+        ax = fig.add_subplot(1, len(arenas), i + 1, projection=proj)
+        pcm = handler.plot_fine(ax, mean_map, visited, cmap, norm)
+
+        ax.set_title(f'{_ARENA_TITLES[key]}\n(n={n_sessions} sessions, '
+                     f'{len(arena_results[key])} place cells)')
+        fig.colorbar(pcm, ax=ax, shrink=0.7, label='Mean normalised occupancy (a.u.)')
+
+    _wrapped_suptitle(fig, f'{title_prefix}Mean occupancy maps (dwell per session smoothed, sigma = '
+                           f'{OCC_SMOOTH_SIGMA_BINS:g} bins, normalised 0-1, averaged over sessions)')
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
+
+
 # --- Stage 2: KDE figures (+ npz) ---
 
 def plot_kde_maps(arena_handlers: dict, arena_results: dict, map_kind: str, save_path: str,
@@ -2223,15 +2405,17 @@ def plot_shuffle_kind(title: str, arena_handlers: dict, summaries: dict, save_pa
         ax = fig.add_subplot(gs[r, 2])
         pc = _draw_bins(ax, handler, seen, s['f_shuf_mean'], dens_cmap, dens_norm)
         _draw_duong_clusters(ax, handler, s)
-        ax.set_title(f"Mean SHUFFLED KDE ({n_done} shuffles)\n"
-                     f"(mean Scott factor {np.mean(s['factors']):.3f})", fontsize=9)
+        bw = ('bandwidth = real KDE H' if DUONG_COMMON_BANDWIDTH
+              else f"mean Scott factor {np.mean(s['factors']):.3f}")
+        ax.set_title(f"Mean SHUFFLED KDE ({n_done} shuffles)\n({bw})", fontsize=9)
         _hbar(fig, pc, ax, 'density (cm$^{-2}$)')
 
         ax = fig.add_subplot(gs[r, 3])
         pc = _draw_bins(ax, handler, seen, s['f_above'] - s['f_below'], div_cmap, TwoSlopeNorm(0.0, -1.0, 1.0))
         _draw_duong_clusters(ax, handler, s)
         ax.set_title(f"Fraction of shuffles significant: above - below\n"
-                     f"(Duong, Hochberg alpha = {DUONG_ALPHA:g}; outlined where >= {SHUFFLE_CONSISTENCY:g})",
+                     f"(Duong, Hochberg alpha = {DUONG_ALPHA:g}, ESS >= {DUONG_MIN_ESS:g}; "
+                     f"outlined where >= {SHUFFLE_CONSISTENCY:g})",
                      fontsize=9)
         _hbar(fig, pc, ax, 'f$_{above}$ - f$_{below}$')
 
@@ -2338,53 +2522,93 @@ def plot_rayleigh(arena: str, handler, panels: dict, n_cells: int, sector_mean: 
 ARM_COLOURS = {'horizontal': '#4C78A8', 'vertical': '#E8853D'}
 
 
-def plot_linear_arm_preference(df: pd.DataFrame, title: str, save_path: str):
-    """One map kind. Columns: topographic index (left - right for 0 / 180, top - down for
-    90 / 270) | magnetic index (mN - mS); rows: Duong bins consistently higher | lower firing."""
-    present = set(df['session_type'])   # grouped by arm: 0, 180 | 90, 270
-    stypes = [t for a in ('horizontal', 'vertical') for t in ARENA_SESSION_TYPES['linear_track']
-              if LINEAR_ARM[t] == a and t in present]
-    fig, axs = plt.subplots(2, 2, figsize=(11, 8.5), sharey=True)
-    for r, (direction, colour) in enumerate((('higher', GREEN_ABOVE), ('lower', MAGENTA_BELOW))):
-        sub = df[df['duong_bins'] == direction].set_index('session_type')
-        for c, (col, ylab) in enumerate((('topographic_index', 'Topographic preference index'),
-                                         ('magnetic_index', 'Magnetic north preference index'))):
-            ax = axs[r, c]
-            ticks = []
-            for i, t in enumerate(stypes):
-                row = sub.loc[t] if t in sub.index else None
-                if c == 0:
-                    lab = f'{t}°\n(left - right)' if LINEAR_ARM[t] == 'horizontal' else f'{t}°\n(top - down)'
-                else:
-                    lab = f'{t}°\n(mN {LINEAR_MN_SIDE[t]})'
-                ticks.append(lab)
-                if row is None or not np.isfinite(row[col]):
-                    ax.text(i, 0.04, 'no sig.\nbins', ha='center', va='bottom', fontsize=8, color='0.4')
-                    continue
-                v = float(row[col])
-                ax.bar(i, v, width=0.6, color=ARM_COLOURS[LINEAR_ARM[t]])
-                ax.text(i, v + (0.04 if v >= 0 else -0.04), f'{v:+.2f}\n(n={int(row["n_significant"])})',
-                        ha='center', va='bottom' if v >= 0 else 'top', fontsize=8)
-            ax.axhline(0.0, color='0.3', lw=0.8)
-            ax.set_xticks(range(len(stypes)))
-            ax.set_xticklabels(ticks, fontsize=9)
-            ax.set_xlim(-0.6, len(stypes) - 0.4)
-            ax.set_ylim(-1.3, 1.3)
-            ax.set_ylabel(ylab)
-            ax.spines[['top', 'right']].set_visible(False)
-            ax.set_title(f'{"Topographic" if c == 0 else "Magnetic"} -- Duong bins consistently '
-                         f'{direction.upper()} than shuffles', fontsize=10)
-            ax.add_patch(matplotlib.patches.Rectangle((0, 1.0), 1, 0.012, transform=ax.transAxes,
-                                                      color=colour, clip_on=False))
+_ARM_INDEX_COLS = (('topographic_index', 'Topographic preference index'),
+                   ('magnetic_index', 'Magnetic north preference index'))
+_DIRECTION_COLOURS = {'higher': GREEN_ABOVE, 'lower': MAGENTA_BELOW}
+
+
+def _arm_pref_session_types(df: pd.DataFrame) -> list:
+    """Linear session types present in df, grouped by arm: 0, 180 | 90, 270."""
+    present = set(df['session_type'])
+    return [t for a in ('horizontal', 'vertical') for t in ARENA_SESSION_TYPES['linear_track']
+            if LINEAR_ARM[t] == a and t in present]
+
+
+def _arm_pref_panel(ax, sub: pd.DataFrame, stypes: list, c: int, direction: str, title: str):
+    """One bar panel: index _ARM_INDEX_COLS[c] per session type of sub (one direction, indexed by
+    session type), bar colour = arm, strip on top = direction colour."""
+    col, ylab = _ARM_INDEX_COLS[c]
+    ticks = []
+    for i, t in enumerate(stypes):
+        row = sub.loc[t] if t in sub.index else None
+        if c == 0:
+            lab = f'{t}°\n(left - right)' if LINEAR_ARM[t] == 'horizontal' else f'{t}°\n(top - down)'
+        else:
+            lab = f'{t}°\n(mN {LINEAR_MN_SIDE[t]})'
+        ticks.append(lab)
+        if row is None or not np.isfinite(row[col]):
+            ax.text(i, 0.04, 'no sig.\nbins', ha='center', va='bottom', fontsize=8, color='0.4')
+            continue
+        v = float(row[col])
+        ax.bar(i, v, width=0.6, color=ARM_COLOURS[LINEAR_ARM[t]])
+        ax.text(i, v + (0.04 if v >= 0 else -0.04), f'{v:+.2f}\n(n={int(row["n_significant"])})',
+                ha='center', va='bottom' if v >= 0 else 'top', fontsize=8)
+    ax.axhline(0.0, color='0.3', lw=0.8)
+    ax.set_xticks(range(len(stypes)))
+    ax.set_xticklabels(ticks, fontsize=9)
+    ax.set_xlim(-0.6, len(stypes) - 0.4)
+    ax.set_ylim(-1.3, 1.3)
+    ax.set_ylabel(ylab)
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.set_title(title, fontsize=10)
+    ax.add_patch(matplotlib.patches.Rectangle((0, 1.0), 1, 0.012, transform=ax.transAxes,
+                                              color=_DIRECTION_COLOURS[direction], clip_on=False))
+
+
+def _arm_pref_finish(fig, suptitle: str, save_path: str, rect: tuple):
     handles = [matplotlib.patches.Patch(color=ARM_COLOURS[a], label=f'{a.capitalize()} arm')
                for a in ('horizontal', 'vertical')]
     fig.legend(handles=handles, loc='lower center', ncol=2, frameon=False, fontsize=10)
-    _wrapped_suptitle(fig, f'Linear track arm preference -- {title}: (side 1 - side 2) / significant bins, '
-                           f'track split at its middle; raw tracking frame (x right, y up)')
-    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    _wrapped_suptitle(fig, suptitle)
+    fig.tight_layout(rect=rect)
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
     print(f'[SAVED] {save_path}')
+
+
+def plot_linear_arm_preference(df: pd.DataFrame, title: str, save_path: str, quantity: str = 'firing'):
+    """One map kind. Columns: topographic index (left - right for 0 / 180, top - down for
+    90 / 270) | magnetic index (mN - mS); rows: Duong bins consistently higher | lower `quantity`
+    (firing; occupancy = over- | under-occupied)."""
+    stypes = _arm_pref_session_types(df)
+    fig, axs = plt.subplots(2, 2, figsize=(11, 8.5), sharey=True)
+    for r, direction in enumerate(('higher', 'lower')):
+        sub = df[df['direction'] == direction].set_index('session_type')
+        for c in range(2):
+            _arm_pref_panel(axs[r, c], sub, stypes, c, direction,
+                            f'{"Topographic" if c == 0 else "Magnetic"} -- Duong bins consistently '
+                            f'{direction.upper()} {quantity} than shuffles')
+    _arm_pref_finish(fig, f'Linear track arm preference -- {title}: (side 1 - side 2) / significant bins, '
+                          f'track split at its middle; raw tracking frame (x right, y up)', save_path,
+                     (0, 0.04, 1, 0.95))
+
+
+def plot_linear_arm_preference_envelope(df: pd.DataFrame, title: str, direction: str, save_path: str,
+                                        quantity: str = 'firing'):
+    """One map kind, one direction of the pointwise envelope (higher = real above the upper
+    percentile of the shuffles, lower = below the lower one). Columns: topographic | magnetic index."""
+    stypes = _arm_pref_session_types(df)
+    sub = df[df['direction'] == direction].set_index('session_type')
+    lo, hi = SHUFFLE_ENVELOPE
+    rule = f'real > {hi:g}th' if direction == 'higher' else f'real < {lo:g}th'
+    fig, axs = plt.subplots(1, 2, figsize=(11, 5.0), sharey=True)
+    for c in range(2):
+        _arm_pref_panel(axs[c], sub, stypes, c, direction,
+                        f'{"Topographic" if c == 0 else "Magnetic"} -- envelope bins {direction.upper()} '
+                        f'{quantity}\n({rule} percentile of the shuffled KDEs)')
+    _arm_pref_finish(fig, f'Linear track arm preference, ENVELOPE bins, {direction} {quantity} -- {title}: '
+                          f'(side 1 - side 2) / envelope bins, track split at its middle; raw tracking '
+                          f'frame (x right, y up)', save_path, (0, 0.07, 1, 0.98))
 
 
 
@@ -2447,13 +2671,15 @@ def run_full_pipeline(arena_handlers: dict, arena_results: dict, out_dir: str, l
     prefix = f'{label} -- ' if label else ''
     print(f'\n{"=" * 70}\n{label or "All arenas"} -> {out_dir}\n{"=" * 70}')
 
-    # 1. Mean rate maps: overall, field-only, peak proportion
+    # 1. Mean rate maps: overall, field-only, peak proportion; and the mean occupancy map
     plot_fig_S1H(arena_handlers, arena_results, os.path.join(out_dir, 'WholeRM_MeanFieldIndex.png'),
                  prefix)
     plot_field_only_mean_maps(arena_handlers, arena_results,
                               os.path.join(out_dir, 'FieldOnly_MeanFieldIndex.png'), prefix)
     plot_peak_proportion_maps(arena_handlers, arena_results,
                               os.path.join(out_dir, 'PeakProportion_Map.png'), prefix)
+    plot_mean_occupancy_maps(arena_handlers, arena_results,
+                             os.path.join(out_dir, 'Occupancy_MeanMap.png'), prefix)
 
     # 4. Rayleigh tests of the mean maps (open field, circular track; run before the slow shuffles)
     if RUN_RAYLEIGH:
