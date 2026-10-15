@@ -158,10 +158,10 @@ from scipy.special import erf
 # ============================================================================
 #ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
 
-ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99_Bin2") 
+ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiAdptBin_CI99_Bin2") 
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'PhasePrec_Results_FitRShuffle'
-OUTPUT_EXCEL_NAME = 'theta_phase_Hilbert.xlsx'   # written to RESULTS_FOLDER
+RESULTS_FOLDER = ROOT_FOLDER / 'Results\PhasePrec_Results_FitRShuffle_CI95'
+OUTPUT_EXCEL_NAME = 'theta_phase_CI95.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 # (no_phase_relation cells share the PhaseLocked folder)
 CLASS_PLOT_FOLDERS = {
@@ -247,7 +247,7 @@ N_FIT_R_SHUFFLES = 1000             # burst-preserving phase permutations; each 
 # --- Step 1/2: theta phase-locking / modulation parameters ---
 PHASE_BIN_SIZE_DEG = 36             # degrees per polar-histogram bin (360 must be divisible by this);
                                      # matches calc_tmi's bin_width_deg for consistency
-ALPHA = 0.01                        # Rayleigh-test / TMI-shuffle significance threshold
+ALPHA = 0.05                        # Rayleigh-test / TMI-shuffle significance threshold
 MIN_SPIKES_FOR_TMI = 50              # min spikes required to run the polar-plot / TMI battery
 N_TMI_SHUFFLES = 1000               # number of surrogate random-phase draws for the TMI shuffle test
 TMI_BURST_MAX_GAP_SEC = 0.05        # consecutive spikes closer than this (Frank et al. 2001: 50 ms) AND

@@ -38,12 +38,12 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
-root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiAdptBin_CI99.xlsx'
+root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\QualFiltData_AllCells'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiSkaggsAdptBin_CI99_2.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiAdptBin_CI99'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
 
 
 # Per-unit figure subfolders, created next to each .ntt file
@@ -120,10 +120,11 @@ YARTSEV_DISC_OCC_S  = 1.0     # occupancy (s) a disc must enclose (Yartsev / Gri
 # 100 gives 3.8 cm in-field / 5.0-5.5 cm out-of-field (more smoothing).
 SKAGGS_ALPHA        = 50.0    # cm * s * sqrt(spike)
 #
-# SAVE_ADAPTIVE_RATEMAP = False skips computing and plotting the display-only
-# adaptive-binned map in the 'ratemaps' figure. It does NOT affect SIR, which
-# still uses the SI_RATEMAP_TYPE ratemap above.
-SAVE_ADAPTIVE_RATEMAP = False
+# SAVE_SI_RATEMAP = True plots the SI_RATEMAP_TYPE ratemap (whichever type is
+# used for SIR / sparsity; display only) below the Gaussian-smoothed map in the
+# 'ratemaps' figure; False skips it. It does NOT affect SIR, which always uses
+# the SI_RATEMAP_TYPE ratemap above.
+SAVE_SI_RATEMAP = True
 #
 # USE_SI_MIN_OCC = True restricts the SIR and sparsity sums to valid bins with
 # >= SI_MIN_OCC_S of occupancy (applied identically to the real data and every
@@ -389,7 +390,7 @@ RUN_CONFIG_VARS = [
     'GAUSSIAN_SIGMA_CM',
     'SI_RATEMAP_TYPE', 'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
     'ADAPTIVE_MAX_RSQ', 'ADAPTIVE_MIN_OCC_S', 'YARTSEV_DISC_OCC_S', 'SKAGGS_ALPHA',
-    'SAVE_ADAPTIVE_RATEMAP',
+    'SAVE_SI_RATEMAP',
     'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
     'PLACE_FIELDS_MAX_TOTAL_AREA_PCT',
     'PLACE_CELL_MIN_SPIKES', 'PLACE_CELL_MIN_PEAK_FR', 'PLACE_CELL_MAX_PEAK_FR',
@@ -1840,16 +1841,16 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
                             ctx_circular: dict | None = None) -> None:
     """Plot the raw trajectory (with spike locations overlaid) beside the
     fixed-bin, Gaussian-smoothed firing-rate map (middle top) and the
-    adaptive-binned firing-rate map (middle bottom) for one cell, and save
+    SI_RATEMAP_TYPE firing-rate map (middle bottom) for one cell, and save
     them next to its .ntt file, in a 'ratemaps' folder (mirrors the 'speed
     modulation' folder convention above).
 
-    The adaptive map (from `spike_map` / `occ_map`) is computed here for
+    The bottom map (from `spike_map` / `occ_map`) is recomputed here for
     DISPLAY ONLY -- it does not feed any metric or the field detection. It is
-    the Skaggs map (_skaggs_adaptive_binned_ratemap, title gives the median
-    disc radius) when SI_RATEMAP_TYPE = 'Skaggs_adaptive_binned', otherwise
-    the Yartsev map (_yartsev_adaptive_binned_ratemap). Bins whose adaptive
-    disc never reached ADAPTIVE_MIN_OCC_S are left blank.
+    the same ratemap the SIR / sparsity use (_si_ratemap); for
+    'Skaggs_adaptive_binned' the title also gives the median disc radius.
+    Bins with no (adaptive / smoothed) occupancy, e.g. an adaptive disc that
+    never reached ADAPTIVE_MIN_OCC_S, are left blank.
 
     `fields_threshold` is the list of threshold-method fields detected for
     this cell, passed only for confirmed (final-verdict) place cells; it is
@@ -1861,24 +1862,31 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
     """
     display_map = np.ma.masked_where(~valid_mask, fr_map)
 
-    if SAVE_ADAPTIVE_RATEMAP:
+    if SAVE_SI_RATEMAP:
         if SI_RATEMAP_TYPE == 'Skaggs_adaptive_binned':
-            fr_adaptive, occ_adaptive, radius_cm = _skaggs_adaptive_core(
+            fr_si, occ_si, radius_cm = _skaggs_adaptive_core(
                 spike_map, occ_map, valid_mask, target_bin_cm)
             med_r = np.nanmedian(radius_cm) if valid_mask.any() else float('nan')
-            adaptive_title = f'Skaggs adaptive (alpha={SKAGGS_ALPHA:g}, median r={med_r:.1f} cm)'
+            si_title = f'Skaggs adaptive (alpha={SKAGGS_ALPHA:g}, median r={med_r:.1f} cm)'
         else:
-            fr_adaptive, occ_adaptive = _yartsev_adaptive_binned_ratemap(spike_map, occ_map, valid_mask)
-            adaptive_title = 'Yartsev adaptive-binned'
-        display_adaptive = np.ma.masked_where(~valid_mask | (occ_adaptive <= 0), fr_adaptive)
+            fr_raw = np.zeros_like(occ_map)
+            fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
+            fr_si, occ_si = _si_ratemap(spike_map, occ_map, fr_raw, fr_map,
+                                        valid_mask, target_bin_cm)
+            si_title = {'raw':                     'Raw (unsmoothed)',
+                        'occ_weighted_smooth':     'Occupancy-weighted smoothed',
+                        'gaussian_smooth':         'Gaussian-smoothed (SIR map)',
+                        'Yartsev_adaptive_binned': 'Yartsev adaptive-binned',
+                        }[SI_RATEMAP_TYPE]
+        display_si = np.ma.masked_where(~valid_mask | (occ_si <= 0), fr_si)
 
     show_fields    = fields_threshold is not None
     n_field_panels = (2 if arena_type == 'Circle' else 1) if show_fields else 0
     n_panels       = 2 + n_field_panels
 
     # Two rows: trajectory and field panel(s) span both rows; the middle
-    # column stacks the Gaussian-smoothed (top) and adaptive-binned (bottom) maps
-    # (Gaussian-smoothed spans both rows if SAVE_ADAPTIVE_RATEMAP is False).
+    # column stacks the Gaussian-smoothed (top) and SI_RATEMAP_TYPE (bottom) maps
+    # (Gaussian-smoothed spans both rows if SAVE_SI_RATEMAP is False).
     fig = Figure(figsize=(6 * n_panels, 11))
     FigureCanvasAgg(fig)
     gs = fig.add_gridspec(2, n_panels)
@@ -1896,7 +1904,7 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
     ax_traj.legend(loc='lower left', bbox_to_anchor=(0, 1), ncol=2, fontsize=8)
 
     # ── middle top: Gaussian-smoothed firing-rate map ───────────────────────
-    ax_rate = fig.add_subplot(gs[0, 1] if SAVE_ADAPTIVE_RATEMAP else gs[:, 1])
+    ax_rate = fig.add_subplot(gs[0, 1] if SAVE_SI_RATEMAP else gs[:, 1])
     extent = [0, n_bins_x * target_bin_cm, 0, n_bins_y * target_bin_cm]
     im = ax_rate.imshow(display_map.T, origin='lower', extent=extent,
                          cmap='jet', interpolation='nearest')
@@ -1905,15 +1913,15 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
     ax_rate.set_xlabel('x (cm)')
     ax_rate.set_ylabel('y (cm)')
 
-    # ── middle bottom: adaptive-binned firing-rate map (display only) ───────
-    if SAVE_ADAPTIVE_RATEMAP:
-        ax_adapt = fig.add_subplot(gs[1, 1])
-        im_adapt = ax_adapt.imshow(display_adaptive.T, origin='lower', extent=extent,
-                                   cmap='jet', interpolation='nearest')
-        fig.colorbar(im_adapt, ax=ax_adapt, label='firing rate (Hz)')
-        ax_adapt.set_title(adaptive_title)
-        ax_adapt.set_xlabel('x (cm)')
-        ax_adapt.set_ylabel('y (cm)')
+    # ── middle bottom: SI_RATEMAP_TYPE firing-rate map (display only) ───────
+    if SAVE_SI_RATEMAP:
+        ax_si = fig.add_subplot(gs[1, 1])
+        im_si = ax_si.imshow(display_si.T, origin='lower', extent=extent,
+                             cmap='jet', interpolation='nearest')
+        fig.colorbar(im_si, ax=ax_si, label='firing rate (Hz)')
+        ax_si.set_title(si_title)
+        ax_si.set_xlabel('x (cm)')
+        ax_si.set_ylabel('y (cm)')
 
     # ── extra panel(s): detected place field(s), confirmed place cells only ──
     if show_fields:

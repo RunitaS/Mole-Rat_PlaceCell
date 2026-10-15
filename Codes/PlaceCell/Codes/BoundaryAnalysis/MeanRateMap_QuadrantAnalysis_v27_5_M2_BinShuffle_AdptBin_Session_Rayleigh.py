@@ -35,6 +35,11 @@ PIPELINE (run_full_pipeline), per arena:
      97.5th = higher firing, green / below the 2.5th percentile of the shuffles = lower firing,
      magenta), one figure per map kind x direction: Linear_ArmPreference_Envelope_<kind>_<Higher|
      Lower>.png and Linear_ArmPreference_Envelope.xlsx.
+  6. ANIMALS (run_animal_analyses; RUN_ANIMALS) -- stages 1-5 repeated on the cells of each animal
+     alone (animal ID from the session path), only on that animal's arenas (ANIMAL_ARENAS), in
+     OUTPUT_DIR/AnimalID/<animal>/AllSessions and .../SessionType/<Arena>_<type>; then comparison
+     figures in OUTPUT_DIR/AnimalID with every animal in its ANIMAL_COLORS colour: Rayleigh vectors
+     (open field, circular track) and linear-track arm preference indices. See the ANIMALS section.
 
 METHOD 2 -- BIN-SHUFFLE BOOTSTRAP OF THE DUONG TEST (stage 3), per map kind x arena:
   Step 1 -- shuffle (shuffle_map_values): the values the KDE is fitted to (the pooled map inside
@@ -363,6 +368,47 @@ RUN_LINEAR_ARM_PREFERENCE = True    # needs RUN_SESSION_TYPES
 # frame (x to the right, y UP): 0 / 180 = horizontal (-) arm, 90 / 270 = vertical (|) arm.
 LINEAR_ARM    = {'0': 'horizontal', '180': 'horizontal', '90': 'vertical', '270': 'vertical'}
 LINEAR_MN_SIDE = {'0': 'left', '180': 'right', '90': 'top', '270': 'bottom'}
+
+# --- Per-animal runs (stage 6; see the ANIMALS section) ---
+RUN_ANIMALS               = True    # whole pipeline per animal -> OUTPUT_DIR/AnimalID/<animal>
+RUN_ANIMAL_SESSION_TYPES  = True    # + per animal x session type (needed for the arm preference)
+ANIMAL_DIR_NAME           = 'AnimalID'
+# Arenas analysed per animal (only these are run / plotted for that animal).
+ANIMAL_ARENAS = {
+    'Fa8477': ['open_field', 'circular_track'],
+    'Fa1059': ['open_field', 'linear_track'],
+    'Fa23BD': ['open_field', 'linear_track'],
+    'Fa5834': ['open_field', 'circular_track'],
+}
+
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
+
+
+def _detect_animal(session_path: str):
+    """Animal ID (ANIMAL_COLORS key) named in a folder of session_path, matched as animal_color
+    does ('Fa8477\\Open\\Day8\\1Cntrl' -> 'Fa8477'); the first matching folder wins. None if none."""
+    for part in re.split(r'[\\/]+', str(session_path).strip()):
+        part = part.upper()
+        for animal_id in ANIMAL_COLORS:
+            if animal_id[2:].upper() in part:
+                return animal_id
+    return None
 
 ntt_dtype = np.dtype([
     ('timestamp',   '<u8'),
@@ -1929,9 +1975,9 @@ def _rayleigh_map(handler, results: list, pool_fn, wall_weighted: bool) -> np.nd
 _RAYLEIGH_FILE = {'open_field': 'Rayleigh_OpenField', 'circular_track': 'Rayleigh_CircularTrack'}
 
 
-def run_rayleigh(arena: str, handler, results: list, out_dir: str, title_prefix: str = ''):
-    """Steps 1-4 for the three map kinds of one arena (open field or circular track); figure +
-    workbook."""
+def run_rayleigh(arena: str, handler, results: list, out_dir: str, title_prefix: str = '') -> dict:
+    """Steps 1-4 for the four map kinds of one arena (open field or circular track); figure +
+    workbook. Returns {map kind: rayleigh_test output of the primary sector mean}."""
     open_field = arena == 'open_field'
     methods = ('ring_equalised', 'plain') if open_field else ('plain',)
     primary = 'ring_equalised' if (open_field and RAYLEIGH_AREA_CORRECTION) else 'plain'
@@ -1971,6 +2017,7 @@ def run_rayleigh(arena: str, handler, results: list, out_dir: str, title_prefix:
         pd.DataFrame(test_rows).to_excel(xw, sheet_name='Tests', index=False)
         pd.DataFrame(sector_rows).to_excel(xw, sheet_name='Sectors', index=False)
     print(f'[SAVED] {xlsx}')
+    return {kind: p['stats'] for kind, p in panels.items()}
 
 
 # ============================================================================
@@ -2041,7 +2088,7 @@ def linear_arm_preference(handler, consistent_by_type: dict, bin_set: str = 'duo
     return rows
 
 
-def run_linear_arm_preference(handler, consistent_by_type: dict, out_dir: str):
+def run_linear_arm_preference(handler, consistent_by_type: dict, out_dir: str, title_prefix: str = ''):
     """Duong bins: one figure per map kind (rows higher | lower), Linear_ArmPreference.xlsx.
     Envelope bins: one figure per map kind x direction, Linear_ArmPreference_Envelope.xlsx."""
     for bin_set in ARM_BIN_SETS:
@@ -2058,13 +2105,13 @@ def run_linear_arm_preference(handler, consistent_by_type: dict, out_dir: str):
             quantity = _KIND_QUANTITY[kind]
             if bin_set == 'duong':
                 plot_linear_arm_preference(sub, title, os.path.join(out_dir, f'Linear_ArmPreference_{kind}.png'),
-                                           quantity)
+                                           quantity, title_prefix)
             else:
                 for direction in ('higher', 'lower'):
                     plot_linear_arm_preference_envelope(
                         sub, title, direction,
                         os.path.join(out_dir, f'Linear_ArmPreference{suffix}_{kind}_{direction.capitalize()}.png'),
-                        quantity)
+                        quantity, title_prefix)
         xlsx = os.path.join(out_dir, f'Linear_ArmPreference{suffix}.xlsx')
         df.to_excel(xlsx, index=False)
         print(f'[SAVED] {xlsx}')
@@ -2576,7 +2623,8 @@ def _arm_pref_finish(fig, suptitle: str, save_path: str, rect: tuple):
     print(f'[SAVED] {save_path}')
 
 
-def plot_linear_arm_preference(df: pd.DataFrame, title: str, save_path: str, quantity: str = 'firing'):
+def plot_linear_arm_preference(df: pd.DataFrame, title: str, save_path: str, quantity: str = 'firing',
+                               title_prefix: str = ''):
     """One map kind. Columns: topographic index (left - right for 0 / 180, top - down for
     90 / 270) | magnetic index (mN - mS); rows: Duong bins consistently higher | lower `quantity`
     (firing; occupancy = over- | under-occupied)."""
@@ -2588,13 +2636,13 @@ def plot_linear_arm_preference(df: pd.DataFrame, title: str, save_path: str, qua
             _arm_pref_panel(axs[r, c], sub, stypes, c, direction,
                             f'{"Topographic" if c == 0 else "Magnetic"} -- Duong bins consistently '
                             f'{direction.upper()} {quantity} than shuffles')
-    _arm_pref_finish(fig, f'Linear track arm preference -- {title}: (side 1 - side 2) / significant bins, '
+    _arm_pref_finish(fig, f'{title_prefix}Linear track arm preference -- {title}: (side 1 - side 2) / significant bins, '
                           f'track split at its middle; raw tracking frame (x right, y up)', save_path,
                      (0, 0.04, 1, 0.95))
 
 
 def plot_linear_arm_preference_envelope(df: pd.DataFrame, title: str, direction: str, save_path: str,
-                                        quantity: str = 'firing'):
+                                        quantity: str = 'firing', title_prefix: str = ''):
     """One map kind, one direction of the pointwise envelope (higher = real above the upper
     percentile of the shuffles, lower = below the lower one). Columns: topographic | magnetic index."""
     stypes = _arm_pref_session_types(df)
@@ -2606,9 +2654,143 @@ def plot_linear_arm_preference_envelope(df: pd.DataFrame, title: str, direction:
         _arm_pref_panel(axs[c], sub, stypes, c, direction,
                         f'{"Topographic" if c == 0 else "Magnetic"} -- envelope bins {direction.upper()} '
                         f'{quantity}\n({rule} percentile of the shuffled KDEs)')
-    _arm_pref_finish(fig, f'Linear track arm preference, ENVELOPE bins, {direction} {quantity} -- {title}: '
+    _arm_pref_finish(fig, f'{title_prefix}Linear track arm preference, ENVELOPE bins, {direction} {quantity} -- {title}: '
                           f'(side 1 - side 2) / envelope bins, track split at its middle; raw tracking '
                           f'frame (x right, y up)', save_path, (0, 0.07, 1, 0.98))
+
+
+# --- Stage 6: per-animal comparison figures ---
+
+# Dark outline around the (pastel) animal colours, so vectors / bars stay visible on white.
+_ANIMAL_HALO = [pe.Stroke(linewidth=4.2, foreground='0.2'), pe.Normal()]
+
+
+def _animals_in(labels) -> list:
+    """Animals of ANIMAL_COLORS present in labels, in ANIMAL_COLORS order."""
+    labels = set(labels)
+    return [a for a in ANIMAL_COLORS if a in labels]
+
+
+def _rayleigh_group_label(arena: str, group: str) -> str:
+    return group if group == RAYLEIGH_ALL_SESSIONS else _session_type_label(arena, group)
+
+
+def plot_rayleigh_animal_comparison(arena: str, groups: dict, save_path: str):
+    """groups = {'All sessions' or session type: {animal: {map kind: rayleigh_test output}}}.
+    Rows = groups, columns = map kinds. Every animal's unimodal mean vector (arrow) and bimodal mean
+    axis (dashed) in its ANIMAL_COLORS colour, length = grouping-corrected R on a shared radial
+    scale; per-animal R, direction and p_perm listed under each panel (* = p_perm < RAYLEIGH_ALPHA)."""
+    kinds = list(_KDE_MAP_KINDS)
+    animals = _animals_in(a for by_animal in groups.values() for a in by_animal)
+    r_all = [st[f'{t}_R_corr'] for by_animal in groups.values() for by_kind in by_animal.values()
+             for st in by_kind.values() for t in ('uni', 'bi') if f'{t}_R_corr' in st]
+    r_max = 1.15 * max(r_all) if r_all and max(r_all) > 0 else 1.0
+    # Each group = a row of polar panels + a row of text axes holding the per-animal statistics.
+    text_h = 0.2 + 0.17 * 2 * len(animals)
+    fig = plt.figure(figsize=(4.8 * len(kinds), 1.2 + (5.0 + text_h) * len(groups)))
+    gs = fig.add_gridspec(2 * len(groups), len(kinds), height_ratios=[5.0, text_h] * len(groups))
+    for g_i, (group, by_animal) in enumerate(groups.items()):
+        for k_i, kind in enumerate(kinds):
+            ax = fig.add_subplot(gs[2 * g_i, k_i], projection='polar')
+            ax.set_ylim(0, r_max)
+            ax.tick_params(axis='y', labelsize=7)
+            lines = []
+            for animal in animals:
+                st = by_animal.get(animal, {}).get(kind)
+                if not st or 'uni_R' not in st:
+                    continue
+                colour = ANIMAL_COLORS[animal]
+                arrow = ax.annotate('', xy=(np.radians(st['uni_dir_deg']), st['uni_R_corr']), xytext=(0, 0),
+                                    arrowprops=dict(arrowstyle='-|>', color=colour, lw=2.4, mutation_scale=16))
+                arrow.arrow_patch.set_path_effects(_ANIMAL_HALO)
+                th2 = np.radians(st['bi_dir_deg'])
+                ax.plot([th2, 0, th2 + np.pi], [st['bi_R_corr'], 0, st['bi_R_corr']], color=colour, lw=2.2,
+                        ls='--', path_effects=_ANIMAL_HALO)
+                star = lambda p: '*' if p < RAYLEIGH_ALPHA else ''
+                lines.append(f'{animal}  uni: R={st["uni_R_corr"]:.3f} @ {st["uni_dir_deg"]:.0f}°, '
+                             f'p={st["uni_p_perm"]:.3g}{star(st["uni_p_perm"])}')
+                lines.append(f'{" " * len(animal)}  bi: R={st["bi_R_corr"]:.3f} @ {st["bi_dir_deg"]:.0f}/'
+                             f'{st["bi_axis2_deg"]:.0f}°, p={st["bi_p_perm"]:.3g}{star(st["bi_p_perm"])}')
+            ax.set_title(f'{_rayleigh_group_label(arena, group)}\n{_KDE_MAP_KINDS[kind][1]}', fontsize=10, pad=12)
+            tax = fig.add_subplot(gs[2 * g_i + 1, k_i])
+            tax.axis('off')
+            tax.text(0.5, 1.0, '\n'.join(lines) if lines else 'no data', transform=tax.transAxes,
+                     ha='center', va='top', multialignment='left', fontsize=7.5, family='monospace')
+
+    handles = [Line2D([], [], color=ANIMAL_COLORS[a], lw=6, path_effects=_ANIMAL_HALO, label=a)
+               for a in animals]
+    handles += [Line2D([], [], color='0.2', lw=2.2, marker='>', markevery=[1], label='Unimodal mean vector'),
+                Line2D([], [], color='0.2', lw=2.2, ls='--', label='Bimodal (axial) mean axis')]
+    fig.legend(handles=handles, loc='lower center', ncol=len(handles), frameon=False, fontsize=10)
+    maps = 'wall-weighted mean maps, sector value = ring-equalised mean' if (
+        arena == 'open_field' and RAYLEIGH_AREA_CORRECTION) else 'mean maps, sector value = plain mean'
+    _wrapped_suptitle(fig, f'{_ARENA_TITLES[arena]} -- Rayleigh vectors per animal ({maps}, '
+                           f'{RAYLEIGH_SECTOR_DEG:g} deg sectors); length = grouping-corrected R, shared '
+                           f'scale; * = p_perm < {RAYLEIGH_ALPHA:g}')
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
+
+
+def plot_arm_preference_animal_comparison(df: pd.DataFrame, title: str, bin_set: str, save_path: str,
+                                          quantity: str = 'firing'):
+    """One map kind, one bin set (Duong-consistent or envelope). Rows: higher | lower `quantity`;
+    columns: topographic | magnetic index. Grouped bars: session types (0, 180 | 90, 270) x animals,
+    bar colour = ANIMAL_COLORS."""
+    stypes = _arm_pref_session_types(df)
+    animals = _animals_in(df['animal'])
+    w = 0.8 / max(len(animals), 1)
+    fig, axs = plt.subplots(2, 2, figsize=(max(11.0, 1.4 * len(stypes) * len(animals) + 4.0), 9.0),
+                            sharey=True)
+    lo, hi = SHUFFLE_ENVELOPE
+    for r, direction in enumerate(('higher', 'lower')):
+        sub = df[df['direction'] == direction]
+        for c, (col, ylab) in enumerate(_ARM_INDEX_COLS):
+            ax = axs[r, c]
+            for j, animal in enumerate(animals):
+                for i, t in enumerate(stypes):
+                    row = sub[(sub['animal'] == animal) & (sub['session_type'] == t)]
+                    if not len(row):            # this animal has no Method 2 run of that session type
+                        continue
+                    x = i - 0.4 + w * (j + 0.5)
+                    v = float(row[col].iloc[0])
+                    if not np.isfinite(v):
+                        ax.text(x, 0.04, 'no sig.\nbins', ha='center', va='bottom', fontsize=6.5, color='0.4')
+                        continue
+                    ax.bar(x, v, width=0.92 * w, color=ANIMAL_COLORS[animal], edgecolor='0.25', lw=0.8)
+                    ax.text(x, v + (0.04 if v >= 0 else -0.04), f'{v:+.2f}\n(n={int(row["n_significant"].iloc[0])})',
+                            ha='center', va='bottom' if v >= 0 else 'top', fontsize=7)
+            ticks = []
+            for t in stypes:
+                side = ('left - right' if LINEAR_ARM[t] == 'horizontal' else 'top - down') if c == 0 \
+                    else f'mN {LINEAR_MN_SIDE[t]}'
+                ticks.append(f'{t}° ({LINEAR_ARM[t][0].upper()} arm)\n({side})')
+            ax.axhline(0.0, color='0.3', lw=0.8)
+            ax.set_xticks(range(len(stypes)))
+            ax.set_xticklabels(ticks, fontsize=9)
+            ax.set_xlim(-0.6, len(stypes) - 0.4)
+            ax.set_ylim(-1.3, 1.3)
+            ax.set_ylabel(ylab)
+            ax.spines[['top', 'right']].set_visible(False)
+            if bin_set == 'duong':
+                what = f'Duong bins consistently {direction.upper()} {quantity} than shuffles'
+            else:
+                rule = f'real > {hi:g}th' if direction == 'higher' else f'real < {lo:g}th'
+                what = f'envelope bins {direction.upper()} {quantity} ({rule} pct of shuffles)'
+            ax.set_title(f'{"Topographic" if c == 0 else "Magnetic"} -- {what}', fontsize=10)
+            ax.add_patch(matplotlib.patches.Rectangle((0, 1.0), 1, 0.012, transform=ax.transAxes,
+                                                      color=_DIRECTION_COLOURS[direction], clip_on=False))
+    handles = [matplotlib.patches.Patch(facecolor=ANIMAL_COLORS[a], edgecolor='0.25', label=a) for a in animals]
+    fig.legend(handles=handles, loc='lower center', ncol=len(handles), frameon=False, fontsize=10)
+    bins = 'Duong-consistent bins' if bin_set == 'duong' else 'ENVELOPE bins'
+    _wrapped_suptitle(fig, f'Linear track arm preference per animal, {bins} -- {title}: (side 1 - side 2) / '
+                           f'significant bins, track split at its middle; H / V = horizontal / vertical arm; '
+                           f'raw tracking frame (x right, y up)')
+    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f'[SAVED] {save_path}')
 
 
 
@@ -2622,7 +2804,8 @@ def export_excel(arena_handlers: dict, arena_results: dict, out_path: str):
     for key, results in arena_results.items():
         for r in results:
             rows.append(dict(
-                arena=key, session_type=r.get('session_type'), session=r['session'], unit=r['unit'],
+                arena=key, animal=r.get('animal'), session_type=r.get('session_type'),
+                session=r['session'], unit=r['unit'],
                 n_spikes=r['n_spikes'], n_spikes_speed_excluded=r.get('n_spikes_speed_excluded'),
                 peak_fr=r['peak_fr'], mean_fr=r['mean_fr'],
                 sir=r['sir'], sparsity=r['sparsity'],
@@ -2639,8 +2822,8 @@ def export_excel(arena_handlers: dict, arena_results: dict, out_path: str):
 
 def collect_all_results(arena_handlers: dict) -> dict:
     """Per-cell rate maps of every arena (computed once, shared by the all-arena and the
-    session-type runs), each cell tagged with its session type ('session_type', None if not
-    recognised)."""
+    session-type runs), each cell tagged with its session type ('session_type') and animal
+    ('animal'), None if not recognised."""
     arena_sessions = {key: find_arena_sessions(key, arena_handlers[key]) for key in _ARENA_ORDER}
     arena_results = {}
     for key in _ARENA_ORDER:
@@ -2649,7 +2832,17 @@ def collect_all_results(arena_handlers: dict) -> dict:
         arena_results[key] = collect_arena_results(arena_handlers[key], arena_sessions[key])
         for r in arena_results[key]:
             r['session_type'] = _detect_session_type(r['session'], key)
+            r['animal'] = _detect_animal(r['session'])
         print(f'[{key}] {len(arena_results[key])} place cells pooled')
+
+        no_animal = sorted({r['session'] for r in arena_results[key] if r['animal'] is None})
+        if no_animal:
+            print(f'WARNING [{key}]: {len(no_animal)} session(s) with no recognisable animal ID '
+                  f'({list(ANIMAL_COLORS)}); left out of the per-animal runs:')
+            for s in no_animal:
+                print(f'    {s}')
+        animal_counts = {a: sum(r['animal'] == a for r in arena_results[key]) for a in ANIMAL_COLORS}
+        print(f'[{key}] place cells per animal: {animal_counts}')
 
         unknown = sorted({r['session'] for r in arena_results[key] if r['session_type'] is None})
         if unknown:
@@ -2664,9 +2857,10 @@ def collect_all_results(arena_handlers: dict) -> dict:
 
 
 def run_full_pipeline(arena_handlers: dict, arena_results: dict, out_dir: str, label: str = '',
-                      summary_name: str = 'AllArenas_Summary.xlsx') -> None:
-    """Stages 1-3 + summary workbook on arena_results ({arena: cells}), saved to out_dir. label
-    (e.g. 'Linear_180') prefixes the figure titles."""
+                      summary_name: str = 'AllArenas_Summary.xlsx') -> tuple:
+    """Stages 1-4 + summary workbook on arena_results ({arena: cells}), saved to out_dir. label
+    (e.g. 'Linear_180') prefixes the figure titles. Returns (run_shuffle_duong's consistent /
+    envelope bins, {arena: {map kind: Rayleigh stats}})."""
     os.makedirs(out_dir, exist_ok=True)
     prefix = f'{label} -- ' if label else ''
     print(f'\n{"=" * 70}\n{label or "All arenas"} -> {out_dir}\n{"=" * 70}')
@@ -2682,10 +2876,12 @@ def run_full_pipeline(arena_handlers: dict, arena_results: dict, out_dir: str, l
                              os.path.join(out_dir, 'Occupancy_MeanMap.png'), prefix)
 
     # 4. Rayleigh tests of the mean maps (open field, circular track; run before the slow shuffles)
+    rayleigh = {}
     if RUN_RAYLEIGH:
         for arena in _RAYLEIGH_FILE:
             if arena_results.get(arena):
-                run_rayleigh(arena, arena_handlers[arena], arena_results[arena], out_dir, prefix)
+                rayleigh[arena] = run_rayleigh(arena, arena_handlers[arena], arena_results[arena],
+                                               out_dir, prefix)
 
     # 2. KDE of every pooled map
     kdes = {'real': {}, 'null': {}}
@@ -2699,7 +2895,105 @@ def run_full_pipeline(arena_handlers: dict, arena_results: dict, out_dir: str, l
                                    title_prefix=prefix)
 
     export_excel(arena_handlers, arena_results, os.path.join(out_dir, summary_name))
-    return consistent
+    return consistent, rayleigh
+
+
+# ============================================================================
+# STAGE 6 -- ANIMALS: the whole analysis per animal + cross-animal comparison figures
+# ============================================================================
+# Every animal of ANIMAL_ARENAS (animal ID detected from the session path, _detect_animal) is run
+# through exactly the same pipeline as the full dataset, on its own cells and only on its arenas:
+#   OUTPUT_DIR/AnimalID/<animal>/AllSessions               stages 1-4, all its session types pooled
+#   OUTPUT_DIR/AnimalID/<animal>/SessionType/<Arena>_<type>  stages 1-4 per session type
+#   OUTPUT_DIR/AnimalID/<animal>/SessionType/Linear_ArmPreference*   stage 5 (linear-track animals)
+# The mean maps, KDEs, shuffles and Rayleigh / arm-preference statistics are therefore all computed
+# from that animal's cells alone. Comparison figures in OUTPUT_DIR/AnimalID, animal = ANIMAL_COLORS:
+#   Rayleigh_AnimalComparison_<OpenField|CircularTrack>.png / .xlsx -- every animal's unimodal mean
+#       vector and bimodal axis per map kind; rows = all sessions pooled + each session type.
+#   Linear_ArmPreference[_Envelope]_AnimalComparison_<kind>.png, Linear_ArmPreference_AnimalComparison.xlsx
+#       -- topographic and magnetic indices per session type, grouped by animal.
+
+RAYLEIGH_ALL_SESSIONS = 'All sessions'   # Rayleigh comparison row of the pooled per-animal run
+
+
+def run_animal_analyses(arena_handlers: dict, arena_results: dict):
+    base_dir = os.path.join(OUTPUT_DIR, ANIMAL_DIR_NAME)
+    rayleigh = {arena: {} for arena in _RAYLEIGH_FILE}   # {arena: {group: {animal: {kind: stats}}}}
+    arm_rows = []
+    for animal, arenas in ANIMAL_ARENAS.items():
+        cells_by_arena = {key: [r for r in arena_results[key] if r['animal'] == animal]
+                          for key in _ARENA_ORDER if key in arenas}
+        cells_by_arena = {key: cells for key, cells in cells_by_arena.items() if cells}
+        if not cells_by_arena:
+            print(f'\n[{animal}] no place cells in {arenas}; skipped')
+            continue
+        animal_dir = os.path.join(base_dir, animal)
+
+        _, ray = run_full_pipeline(arena_handlers, cells_by_arena, os.path.join(animal_dir, 'AllSessions'),
+                                   animal, summary_name=f'{animal}_Summary.xlsx')
+        for arena, by_kind in ray.items():
+            rayleigh[arena].setdefault(RAYLEIGH_ALL_SESSIONS, {})[animal] = by_kind
+
+        if not RUN_ANIMAL_SESSION_TYPES:
+            continue
+        linear_consistent = {}
+        for key, cells_all in cells_by_arena.items():
+            for stype in ARENA_SESSION_TYPES[key]:
+                label = _session_type_label(key, stype)
+                cells = [r for r in cells_all if r['session_type'] == stype]
+                if not cells:
+                    print(f'\n[{animal} {label}] no place cells; skipped')
+                    continue
+                consistent, ray = run_full_pipeline(arena_handlers, {key: cells},
+                                                    os.path.join(animal_dir, 'SessionType', label),
+                                                    f'{animal} {label}',
+                                                    summary_name=f'{animal}_{label}_Summary.xlsx')
+                for arena, by_kind in ray.items():
+                    rayleigh[arena].setdefault(stype, {})[animal] = by_kind
+                if key == 'linear_track':
+                    linear_consistent[stype] = consistent
+
+        if RUN_LINEAR_ARM_PREFERENCE and linear_consistent:
+            handler = arena_handlers['linear_track']
+            run_linear_arm_preference(handler, linear_consistent, os.path.join(animal_dir, 'SessionType'),
+                                      title_prefix=f'{animal} -- ')
+            for bin_set in ARM_BIN_SETS:
+                arm_rows += [dict(animal=animal, **row)
+                             for row in linear_arm_preference(handler, linear_consistent, bin_set)]
+
+    # Cross-animal comparison figures
+    os.makedirs(base_dir, exist_ok=True)
+    for arena, groups in rayleigh.items():
+        if not groups:
+            continue
+        order = [RAYLEIGH_ALL_SESSIONS] + ARENA_SESSION_TYPES[arena]
+        groups = {g: groups[g] for g in order if g in groups}
+        stem = _RAYLEIGH_FILE[arena].replace('Rayleigh_', 'Rayleigh_AnimalComparison_')
+        plot_rayleigh_animal_comparison(arena, groups, os.path.join(base_dir, f'{stem}.png'))
+        rows = [dict(arena=arena, group=_rayleigh_group_label(arena, g), animal=a, map_kind=kind,
+                     **{k: (round(v, 6) if isinstance(v, float) else v) for k, v in st.items()})
+                for g, by_animal in groups.items() for a in _animals_in(by_animal)
+                for kind, st in by_animal[a].items()]
+        xlsx = os.path.join(base_dir, f'{stem}.xlsx')
+        pd.DataFrame(rows).to_excel(xlsx, index=False)
+        print(f'[SAVED] {xlsx}')
+
+    if arm_rows:
+        df = pd.DataFrame(arm_rows)
+        for bin_set in ARM_BIN_SETS:
+            suffix = '' if bin_set == 'duong' else '_Envelope'
+            for kind, (_, title, *_) in _KDE_MAP_KINDS.items():
+                sub = df[(df['bin_set'] == bin_set) & (df['map_kind'] == kind)]
+                if len(sub):
+                    plot_arm_preference_animal_comparison(
+                        sub, title, bin_set,
+                        os.path.join(base_dir, f'Linear_ArmPreference{suffix}_AnimalComparison_{kind}.png'),
+                        _KIND_QUANTITY[kind])
+        xlsx = os.path.join(base_dir, 'Linear_ArmPreference_AnimalComparison.xlsx')
+        with pd.ExcelWriter(xlsx) as xw:
+            for bin_set in ARM_BIN_SETS:
+                df[df['bin_set'] == bin_set].to_excel(xw, sheet_name=bin_set.capitalize(), index=False)
+        print(f'[SAVED] {xlsx}')
 
 
 if __name__ == '__main__':
@@ -2720,9 +3014,9 @@ if __name__ == '__main__':
                 if not cells:
                     print(f'\n[{label}] no place cells; skipped')
                     continue
-                consistent = run_full_pipeline(arena_handlers, {key: cells},
-                                               os.path.join(OUTPUT_DIR, 'SessionType', label), label,
-                                               summary_name=f'{label}_Summary.xlsx')
+                consistent, _ = run_full_pipeline(arena_handlers, {key: cells},
+                                                  os.path.join(OUTPUT_DIR, 'SessionType', label), label,
+                                                  summary_name=f'{label}_Summary.xlsx')
                 if key == 'linear_track':
                     linear_consistent[stype] = consistent
 
@@ -2730,4 +3024,8 @@ if __name__ == '__main__':
         if RUN_LINEAR_ARM_PREFERENCE:
             run_linear_arm_preference(arena_handlers['linear_track'], linear_consistent,
                                       os.path.join(OUTPUT_DIR, 'SessionType'))
+
+    # 6. Whole analysis per animal (its own arenas only) + cross-animal comparison figures
+    if RUN_ANIMALS:
+        run_animal_analyses(arena_handlers, arena_results)
     print('\nDone.')
