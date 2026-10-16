@@ -51,10 +51,10 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed.
-ROOT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_surrogate_simul')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_EDminThresh')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 
 # ---- Acquisition ----

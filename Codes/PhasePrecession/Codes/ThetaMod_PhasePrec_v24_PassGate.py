@@ -133,11 +133,17 @@ v24 changes to Step 3 (pass index; compared against jrclimer/Pass_Index):
     frozen pass index).
   * Field index along the path is bilinearly interpolated from the field-index map
     (was a nearest-bin staircase).
-  * Spatial filter: Butterworth order 3 as in pass_index_parser.m; band edges set by
-    FIELD_AREA_THRESH / FILTER_LOW_PER_RADIUS / FILTER_HIGH_PER_RADIUS.
-  * Only passes whose field index reaches PASS_MIN_PEAK_FI are analysed: the Hilbert
-    pass index is amplitude-blind, so out-of-field wiggles of the filtered trace were
-    being counted as full -1 -> +1 passes (4-15x more passes than field entries).
+  * Place fields are isolated with PlaceCell_Main_v20's threshold method (bins >= 20%
+    of peak AND above the mean rate, visited >= 2 times, 8-connected components of
+    >= 9 bins; 1-D angular map with wrap-around on the Circle track), on Climer's
+    rate map (sigma 6 cm, unvisited bins nearest-filled). See detect_place_fields.
+  * Every field is analysed separately: its own spatial filter band (FILTER_LOW/
+    HIGH_PER_RADIUS / r, r from the field's area; Butterworth order 3 as in
+    pass_index_parser.m), and only passes whose field-index maximum lies inside the
+    field and reaches PASS_MIN_FIELD_PEAK_FRAC of the field's peak. The Hilbert pass
+    index is amplitude-blind, so without this gate out-of-field wiggles of the
+    filtered trace count as full -1 -> +1 passes (4-15x more passes than entries).
+    Field 1 = highest peak rate. One Excel row and one figure (<unit>_F<k>_...) per field.
   * Kempter z-test run on one event per burst (BURST_COLLAPSE_FOR_ZTEST).
   * Density-map occupancy restricted to the same running / kept-pass samples.
   Per-unit figures go to <session>/ThetaMod_PhasePrecession_v24.
@@ -179,8 +185,8 @@ from scipy.special import erf
 
 ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiAdptBin_CI99_Bin2") 
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'PhasePrec_Results_v24_PassGate'
-OUTPUT_EXCEL_NAME = 'theta_phase_CI95.xlsx'   # written to RESULTS_FOLDER
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'PhasePrec_Results_v24_FieldDetect'
+OUTPUT_EXCEL_NAME = 'theta_phase_v24_FieldDetect.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 # (no_phase_relation cells share the PhaseLocked folder)
 CLASS_PLOT_FOLDERS = {
@@ -498,15 +504,20 @@ def spk_pos(pos_ts, pos_xy, spk_ts):
     return pos_xy[idx], idx
 
 
-def rate_map(pos_ts, pos_xy, spk_xy, binside, smth_width):
-    """Occupancy-normalized 2D rate map. Returns (map, occupancy, x_edges, y_edges)."""
+def rate_map(pos_ts, pos_xy, spk_xy, binside, smth_width, sample_mask=None, return_counts=False):
+    """Occupancy-normalized 2D rate map (rate_map.m: unvisited bins filled with the
+    nearest visited value, Gaussian sigma = smth_width / 2, unvisited bins then 0).
+    Returns (map, occupancy, x_edges, y_edges). `sample_mask` (bool per position
+    sample) restricts occupancy to those samples; the grid always spans all of
+    pos_xy. With return_counts=True, the raw spike-count map is appended."""
     mins = np.floor(pos_xy.min(axis=0) / binside) * binside
     maxs = np.ceil(pos_xy.max(axis=0) / binside) * binside
     x_edges = np.arange(mins[0], maxs[0] + binside, binside)
     y_edges = np.arange(mins[1], maxs[1] + binside, binside)
 
     dt = float(np.mean(np.diff(pos_ts)))
-    occupancy, _, _ = np.histogram2d(pos_xy[:, 0], pos_xy[:, 1], bins=[x_edges, y_edges])
+    occ_xy = pos_xy if sample_mask is None else pos_xy[sample_mask]
+    occupancy, _, _ = np.histogram2d(occ_xy[:, 0], occ_xy[:, 1], bins=[x_edges, y_edges])
     occupancy = occupancy * dt
 
     spk_counts, _, _ = np.histogram2d(spk_xy[:, 0], spk_xy[:, 1], bins=[x_edges, y_edges])
@@ -519,6 +530,8 @@ def rate_map(pos_ts, pos_xy, spk_xy, binside, smth_width):
     rmap = gaussian_filter(rmap, sigma=sigma, truncate=3.0, mode='nearest')
     rmap[occupancy == 0] = 0.0
 
+    if return_counts:
+        return rmap, occupancy, x_edges, y_edges, spk_counts
     return rmap, occupancy, x_edges, y_edges
 
 
@@ -618,15 +631,214 @@ def bandpass_filter(data, low, high, fs, order=4, warn_clamp=False):
     return filtered
 
 
-def auto_filter_band(method, rmap, occupancy, binside, n_dims=2):
+def auto_filter_band(method, field_radius_cm):
+    """Spatial filter band (cycles/cm). 'place': from the analysed field's radius r
+    (radius of the circle with the field's area; n_dims == 2 case of
+    pass_index_parser.m), FILTER_LOW/HIGH_PER_RADIUS / r."""
     if method == 'grid':
         return (1.0 / (2 * 170.0), 1.0 / (26.7 / 8.0))
-    # 'place': field radius r from the area with > FIELD_AREA_THRESH of peak rate
-    peak = np.nanmax(rmap)
-    volume = float(np.sum(rmap > FIELD_AREA_THRESH * peak)) * binside ** n_dims
-    r = np.sqrt(volume / np.pi)  # n_dims == 2 case of pass_index_parser.m
-    r = max(r, 1e-6)
+    r = max(float(field_radius_cm), 1e-6)
     return (FILTER_LOW_PER_RADIUS / r, FILTER_HIGH_PER_RADIUS / r)
+
+
+# ============================================================================
+# Place-field isolation: "threshold method" of PlaceCell_Main_v20
+# (detect_place_fields_threshold_2d / _circular), on Climer's rate map
+# ============================================================================
+
+def _visit_counts(flat_idx, n_bins):
+    """Visits per bin: a visit starts whenever the bin index differs from the
+    previous sample's (PlaceCell_Main_v20 _bin_visit_counts)."""
+    flat_idx = np.asarray(flat_idx)
+    if flat_idx.size == 0:
+        return np.zeros(n_bins, dtype=np.int64)
+    starts = np.ones(flat_idx.size, dtype=bool)
+    starts[1:] = flat_idx[1:] != flat_idx[:-1]
+    return np.bincount(flat_idx[starts], minlength=n_bins)
+
+
+def _fit_ring_centre(x, y):
+    """Algebraic (Kasa) circle fit -> (cx, cy) (PlaceCell_Main_v20 _fit_ring_centre)."""
+    A = np.column_stack([x, y, np.ones_like(x)])
+    sol, *_ = np.linalg.lstsq(A, x ** 2 + y ** 2, rcond=None)
+    return sol[0] / 2.0, sol[1] / 2.0
+
+
+def _circular_runs(qualifies):
+    """Contiguous runs of True bins on a circular axis, a run touching both ends
+    merged across the 0/2*pi seam (PlaceCell_Main_v20 _circular_runs)."""
+    n = len(qualifies)
+    if not qualifies.any():
+        return []
+    if qualifies.all():
+        return [list(range(n))]
+    idx = np.flatnonzero(qualifies)
+    runs, current = [], [int(idx[0])]
+    for b in idx[1:]:
+        if b == current[-1] + 1:
+            current.append(int(b))
+        else:
+            runs.append(current)
+            current = [int(b)]
+    runs.append(current)
+    if len(runs) > 1 and runs[0][0] == 0 and runs[-1][-1] == n - 1:
+        runs = runs[1:-1] + [runs[-1] + runs[0]]
+    return runs
+
+
+def _number_fields(fields):
+    """Sort by peak (smoothed) rate, highest first, and number 1..n."""
+    fields.sort(key=lambda f: -f['peak_rate_Hz'])
+    for k, f in enumerate(fields, start=1):
+        f['field_number'] = k
+    return fields
+
+
+def _detect_fields_2d(rmap, occupancy, spk_counts, valid, binside, x_edges, y_edges):
+    """Threshold method on the 2-D map: valid bins with smoothed rate >=
+    FIELD_RATE_THRESHOLD_FRAC * peak AND > the mean raw rate, 8-connected
+    components of >= MIN_FIELD_SIZE_BINS bins."""
+    peak = float(rmap[valid].max())
+    mean_fr = float(spk_counts[valid].sum() / occupancy[valid].sum())
+    qualifies = valid & (rmap >= FIELD_RATE_THRESHOLD_FRAC * peak) & (rmap > mean_fr)
+    labels, n_comp = nd_label(qualifies, structure=np.ones((3, 3), dtype=int))
+    xc, yc = 0.5 * (x_edges[1:] + x_edges[:-1]), 0.5 * (y_edges[1:] + y_edges[:-1])
+    with np.errstate(invalid='ignore', divide='ignore'):
+        raw = np.where(occupancy > 0, spk_counts / occupancy, np.nan)
+
+    fields = []
+    for c in range(1, n_comp + 1):
+        mask = labels == c
+        n_bins = int(mask.sum())
+        if n_bins < MIN_FIELD_SIZE_BINS:
+            continue
+        rates = rmap[mask]
+        bx, by = np.nonzero(mask)
+        area = n_bins * binside ** 2
+        fields.append(dict(
+            mask_2d=mask, peak_rate_Hz=float(rates.max()),
+            peak_rate_raw_Hz=float(np.nanmax(raw[mask])),
+            n_bins=n_bins, area_cm2=area, radius_cm=float(np.sqrt(area / np.pi)),
+            pct_of_occupied_area=100.0 * n_bins / int(valid.sum()),
+            com_x_cm=float(np.sum(rates * xc[bx]) / rates.sum()),
+            com_y_cm=float(np.sum(rates * yc[by]) / rates.sum()),
+            com_theta_deg=np.nan, arc_length_cm=np.nan, track_width_cm=np.nan))
+    return _number_fields(fields), mean_fr, peak
+
+
+def _detect_fields_circular(pos_ts, pos_xy, moving, spk_xy_moving, binside, smth_width,
+                            x_edges, y_edges, occupancy_2d):
+    """Threshold method on the 1-D angular map of the Circle track
+    (PlaceCell_Main_v20 _build_ratemap_circular / detect_place_fields_threshold_circular):
+    bearing around the fitted ring centre binned at ~binside cm of arc, radius discarded,
+    smoothed Climer-style (nearest-fill of unvisited bins, Gaussian sigma = smth_width / 2,
+    wrapping around the ring); qualifying runs of >= MIN_FIELD_SIZE_BINS bins, wrapping
+    across the 0/360 deg seam. Each field also gets a 2-D display mask (occupied 2-D
+    bins whose centre bearing falls in the field). Returns (fields, mean_fr, peak,
+    ring) with ring = dict(cx, cy, bin_w, n_bins, labels) for bearing -> field lookup."""
+    xy = pos_xy[moving]
+    cx, cy = _fit_ring_centre(xy[:, 0], xy[:, 1])
+    r = np.hypot(xy[:, 0] - cx, xy[:, 1] - cy)
+    r_med = float(np.median(r))
+    n_t = max(1, int(round(2 * np.pi * r_med / binside)))
+    bin_w = 2 * np.pi / n_t
+
+    def _theta_bin(p):
+        th = np.mod(np.arctan2(p[:, 1] - cy, p[:, 0] - cx), 2 * np.pi)
+        return np.clip((th / bin_w).astype(int), 0, n_t - 1)
+
+    dt = float(np.mean(np.diff(pos_ts)))
+    bt = _theta_bin(xy)
+    occ = np.bincount(bt, minlength=n_t) * dt
+    spk = np.bincount(_theta_bin(spk_xy_moving), minlength=n_t).astype(float)
+    valid = (occ > 0) & (_visit_counts(bt, n_t) >= FIELD_MIN_VISITS)
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        raw = np.where(occ > 0, spk / occ, np.nan)
+    filled = _fill_nan_nearest(np.tile(raw, 3))[n_t:2 * n_t]      # circular nearest fill
+    smooth = gaussian_filter1d(filled, (smth_width / 2.0) / binside, mode='wrap', truncate=3.0)
+    smooth[occ == 0] = 0.0
+
+    peak = float(smooth[valid].max())
+    mean_fr = float(spk[valid].sum() / occ[valid].sum())
+    qualifies = valid & (smooth >= FIELD_RATE_THRESHOLD_FRAC * peak) & (smooth > mean_fr)
+    track_w = float(np.percentile(r, 100 - RING_RADIAL_CLIP_PCTILE) - np.percentile(r, RING_RADIAL_CLIP_PCTILE))
+
+    xc, yc = 0.5 * (x_edges[1:] + x_edges[:-1]), 0.5 * (y_edges[1:] + y_edges[:-1])
+    gx, gy = np.meshgrid(xc, yc, indexing='ij')
+    grid_tbin = _theta_bin(np.column_stack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+    theta_c = (np.arange(n_t) + 0.5) * bin_w
+
+    fields = []
+    for run in _circular_runs(qualifies):
+        if len(run) < MIN_FIELD_SIZE_BINS:
+            continue
+        run = np.asarray(run)
+        rates = smooth[run]
+        arc = len(run) * bin_w * r_med
+        area = arc * track_w
+        com = np.mod(np.arctan2(np.sum(rates * np.sin(theta_c[run])), np.sum(rates * np.cos(theta_c[run]))),
+                     2 * np.pi)
+        fields.append(dict(
+            theta_bins=run, mask_2d=np.isin(grid_tbin, run) & (occupancy_2d > 0),
+            peak_rate_Hz=float(rates.max()), peak_rate_raw_Hz=float(np.nanmax(raw[run])),
+            n_bins=len(run), area_cm2=area, radius_cm=float(np.sqrt(area / np.pi)),
+            pct_of_occupied_area=100.0 * len(run) / int(valid.sum()),
+            com_x_cm=float(cx + r_med * np.cos(com)), com_y_cm=float(cy + r_med * np.sin(com)),
+            com_theta_deg=float(np.rad2deg(com)), arc_length_cm=arc, track_width_cm=track_w))
+    fields = _number_fields(fields)
+    labels = np.zeros(n_t, dtype=int)
+    for f in fields:
+        labels[f['theta_bins']] = f['field_number']
+    return fields, mean_fr, peak, dict(cx=cx, cy=cy, theta_bin=_theta_bin, labels=labels)
+
+
+def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, method=METHOD) -> dict[str, Any]:
+    """Climer rate map + field-index map, and the place fields of PlaceCell_Main_v20's
+    threshold method on it (2-D, or angular on the Circle track). Immobile frames
+    (< RATEMAP_IMMOBILITY_SPEED_CM_S, smoothed speed) and their spikes are left out,
+    as in PlaceCell_Main_v20. Returns a dict with rate_map, occupancy, x/y_edges,
+    field_index_map, fields (numbered, Field 1 = highest peak rate), mean_fr, and
+    field_label(xy) -> field number (0 = outside every field) for positions."""
+    _, speed = smooth_positions(pos_ts, pos_xy)
+    moving = speed >= RATEMAP_IMMOBILITY_SPEED_CM_S
+    spk_xy, spk_idx = spk_pos(pos_ts, pos_xy, spk_ts)
+    spk_xy_moving = spk_xy[moving[spk_idx]]
+
+    rmap, occupancy, x_edges, y_edges, spk_counts = rate_map(
+        pos_ts, pos_xy, spk_xy_moving, binside, smth_width, sample_mask=moving, return_counts=True)
+    fi_map = field_index_map(rmap, occupancy, method)
+
+    nx, ny = len(x_edges) - 1, len(y_edges) - 1
+
+    def _xy_bins(p):
+        return (np.clip(np.digitize(p[:, 0], x_edges) - 1, 0, nx - 1),
+                np.clip(np.digitize(p[:, 1], y_edges) - 1, 0, ny - 1))
+
+    if arena == 'Circle':
+        fields, mean_fr, peak, ring = _detect_fields_circular(
+            pos_ts, pos_xy, moving, spk_xy_moving, binside, smth_width, x_edges, y_edges, occupancy)
+        detection = 'Circle (1-D angular)'
+
+        def field_label(p):
+            return ring['labels'][ring['theta_bin'](p)]
+    else:
+        bx, by = _xy_bins(pos_xy[moving])
+        valid = (occupancy > 0) & (_visit_counts(bx * ny + by, nx * ny).reshape(nx, ny) >= FIELD_MIN_VISITS)
+        fields, mean_fr, peak = _detect_fields_2d(rmap, occupancy, spk_counts, valid, binside, x_edges, y_edges)
+        detection = '2-D grid'
+        label_map = np.zeros((nx, ny), dtype=int)
+        for f in fields:
+            label_map[f['mask_2d']] = f['field_number']
+
+        def field_label(p):
+            return label_map[_xy_bins(p)]
+
+    for f in fields:
+        f['peak_field_index'] = float(np.nanmax(fi_map[f['mask_2d']])) if f['mask_2d'].any() else np.nan
+    return dict(rate_map=rmap, occupancy=occupancy, x_edges=x_edges, y_edges=y_edges,
+                field_index_map=fi_map, fields=fields, mean_fr=mean_fr, peak_rate=peak,
+                detection=detection, field_label=field_label)
 
 
 # ============================================================================
@@ -1102,43 +1314,47 @@ def burst_events(spk_ts, pass_index, theta):
     return _cmean(pass_index * np.pi) / np.pi, _cmean(theta)
 
 
-def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
-                        method='place', binside='auto', smth_width='auto',
-                        filter_band='auto', lfp_filter_band=(3.0, 7.0),
-                        slope_bnds=None,
-                        phase_spk_ts=None, lfp_theta_mask=None, lfp_phase_unwrapped=None):
-    """`spk_ts` (all spikes) defines the rate map / place field. If `phase_spk_ts`
-    is given (ACG theta-positive spikes), only those spikes enter the pass-index /
-    theta-phase analysis and shuffles. `lfp_theta_mask` (bool per LFP sample), if
-    given, restricts the density-map occupancy to theta-positive samples.
-    `lfp_phase_unwrapped` (per LFP sample), if given, is the precomputed unwrapped
-    Hilbert theta phase of `lfp_sig` filtered to `lfp_filter_band`; otherwise it
-    is computed here."""
-    n_dims = pos_xy.shape[1]
-    if binside == 'auto':
-        binside = 2.0 * n_dims
-    if smth_width == 'auto':
-        smth_width = 3.0 * binside
+def _pass_trace(pos_ts, pos_xy, maps):
+    """Field-independent part of the pass index, computed once per cell and cached
+    in `maps`: jitter-smoothed positions, running mask, the field index (Climer's
+    whole-map field-index map, bilinear) resampled along running arc length, and the
+    field number (maps['field_label']) at every resampled sample."""
+    if 'trace' not in maps:
+        pos_sm, speed = smooth_positions(pos_ts, pos_xy)
+        running = speed >= MIN_SPEED_CM_S
+        field_index = field_index_per_position(pos_sm, maps['field_index_map'],
+                                               maps['x_edges'], maps['y_edges'])
+        cc, ts2, resampled = sample_along_arc(pos_ts, pos_sm, field_index, running)
+        xy2 = np.column_stack([np.interp(ts2, pos_ts, pos_sm[:, 0]), np.interp(ts2, pos_ts, pos_sm[:, 1])])
+        maps['trace'] = dict(pos_sm=pos_sm, running=running, cc=cc, ts2=ts2, resampled=resampled,
+                             arc_label=maps['field_label'](xy2))
+    return maps['trace']
 
-    # Rate map / field index map from all spikes and raw positions (field definition unchanged).
-    spk_xy, _ = spk_pos(pos_ts, pos_xy, spk_ts)
-    rmap, occupancy, x_edges, y_edges = rate_map(pos_ts, pos_xy, spk_xy, binside, smth_width)
-    fi_map = field_index_map(rmap, occupancy, method)
 
-    # Field index along the jitter-smoothed path, bilinear between bins.
-    pos_sm, speed = smooth_positions(pos_ts, pos_xy)
-    running = speed >= MIN_SPEED_CM_S
-    field_index = field_index_per_position(pos_sm, fi_map, x_edges, y_edges)
+def compute_pass_index(pos_ts, pos_xy, maps, field, phase_spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
+                        method='place', filter_band='auto', lfp_filter_band=(3.0, 7.0),
+                        slope_bnds=None, lfp_theta_mask=None, lfp_phase_unwrapped=None):
+    """Pass-index phase precession for ONE place field (`field`, an entry of
+    maps['fields'] from detect_place_fields). `phase_spk_ts` (ACG theta-positive
+    spikes) are the spikes entering the pass-index / theta-phase analysis and
+    shuffles; the rate map / fields in `maps` come from all spikes.
+    `lfp_theta_mask` (bool per LFP sample), if given, restricts the density-map
+    occupancy to theta-positive samples. `lfp_phase_unwrapped` (per LFP sample), if
+    given, is the precomputed unwrapped Hilbert theta phase of `lfp_sig` filtered to
+    `lfp_filter_band`; otherwise it is computed here."""
+    rmap, occupancy = maps['rate_map'], maps['occupancy']
+    x_edges, y_edges, fi_map = maps['x_edges'], maps['y_edges'], maps['field_index_map']
+    trace = _pass_trace(pos_ts, pos_xy, maps)
+    pos_sm, running = trace['pos_sm'], trace['running']
+    cc, ts2, resampled, arc_label = trace['cc'], trace['ts2'], trace['resampled'], trace['arc_label']
+    k = field['field_number']
 
-    if phase_spk_ts is not None:
-        spk_ts = phase_spk_ts
+    spk_ts = phase_spk_ts
     spk_xy, _ = spk_pos(pos_ts, pos_xy, spk_ts)
     n_spikes_input = len(spk_ts)
 
-    cc, ts2, resampled = sample_along_arc(pos_ts, pos_sm, field_index, running)
-
     if filter_band == 'auto':
-        filter_band = auto_filter_band(method, rmap, occupancy, binside, n_dims)
+        filter_band = auto_filter_band(method, field['radius_cm'])
     fs_arc = 1.0 / np.mean(np.diff(cc))
     filtered_field_index = bandpass_filter(resampled, filter_band[0], filter_band[1], fs_arc,
                                            order=SPATIAL_FILTER_ORDER, warn_clamp=True)
@@ -1152,8 +1368,9 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
 
     # Passes: one per cycle of the unwrapped phase (-1 -> +1). The Hilbert phase is
     # amplitude-blind, so every small out-of-field wiggle of the filtered trace is also
-    # a full "pass" (4-15x more passes than real field entries in this data); keep only
-    # passes whose field index actually reaches PASS_MIN_PEAK_FI.
+    # a full "pass" (4-15x more passes than real field entries in this data). A pass
+    # belongs to this field only if the sample where its field index peaks lies inside
+    # the field and reaches PASS_MIN_FIELD_PEAK_FRAC of the field's peak field index.
     pass_offset = int(np.floor((field_phase_unwrapped.min() + np.pi) / (2 * np.pi)))
 
     def _pass_id(ph_unwrapped):
@@ -1161,9 +1378,14 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
 
     trace_pass_id = _pass_id(field_phase_unwrapped).astype(np.int64)
     n_passes = int(trace_pass_id.max()) + 1
+    order = np.lexsort((resampled, trace_pass_id))          # by pass, then field index
+    last_of_pass = np.r_[np.flatnonzero(np.diff(trace_pass_id[order])), len(order) - 1]
+    peak_idx = order[last_of_pass]                           # argmax of field index per pass
     pass_peak_fi = np.full(n_passes, -np.inf)
-    np.maximum.at(pass_peak_fi, trace_pass_id, resampled)
-    good_pass = pass_peak_fi >= PASS_MIN_PEAK_FI
+    pass_peak_label = np.zeros(n_passes, dtype=int)
+    pass_peak_fi[trace_pass_id[peak_idx]] = resampled[peak_idx]
+    pass_peak_label[trace_pass_id[peak_idx]] = arc_label[peak_idx]
+    good_pass = (pass_peak_label == k) & (pass_peak_fi >= PASS_MIN_FIELD_PEAK_FRAC * field['peak_field_index'])
 
     def _in_good_pass(ph_unwrapped):
         pid = _pass_id(ph_unwrapped)
@@ -1192,9 +1414,8 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
     spk_pass_index, spk_theta_phase = spk_pass_index[spk_valid], spk_theta_phase[spk_valid]
     if len(spk_ts) < MIN_SPIKES_FOR_FIT:
         raise TooFewSpikes(
-            f'only {len(spk_ts)} spikes in running (>= {MIN_SPEED_CM_S:g} cm/s) field passes '
-            f'(peak field index >= {PASS_MIN_PEAK_FI:g}; {int(good_pass.sum())} passes) '
-            f'< MIN_SPIKES_FOR_FIT={MIN_SPIKES_FOR_FIT}')
+            f'field {k}: only {len(spk_ts)} spikes in running (>= {MIN_SPEED_CM_S:g} cm/s) passes '
+            f'through the field ({int(good_pass.sum())} passes) < MIN_SPIKES_FOR_FIT={MIN_SPIKES_FOR_FIT}')
 
     # Slope/intercept/fit_R from all analysed spikes; the asymptotic z-test (rho, p) on one
     # event per burst at that slope, since burst spikes share phase and pass index and are
@@ -1304,7 +1525,8 @@ def compute_pass_index(pos_ts, pos_xy, spk_ts, lfp_ts, lfp_sig, lfp_fs, rng,
 
     return {
         'rate_map': rmap, 'occupancy': occupancy, 'x_edges': x_edges, 'y_edges': y_edges,
-        'field_index_map': fi_map,
+        'field_index_map': fi_map, 'field': field, 'fields': maps['fields'],
+        'field_detection': maps['detection'],
         'spk_xy': spk_xy,
         'spk_pass_index': spk_pass_index, 'spk_theta_phase': spk_theta_phase,
         'rho': rho, 'p': p, 's': s, 'b': b, 'fit_R': fit_R,
@@ -1833,18 +2055,32 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
     ax.set_title('Trajectory + analysed spikes (color = pass index)', fontsize=10)
     ax.set_aspect('equal')
 
+    xe, ye = results['x_edges'], results['y_edges']
+    xc, yc = 0.5 * (xe[1:] + xe[:-1]), 0.5 * (ye[1:] + ye[:-1])
+    this_k = results['field']['field_number']
+
+    def _outline_fields(ax, color):
+        """This field solid, the cell's other fields dashed, each labelled F<k>."""
+        for f in results['fields']:
+            if not f['mask_2d'].any() or min(f['mask_2d'].shape) < 2:
+                continue
+            this = f['field_number'] == this_k
+            ax.contour(xc, yc, f['mask_2d'].T.astype(float), levels=[0.5], colors=color,
+                       linewidths=2.0 if this else 1.0, linestyles='solid' if this else 'dashed')
+            ax.text(f['com_x_cm'], f['com_y_cm'], f"F{f['field_number']}", color=color, ha='center',
+                    va='center', fontsize=9, fontweight='bold' if this else 'normal')
+
     ax = axes[0, 1]
-    im = ax.imshow(results['rate_map'].T, origin='lower', cmap='jet',
-                    extent=[results['x_edges'][0], results['x_edges'][-1],
-                            results['y_edges'][0], results['y_edges'][-1]])
+    im = ax.imshow(results['rate_map'].T, origin='lower', cmap='jet', extent=[xe[0], xe[-1], ye[0], ye[-1]])
+    _outline_fields(ax, 'white')
     fig.colorbar(im, ax=ax, label='Rate (Hz)')
-    ax.set_title('Rate map')
+    ax.set_title(f'Rate map (fields: {results["field_detection"]})', fontsize=10)
     ax.set_aspect('equal')
 
     ax = axes[0, 2]
     im = ax.imshow(results['field_index_map'].T, origin='lower', cmap='hot', vmin=0, vmax=1,
-                    extent=[results['x_edges'][0], results['x_edges'][-1],
-                            results['y_edges'][0], results['y_edges'][-1]])
+                    extent=[xe[0], xe[-1], ye[0], ye[-1]])
+    _outline_fields(ax, 'cyan')
     fig.colorbar(im, ax=ax, label='Field index')
     ax.set_title('Field index map')
     ax.set_aspect('equal')
@@ -1864,11 +2100,14 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
     ax.set_title('Density map')
 
     axes[1, 2].axis('off')
+    fld = results['field']
     text_lines = [
+        f"FIELD {this_k} of {len(results['fields'])}: peak {fld['peak_rate_Hz']:.2f} Hz, "
+        f"{fld['area_cm2']:.0f} cm^2 ({fld['pct_of_occupied_area']:.0f}% of arena), r = {fld['radius_cm']:.1f} cm",
         f"spikes: {results['n_spikes_input']} theta -> {results['n_spikes_running']} running "
-        f"-> {results['n_spikes']} in kept passes",
-        f"passes kept = {results['n_passes_kept']} / {results['n_passes_total']} "
-        f"(peak FI >= {PASS_MIN_PEAK_FI:g});  burst events = {results['n_events']}",
+        f"-> {results['n_spikes']} in this field's passes",
+        f"passes kept = {results['n_passes_kept']} / {results['n_passes_total']};  "
+        f"burst events = {results['n_events']}",
         '-- Kempter z-test (on burst events) --' if BURST_COLLAPSE_FOR_ZTEST
         else '-- Kempter (circular-linear, asymptotic z-test) --',
         f"rho = {results['rho']:.3f}",
@@ -1882,9 +2121,9 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
         f"class = {results['precession_class']}",
     ]
     for i, line in enumerate(text_lines):
-        is_class_line = line.startswith('class = ')
-        axes[1, 2].text(0.0, 0.97 - i * 0.075, line, fontsize=9.5,
-                         fontweight='bold' if is_class_line else 'normal')
+        is_bold = line.startswith(('class = ', 'FIELD '))
+        axes[1, 2].text(0.0, 0.99 - i * 0.07, line, fontsize=9,
+                         fontweight='bold' if is_bold else 'normal')
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
@@ -2301,7 +2540,7 @@ def plot_arena_comparison(df_sig: pd.DataFrame, omnibus_df: pd.DataFrame, pairwi
         positions = np.arange(1, len(present) + 1)
         post = pairwise_df[pairwise_df['Metric'] == label]
 
-        stats_lines = [f'Cells: {population}'] if population else []
+        stats_lines = [f'Population: {population}'] if population else []
         stats_lines += [f'{_label(a)} (n={len(v)}): {_desc_str(v)}' for a, v in zip(present, data)]
         stats_lines += _arena_test_lines(omnibus_df[omnibus_df['Metric'] == label], post, group_col)
         fig_w = _bar_fig_width(len(present))
@@ -2427,7 +2666,8 @@ def plot_pi0_phase_by_arena(df_pi0: pd.DataFrame, desc_df: pd.DataFrame, omnibus
     positions = np.arange(1, len(present) + 1)
     lo, hi = PI0_PRECESSION_RANGE_DEG
 
-    stats_lines = [f'Cells: {", ".join(PI0_PHASE_CLASSES)}; animals pooled within {pooled_within}']
+    stats_lines = [f'Place fields (one value per field): {", ".join(PI0_PHASE_CLASSES)}; '
+                   f'animals pooled within {pooled_within}']
     for _, r in desc_df.iterrows():
         stats_lines.append(f'{_label(r[group_col])} (n={int(r["N"])}): circular mean {r["CircMean_deg"]:.1f}°, '
                            f'MRL {r["MRL"]:.2f} | precession range {int(r["N_precession_range"])}/'
@@ -2528,15 +2768,15 @@ def run_group_comparisons(df: pd.DataFrame, group_col: str, group_order, out_dir
         tables['Omnibus'], tables['Pairwise'] = omnibus_df, pairwise_df
         plot_paths = plot_arena_comparison(
             df_sig, omnibus_df, pairwise_df, out_dir / f'{file_prefix}_PhasePrecession',
-            population=f'significantly precessing/recessing cells; {pooled}',
+            population=f'significantly precessing/recessing place fields (one value per field); {pooled}',
             group_col=group_col, group_order=group_order, title_prefix=title_prefix)
         print(f'Phase-precession comparison ({", ".join(map(_label, present))}) plots saved: '
               f'{", ".join(p.name for p in plot_paths)}')
     else:
         skip_msg(present, 'significantly precessing/recessing cells', 'phase-precession')
 
-    # ---- TMI (significantly theta-modulated cells) ----
-    df_tmi_sig = df.loc[df['TMI_Significant'] == True].copy()  # noqa: E712
+    # ---- TMI (significantly theta-modulated cells; one row per cell, not per field) ----
+    df_tmi_sig = df.loc[df['TMI_Significant'] == True].drop_duplicates(['FolderPath', 'Unit']).copy()  # noqa: E712
     present = groups_with_data(df_tmi_sig)
     if len(present) >= 2:
         omnibus_df, pairwise_df = compare_arenas(df_tmi_sig, TMI_COMPARISON_METRICS,
@@ -2677,7 +2917,9 @@ def plot_edmin_epochs(edmin_df: pd.DataFrame, out_path: Path):
 
 
 def process_session(data_folder: Path, rng, edmin_records: list | None = None) -> list[dict]:
-    """Run Steps 1-3 on every unit in one session; returns one row per unit.
+    """Run Steps 1-3 on every unit in one session; returns one row per analysed place
+    field (a multi-field unit gives one row per field, its Steps 1-2 columns repeated),
+    or one row for a unit with no field analysed.
     If `edmin_records` is given (and USE_ACG_THETA_EPOCHS), one dict per ACG
     epoch of each LFP file used (Animal, Session, lfp_file, epoch_index, ED_min,
     peakrangenorm, Status) is appended to it, for the pooled ED_min QC plot."""
@@ -2776,14 +3018,21 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
 
             # Remove this unit's plots from any earlier run, so a cell that no longer
             # passes a step (e.g. now fails the TMI shuffle test) leaves no stale plot.
+            # Per-field plots are <prefix>_F<k>_<suffix>.png; the unnumbered names are older runs'.
             for suffix in ('PolarPlot', 'PhaseHistogram', 'TMIShuffle', 'PassIndex', 'FitRShuffle'):
                 (output_dir / f'{file_prefix}_{suffix}.png').unlink(missing_ok=True)
+            for suffix in ('PassIndex', 'FitRShuffle'):
+                for stale in output_dir.glob(f'{file_prefix}_F[0-9]*_{suffix}.png'):
+                    stale.unlink(missing_ok=True)
             stale_dirs = [RESULTS_FOLDER / MULTILINES_FOLDER,
                           *(RESULTS_FOLDER / d / sub for d in set(CLASS_PLOT_FOLDERS.values())
                             for sub in ('', *FIT_R_SUBFOLDERS.values()))]
+            class_prefix = f'{animal_id}_{session_label}_{unit_label}'
             for stale_dir in stale_dirs:
                 for suffix in ('PassIndex', 'FitRShuffle'):
-                    (stale_dir / f'{animal_id}_{session_label}_{unit_label}_{suffix}.png').unlink(missing_ok=True)
+                    (stale_dir / f'{class_prefix}_{suffix}.png').unlink(missing_ok=True)
+                    for stale in stale_dir.glob(f'{class_prefix}_F[0-9]*_{suffix}.png'):
+                        stale.unlink(missing_ok=True)
 
             # ---- ACG theta-positive spike selection (Steps 1-3 use only these spikes) ----
             spk_ts_all = spk_ts
@@ -2819,8 +3068,11 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
                       f'(< MIN_SPIKES_FOR_TMI={MIN_SPIKES_FOR_TMI}), skipping polar plot / TMI test')
 
             # ---- Step 3: phase precession, gated on Step 2's TMI significance ----
+            # One output row per detected place field (Field 1 = highest peak rate); a unit
+            # with no field analysed (TMI fail, no tracking, no field, ...) keeps one row.
             row['PrecessionTested'] = False
             row['PrecessionSkippedReason'] = ''
+            field_rows: list[dict] = []
             if not metrics['TMI_Significant']:
                 row['PrecessionSkippedReason'] = 'not significantly theta-modulated (TMI shuffle test)'
             elif pos_ts is None:
@@ -2836,85 +3088,130 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
                         f'(< MIN_SPIKES_FOR_FIT={MIN_SPIKES_FOR_FIT})')
                 else:
                     try:
-                        results = compute_pass_index(
-                            pos_ts, pos_xy, spk_ts_all_overlap, lfp_ts, lfp_sig, lfp_fs, rng,
-                            method=METHOD, binside=BINSIDE, smth_width=SMTH_WIDTH,
-                            filter_band=FILTER_BAND, lfp_filter_band=LFP_FILTER_BAND,
-                            slope_bnds=SLOPE_BNDS,
-                            phase_spk_ts=spk_ts_overlap,
-                            lfp_theta_mask=lfp_theta_mask,
-                            lfp_phase_unwrapped=lfp_phase_unwrapped,
-                        )
-                        png_path = output_dir / f'{file_prefix}_PassIndex.png'
-                        plot_unit_summary(pos_xy, results, plot_label, png_path)
-                        # fit_R shuffle-test figure, for every cell the fit_R gate was run on.
-                        fit_r_png = None
-                        if results['shuffle_fit_r'] is not None:
-                            fit_r_png = output_dir / f'{file_prefix}_FitRShuffle.png'
-                            plot_fit_r_shuffle(results, plot_label, fit_r_png)
-                        # Also save the plot into RESULTS_FOLDER/<class folder> (next to the Excel
-                        # file); the CLASS_PLOT_FOLDERS versions get an extra top row with the
-                        # polar plot, TMI histogram and TMI shuffle null.
-                        if results['fit_too_steep']:
-                            class_dir_name = MULTILINES_FOLDER
-                        else:
-                            class_dir_name = CLASS_PLOT_FOLDERS.get(results['precession_class'])
-                        if class_dir_name:
-                            class_dir = RESULTS_FOLDER / class_dir_name
-                            if class_dir_name != MULTILINES_FOLDER and results['shuffle_fit_r'] is not None:
-                                class_dir = class_dir / FIT_R_SUBFOLDERS[results['fit_R_Significant']]
-                            class_dir.mkdir(parents=True, exist_ok=True)
-                            class_png = class_dir / f'{animal_id}_{session_label}_{unit_label}_PassIndex.png'
-                            if class_dir_name == MULTILINES_FOLDER:
-                                shutil.copy2(png_path, class_png)
-                            else:
-                                plot_unit_summary(pos_xy, results, plot_label, class_png,
-                                                  theta=dict(phase_deg=phase_deg, metrics=metrics,
-                                                             shuffle_tmis=shuffle_tmis))
-                            if fit_r_png is not None:
-                                shutil.copy2(fit_r_png, class_dir /
-                                             f'{animal_id}_{session_label}_{unit_label}_FitRShuffle.png')
-                        row['PrecessionTested'] = True
-                        row.update({
-                            'PassIndex_n_spikes': results['n_spikes'],
-                            'PassIndex_n_burst_events': results['n_events'],
-                            'PassIndex_n_spikes_running': results['n_spikes_running'],
-                            'n_passes_total': results['n_passes_total'],
-                            'n_passes_kept': results['n_passes_kept'],
-                            'spatial_filter_band': '%.4f-%.4f' % results['filter_band'],
-                            'rho': results['rho'],
-                            'precession_p': results['p'],
-                            'slope_deg_per_pass': results['slope_deg_per_pass'],
-                            'r_squared': results['r_squared'], 'fit_R': results['fit_R'],
-                            'fit_R_shuffle_p': results['fit_R_shuffle_p'],
-                            'fit_R_Significant': results['fit_R_Significant'],
-                            'phase_range_deg': results['phase_range_deg'],
-                            **{k: v for _, key, *_ in PASS_INDEX_PHASE_POINTS
-                               for k, v in ((f'phase_at_{key}_deg', results[f'phase_at_{key}_deg']),
-                                            (f'phase_at_{key}_range',
-                                             phase_range_label(results[f'phase_at_{key}_deg'])))},
-                            'is_precessing': results['is_precessing'],
-                            'is_recessing': results['is_recessing'],
-                            'is_phase_locked': results['is_phase_locked'],
-                            'PrecessionClass': results['precession_class'],
-                            'n_fit_lines': results['n_fit_lines'],
-                            'MultiLinesFit': results['fit_too_steep'],
-                        })
-                        print(f'  {unit_label}: PRECESSION rho={results["rho"]:.3f}  '
-                              f'p={results["p"]:.3g}  '
-                              f'fitR={results["fit_R"]:.3f} (shuffle p={results["fit_R_shuffle_p"]:.3g})  '
-                              f'slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
-                              f'class={results["precession_class"]}')
-                    except TooFewSpikes as exc:
-                        row['PrecessionSkippedReason'] = str(exc)
-                        print(f'  {unit_label}: precession skipped -- {exc}')
+                        maps = detect_place_fields(pos_ts, pos_xy, spk_ts_all_overlap, detect_arena(data_folder),
+                                                   BINSIDE, SMTH_WIDTH, METHOD)
                     except Exception as exc:
-                        row['PrecessionSkippedReason'] = f'ERROR ({exc})'
-                        print(f'  {unit_label}: phase-precession ERROR ({exc})')
+                        maps = None
+                        row['PrecessionSkippedReason'] = f'ERROR in place-field detection ({exc})'
+                        print(f'  {unit_label}: place-field detection ERROR ({exc})')
+                    if maps is not None and not maps['fields']:
+                        row['n_fields'] = 0
+                        row['FieldDetection'] = maps['detection']
+                        row['PrecessionSkippedReason'] = 'no place field detected (threshold method)'
+                        print(f'  {unit_label}: no place field detected -- precession skipped')
+                    elif maps is not None:
+                        n_fields = len(maps['fields'])
+                        print(f'  {unit_label}: {n_fields} place field(s) ({maps["detection"]})')
+                        for field in maps['fields']:
+                            row_f = _process_field(
+                                row, field, n_fields, maps, pos_ts, pos_xy, spk_ts_overlap,
+                                lfp_ts, lfp_sig, lfp_fs, rng, lfp_theta_mask, lfp_phase_unwrapped,
+                                output_dir, file_prefix, plot_label, class_prefix, unit_label,
+                                dict(phase_deg=phase_deg, metrics=metrics, shuffle_tmis=shuffle_tmis))
+                            field_rows.append(row_f)
 
-            rows.append(row)
+            rows.extend(field_rows if field_rows else [row])
 
     return rows
+
+
+def _field_columns(field, n_fields, detection):
+    """Excel columns describing one place field (one row per field)."""
+    return {
+        'Field': field['field_number'], 'n_fields': n_fields, 'MultiField': n_fields > 1,
+        'FieldDetection': detection,
+        'field_peak_rate_Hz': field['peak_rate_Hz'], 'field_peak_rate_raw_Hz': field['peak_rate_raw_Hz'],
+        'field_n_bins': field['n_bins'], 'field_area_cm2': field['area_cm2'],
+        'field_pct_of_occupied_area': field['pct_of_occupied_area'], 'field_radius_cm': field['radius_cm'],
+        'field_com_x_cm': field['com_x_cm'], 'field_com_y_cm': field['com_y_cm'],
+        'field_com_theta_deg': field['com_theta_deg'], 'field_arc_length_cm': field['arc_length_cm'],
+        'field_track_width_cm': field['track_width_cm'],
+    }
+
+
+def _process_field(row, field, n_fields, maps, pos_ts, pos_xy, spk_ts_overlap,
+                   lfp_ts, lfp_sig, lfp_fs, rng, lfp_theta_mask, lfp_phase_unwrapped,
+                   output_dir, file_prefix, plot_label, class_prefix, unit_label, theta):
+    """Step 3 for one place field of one unit: pass index + phase-precession fit,
+    figures (<prefix>_F<k>_PassIndex / _FitRShuffle, plus the class-folder copy), and
+    the Excel row (the unit's Steps 1-2 columns + this field's columns + its fit)."""
+    k = field['field_number']
+    row_f = {**row, **_field_columns(field, n_fields, maps['detection'])}
+    field_label = f'{plot_label} | Field {k} of {n_fields}'
+    try:
+        results = compute_pass_index(
+            pos_ts, pos_xy, maps, field, spk_ts_overlap, lfp_ts, lfp_sig, lfp_fs, rng,
+            method=METHOD, filter_band=FILTER_BAND, lfp_filter_band=LFP_FILTER_BAND,
+            slope_bnds=SLOPE_BNDS, lfp_theta_mask=lfp_theta_mask,
+            lfp_phase_unwrapped=lfp_phase_unwrapped)
+    except TooFewSpikes as exc:
+        row_f['PrecessionSkippedReason'] = str(exc)
+        print(f'  {unit_label} field {k}: precession skipped -- {exc}')
+        return row_f
+    except Exception as exc:
+        row_f['PrecessionSkippedReason'] = f'ERROR ({exc})'
+        print(f'  {unit_label} field {k}: phase-precession ERROR ({exc})')
+        return row_f
+
+    tag = f'F{k}'
+    png_path = output_dir / f'{file_prefix}_{tag}_PassIndex.png'
+    plot_unit_summary(pos_xy, results, field_label, png_path)
+    # fit_R shuffle-test figure, for every field the fit_R gate was run on.
+    fit_r_png = None
+    if results['shuffle_fit_r'] is not None:
+        fit_r_png = output_dir / f'{file_prefix}_{tag}_FitRShuffle.png'
+        plot_fit_r_shuffle(results, field_label, fit_r_png)
+    # Also save the plot into RESULTS_FOLDER/<class folder> (next to the Excel file);
+    # the CLASS_PLOT_FOLDERS versions get an extra top row with the polar plot, TMI
+    # histogram and TMI shuffle null.
+    if results['fit_too_steep']:
+        class_dir_name = MULTILINES_FOLDER
+    else:
+        class_dir_name = CLASS_PLOT_FOLDERS.get(results['precession_class'])
+    if class_dir_name:
+        class_dir = RESULTS_FOLDER / class_dir_name
+        if class_dir_name != MULTILINES_FOLDER and results['shuffle_fit_r'] is not None:
+            class_dir = class_dir / FIT_R_SUBFOLDERS[results['fit_R_Significant']]
+        class_dir.mkdir(parents=True, exist_ok=True)
+        class_png = class_dir / f'{class_prefix}_{tag}_PassIndex.png'
+        if class_dir_name == MULTILINES_FOLDER:
+            shutil.copy2(png_path, class_png)
+        else:
+            plot_unit_summary(pos_xy, results, field_label, class_png, theta=theta)
+        if fit_r_png is not None:
+            shutil.copy2(fit_r_png, class_dir / f'{class_prefix}_{tag}_FitRShuffle.png')
+
+    row_f['PrecessionTested'] = True
+    row_f.update({
+        'PassIndex_n_spikes': results['n_spikes'],
+        'PassIndex_n_burst_events': results['n_events'],
+        'PassIndex_n_spikes_running': results['n_spikes_running'],
+        'n_passes_total': results['n_passes_total'],
+        'n_passes_kept': results['n_passes_kept'],
+        'spatial_filter_band': '%.4f-%.4f' % results['filter_band'],
+        'rho': results['rho'],
+        'precession_p': results['p'],
+        'slope_deg_per_pass': results['slope_deg_per_pass'],
+        'r_squared': results['r_squared'], 'fit_R': results['fit_R'],
+        'fit_R_shuffle_p': results['fit_R_shuffle_p'],
+        'fit_R_Significant': results['fit_R_Significant'],
+        'phase_range_deg': results['phase_range_deg'],
+        **{c: v for _, key, *_ in PASS_INDEX_PHASE_POINTS
+           for c, v in ((f'phase_at_{key}_deg', results[f'phase_at_{key}_deg']),
+                        (f'phase_at_{key}_range', phase_range_label(results[f'phase_at_{key}_deg'])))},
+        'is_precessing': results['is_precessing'],
+        'is_recessing': results['is_recessing'],
+        'is_phase_locked': results['is_phase_locked'],
+        'PrecessionClass': results['precession_class'],
+        'n_fit_lines': results['n_fit_lines'],
+        'MultiLinesFit': results['fit_too_steep'],
+    })
+    print(f'  {unit_label} field {k}: PRECESSION rho={results["rho"]:.3f}  '
+          f'p={results["p"]:.3g}  '
+          f'fitR={results["fit_R"]:.3f} (shuffle p={results["fit_R_shuffle_p"]:.3g})  '
+          f'slope={results["slope_deg_per_pass"]:.1f} deg/pass  '
+          f'class={results["precession_class"]}')
+    return row_f
 
 
 def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
@@ -2932,46 +3229,59 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     def pct(n, d):
         return (100.0 * n / d) if d > 0 else np.nan
 
-    total_cells = len(df)
-    n_sig_theta = int((df['SignificantThetaModulation'] == True).sum())      # noqa: E712
-    n_tmi_sig = int((df['TMI_Significant'] == True).sum())                   # noqa: E712
-    n_precession_tested = int((df['PrecessionTested'] == True).sum())        # noqa: E712
-    n_precessing = int((df['is_precessing'] == True).sum())                  # noqa: E712
-    n_recessing = int((df['is_recessing'] == True).sum())                    # noqa: E712
-    n_phase_locked = int((df['is_phase_locked'] == True).sum())              # noqa: E712
-    n_no_phase_relation = int((df['PrecessionClass'] == 'no_phase_relation').sum())
+    # df has one row per place field: cell-level counts use one row per unit, and the
+    # precession outcomes are counted per field (the Field rows) and per cell (cells
+    # with >= 1 field of that class).
+    unit_key = ['FolderPath', 'Unit']
+    cells = df.drop_duplicates(unit_key)
+    total_cells = len(cells)
+    n_sig_theta = int((cells['SignificantThetaModulation'] == True).sum())   # noqa: E712
+    n_tmi_sig = int((cells['TMI_Significant'] == True).sum())                # noqa: E712
+    tested = df['PrecessionTested'] == True                                  # noqa: E712
+    n_fields_tested = int(tested.sum())
+    n_cells_tested = int(df.loc[tested, unit_key].drop_duplicates().shape[0])
+    n_multi = int((cells['n_fields'] > 1).sum())
+
+    def n_cells_with(mask):
+        return int(df.loc[mask, unit_key].drop_duplicates().shape[0])
 
     rows = [
+        dict(Metric='Cells with > 1 place field (each field analysed separately)',
+             Count=n_multi, Denominator=total_cells, DenominatorLabel='total cells',
+             Percent=pct(n_multi, total_cells)),
+        dict(Metric='Place fields precession-tested',
+             Count=n_fields_tested, Denominator=np.nan, DenominatorLabel='',
+             Percent=np.nan),
+    ]
+    for cls, col in (('phase_precessing', 'is_precessing'), ('phase_succeeding', 'is_recessing'),
+                     ('phase_locked', 'is_phase_locked'), ('no_phase_relation', None)):
+        mask = (df['PrecessionClass'] == cls) if col is None else (df[col] == True)  # noqa: E712
+        n_f = int(mask.sum())
+        n_c = n_cells_with(mask)
+        rows += [
+            dict(Metric=f'{cls} fields (of precession-tested fields)', Count=n_f,
+                 Denominator=n_fields_tested, DenominatorLabel='precession-tested fields',
+                 Percent=pct(n_f, n_fields_tested)),
+            dict(Metric=f'cells with >= 1 {cls} field (of precession-tested cells)', Count=n_c,
+                 Denominator=n_cells_tested, DenominatorLabel='precession-tested cells',
+                 Percent=pct(n_c, n_cells_tested)),
+        ]
+    n_precessing = n_cells_with(df['is_precessing'] == True)                 # noqa: E712
+    cell_rows = [
         dict(Metric='SignificantThetaModulation (Rayleigh) cells',
              Count=n_sig_theta, Denominator=total_cells, DenominatorLabel='total cells',
              Percent=pct(n_sig_theta, total_cells)),
         dict(Metric='TMI_Significant (theta-modulated) cells',
              Count=n_tmi_sig, Denominator=total_cells, DenominatorLabel='total cells',
              Percent=pct(n_tmi_sig, total_cells)),
-        dict(Metric='PrecessionTested cells',
-             Count=n_precession_tested, Denominator=total_cells, DenominatorLabel='total cells',
-             Percent=pct(n_precession_tested, total_cells)),
-        dict(Metric='phase_precessing cells (of theta-modulated cells)',
+        dict(Metric='PrecessionTested cells (>= 1 field tested)',
+             Count=n_cells_tested, Denominator=total_cells, DenominatorLabel='total cells',
+             Percent=pct(n_cells_tested, total_cells)),
+        dict(Metric='cells with >= 1 phase_precessing field (of theta-modulated cells)',
              Count=n_precessing, Denominator=n_tmi_sig, DenominatorLabel='theta-modulated cells',
              Percent=pct(n_precessing, n_tmi_sig)),
-        dict(Metric='phase_precessing cells (of precession-tested cells)',
-             Count=n_precessing, Denominator=n_precession_tested,
-             DenominatorLabel='precession-tested cells',
-             Percent=pct(n_precessing, n_precession_tested)),
-        dict(Metric='phase_recessing cells (of precession-tested cells)',
-             Count=n_recessing, Denominator=n_precession_tested,
-             DenominatorLabel='precession-tested cells',
-             Percent=pct(n_recessing, n_precession_tested)),
-        dict(Metric='phase_locked cells (of precession-tested cells)',
-             Count=n_phase_locked, Denominator=n_precession_tested,
-             DenominatorLabel='precession-tested cells',
-             Percent=pct(n_phase_locked, n_precession_tested)),
-        dict(Metric='no_phase_relation cells (of precession-tested cells)',
-             Count=n_no_phase_relation, Denominator=n_precession_tested,
-             DenominatorLabel='precession-tested cells',
-             Percent=pct(n_no_phase_relation, n_precession_tested)),
     ]
-    return pd.DataFrame(rows, columns=['Metric', 'Count', 'Denominator', 'DenominatorLabel', 'Percent'])
+    return pd.DataFrame(cell_rows + rows, columns=['Metric', 'Count', 'Denominator', 'DenominatorLabel', 'Percent'])
 
 
 def save_metadata_csv(csv_path: Path) -> Path:
@@ -3012,7 +3322,8 @@ def save_metadata_csv(csv_path: Path) -> Path:
         ('PRECESSION_SIGNIFICANCE_TEST',
          ('fit_R burst-preserving phase-permutation shuffle p < ALPHA (if USE_FIT_R_GATE) AND '
           'Kempter et al. (2012) asymptotic z-test p < ALPHA (on burst events if BURST_COLLAPSE_FOR_ZTEST); '
-          'spikes restricted to speed >= MIN_SPEED_CM_S and passes with peak field index >= PASS_MIN_PEAK_FI')),
+          'per place field: spikes restricted to speed >= MIN_SPEED_CM_S and to passes whose field-index '
+          'peak lies inside the field and reaches PASS_MIN_FIELD_PEAK_FRAC of its peak field index')),
     ]
     pd.DataFrame(rows, columns=['Parameter', 'Value']).to_csv(csv_path, index=False)
     return csv_path
@@ -3049,7 +3360,11 @@ def main():
         if edmin_png is not None:
             print(f'ED_min vs. peak range plot saved to {edmin_png}')
 
-    columns = ['Session', 'FolderPath', 'Unit', 'ntt_file', 'lfp_file', 'cell_number', 'n_spikes_total',
+    columns = ['Session', 'FolderPath', 'Unit', 'Field', 'n_fields', 'MultiField', 'FieldDetection',
+               'field_peak_rate_Hz', 'field_peak_rate_raw_Hz', 'field_n_bins', 'field_area_cm2',
+               'field_pct_of_occupied_area', 'field_radius_cm', 'field_com_x_cm', 'field_com_y_cm',
+               'field_com_theta_deg', 'field_arc_length_cm', 'field_track_width_cm',
+               'ntt_file', 'lfp_file', 'cell_number', 'n_spikes_total',
                'n_spikes_theta', 'MRL', 'PreferredPhase_deg', 'Rayleigh_p',
                'SignificantThetaModulation', 'PhasePeak_deg', 'PhaseValley_deg', 'TMI',
                'TMI_shuffle_p', 'TMI_Significant', 'PrecessionTested', 'PassIndex_n_spikes',
@@ -3095,15 +3410,39 @@ def main():
         df.loc[df['Arena'].notna()], 'Arena', ARENA_LABELS, out_dir=RESULTS_FOLDER,
         file_prefix='ArenaComparison', group_word='arena')
 
+    readme_df = pd.DataFrame({'Note': [
+        'ThetaPhase sheet: ONE ROW PER PLACE FIELD. A cell with several place fields (MultiField = True, '
+        'n_fields > 1) has one row per field; its unit-level columns (spike counts, MRL, Rayleigh, TMI) are '
+        'repeated on each of its rows. Cells with no field analysed (not theta-modulated, no tracking, '
+        'no field detected) have a single row with Field empty.',
+        'Field numbering: Field 1 = the field with the highest peak (smoothed) firing rate, then 2, 3, ... in '
+        'descending order of peak rate. Per-field figures are named <animal>_<unit>_F<Field>_PassIndex.png '
+        '(and _F<Field>_FitRShuffle.png); the figure title gives "Field k of n".',
+        f'Place fields: threshold method of PlaceCell_Main_v20 -- bins visited >= {FIELD_MIN_VISITS} times with '
+        f'smoothed rate >= {FIELD_RATE_THRESHOLD_FRAC:g} x peak AND > the mean rate, 8-connected components '
+        f'of >= {MIN_FIELD_SIZE_BINS} bins (Circle track: 1-D angular map, contiguous runs wrapping around); '
+        f'frames slower than {RATEMAP_IMMOBILITY_SPEED_CM_S:g} cm/s excluded. Rate map: Climer pass-index '
+        f'rate map ({BINSIDE:g} cm bins, Gaussian sigma = {SMTH_WIDTH / 2:g} cm, unvisited bins filled with the '
+        f'nearest visited value).',
+        'Each field is analysed separately: spatial filter band from that field\'s radius (field_radius_cm), '
+        'and only passes whose field-index peak lies inside that field (and reaches '
+        f'{PASS_MIN_FIELD_PEAK_FRAC:g} x its peak field index) contribute spikes.',
+        'Summary sheet: theta-modulation counts are per cell; precession outcomes are given per field and as '
+        '"cells with >= 1 field" of each class. Arena / session-type TMI comparisons use one value per cell; '
+        'precession comparisons (r^2, fit R, slope, phase range, phase at pass index) use one value per field.',
+    ]})
     excel_path = RESULTS_FOLDER / OUTPUT_EXCEL_NAME
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        readme_df.to_excel(writer, sheet_name='README', index=False)
         df.to_excel(writer, sheet_name='ThetaPhase', index=False)
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
         for sheet_name, tables in session_type_tables.items():
             pd.concat(tables, ignore_index=True).to_excel(writer, sheet_name=sheet_name, index=False)
         for key, table in arena_tables.items():
             table.to_excel(writer, sheet_name=_comparison_sheet_name('Arena', key), index=False)
-    print(f'\nDone. {len(df)} unit(s) processed. Summary saved to {excel_path}')
+    n_units = df[['FolderPath', 'Unit']].drop_duplicates().shape[0]
+    print(f'\nDone. {n_units} unit(s) processed, {int(df["Field"].notna().sum())} place field row(s). '
+          f'Summary saved to {excel_path}')
 
     metadata_path = save_metadata_csv(excel_path.with_name(excel_path.stem + '_metadata.csv'))
     print(f'Run metadata saved to {metadata_path}')

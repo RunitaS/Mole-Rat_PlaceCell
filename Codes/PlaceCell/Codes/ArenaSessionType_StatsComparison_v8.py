@@ -106,8 +106,8 @@ import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\PC_Res\CI99_Bin2\All_TT_PlaceChar_SiRaw_CI99_Bin2.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_True_SiRaw_CI99_Bin2'
+INPUT_EXCEL = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/All_TT_PlaceChar_SiSkaggsAdptBin_CI99_2.xlsx'
+OUTPUT_DIR  = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/SpikeQualityFilt_v1_PlaceCellData/PC_True_SiSkaggsAdptBin_CI99_2'
 
 STATS_XLSX = os.path.join(OUTPUT_DIR, 'SessionArena_Stats.xlsx')
 STATS_CSV  = os.path.join(OUTPUT_DIR, 'SessionArena_AllStats.csv')
