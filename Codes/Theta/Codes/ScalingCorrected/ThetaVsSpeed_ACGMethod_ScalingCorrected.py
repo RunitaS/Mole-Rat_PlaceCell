@@ -54,6 +54,7 @@ import statsmodels.formula.api as smf
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+import matplotlib.transforms as mtransforms
 from matplotlib.colors import to_rgba
 
 import warnings
@@ -158,6 +159,30 @@ ACG_ED_MIN_THRESH = 1.0
 # speed above SPEED_THRESH_CMS -> 'moving', at/below it -> 'immobile'.
 SPEED_THRESH_CMS = 4.0
 
+# ---- Theta vs. speed (mixed models) ----
+# Before the freq/power ~ speed mixed models are fit, the theta-positive
+# (non-skipped) epochs of each recording (.ncs file) are grouped into
+# SPEED_BIN_WIDTH_CMS-wide bins of median epoch speed ([0,2), [2,4), ... cm/s)
+# and reduced to one BIN_AGG_METHOD value per (recording, speed bin) -- see
+# aggregate_by_speed_bin. The model's predictor is the bin center (1, 3, 5,
+# ... cm/s), so it is fit on one value per speed bin visited per recording
+# rather than on thousands of individual epochs. Same binning as
+# ThetaVsSpeed_v6_Ferret_Final.py.
+SPEED_BIN_WIDTH_CMS = 2.0
+BIN_AGG_METHOD = 'median'   # 'median' or 'mean'
+
+# ---- Relative theta power (method of ThetaVsSpeed_v6_Ferret_Final.py) ----
+# epoch_theta_power_rel = the epoch's theta power (mean square of the
+# THETA_BAND band-passed LFP) as % of the recording's total REL_POWER_BAND
+# power (mean square of the REL_POWER_BAND band-passed LFP) -- the
+# time-domain (Parseval) equivalent of the PSD normalization in
+# Fig4a_PSD_v2_Simul.py. Dividing by each recording's own total power removes
+# per-recording gain differences (electrode impedance/placement), so animals
+# are compared on the share of power in theta rather than on absolute uV^2.
+REL_POWER_BAND = (1.0, 100.0)   # Hz -- matches NORM_BAND in Fig4a_PSD_v2_Simul.py
+REL_POWER_FILTER_ORDER = 4
+THETA_POWER_FILTER_ORDER = 5    # Butterworth order of the THETA_BAND band-pass (v6's FILTER_ORDER)
+
 # ---- Plotting: per-animal colors ----
 # Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
 ANIMAL_COLORS = {
@@ -194,6 +219,42 @@ def outlined(linewidth):
     (and its markers) of width `linewidth`, so pastel lines stay visible."""
     return [pe.Stroke(linewidth=linewidth + 2 * ANIMAL_EDGE_WIDTH, foreground=ANIMAL_EDGE_COLOR),
             pe.Normal()]
+
+
+def legend_and_stats_below(ax, stats_text=None, handles=None, labels=None, ncol=None,
+                           fontsize=7, stats_fontsize=8, linespacing=None, pad_in=0.08,
+                           **legend_kw):
+    """Draw `ax`'s legend and an optional stats text block BELOW the axes --
+    legend first, stats under it, both clear of the x tick labels / x-label --
+    so neither covers the data points.
+
+    The offset from the axes is fixed in inches (not axes fraction), so it
+    stays correct after tight_layout() or bbox_inches='tight' resize the
+    axes. `handles`/`labels` default to ax.get_legend_handles_labels(); any
+    legend already on `ax` is replaced. Call before fig.tight_layout().
+    """
+    fig = ax.figure
+    if handles is None:
+        handles, labels = ax.get_legend_handles_labels()
+    if ax.get_legend() is not None:
+        ax.get_legend().remove()
+
+    canvas = fig.canvas
+    renderer = canvas.get_renderer() if hasattr(canvas, 'get_renderer') else fig._get_renderer()
+    # distance (in) from the axes' bottom edge to the bottom of its tick labels + x-label
+    below_in = (ax.get_window_extent(renderer).y0 - ax.get_tightbbox(renderer).y0) / fig.dpi
+    trans = mtransforms.offset_copy(ax.transAxes, fig=fig, y=-(below_in + pad_in), units='inches')
+
+    anchor = trans
+    if handles:
+        anchor = ax.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0),
+                           bbox_transform=trans, ncol=ncol or min(len(handles), 3),
+                           fontsize=fontsize, frameon=False, **legend_kw)
+    if stats_text:
+        ax.annotate(stats_text, xy=(0.5, 0), xycoords=anchor, xytext=(0, -4),
+                    textcoords='offset points', ha='center', va='top',
+                    fontsize=stats_fontsize, linespacing=linespacing, color='0.1',
+                    annotation_clip=False)
 
 
 # %% ==================== .ncs / tracking data import ==============================
@@ -251,6 +312,15 @@ def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
     nyq = fs_hz / 2.0
     b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
     return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
+
+
+def bandpass_filter(x, fs_hz, band, order):
+    """Zero-phase Butterworth band-pass filter. Second-order sections, not
+    (b, a): a narrow (3-7 Hz) band-pass at 1 kHz has poles so close to the
+    unit circle that the (b, a) form rounds them outside it, and filtfilt
+    then blows up to an all-NaN trace."""
+    sos = signal.butter(order, band, btype='band', fs=fs_hz, output='sos')
+    return signal.sosfiltfilt(sos, np.asarray(x, dtype=np.float64))
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -739,9 +809,13 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     'epoch_index'/'file'; filter on '~skipped' downstream as usual.
 
     Returns a DataFrame (one row per epoch) with the quantify_xcorr_epochs
-    columns plus 'movement', 'median_speed_cms', 'epoch_index', and
+    columns plus 'movement', 'median_speed_cms', 'epoch_index',
     'epoch_power_uv2' (mean squared amplitude of the epoch's cleaned LFP
-    waveform, in uV^2 -- see the ADBitVolts note on 'epoch_power_uv2' below).
+    waveform, in uV^2 -- see the ADBitVolts note on 'epoch_power_uv2' below),
+    'epoch_theta_power_uv2' (mean square of the epoch's THETA_BAND band-passed
+    LFP, uV^2), 'epoch_nontheta_power_uv2' (epoch_power_uv2 minus
+    epoch_theta_power_uv2), 'session_total_power_uv2' (the recording's REL_POWER_BAND
+    power) and 'epoch_theta_power_rel' (theta power as % of that total).
     """
     # load_ncs converts the raw ADC counts to microvolts via the file header's
     # ADBitVolts (samples * read_ncs_adbitvolts(fpath) * 1e6); every step below (resample/notch/detrend/
@@ -757,8 +831,8 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
     keep_deltatheta = reject_deltatheta_epochs(epochs, fs_acg)
-    keep_artifact = keep_deltatheta & reject_artifact_epochs(
-        epochs, ref_mask=keep_deltatheta)
+    keep_mad = reject_artifact_epochs(epochs, ref_mask=keep_deltatheta)
+    keep_artifact = keep_deltatheta & keep_mad
 
     pos_path = find_position_file(fpath)
     if pos_path is None:
@@ -782,6 +856,25 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     # waveform -- a broadband (<=LOWPASS_CUTOFF_HZ) power estimate for the
     # exact same epochs used for the ACG frequency (freq_est) analysis above
     result['epoch_power_uv2'] = np.mean(data_epochs ** 2, axis=0)
+    # theta-band power of the same epochs, raw and relative (see
+    # REL_POWER_BAND). The recording's total power is the mean square of the
+    # REL_POWER_BAND trace over every epoch without an amplitude artifact
+    # (keep_mad) -- any movement state, regardless of the delta/theta filter
+    # -- i.e. the whole session as in ThetaVsSpeed_v6_Ferret_Final.py, minus
+    # the large transients that would otherwise inflate one recording's
+    # denominator.
+    theta_epochs, _ = build_epochs(
+        bandpass_filter(lfp, fs_acg, THETA_BAND, THETA_POWER_FILTER_ORDER), nperseg)
+    broadband_epochs, _ = build_epochs(
+        bandpass_filter(lfp, fs_acg, REL_POWER_BAND, REL_POWER_FILTER_ORDER), nperseg)
+    total_power = np.mean(broadband_epochs[keep_mad] ** 2)
+    result['epoch_theta_power_uv2'] = np.mean(theta_epochs[keep] ** 2, axis=1)
+    # power outside THETA_BAND (delta, beta, gamma ... up to LOWPASS_CUTOFF_HZ):
+    # by Parseval the broadband mean square is the sum of its band powers, so
+    # this is what epoch_power_uv2 carries on top of theta
+    result['epoch_nontheta_power_uv2'] = result['epoch_power_uv2'] - result['epoch_theta_power_uv2']
+    result['session_total_power_uv2'] = total_power
+    result['epoch_theta_power_rel'] = 100 * result['epoch_theta_power_uv2'] / total_power
     result['epoch_index'] = np.where(keep)[0]
     # absolute path -- lets get_epoch_waveform() re-fetch this exact epoch's
     # raw waveform later (e.g. for plot_example_epoch), regardless of cwd
@@ -987,7 +1080,7 @@ def plot_freq_est_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title('freq_est of accepted epochs, by animal')
-    ax.legend(fontsize=7, frameon=False)
+    legend_and_stats_below(ax, ncol=2)
     fig.tight_layout()
     return fig, ax
 
@@ -1064,7 +1157,7 @@ def plot_edmin_rejected_freq_histogram_overlay(df, ed_min_thresh=ACG_ED_MIN_THRE
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title(f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs, by animal')
-    ax.legend(fontsize=7, frameon=False)
+    legend_and_stats_below(ax, ncol=2)
     fig.tight_layout()
     return fig, ax
 
@@ -1127,14 +1220,10 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     ax.set_ylabel('Autocorr. peak range (norm.)')
     title = 'ED_min vs. normalised peak range'
     ax.set_title(f'{animal}: {title}' if animal else title)
-    ax.legend(loc='upper right', fontsize=7, frameon=False, markerscale=2)
-
     stats_text = (f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
                  f'Spearman rho = {r_s:.3f} (p = {p_s:.2e})\n'
                  f'n = {len(sub)}')
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
-           fontsize=8, color='0.1',
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
+    legend_and_stats_below(ax, stats_text, markerscale=2)
 
     fig.tight_layout()
     return fig, ax, {'pearson_r': r_p, 'pearson_p': p_p,
@@ -1176,11 +1265,115 @@ def save_mixedlm_stats_excel(result, out_path, model_desc=''):
         info.to_excel(writer, sheet_name='Model info', index=False)
 
 
-def plot_freq_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), color='#4C72B0'):
+def aggregate_by_speed_bin(df, response, speed_col='median_speed_cms', recording='file',
+                           group='animal', bin_width=SPEED_BIN_WIDTH_CMS,
+                           agg_method=BIN_AGG_METHOD):
+    """One `agg_method` value of `response` per (recording, speed bin).
+
+    Epochs are grouped by `bin_width`-wide bins of their median speed ([0,w),
+    [w,2w), ... cm/s) within each recording, so the mixed model is fit on a
+    value that summarises a distinct speed rather than on many individual
+    epochs. `speed_within_bin` is the agg_method'd speed of the bin's epochs;
+    `speed_bin_center` ((k + 0.5) * w for bin [k*w, (k+1)*w)) is the model's
+    predictor; `n_epochs` is how many epochs went into the bin.
+    """
+    d = df.dropna(subset=[response, speed_col, group]).copy()
+    d['speed_bin'] = np.floor(d[speed_col] / bin_width)
+    agg = (d.groupby([group, recording, 'speed_bin'])
+            .agg(**{response: (response, agg_method)},
+                 speed_within_bin=(speed_col, agg_method),
+                 n_epochs=(response, 'size'))
+            .reset_index())
+    agg['speed_bin_center'] = (agg['speed_bin'] + 0.5) * bin_width
+    return agg.drop(columns='speed_bin')
+
+
+def _plot_vs_speed_mixedmodel(df, response, ylabel, title, unit, animal=None, ax=None,
+                              figsize=(7, 5), color='#4C72B0'):
+    """Shared body of the *_vs_speed_mixedmodel plots (same style as
+    ThetaVsSpeed_v6_Ferret_Final.py's plot_mixed_model_fit): theta-positive
+    (non-skipped) epochs reduced to one value per (recording,
+    SPEED_BIN_WIDTH_CMS speed bin) (aggregate_by_speed_bin) and scattered per
+    animal against the bin center, the random-intercept mixed model's
+    fixed-effect line + 95% CI band, and the legend plus full model
+    statistics written below the plot.
+
+    The model is always fit across ALL animals; `animal`, if given, only
+    restricts which points are drawn on top of that shared fit.
+    """
+    predictor, group = 'speed_bin_center', 'animal'
+    binned = aggregate_by_speed_bin(df[~df['skipped']], response, group=group)
+    if len(binned) < 2 or binned[group].nunique() < 2:
+        raise ValueError('Not enough theta-positive speed bins / animals to fit a mixed model '
+                         f'(need >=2 animals with valid {response}/median_speed_cms).')
+
+    result = fit_freq_speed_mixed_model(binned, response=response, predictor=predictor, group=group)
+    sub = binned
+    scope = sub if animal is None else sub[sub[group] == animal]
+
+    intercept = result.params['Intercept']
+    slope = result.params[predictor]
+    pvalue = result.pvalues[predictor]
+    slope_se = result.bse[predictor]
+    slope_z = result.tvalues[predictor]
+    slope_ci_low, slope_ci_high = result.conf_int().loc[predictor]
+    cov = result.cov_params()
+
+    x_range = np.linspace(sub[predictor].min(), sub[predictor].max(), 100)
+    y_pred = intercept + slope * x_range
+    se = np.sqrt(
+        cov.loc['Intercept', 'Intercept']
+        + x_range ** 2 * cov.loc[predictor, predictor]
+        + 2 * x_range * cov.loc['Intercept', predictor]
+    )
+    z = norm.ppf(0.975)
+    y_ci_low = y_pred - z * se
+    y_ci_high = y_pred + z * se
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    handles = []
+    for animal_label in ordered_animals(scope[group]):
+        pts = scope[scope[group] == animal_label]
+        handles.append(ax.scatter(pts[predictor], pts[response],
+                                  color=animal_color(animal_label, default=color),
+                                  edgecolor='k', linewidth=0.5, alpha=0.8, s=25,
+                                  label=animal_label))
+    handles += ax.plot(x_range, y_pred, color='black', linewidth=2, label='Mixed Linear Fit')
+    handles.append(ax.fill_between(x_range, y_ci_low, y_ci_high, color='grey', alpha=0.5,
+                                   label='95% CI'))
+    ax.set_xlabel('Speed bin center (cm/s)', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(f'{animal}: {title}' if animal else title, fontsize=14, weight='bold')
+    ax.grid(True, linestyle='--', alpha=0.4)
+
+    details = '\n'.join([
+        f'Model: {response} ~ {predictor} + (1 | {group})   [linear mixed model, REML]',
+        f'Slope β = {slope:.4g} ± {slope_se:.3g} SE {unit} per cm/s,  '
+        f'95% CI [{slope_ci_low:.4g}, {slope_ci_high:.4g}],  z = {slope_z:.2f},  '
+        + (f'p = {pvalue:.3g}' if pvalue > 0 else 'p < 1e-300'),
+        f'Intercept = {intercept:.4g} {unit};  random-intercept var = {result.cov_re.iloc[0, 0]:.3g};  '
+        f'residual var = {result.scale:.3g};  converged = {result.converged}',
+        f'n = {len(sub)} speed bins from {sub["file"].nunique()} recordings, '
+        f'{sub[group].nunique()} animals ({int(sub["n_epochs"].sum())} theta-positive epochs)'
+        + (f';  points shown: {animal} only' if animal else ''),
+        f'bin width = {SPEED_BIN_WIDTH_CMS:g} cm/s,  value per (recording, bin) = {BIN_AGG_METHOD}',
+    ])
+    legend_and_stats_below(ax, details, handles=handles, labels=[h.get_label() for h in handles],
+                           ncol=3, fontsize=9, stats_fontsize=9, linespacing=1.4)
+
+    fig.tight_layout()
+    return fig, ax, result
+
+
+def plot_freq_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5), color='#4C72B0'):
     """Theta-positive epochs only (non-skipped, i.e. passed artifact/delta-theta
     rejection and had an acceptable sinusoid fit): scatter of matched-sinusoid
-    frequency ('freq') vs. per-epoch median running speed ('median_speed_cms'),
-    with a random-intercept mixed-model fit (grouped by animal) overlaid as the
+    frequency ('freq') vs. running speed, one value per (recording,
+    SPEED_BIN_WIDTH_CMS speed bin of 'median_speed_cms'), with a random-intercept mixed-model fit (grouped by animal) overlaid as the
     fixed-effect line and its 95% CI band -- the same
     fit_mixed_model/plot_mixed_model_fit stats used in ThetaVsSpeed_v2.py,
     applied here to the ACG epochs' own freq_est/speed columns instead of the
@@ -1192,69 +1385,17 @@ def plot_freq_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), colo
 
     Returns (fig, ax, mixedlm_result).
     """
-    sub = df[~df['skipped']].dropna(subset=['freq', 'median_speed_cms', 'animal'])
-    if len(sub) < 2 or sub['animal'].nunique() < 2:
-        raise ValueError('Not enough theta-positive epochs / animals to fit a mixed model '
-                         '(need >=2 animals with valid freq/median_speed_cms).')
-
-    result = fit_freq_speed_mixed_model(sub)
-
-    scope = sub if animal is None else sub[sub['animal'] == animal]
-
-    intercept = result.params['Intercept']
-    slope = result.params['median_speed_cms']
-    cov = result.cov_params()
-
-    x_range = np.linspace(sub['median_speed_cms'].min(), sub['median_speed_cms'].max(), 100)
-    y_pred = intercept + slope * x_range
-    se = np.sqrt(
-        cov.loc['Intercept', 'Intercept']
-        + x_range ** 2 * cov.loc['median_speed_cms', 'median_speed_cms']
-        + 2 * x_range * cov.loc['Intercept', 'median_speed_cms']
-    )
-    z = norm.ppf(0.975)
-    y_ci_low = y_pred - z * se
-    y_ci_high = y_pred + z * se
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
-    else:
-        fig = ax.figure
-
-    for animal_label in ordered_animals(scope['animal']):
-        pts = scope[scope['animal'] == animal_label]
-        # alpha on the fill only, so the dark outline stays fully visible
-        ax.scatter(pts['median_speed_cms'], pts['freq'],
-                   facecolor=to_rgba(animal_color(animal_label, default=color), 0.8),
-                   edgecolor=ANIMAL_EDGE_COLOR, linewidth=ANIMAL_EDGE_WIDTH,
-                   s=18, zorder=2, label=animal_label)
-    ax.plot(x_range, y_pred, color='black', linewidth=2, label='Mixed model fit', zorder=4)
-    ax.fill_between(x_range, y_ci_low, y_ci_high, color='grey', alpha=0.4,
-                    label='95% CI', zorder=3)
-    ax.set_xlabel('Median epoch speed (cm/s)')
-    ax.set_ylabel('Matched sinusoid frequency, freq_est (Hz)')
-    title = 'Theta-positive epochs: freq_est vs. speed (mixed model, grouped by animal)'
-    ax.set_title(f'{animal}: {title}' if animal else title, fontsize=10)
-    ax.legend(fontsize=7, frameon=False, markerscale=1.5)
-
-    speed_pval = result.pvalues['median_speed_cms']
-    stats_text = (f'Intercept (β₀) = {intercept:.3f} Hz\n'
-                 f'Speed slope (β₁) = {slope:.4f} Hz per cm/s\n'
-                 f'p (speed) = {speed_pval:.2e}\n'
-                 f'n = {len(sub)} epochs, {sub["animal"].nunique()} animals')
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
-           fontsize=8, color='0.1',
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
-
-    fig.tight_layout()
-    return fig, ax, result
+    return _plot_vs_speed_mixedmodel(
+        df, 'freq', ylabel='Theta Frequency, freq_est [Hz]',
+        title='Theta Frequency vs. Speed (Mixed Model)', unit='Hz',
+        animal=animal, ax=ax, figsize=figsize, color=color)
 
 
-def plot_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), color='#55A868'):
+def plot_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5), color='#55A868'):
     """Theta-positive epochs only (non-skipped): scatter of per-epoch
     broadband LFP power ('epoch_power_uv2', mean squared amplitude of the
     cleaned, ADBitVolts-scaled uV waveform -- see process_ncs_for_acg) vs.
-    per-epoch median running speed ('median_speed_cms'), with a
+    running speed, binned like plot_freq_vs_speed_mixedmodel, with a
     random-intercept mixed-model fit (grouped by animal) overlaid as the
     fixed-effect line and its 95% CI band. Same
     fit_mixed_model/plot_mixed_model_fit stats as ThetaVsSpeed_v2.py and
@@ -1266,62 +1407,97 @@ def plot_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(6, 5), col
 
     Returns (fig, ax, mixedlm_result).
     """
-    sub = df[~df['skipped']].dropna(subset=['epoch_power_uv2', 'median_speed_cms', 'animal'])
-    if len(sub) < 2 or sub['animal'].nunique() < 2:
-        raise ValueError('Not enough theta-positive epochs / animals to fit a mixed model '
-                         '(need >=2 animals with valid epoch_power_uv2/median_speed_cms).')
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_power_uv2', ylabel='Epoch LFP Power [µV²]',
+        title='Epoch LFP Power vs. Speed (Mixed Model)', unit='µV²',
+        animal=animal, ax=ax, figsize=figsize, color=color)
 
-    result = fit_freq_speed_mixed_model(sub, response='epoch_power_uv2')
 
-    scope = sub if animal is None else sub[sub['animal'] == animal]
+def plot_theta_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5),
+                                         color='#4C72B0'):
+    """Theta-band power ('epoch_theta_power_uv2', mean square of the
+    THETA_BAND band-passed epoch, uV^2 -- no normalization) vs. speed, same
+    binning / mixed model as plot_freq_vs_speed_mixedmodel. The un-normalized
+    counterpart of plot_relpower_vs_speed_mixedmodel.
 
-    intercept = result.params['Intercept']
-    slope = result.params['median_speed_cms']
-    cov = result.cov_params()
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_theta_power_uv2', ylabel='Theta Power [µV²]',
+        title='Theta Power vs. Speed (no normalization, Mixed Model)', unit='µV²',
+        animal=animal, ax=ax, figsize=figsize, color=color)
 
-    x_range = np.linspace(sub['median_speed_cms'].min(), sub['median_speed_cms'].max(), 100)
-    y_pred = intercept + slope * x_range
-    se = np.sqrt(
-        cov.loc['Intercept', 'Intercept']
-        + x_range ** 2 * cov.loc['median_speed_cms', 'median_speed_cms']
-        + 2 * x_range * cov.loc['Intercept', 'median_speed_cms']
-    )
-    z = norm.ppf(0.975)
-    y_ci_low = y_pred - z * se
-    y_ci_high = y_pred + z * se
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
-    else:
-        fig = ax.figure
+def plot_relpower_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5),
+                                      color='#4C72B0'):
+    """Relative theta power ('epoch_theta_power_rel', % of the recording's
+    REL_POWER_BAND power -- see REL_POWER_BAND) vs. speed, same binning /
+    mixed model as plot_freq_vs_speed_mixedmodel.
 
-    for animal_label in ordered_animals(scope['animal']):
-        pts = scope[scope['animal'] == animal_label]
-        # alpha on the fill only, so the dark outline stays fully visible
-        ax.scatter(pts['median_speed_cms'], pts['epoch_power_uv2'],
-                   facecolor=to_rgba(animal_color(animal_label, default=color), 0.8),
-                   edgecolor=ANIMAL_EDGE_COLOR, linewidth=ANIMAL_EDGE_WIDTH,
-                   s=18, zorder=2, label=animal_label)
-    ax.plot(x_range, y_pred, color='black', linewidth=2, label='Mixed model fit', zorder=4)
-    ax.fill_between(x_range, y_ci_low, y_ci_high, color='grey', alpha=0.4,
-                    label='95% CI', zorder=3)
-    ax.set_xlabel('Median epoch speed (cm/s)')
-    ax.set_ylabel('Epoch LFP power (uV$^2$)')
-    title = 'Theta-positive epochs: epoch power vs. speed (mixed model, grouped by animal)'
-    ax.set_title(f'{animal}: {title}' if animal else title, fontsize=10)
-    ax.legend(fontsize=7, frameon=False, markerscale=1.5)
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_theta_power_rel',
+        ylabel=f'Relative Theta Power [% of {REL_POWER_BAND[0]:g}–{REL_POWER_BAND[1]:g} Hz power]',
+        title='Theta Power vs. Speed (relative power, Mixed Model)', unit='%',
+        animal=animal, ax=ax, figsize=figsize, color=color)
 
-    speed_pval = result.pvalues['median_speed_cms']
-    stats_text = (f'Intercept (β₀) = {intercept:.3f} uV²\n'
-                 f'Speed slope (β₁) = {slope:.4f} uV² per cm/s\n'
-                 f'p (speed) = {speed_pval:.2e}\n'
-                 f'n = {len(sub)} epochs, {sub["animal"].nunique()} animals')
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
-           fontsize=8, color='0.1',
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
 
+def plot_nontheta_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5),
+                                            color='#4C72B0'):
+    """Power outside THETA_BAND ('epoch_nontheta_power_uv2' = epoch_power_uv2 -
+    epoch_theta_power_uv2, uV^2) vs. speed, same binning / mixed model as
+    plot_freq_vs_speed_mixedmodel -- the part of the un-filtered power
+    (delta, beta, gamma ...) that is not theta.
+
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_nontheta_power_uv2', ylabel='Non-theta Power [µV²]',
+        title='Non-theta Power vs. Speed (Mixed Model)', unit='µV²',
+        animal=animal, ax=ax, figsize=figsize, color=color)
+
+
+def plot_power_band_comparison_vs_speed(df, animal=None, figsize=(22, 6)):
+    """Side-by-side check of how much of the un-normalized power ~ speed
+    relationship is theta: the same theta-positive epochs' power (a) without
+    band-pass (<= LOWPASS_CUTOFF_HZ), (b) after the THETA_BAND band-pass, and
+    (c) outside THETA_BAND (a minus b) -- each vs. speed with its own binned
+    random-intercept mixed model (see _plot_vs_speed_mixedmodel). If (a)'s
+    slope is driven by faster rhythms (e.g. gamma rising with speed), it shows
+    up in (c) rather than (b).
+
+    Returns (fig, axes, {response: mixedlm_result}).
+    """
+    theta_lbl = f'{THETA_BAND[0]:g}–{THETA_BAND[1]:g} Hz'
+    panels = [
+        ('epoch_power_uv2', f'LFP Power ≤{LOWPASS_CUTOFF_HZ:g} Hz [µV²]',
+         f'(a) ≤{LOWPASS_CUTOFF_HZ:g} Hz, no band-pass'),
+        ('epoch_theta_power_uv2', f'Theta Power {theta_lbl} [µV²]',
+         f'(b) {theta_lbl} band-pass'),
+        ('epoch_nontheta_power_uv2', 'Non-theta Power [µV²]',
+         f'(c) outside {theta_lbl} (a − b)'),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=figsize)
+    results = {}
+    for ax, (col, ylabel, title) in zip(axes, panels):
+        _fig, _ax, results[col] = _plot_vs_speed_mixedmodel(
+            df, col, ylabel=ylabel, title=title, unit='µV²', animal=animal, ax=ax)
+    title = 'Epoch power vs. speed: un-filtered vs. theta band-passed'
+    fig.suptitle(f'{animal}: {title}' if animal else title, fontsize=15, weight='bold')
     fig.tight_layout()
-    return fig, ax, result
+    return fig, axes, results
+
+
+# (response column, plot function, output file stem, slope unit) of every
+# theta vs. speed mixed model the driver fits and plots
+SPEED_MODELS = [
+    ('freq',                     plot_freq_vs_speed_mixedmodel,           'freq_est_vs_speed_mixedmodel',             'Hz'),
+    ('epoch_power_uv2',          plot_power_vs_speed_mixedmodel,          'power_vs_speed_mixedmodel',                'uV^2'),
+    ('epoch_theta_power_uv2',    plot_theta_power_vs_speed_mixedmodel,    'theta_power_vs_speed_mixedmodel',          'uV^2'),
+    ('epoch_nontheta_power_uv2', plot_nontheta_power_vs_speed_mixedmodel, 'nontheta_power_vs_speed_mixedmodel',       'uV^2'),
+    ('epoch_theta_power_rel',    plot_relpower_vs_speed_mixedmodel,       'theta_power_relative_vs_speed_mixedmodel', '%'),
+]
 
 
 def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
@@ -1335,6 +1511,11 @@ def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
     ax.set_ylabel('Autocorr. peak range (norm.)')
     ax.set_xlabel('Channel')
     ax.set_title(animal)
+    leg = ax.get_legend()
+    if leg is not None:
+        handles = getattr(leg, 'legend_handles', None) or leg.legendHandles
+        legend_and_stats_below(ax, handles=handles, labels=[t.get_text() for t in leg.get_texts()],
+                               title=leg.get_title().get_text() or None)
     return ax
 
 
@@ -1492,13 +1673,9 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     ax_main.set_xlabel('Frequency (Hz)')
     ax_main.set_ylabel('Autocorr. peak range')
     ax_main.set_ylim(0, 1)
-    ax_main.legend(loc='upper left', frameon=False, fontsize=7)
-    if show_edmin_annotation:
-        ax_main.text(0.98, 0.02,
-                     f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
-                     f'rejected ({n_edmin_rejected}/{len(scope)})',
-                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
-                     color='0.3')
+    edmin_text = (f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
+                  f'rejected ({n_edmin_rejected}/{len(scope)})') if show_edmin_annotation else None
+    legend_and_stats_below(ax_main, edmin_text, ncol=2, stats_fontsize=7)
 
     cmap_obj = plt.get_cmap(moving_cmap)
 
@@ -1602,6 +1779,7 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     outer = fig.add_gridspec(1, 3, wspace=0.6, bottom=0.22, top=0.88)
 
     centroids = None
+    main_axes = []
     for col, (mode, title) in enumerate((('moving', 'Mobility'),
                                          ('immobile', 'Immobility'),
                                          ('both', 'Merged'))):
@@ -1610,6 +1788,7 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
         ax_main = fig.add_subplot(sub_gs[1, 0])
         ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
         ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
+        main_axes.append(ax_main)
 
         sc, c = _draw_freq_peakrange_scatter(
             df, ax_main, ax_top, ax_right, animal=animal, mode=mode,
@@ -1645,7 +1824,12 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     pct_immobile_edmin_of_immobile = 100 * n_edmin_immobile / n_immobile_total if n_immobile_total else 0.0
     pct_moving_edmin_of_moving = 100 * n_edmin_moving / n_moving_total if n_moving_total else 0.0
 
-    fig.text(0.5, 0.02,
+    # footer goes just under the lowest panel legend (which sits below each
+    # panel's x-label), so the two never overlap
+    canvas = fig.canvas
+    renderer = canvas.get_renderer() if hasattr(canvas, 'get_renderer') else fig._get_renderer()
+    footer_y = min(ax.get_tightbbox(renderer).y0 for ax in main_axes) / fig.bbox.height - 0.02
+    fig.text(0.5, footer_y,
              f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected}/{len(scope)} '
              f'epochs overall ({pct_edmin_rejected:.1f}%)\n'
              f'ED_min rejected epochs in immobility ({pct_edmin_immobile:.1f}%) | '
@@ -1654,7 +1838,7 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
              f'{pct_immobile_edmin_of_immobile:.1f}% ({n_edmin_immobile}/{n_immobile_total}) | '
              f'% of total mobility epochs with ED_min > {ACG_ED_MIN_THRESH}: '
              f'{pct_moving_edmin_of_moving:.1f}% ({n_edmin_moving}/{n_moving_total})',
-             ha='center', va='bottom', fontsize=8, color='0.2')
+             ha='center', va='top', fontsize=8, color='0.2')
 
     return fig, centroids
 
@@ -1751,6 +1935,11 @@ CONFIG_SETTINGS = [
     ('Tracking / speed',   'POS_JUMP_THRESH_CMS',  'Frame-to-frame jumps above this speed (cm/s) treated as tracking artifacts'),
     ('Tracking / speed',   'POS_SMOOTH_SIGMA_SMP', 'Gaussian smoothing sigma (samples) on x/y position'),
     ('Tracking / speed',   'SPEED_THRESH_CMS',     'Epoch median speed > this -> moving, <= this -> immobile (cm/s)'),
+    ('Theta vs. speed',    'SPEED_BIN_WIDTH_CMS',  'Width (cm/s) of the speed bins epochs are grouped into per recording before the mixed models'),
+    ('Theta vs. speed',    'BIN_AGG_METHOD',       "Value per (recording, speed bin): 'median' or 'mean'"),
+    ('Relative power',     'REL_POWER_BAND',       'Band (Hz) whose total power (recording mean square) normalizes theta power'),
+    ('Relative power',     'REL_POWER_FILTER_ORDER', 'Butterworth order of the REL_POWER_BAND band-pass (sosfiltfilt)'),
+    ('Relative power',     'THETA_POWER_FILTER_ORDER', 'Butterworth order of the THETA_BAND band-pass for epoch theta power (sosfiltfilt)'),
     ('ACG',                'FS_ACG',               'Resample rate for ACG analysis (Hz)'),
     ('ACG',                'EPOCH_SEC',            'Autocorrelogram epoch length (s)'),
     ('ACG',                'ACG_FREQ_RANGE',       'Reference sinusoid bank frequency range (Hz)'),
@@ -1772,8 +1961,17 @@ PIPELINE_NOTES = [
      'delta/theta-kept epochs) -> moving/immobile labelling -> ACG peak-range quantification'),
     ('Delta/theta Welch PSD', "hann window, nperseg = epoch length, noverlap = 0, detrend = 'constant'"),
     ('Speed per epoch', 'median of tracking-sample speeds within the epoch (nearest sample if none)'),
-    ('Mixed model (freq)', 'smf.mixedlm: freq ~ median_speed_cms, groups = animal, non-skipped epochs'),
-    ('Mixed model (power)', 'smf.mixedlm: epoch_power_uv2 ~ median_speed_cms, groups = animal, non-skipped epochs'),
+    ('Speed binning', 'non-skipped epochs grouped per (animal, file, floor(median_speed_cms / '
+                      'SPEED_BIN_WIDTH_CMS)); BIN_AGG_METHOD of the response per group; '
+                      'predictor = bin center'),
+    ('Mixed models', 'smf.mixedlm: <response> ~ speed_bin_center, groups = animal; responses = freq, '
+                     'epoch_power_uv2, epoch_theta_power_uv2, epoch_nontheta_power_uv2, '
+                     'epoch_theta_power_rel'),
+    ('Theta power', 'epoch_theta_power_uv2 = per-epoch mean square of the THETA_BAND band-passed LFP'),
+    ('Non-theta power', 'epoch_nontheta_power_uv2 = epoch_power_uv2 - epoch_theta_power_uv2'),
+    ('Relative theta power', 'epoch_theta_power_rel = 100 * epoch_theta_power_uv2 / mean square of the '
+                             'REL_POWER_BAND band-passed LFP over all epochs of the recording that '
+                             'passed MAD peak-to-peak rejection'),
     ('Figure dpi', '200'),
 ]
 
@@ -1787,7 +1985,9 @@ METADATA_FUNCTIONS = [
     'plot_edmin_rejected_freq_histogram', 'plot_edmin_rejected_freq_histogram_overlay',
     'plot_edmin_vs_peakrangenorm', 'fit_freq_speed_mixed_model',
     'plot_freq_vs_speed_mixedmodel', 'plot_power_vs_speed_mixedmodel',
-    '_draw_freq_peakrange_scatter', 'plot_freq_peakrange_by_movement', 'plot_figure4_style',
+    'plot_theta_power_vs_speed_mixedmodel', 'plot_relpower_vs_speed_mixedmodel',
+    'plot_nontheta_power_vs_speed_mixedmodel', 'plot_power_band_comparison_vs_speed',
+    'aggregate_by_speed_bin', '_draw_freq_peakrange_scatter', 'plot_freq_peakrange_by_movement', 'plot_figure4_style',
 ]
 
 
@@ -1861,8 +2061,17 @@ def save_run_metadata(meta_dir=META_DIR):
         'ACG_PEAK_PROMINENCE':      ACG_PEAK_PROMINENCE,
         'ACG_ED_MIN_THRESH':        ACG_ED_MIN_THRESH,
         # ---- theta vs. speed (mixed model, grouped by animal) ----
-        'freq_speed_model':         'smf.mixedlm: freq ~ median_speed_cms, groups=animal (non-skipped epochs)',
-        'power_speed_model':        'smf.mixedlm: epoch_power_uv2 ~ median_speed_cms, groups=animal (non-skipped epochs)',
+        'SPEED_BIN_WIDTH_CMS':      SPEED_BIN_WIDTH_CMS,
+        'BIN_AGG_METHOD':           BIN_AGG_METHOD,
+        'speed_models':             'smf.mixedlm: <response> ~ speed_bin_center, groups=animal; one '
+                                    'BIN_AGG_METHOD value per (recording, speed bin) of non-skipped epochs',
+        'speed_model_responses':    [m[0] for m in SPEED_MODELS],
+        # ---- theta power / relative-power normalization ----
+        'THETA_POWER_FILTER_ORDER': THETA_POWER_FILTER_ORDER,
+        'REL_POWER_BAND':           REL_POWER_BAND,
+        'REL_POWER_FILTER_ORDER':   REL_POWER_FILTER_ORDER,
+        'rel_power_denominator':    'mean square of REL_POWER_BAND trace over the recording\'s '
+                                    'MAD-artifact-free epochs',
         # ---- summaries / plots ----
         'FREQ_HIST_BIN_EDGES':      FREQ_HIST_BIN_EDGES,
         'freq_est_histogram_bins':  30,
@@ -1963,7 +2172,7 @@ def collect_settings():
             for sec, name, desc in CONFIG_SETTINGS]
     listed = {name for _, name, _ in CONFIG_SETTINGS}
     skip = listed | {'RUN_METADATA_FILENAME', 'CONFIG_SETTINGS', 'PIPELINE_NOTES',
-                     'METADATA_FUNCTIONS'}
+                     'METADATA_FUNCTIONS', 'SPEED_MODELS'}
     for name in sorted(g):
         if name.isupper() and name not in skip and not callable(g[name]) \
                 and not inspect.ismodule(g[name]):
@@ -2176,36 +2385,42 @@ if __name__ == '__main__':
           f"Spearman rho={edmin_pr_stats['spearman_r']:.3f}, n={edmin_pr_stats['n']})")
     edmin_pr_stats_rows = [{'animal': 'ALL', **edmin_pr_stats}]
 
-    # Theta-positive (non-skipped) epochs: matched-sinusoid freq_est vs.
-    # median epoch speed, mixed-model fit (grouped by animal) -- ported stats
-    # from ThetaVsSpeed_v2.py
-    fig_freqspeed, _ax_freqspeed, freqspeed_result = plot_freq_vs_speed_mixedmodel(results_df)
-    freqspeed_path = os.path.join(FIGURE_DIR, 'freq_est_vs_speed_mixedmodel.png')
-    fig_freqspeed.savefig(freqspeed_path, dpi=200, bbox_inches='tight')
-    plt.close(fig_freqspeed)
-    print(f'Saved figure -> {freqspeed_path}')
-    freqspeed_stats_path = os.path.join(OUTPUT_DIR, 'freq_est_vs_speed_mixedmodel_stats.xlsx')
-    save_mixedlm_stats_excel(
-        freqspeed_result, freqspeed_stats_path,
-        model_desc='freq ~ median_speed_cms, groups=animal (theta-positive epochs only)')
-    print(f'Saved mixed-model stats -> {freqspeed_stats_path}')
-    print(f"  freq_est ~ speed slope = {freqspeed_result.params['median_speed_cms']:.4f} Hz per cm/s "
-          f"(p = {freqspeed_result.pvalues['median_speed_cms']:.2e})")
+    # Theta-positive (non-skipped) epochs vs. running speed, one value per
+    # (recording, SPEED_BIN_WIDTH_CMS speed bin), mixed-model fit (grouped by
+    # animal): matched-sinusoid freq_est, broadband epoch power (uV^2), and
+    # theta power both un-normalized (uV^2) and relative (% of REL_POWER_BAND
+    # power) -- see SPEED_MODELS
+    speed_binned = {}
+    for response, plot_func, stem, unit in SPEED_MODELS:
+        fig_speed, _ax_speed, speed_result = plot_func(results_df)
+        speed_fig_path = os.path.join(FIGURE_DIR, f'{stem}.png')
+        fig_speed.savefig(speed_fig_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+        plt.close(fig_speed)
+        print(f'Saved figure -> {speed_fig_path}')
+        speed_stats_path = os.path.join(OUTPUT_DIR, f'{stem}_stats.xlsx')
+        save_mixedlm_stats_excel(
+            speed_result, speed_stats_path,
+            model_desc=f'{response} ~ speed_bin_center, groups=animal ({SPEED_BIN_WIDTH_CMS:g} cm/s '
+                       f'speed bins, {BIN_AGG_METHOD} per recording x bin, theta-positive epochs only)')
+        print(f'Saved mixed-model stats -> {speed_stats_path}')
+        print(f"  {response} ~ speed slope = {speed_result.params['speed_bin_center']:.4g} {unit} per cm/s "
+              f"(p = {speed_result.pvalues['speed_bin_center']:.2e})")
+        speed_binned[response] = aggregate_by_speed_bin(results_df[~results_df['skipped']], response)
 
-    # Same theta-positive epochs, now their broadband LFP power
-    # ('epoch_power_uv2', ADBitVolts-scaled uV^2) vs. median epoch speed
-    fig_powerspeed, _ax_powerspeed, powerspeed_result = plot_power_vs_speed_mixedmodel(results_df)
-    powerspeed_path = os.path.join(FIGURE_DIR, 'power_vs_speed_mixedmodel.png')
-    fig_powerspeed.savefig(powerspeed_path, dpi=200, bbox_inches='tight')
-    plt.close(fig_powerspeed)
-    print(f'Saved figure -> {powerspeed_path}')
-    powerspeed_stats_path = os.path.join(OUTPUT_DIR, 'power_vs_speed_mixedmodel_stats.xlsx')
-    save_mixedlm_stats_excel(
-        powerspeed_result, powerspeed_stats_path,
-        model_desc='epoch_power_uv2 ~ median_speed_cms, groups=animal (theta-positive epochs only)')
-    print(f'Saved mixed-model stats -> {powerspeed_stats_path}')
-    print(f"  epoch_power_uv2 ~ speed slope = {powerspeed_result.params['median_speed_cms']:.4f} uV^2 per cm/s "
-          f"(p = {powerspeed_result.pvalues['median_speed_cms']:.2e})")
+    speed_binned_path = os.path.join(OUTPUT_DIR, 'theta_vs_speed_binned.xlsx')
+    with pd.ExcelWriter(speed_binned_path, engine='openpyxl') as writer:
+        for response, binned in speed_binned.items():
+            binned.to_excel(writer, sheet_name=response, index=False)
+    print(f'Saved speed-binned values (what the mixed models are fit on) -> {speed_binned_path}')
+
+    # Un-filtered (<= LOWPASS_CUTOFF_HZ) vs. THETA_BAND band-passed vs.
+    # non-theta epoch power, side by side -- is the un-normalized power ~
+    # speed slope theta, or faster rhythms (e.g. gamma)?
+    fig_bands, _axes_bands, _ = plot_power_band_comparison_vs_speed(results_df)
+    bands_path = os.path.join(FIGURE_DIR, 'power_band_comparison_vs_speed_mixedmodel.png')
+    fig_bands.savefig(bands_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig_bands)
+    print(f'Saved figure -> {bands_path}')
 
     all_centroids = []
     for animal_label in ordered_animals(results_df['animal']):
@@ -2213,7 +2428,7 @@ if __name__ == '__main__':
         plot_moving_vs_immobile(results_df, animal_label, ax=ax)
         fig.tight_layout()
         fig_path = os.path.join(FIGURE_DIR, f'{animal_label}_acg_moving_vs_immobile.png')
-        fig.savefig(fig_path, dpi=200)
+        fig.savefig(fig_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f'Saved figure -> {fig_path}')
 
@@ -2226,31 +2441,28 @@ if __name__ == '__main__':
         plt.close(fig_freqhist_a)
         print(f'Saved figure -> {freqhist_a_path}')
 
-        # freq_est vs. speed, this animal's theta-positive epochs plotted
-        # against the shared (all-animals) mixed-model fit
+        # freq_est / power / theta power / relative theta power vs. speed,
+        # this animal's speed bins plotted against the shared (all-animals)
+        # mixed-model fit
+        for _response, plot_func, stem, _unit in SPEED_MODELS:
+            try:
+                fig_speed_a, _ax_speed_a, _ = plot_func(results_df, animal=animal_label)
+                speed_a_path = os.path.join(FIGURE_DIR, f'{animal_label}_{stem}.png')
+                fig_speed_a.savefig(speed_a_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+                plt.close(fig_speed_a)
+                print(f'Saved figure -> {speed_a_path}')
+            except ValueError as e:
+                print(f'  SKIP {stem} plot for {animal_label}: {e}')
         try:
-            fig_freqspeed_a, _ax_freqspeed_a, _ = plot_freq_vs_speed_mixedmodel(
+            fig_bands_a, _axes_bands_a, _ = plot_power_band_comparison_vs_speed(
                 results_df, animal=animal_label)
-            freqspeed_a_path = os.path.join(
-                FIGURE_DIR, f'{animal_label}_freq_est_vs_speed_mixedmodel.png')
-            fig_freqspeed_a.savefig(freqspeed_a_path, dpi=200, bbox_inches='tight')
-            plt.close(fig_freqspeed_a)
-            print(f'Saved figure -> {freqspeed_a_path}')
+            bands_a_path = os.path.join(
+                FIGURE_DIR, f'{animal_label}_power_band_comparison_vs_speed_mixedmodel.png')
+            fig_bands_a.savefig(bands_a_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+            plt.close(fig_bands_a)
+            print(f'Saved figure -> {bands_a_path}')
         except ValueError as e:
-            print(f'  SKIP freq_est-vs-speed mixed model plot for {animal_label}: {e}')
-
-        # epoch power vs. speed, this animal's theta-positive epochs plotted
-        # against the shared (all-animals) mixed-model fit
-        try:
-            fig_powerspeed_a, _ax_powerspeed_a, _ = plot_power_vs_speed_mixedmodel(
-                results_df, animal=animal_label)
-            powerspeed_a_path = os.path.join(
-                FIGURE_DIR, f'{animal_label}_power_vs_speed_mixedmodel.png')
-            fig_powerspeed_a.savefig(powerspeed_a_path, dpi=200, bbox_inches='tight')
-            plt.close(fig_powerspeed_a)
-            print(f'Saved figure -> {powerspeed_a_path}')
-        except ValueError as e:
-            print(f'  SKIP power-vs-speed mixed model plot for {animal_label}: {e}')
+            print(f'  SKIP power band comparison plot for {animal_label}: {e}')
 
         # freq_est histogram of this animal's epochs rejected by the ED_min
         # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH)

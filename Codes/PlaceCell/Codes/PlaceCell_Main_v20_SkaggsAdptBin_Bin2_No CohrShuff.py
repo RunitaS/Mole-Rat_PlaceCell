@@ -10,8 +10,8 @@ SIR, and its bootstrap    occupancy-weighted> smoothed map>    raw
 Sparsity>    smoothed>    raw
 Mean firing rate>    smoothed>    raw
 Peak firing rate>    raw>    raw (unchanged)
-Coherence, and its bootstrap>    smoothed>    smoothed (unchanged)
-Split-half stability>    raw>    smoothed
+Coherence, and its bootstrap>    smoothed>    SI_RATEMAP_TYPE map
+Split-half stability>    raw>    SI_RATEMAP_TYPE map
 
 Also added minimum velocity filter to remove non-spatial firing during immobility (e.g. sharp-wave ripples). See compute_metrics step 2c.
 """
@@ -39,27 +39,30 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
 root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\QualFiltData_AllCells'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiSkaggsAdptBin_CI99_2.xlsx'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiSkaggsAdptBin_CohrStabSkaggs.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CohrStabSkaggs'
 
 
 # Per-unit figure subfolders, created next to each .ntt file
-SPEED_MOD_SUBDIR = 'speed modulation_SiAdptBin_CI99'
-SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_CI99'
-RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CI99'
+SPEED_MOD_SUBDIR = 'speed modulation_SiAdptBin_CohrStabSkaggs'
+SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_CohrStabSkaggs'
+RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CohrStabSkaggs'
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
-# SI_RATEMAP_TYPE ratemap    : SIR, sparsity, and the SIR bootstrap shuffles
-#                              (see the options below). Bins always enter the
+# SI_RATEMAP_TYPE ratemap    : SIR, sparsity, the SIR bootstrap shuffles
+#                              (see the options below), coherence, the
+#                              coherence bootstrap shuffles, and split-half
+#                              stability. SIR / sparsity bins always enter the
 #                              sums by RAW occupancy (USE_SI_MIN_OCC).
+#                              Coherence and stability use the valid bins with
+#                              a rate estimate in that map (see _si_map_valid).
 # RAW (unsmoothed) ratemap   : peak_fr, mean_fr.
-# SMOOTHED ratemap           : coherence, split-half stability, the coherence
-#                              bootstrap shuffles, and place-field extraction.
+# SMOOTHED ratemap           : place-field extraction.
 #
-# SI_RATEMAP_TYPE options (ratemap used for SIR and sparsity, and their shuffles):
+# SI_RATEMAP_TYPE options (ratemap used for SIR, sparsity, coherence, stability):
 #   'raw'                 : RAW (unsmoothed) ratemap spikes / occupancy;
 #                           pi weights = raw occupancy.
 #   'occ_weighted_smooth' : smooth(spikes) / smooth(occupancy), see
@@ -721,6 +724,14 @@ def _si_ratemap(spike_map: np.ndarray, occ_map: np.ndarray, fr_raw: np.ndarray,
     if SI_RATEMAP_TYPE == 'gaussian_smooth':
         return fr_smooth, occ_map
     return fr_raw, occ_map
+
+
+def _si_map_valid(si_occ: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Bins of the SI_RATEMAP_TYPE map used for coherence and split-half
+    stability: valid bins with a rate estimate in that map (pi weight > 0).
+    Drops e.g. adaptive bins whose disc never reached ADAPTIVE_MIN_OCC_S;
+    equals valid_mask for 'raw' and 'gaussian_smooth'."""
+    return valid_mask & (si_occ > 0)
 
 
 def _compute_sir(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndarray,
@@ -1466,13 +1477,12 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     changes. Equivalent to MATLAB: locs_rand = [locs(rnd:end); locs(1:rnd-1)]
 
     Both metrics are derived from the single shuffled rate map built here so
-    that each bootstrap iteration only needs one shuffled spike train: SIR is
-    computed on the shuffled ratemap chosen by SI_RATEMAP_TYPE (matching the
-    real-data SIR), while coherence is computed on the Gaussian-SMOOTHED
-    shuffled ratemap (matching the real-data coherence).
+    that each bootstrap iteration only needs one shuffled spike train: SIR and
+    coherence are both computed on the shuffled ratemap chosen by
+    SI_RATEMAP_TYPE (matching the real-data SIR and coherence).
 
-    with_coherence=False skips the coherence (returned as NaN) and the Gaussian
-    smoothing unless SI_RATEMAP_TYPE needs it, so only SIR is computed.
+    with_coherence=False skips the coherence (returned as NaN), so only SIR
+    is computed.
     """
     n_frames   = len(beh_bx)
     shuf_frame = (spike_frame_indices + rnd) % n_frames
@@ -1483,7 +1493,7 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     fr_raw = np.zeros_like(spike_map)
     np.divide(spike_map, occ_map, out=fr_raw, where=valid_mask)
 
-    if with_coherence or SI_RATEMAP_TYPE == 'gaussian_smooth':
+    if SI_RATEMAP_TYPE == 'gaussian_smooth':
         fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
     else:
         fr_smooth = fr_raw   # unused by _si_ratemap for the other SI_RATEMAP_TYPEs
@@ -1491,7 +1501,8 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, bin_cm)
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
-    coherence = (_compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
+    coherence = (_compute_coherence(si_rate, _si_map_valid(si_occ, valid_mask),
+                                    n_bins_x, n_bins_y)
                  if with_coherence else float('nan'))
 
     return sir, coherence
@@ -1990,12 +2001,13 @@ def _compute_coherence(fr_map: np.ndarray, valid_mask: np.ndarray,
     return float('nan')
 
 
-def _split_half_smoothed_maps(ctx: dict, bin_cm: float) -> dict:
-    """First/second-half occupancy-normalised ratemaps on the SAME full-session
-    grid (ctx['beh_bx'] / ctx['beh_by']), each Gaussian-smoothed within its own
-    valid bins. Shared by _compute_split_half_stability and
-    _plot_and_save_split_half_ratemap so the plot shows exactly the maps the
-    stability score is computed from."""
+def _split_half_maps(ctx: dict, bin_cm: float) -> dict:
+    """First/second-half SI_RATEMAP_TYPE ratemaps on the SAME full-session
+    grid (ctx['beh_bx'] / ctx['beh_by']), each built from its own half's
+    spikes, occupancy and valid bins (see _si_ratemap); valid_first /
+    valid_second are each half's _si_map_valid bins. Shared by
+    _compute_split_half_stability and _plot_and_save_split_half_ratemap so
+    the plot shows exactly the maps the stability score is computed from."""
     t           = ctx['t']
     beh_bx      = ctx['beh_bx']
     beh_by      = ctx['beh_by']
@@ -2022,22 +2034,27 @@ def _split_half_smoothed_maps(ctx: dict, bin_cm: float) -> dict:
     valid_first  = _valid_bin_mask(occ_first,  _visits_2d(beh_bx[:mid], beh_by[:mid], n_bins_x, n_bins_y))
     valid_second = _valid_bin_mask(occ_second, _visits_2d(beh_bx[mid:], beh_by[mid:], n_bins_x, n_bins_y))
 
-    fr_first_raw  = np.zeros_like(occ_first)
-    fr_second_raw = np.zeros_like(occ_second)
-    fr_first_raw[valid_first]   = spike_first[valid_first]   / occ_first[valid_first]
-    fr_second_raw[valid_second] = spike_second[valid_second] / occ_second[valid_second]
+    def _half_map(spike_h, occ_h, valid_h):
+        fr_raw_h = np.zeros_like(occ_h)
+        fr_raw_h[valid_h] = spike_h[valid_h] / occ_h[valid_h]
+        fr_smooth_h = (_gaussian_smooth(fr_raw_h, valid_h, bin_cm)
+                       if SI_RATEMAP_TYPE == 'gaussian_smooth' else fr_raw_h)
+        rate_h, pi_h = _si_ratemap(spike_h, occ_h, fr_raw_h, fr_smooth_h, valid_h, bin_cm)
+        return rate_h, _si_map_valid(pi_h, valid_h)
 
-    return dict(valid_first=valid_first, valid_second=valid_second,
-                fr_first_smooth=_gaussian_smooth(fr_first_raw,  valid_first,  bin_cm),
-                fr_second_smooth=_gaussian_smooth(fr_second_raw, valid_second, bin_cm))
+    fr_first,  si_valid_first  = _half_map(spike_first,  occ_first,  valid_first)
+    fr_second, si_valid_second = _half_map(spike_second, occ_second, valid_second)
+
+    return dict(valid_first=si_valid_first, valid_second=si_valid_second,
+                fr_first=fr_first, fr_second=fr_second)
 
 
 def _compute_split_half_stability(ctx: dict, bin_cm: float,
                                    min_valid_bins: int = STABILITY_MIN_BINS) -> dict:
-    """Split-half spatial stability: Pearson correlation of the Gaussian-
-    SMOOTHED firing-rate map between the first and second half of the
-    session (each half smoothed within its own valid bins, see
-    _split_half_smoothed_maps).
+    """Split-half spatial stability: Pearson correlation of the
+    SI_RATEMAP_TYPE firing-rate map between the first and second half of the
+    session (each half's map built within its own valid bins, see
+    _split_half_maps).
 
     Uses the SAME spatial grid as the full-session ratemap (ctx['beh_bx'] /
     ctx['beh_by'], built from the full session's extent) for both halves, so
@@ -2062,7 +2079,7 @@ def _compute_split_half_stability(ctx: dict, bin_cm: float,
     if not ctx or len(ctx['t']) < 2:
         return result
 
-    halves       = _split_half_smoothed_maps(ctx, bin_cm)
+    halves       = _split_half_maps(ctx, bin_cm)
     common_valid = halves['valid_first'] & halves['valid_second']
 
     n_common = int(common_valid.sum())
@@ -2070,8 +2087,8 @@ def _compute_split_half_stability(ctx: dict, bin_cm: float,
     if n_common < min_valid_bins:
         return result
 
-    fr_first  = halves['fr_first_smooth'][common_valid]
-    fr_second = halves['fr_second_smooth'][common_valid]
+    fr_first  = halves['fr_first'][common_valid]
+    fr_second = halves['fr_second'][common_valid]
 
     if np.std(fr_first) == 0 or np.std(fr_second) == 0:
         return result
@@ -2089,29 +2106,29 @@ def _plot_and_save_split_half_ratemap(ctx: dict, stability: dict,
     second-half ratemap (bottom-right), with the split-half stability score
     annotated at the bottom.
 
-    First/second-half maps come from `_split_half_smoothed_maps` -- the SAME
-    full-session grid and smoothed maps `_compute_split_half_stability`
-    correlates (not the independently-binned first/second-half rows computed
-    elsewhere), so this plot is bin-aligned with, and visually explains, the
-    reported stability score.
+    All three panels are SI_RATEMAP_TYPE maps. First/second-half maps come
+    from `_split_half_maps` -- the SAME full-session grid and maps
+    `_compute_split_half_stability` correlates (not the independently-binned
+    first/second-half rows computed elsewhere), so this plot is bin-aligned
+    with, and visually explains, the reported stability score.
     """
     n_bins_x    = ctx['n_bins_x']
     n_bins_y    = ctx['n_bins_y']
-    fr_full     = ctx['fr_smooth']
-    valid_full  = ctx['valid_mask']
+    fr_full     = ctx['fr_si']
+    valid_full  = ctx['si_valid']
 
     if len(ctx['t']) < 2:
         return
 
-    halves           = _split_half_smoothed_maps(ctx, target_bin_cm)
-    valid_first      = halves['valid_first']
-    valid_second     = halves['valid_second']
-    fr_first_smooth  = halves['fr_first_smooth']
-    fr_second_smooth = halves['fr_second_smooth']
+    halves       = _split_half_maps(ctx, target_bin_cm)
+    valid_first  = halves['valid_first']
+    valid_second = halves['valid_second']
+    fr_first     = halves['fr_first']
+    fr_second    = halves['fr_second']
 
     disp_full   = np.ma.masked_where(~valid_full,   fr_full)
-    disp_first  = np.ma.masked_where(~valid_first,  fr_first_smooth)
-    disp_second = np.ma.masked_where(~valid_second, fr_second_smooth)
+    disp_first  = np.ma.masked_where(~valid_first,  fr_first)
+    disp_second = np.ma.masked_where(~valid_second, fr_second)
 
     extent = [0, n_bins_x * target_bin_cm, 0, n_bins_y * target_bin_cm]
     vmax = max((disp_full.max()   if disp_full.count()   else 0.0),
@@ -2151,7 +2168,7 @@ def _plot_and_save_split_half_ratemap(ctx: dict, stability: dict,
     ax_second.set_ylabel('y (cm)')
 
     ntt_name = os.path.splitext(os.path.basename(ntt_path))[0]
-    fig.suptitle(ntt_name, fontsize=11)
+    fig.suptitle(f'{ntt_name}\n({SI_RATEMAP_TYPE} ratemap)', fontsize=11)
 
     r      = stability.get('stability_score')
     p      = stability.get('stability_p_value')
@@ -2277,6 +2294,13 @@ def compute_metrics(csv_path: str, ntt_path: str,
     # ── 7. Smoothed firing rate map ───────────────────────────────────────────
     fr_smooth = _gaussian_smooth(fr_raw, valid_mask, target_bin_cm)
 
+    # ── 7b. SI_RATEMAP_TYPE ratemap (SIR, sparsity, coherence, stability) ─────
+    # raw / occupancy-weighted / Gaussian-smoothed / Yartsev or Skaggs adaptive
+    # ratemap. pi weights: smoothed occupancy for occ_weighted_smooth, raw
+    # occupancy otherwise.
+    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, target_bin_cm)
+    si_valid = _si_map_valid(si_occ, valid_mask)
+
     # ── 8. Compute metrics ────────────────────────────────────────────────────
     # spike_ts / spike_frame / t / x_cm / y_cm / beh_* / dt_frames: moving
     # frames only (immobility-filtered). *_all: full track and 50 ms-gated
@@ -2289,7 +2313,8 @@ def compute_metrics(csv_path: str, ntt_path: str,
                occ_map=occ_map, spike_map=spike_map, valid_mask=valid_mask,
                dt_frames=dt_frames,
                n_bins_x=n_bins_x, n_bins_y=n_bins_y,
-               fr_raw=fr_raw, fr_smooth=fr_smooth)
+               fr_raw=fr_raw, fr_smooth=fr_smooth,
+               fr_si=si_rate, si_valid=si_valid)
 
     if not valid_mask.any():
         return ({'n_spikes': n_spikes, 'n_discarded': n_discarded,
@@ -2306,17 +2331,14 @@ def compute_metrics(csv_path: str, ntt_path: str,
     peak_fr = float(fr_raw[valid_mask].max())
     mean_fr = r_mean
 
-    # SIR, sparsity: raw / occupancy-weighted / Gaussian-smoothed / Yartsev or
-    # Skaggs adaptive ratemap (see SI_RATEMAP_TYPE). pi weights: smoothed occupancy for
-    # occ_weighted_smooth, raw occupancy otherwise.
-    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, target_bin_cm)
+    # SIR: SI_RATEMAP_TYPE ratemap (step 7b).
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
     # Sparsity = (Σ pi ri)² / Σ pi ri²   (Skaggs et al. 1996), same map, pi and bins as SIR
     sparsity = _compute_sparsity(occ_map, si_occ, si_rate, valid_mask)
 
-    # Spatial coherence: SMOOTHED map vs 8-neighbour mean (Fisher Z)
-    coherence = _compute_coherence(fr_smooth, valid_mask, n_bins_x, n_bins_y)
+    # Spatial coherence: SI_RATEMAP_TYPE map vs 8-neighbour mean (Fisher Z)
+    coherence = _compute_coherence(si_rate, si_valid, n_bins_x, n_bins_y)
 
     metrics = {
         'n_spikes':    n_spikes,
@@ -3189,7 +3211,7 @@ def _run_job(args):
     first_row, _        = _build_row('first',  'first_half')
     second_row, _       = _build_row('second', 'second_half')
 
-    # Split-half spatial stability (Pearson r of the smoothed ratemap between the
+    # Split-half spatial stability (Pearson r of the SI_RATEMAP_TYPE ratemap between the
     # first and second half of the SESSION) -- computed once here on the
     # full-session grid, not from the independently-binned first/second-half
     # rows above (see _compute_split_half_stability docstring). Reported only

@@ -17,6 +17,8 @@ Metrics computed
   Presence ratio       – fraction of 1-s bins that contain ≥ 1 spike
   CSI                  – complex spike index: % of all ISIs in [3, 20] ms
                          where the 2nd spike amplitude < 1st (Bhatt et al. 2020)
+  CSI modified         – same as CSI but WITHOUT the decreasing-amplitude criterion:
+                         % of all ISIs in [3, 20] ms
 
 Acceptance criteria (unit is "accepted" only if ALL three hold)
 ─────────────────────────────────────────────────────────────
@@ -34,6 +36,11 @@ Multi-trigger (bursting) review
   to cluster 0 (the copy in the accepted tree is rewritten so those spikes have
   cell_number = 0; the original .ntt is never modified). The manual decision overrides the
   automatic one (for copying and for the accepted/rejected colouring in every histogram).
+  If USE_SAVED_MT_LABELS is True and SAVED_MT_LABELS_FILE exists (.csv or .xlsx with
+  session / unit / manual_review columns, e.g. a previous QUALITY_METRICS.xlsx or
+  <name>_MT_labels.csv), units labelled there take the saved decision and only the
+  remaining ones are shown in the GUI. Every run writes the decisions to
+  <OUTPUT_EXCEL name>_MT_labels.csv.
 
 Accepted units' .ntt files, plus every .csv and .ncs file found alongside them,
 are copied into a sibling '<ROOT_FOLDER>_Accepted' tree that mirrors the
@@ -72,6 +79,13 @@ ACCEPTED_ROOT_FOLDER = ROOT_FOLDER.rstrip('\\/') + '_SpkQltyFilt'
 # True: copy accepted units (+ session .csv/.ncs files) into ACCEPTED_ROOT_FOLDER.
 # False: compute metrics/figures only, no files are copied.
 SAVE_ACCEPTED_COPY = True
+
+# True: take the manually curated multi-trigger labels (accepted / rejected /
+# accepted, MT spikes -> cl 0) from SAVED_MT_LABELS_FILE instead of re-reviewing
+# them in the GUI. Units not found in the file are still shown in the GUI.
+# False: review every multi-trigger unit in the GUI.
+USE_SAVED_MT_LABELS = True
+SAVED_MT_LABELS_FILE = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data\QUALITY_METRICS.xlsx'
 
 # ROOT_FOLDER  = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test'
 # OUTPUT_EXCEL = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/L_Iso_CSI_Test/QUALITY_METRICS.xlsx'
@@ -207,7 +221,7 @@ ALL_METRIC_KEYS = [
     'pt_best_channel', 'peak_time_ms', 'peak_amp_uV',
     'trough_time_ms', 'trough_amp_uV', 'pt_time_ms', 'pt_ratio',
     'spike_start_time_ms', 'spike_end_time_ms', 'spike_duration_ms',
-    'csi',
+    'csi', 'csi_modified',
     'n_multi_trigger_peaks',
 ]
 
@@ -518,6 +532,19 @@ def compute_csi(waveforms: np.ndarray, spike_ts_us: np.ndarray,
     return round(float(n_complex / len(isis) * 100.0), 4)
 
 
+def compute_csi_modified(spike_ts_us: np.ndarray,
+                         min_isi_us: float = 3000.0, max_isi_us: float = 20000.0) -> float:
+    """
+    CSI modified: identical to compute_csi but without the decreasing-amplitude
+    criterion, i.e. % of ALL consecutive ISIs that fall in [3, 20] ms.
+    """
+    if len(spike_ts_us) < 2:
+        return float('nan')
+    isis     = np.diff(np.sort(spike_ts_us))
+    in_range = (isis >= min_isi_us) & (isis <= max_isi_us)
+    return round(float(np.sum(in_range) / len(isis) * 100.0), 4)
+
+
 def detect_multi_triggers(waveforms: np.ndarray, best_ch: int, peak_idx: int,
                           offset: int = MULTI_TRIGGER_OFFSET_SAMPLES,
                           amp_frac: float = MULTI_TRIGGER_AMP_FRAC,
@@ -742,6 +769,55 @@ def review_multi_trigger_units(candidates: list) -> dict:
     return decisions
 
 
+# ── Saved (manually curated) multi-trigger labels ────────────────────────────
+
+def _label_key(session, unit) -> tuple:
+    return (os.path.normpath(str(session)).lower(), str(unit).strip().lower())
+
+
+def _parse_mt_label(value):
+    """Map a manual_review entry to 'accept' / 'reject' / 'clean' (None = no decision)."""
+    s = str(value).strip().lower()
+    if not s or s in ('nan', 'none', 'not reviewed'):
+        return None
+    if s.startswith('rej'):
+        return 'reject'
+    if s == 'clean' or 'cl 0' in s or 'cluster 0' in s or 'moved' in s or 'mt0' in s:
+        return 'clean'
+    if s.startswith('acc'):
+        return 'accept'
+    return None
+
+
+def load_saved_mt_labels(path: str) -> dict:
+    """
+    Read curated multi-trigger labels from a .csv or .xlsx (first sheet) with
+    'session', 'unit' and 'manual_review' columns (as written by this script).
+    Returns {(session, unit): 'accept' / 'reject' / 'clean'}.
+    """
+    if not os.path.isfile(path):
+        print(f'Saved multi-trigger labels not found: {path}\n'
+              f'  -> all multi-trigger units will be reviewed in the GUI.')
+        return {}
+    if path.lower().endswith('.csv'):
+        lab = pd.read_csv(path)
+    else:
+        lab = pd.read_excel(path, sheet_name=0, engine='openpyxl')
+    if 'manual_review' not in lab.columns:
+        print(f'Saved labels file has no "manual_review" column: {path}\n'
+              f'  -> all multi-trigger units will be reviewed in the GUI.')
+        return {}
+    session_col = 'session' if 'session' in lab.columns else lab.columns[0]
+    unit_col    = 'unit' if 'unit' in lab.columns else lab.columns[1]
+    labels = {}
+    for session, unit, value in zip(lab[session_col], lab[unit_col], lab['manual_review']):
+        decision = _parse_mt_label(value)
+        if decision is not None:
+            labels[_label_key(session, unit)] = decision
+    print(f'Loaded {len(labels)} saved multi-trigger label(s) from {path}')
+    return labels
+
+
 # ── Master metric computation ─────────────────────────────────────────────────
 
 def compute_metrics(ntt_path: str) -> dict:
@@ -783,6 +859,7 @@ def compute_metrics(ntt_path: str) -> dict:
         'spike_end_time_ms':    pt_result['spike_end_time_ms'],
         'spike_duration_ms':    pt_result['spike_duration_ms'],
         'csi':                  compute_csi(waveforms, spike_ts),
+        'csi_modified':         compute_csi_modified(spike_ts),
         'n_multi_trigger_peaks': int(detect_multi_triggers(waveforms, pt_result['best_channel'],
                                                            pt_result['peak_idx']).sum()),
         '_pt_plot':            pt_result,   # not an Excel column; used for per-unit waveform plots
@@ -793,6 +870,10 @@ def compute_metrics(ntt_path: str) -> dict:
 
 WAVEFORM_PLOT_DIR = os.path.join(os.path.dirname(OUTPUT_EXCEL), 'waveform_plots')
 os.makedirs(WAVEFORM_PLOT_DIR, exist_ok=True)
+MT_LABELS_CSV = os.path.splitext(OUTPUT_EXCEL)[0] + '_MT_labels.csv'
+
+# Read before the scan, so a labels file that is also OUTPUT_EXCEL is read before it is overwritten
+saved_mt_labels = load_saved_mt_labels(SAVED_MT_LABELS_FILE) if USE_SAVED_MT_LABELS else {}
 
 records = []
 waveform_plot_entries = []   # [(label, png_path), ...] for Excel embedding
@@ -872,10 +953,23 @@ for dirpath, _, filenames in os.walk(ROOT_FOLDER):
 # are copied to ACCEPTED_ROOT_FOLDER and coloured as accepted in all histograms.
 
 n_manual_accepted = n_manual_rejected = n_manual_cleaned = 0
+n_from_saved = 0
 if review_candidates:
-    print(f'\n{len(review_candidates)} unit(s) with > {MULTI_TRIGGER_MIN_PEAKS} secondary peaks '
-          f'-> opening manual review GUI...')
-    decisions = review_multi_trigger_units(review_candidates)
+    decisions = {}
+    for k, cand in enumerate(review_candidates):
+        saved = saved_mt_labels.get(_label_key(cand['session'], cand['unit']))
+        if saved is not None:
+            decisions[k] = saved
+    n_from_saved = len(decisions)
+    if USE_SAVED_MT_LABELS:
+        print(f'\n{n_from_saved} of {len(review_candidates)} multi-trigger unit(s) '
+              f'labelled from saved file')
+    to_review = [k for k in range(len(review_candidates)) if k not in decisions]
+    if to_review:
+        print(f'\n{len(to_review)} unit(s) with > {MULTI_TRIGGER_MIN_PEAKS} secondary peaks '
+              f'-> opening manual review GUI...')
+        gui_decisions = review_multi_trigger_units([review_candidates[k] for k in to_review])
+        decisions.update({to_review[j]: d for j, d in gui_decisions.items()})
     for k, cand in enumerate(review_candidates):
         rec = records[cand['record_idx']]
         decision = decisions.get(k)
@@ -906,7 +1000,16 @@ if review_candidates:
     print(f'Manual review: {n_manual_accepted} accepted, '
           f'{n_manual_cleaned} accepted with multi-trigger spikes -> cluster 0, '
           f'{n_manual_rejected} rejected, '
-          f'{len(review_candidates) - len(decisions)} not reviewed (automatic decision kept)')
+          f'{len(review_candidates) - len(decisions)} not reviewed (automatic decision kept); '
+          f'{n_from_saved} taken from saved labels')
+
+    # Curated labels for re-use (point SAVED_MT_LABELS_FILE here on a later run)
+    pd.DataFrame([{'session':       cand['session'],
+                   'unit':          cand['unit'],
+                   'manual_review': records[cand['record_idx']]['manual_review'],
+                   'accepted':      records[cand['record_idx']]['accepted']}
+                  for cand in review_candidates]).to_csv(MT_LABELS_CSV, index=False)
+    print(f'Multi-trigger labels saved: {MT_LABELS_CSV}')
 
 if SAVE_ACCEPTED_COPY:
     print(f'\nAccepted units copied: {n_units_copied}  |  Support files (.csv/.ncs) copied: {n_support_files_copied}')
@@ -938,7 +1041,7 @@ COL_WIDTHS = {
     'trough_time_ms':       14, 'trough_amp_uV':         14, 'pt_time_ms':           14,
     'pt_ratio':             12,
     'spike_start_time_ms':  16, 'spike_end_time_ms':     16, 'spike_duration_ms':    16,
-    'csi':                  10,
+    'csi':                  10, 'csi_modified':         14,
     'n_multi_trigger_peaks': 20, 'multi_trigger':        14, 'manual_review':        30,
 }
 for col_idx, col_name in enumerate(COLUMN_ORDER, start=1):
@@ -1101,6 +1204,7 @@ histogram_specs = [
     ('Hist_SpikeDur','_hist_SpikeDur',  'spike_duration_ms',  'Spike Duration',                 'Spike duration  (ms)',          (),                              (),                                     (),                                                                              ACCEPTED_COLOR),
     ('Hist_PTRatio', '_hist_PTRatio',   'pt_ratio',           'Peak-to-Trough Ratio',           '|peak| / |trough|  (a.u.)',     (1.0,),                          (INK_MUTED,),                           ('ratio = 1.0',),                                                                ACCEPTED_COLOR),
     ('Hist_CSI',     '_hist_CSI',       'csi',                'Complex Spike Index (CSI)',       'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)', (10.0,), (COLOR_THR_BAD,),                       ('CSI = 10%',),                                                                  ACCEPTED_COLOR),
+    ('Hist_CSImod',  '_hist_CSImod',    'csi_modified',       'CSI modified (no amplitude criterion)', 'CSI modified  (% of ISIs in [3–20 ms])', (10.0,), (COLOR_THR_BAD,),                ('CSI = 10%',),                                                                  ACCEPTED_COLOR),
 ]
 
 png_paths = {}
@@ -1166,7 +1270,7 @@ for col, label in [('snr', 'SNR quality'), ('isi_violation_pct', 'ISI quality')]
             print(f'  {lbl:12s}: {n}')
 
 for col in ['isi_violation_pct', 'template_correlation', 'pt_time_ms',
-            'pt_ratio', 'spike_duration_ms', 'csi']:
+            'pt_ratio', 'spike_duration_ms', 'csi', 'csi_modified']:
     vals = df[col].dropna()
     if len(vals):
         print(f'\n{col}: mean={vals.mean():.4f}  median={vals.median():.4f}  SD={vals.std():.4f}  n={len(vals)}')

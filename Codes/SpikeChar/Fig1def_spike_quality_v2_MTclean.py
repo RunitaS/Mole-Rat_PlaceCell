@@ -493,6 +493,8 @@ histogram_specs = [
      (), (), ()),
     ('CSI',      'csi',                  'Complex Spike Index (CSI)',    'CSI  (% of ISIs in [3–20 ms] with smaller 2nd spike)',
      (10.0,), (COLOR_THR_BAD,), ('CSI = 10%',)),
+    ('CSImod',   'csi_modified',         'CSI modified (no amplitude criterion)', 'CSI modified  (% of ISIs in [3–20 ms])',
+     (10.0,), (COLOR_THR_BAD,), ('CSI = 10%',)),
 ]
 
 accepted_flags = df['accepted'].values
