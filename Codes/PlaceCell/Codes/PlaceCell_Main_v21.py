@@ -10,8 +10,9 @@ SIR, and its bootstrap    occupancy-weighted> smoothed map>    raw
 Sparsity>    smoothed>    raw
 Mean firing rate>    smoothed>    raw
 Peak firing rate>    raw>    raw (unchanged)
-Coherence, and its bootstrap>    smoothed>    SI_RATEMAP_TYPE map
-Split-half stability>    raw>    SI_RATEMAP_TYPE map
+Coherence, and its bootstrap>    smoothed>    COHERENCE_STABILITY_RATEMAP_TYPE map
+Split-half stability>    raw>    COHERENCE_STABILITY_RATEMAP_TYPE map
+(Peak / mean rate: FIRING_RATE_RATEMAP_TYPE map; place fields: PLACE_FIELD_RATEMAP_TYPE map.)
 
 Also added minimum velocity filter to remove non-spatial firing during immobility (e.g. sharp-wave ripples). See compute_metrics step 2c.
 """
@@ -52,23 +53,37 @@ SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_CohrStabSkaggs'
 RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CohrStabSkaggs'
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
-# SI_RATEMAP_TYPE ratemap    : SIR, sparsity, the SIR bootstrap shuffles
-#                              (see the options below), coherence, the
-#                              coherence bootstrap shuffles, and split-half
-#                              stability. SIR / sparsity bins always enter the
-#                              sums by RAW occupancy (USE_SI_MIN_OCC).
-#                              Coherence and stability use the valid bins with
-#                              a rate estimate in that map (see _si_map_valid).
-# RAW (unsmoothed) ratemap   : peak_fr, mean_fr.
-# SMOOTHED ratemap           : place-field extraction.
+# Each metric group below takes its own ratemap type (options listed further
+# down); groups set to the same type share one map, built once.
+#   SI_RATEMAP_TYPE                   : SIR, sparsity, the SIR bootstrap
+#                                       shuffles. SIR / sparsity bins always
+#                                       enter the sums by RAW occupancy
+#                                       (USE_SI_MIN_OCC).
+#   COHERENCE_STABILITY_RATEMAP_TYPE  : coherence, the coherence bootstrap
+#                                       shuffles, split-half stability (and the
+#                                       split-half ratemap figure). Both use the
+#                                       valid bins with a rate estimate in that
+#                                       map (see _map_valid).
+#   FIRING_RATE_RATEMAP_TYPE          : peak_fr, mean_fr (mean = occupancy-
+#                                       weighted, pi weights of that map), and
+#                                       the place-field peak-bin check that
+#                                       backs peak_fr (field columns
+#                                       peak_fr_hz_raw / field_raw_max_fr_hz).
+#   PLACE_FIELD_RATEMAP_TYPE          : place-field isolation (Stage 2 below)
+#                                       and the field-boundary panel(s).
+# Speed score has no option: it correlates a time series of the
+# instantaneous firing rate with running speed (_compute_speed_modulation)
+# and uses no spatial ratemap.
+# On the Circle track, firing rate and place fields use the 1-D angular
+# version of the chosen type (_ratemap_circular).
 #
-# SI_RATEMAP_TYPE options (ratemap used for SIR, sparsity, coherence, stability):
+# Ratemap type options:
 #   'raw'                 : RAW (unsmoothed) ratemap spikes / occupancy;
 #                           pi weights = raw occupancy.
 #   'occ_weighted_smooth' : smooth(spikes) / smooth(occupancy), see
 #                           _occ_weighted_smooth; pi weights = smoothed occupancy.
-#   'gaussian_smooth'     : Gaussian-SMOOTHED ratemap (same map as coherence,
-#                           see _gaussian_smooth); pi weights = raw occupancy.
+#   'gaussian_smooth'     : Gaussian-SMOOTHED ratemap (see _gaussian_smooth);
+#                           pi weights = raw occupancy.
 #   'Yartsev_adaptive_binned' : adaptive-binned ratemap, Yartsev & Ulanovsky 2013
 #                           occupancy-only criterion (Grieves rate_mapper.m
 #                           'yadaptive'), see _yartsev_adaptive_binned_ratemap;
@@ -77,13 +92,17 @@ RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CohrStabSkaggs'
 #                           occupancy-and-spikes criterion (Grieves rate_mapper.m
 #                           'adaptive' / 'kadaptive'), see
 #                           _skaggs_adaptive_binned_ratemap; pi weights = raw occupancy.
-SI_RATEMAP_TYPE = 'Skaggs_adaptive_binned'  # 'raw', 'occ_weighted_smooth', 'gaussian_smooth',
-                                            # 'Yartsev_adaptive_binned', 'Skaggs_adaptive_binned'
-_SI_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth',
-                     'Yartsev_adaptive_binned', 'Skaggs_adaptive_binned')
-if SI_RATEMAP_TYPE not in _SI_RATEMAP_TYPES:
-    raise ValueError(f"SI_RATEMAP_TYPE must be one of {_SI_RATEMAP_TYPES}, "
-                     f"got {SI_RATEMAP_TYPE!r}")
+SI_RATEMAP_TYPE                  = 'Skaggs_adaptive_binned'
+COHERENCE_STABILITY_RATEMAP_TYPE = 'gaussian_smooth'
+FIRING_RATE_RATEMAP_TYPE         = 'raw'               # peak / mean rate are normally RAW
+PLACE_FIELD_RATEMAP_TYPE         = 'gaussian_smooth'   # field isolation is normally Gaussian-smoothed
+_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth',
+                  'Yartsev_adaptive_binned', 'Skaggs_adaptive_binned')
+for _name in ('SI_RATEMAP_TYPE', 'COHERENCE_STABILITY_RATEMAP_TYPE',
+              'FIRING_RATE_RATEMAP_TYPE', 'PLACE_FIELD_RATEMAP_TYPE'):
+    if globals()[_name] not in _RATEMAP_TYPES:
+        raise ValueError(f"{_name} must be one of {_RATEMAP_TYPES}, "
+                         f"got {globals()[_name]!r}")
 #
 # Adaptive-disc settings shared by both adaptive methods. For each valid bin a
 # disc (radius in BIN units, r^2 = 0, 1, 2, ...) grows until the method's
@@ -93,13 +112,13 @@ ADAPTIVE_MAX_RSQ    = 200     # disc stops growing at r^2 = ADAPTIVE_MAX_RSQ - 1
 ADAPTIVE_MIN_OCC_S  = 0.5     # bins whose final disc holds < this occupancy (s) get rate 0
                               # and pi weight 0 (MATLAB params(2))
 #
-# Yartsev method (used only when SI_RATEMAP_TYPE = 'Yartsev_adaptive_binned'):
+# Yartsev method (used only where a ratemap type above is 'Yartsev_adaptive_binned'):
 #     occ_in_disc >= YARTSEV_DISC_OCC_S,
 # independent of spikes. Larger YARTSEV_DISC_OCC_S -> larger discs -> more
 # smoothing. Because r is in bins, the effective smoothing depends on target_bin_cm.
 YARTSEV_DISC_OCC_S  = 1.0     # occupancy (s) a disc must enclose (Yartsev / Grieves: 1 s)
 #
-# Skaggs method (used only when SI_RATEMAP_TYPE = 'Skaggs_adaptive_binned'):
+# Skaggs method (used only where a ratemap type above is 'Skaggs_adaptive_binned'):
 # Skaggs & McNaughton 1998 criterion  r >= alpha / (n * sqrt(s)),  i.e. the disc
 # grows until
 #     r_cm * occ_in_disc_s * sqrt(spikes_in_disc) >= SKAGGS_ALPHA,
@@ -162,9 +181,9 @@ if not RUN_COHERENCE_SHUFFLE:
 
 # ── Stage 2: place-field detection ("threshold method") ───────────────────────
 # Run only on cells that pass Stage 1 (see detect_place_fields_threshold_2d /
-# _circular). A bin qualifies for a field if its Gaussian-smoothed firing rate
-# is >= METHOD2_RATE_THRESHOLD_FRAC of the cell's peak (smoothed) rate AND
-# above the cell's mean firing rate; 8-connected components of qualifying bins
+# _circular). A bin qualifies for a field if its firing rate in the
+# PLACE_FIELD_RATEMAP_TYPE map is >= METHOD2_RATE_THRESHOLD_FRAC of that map's
+# peak rate AND above the cell's mean firing rate; 8-connected components of qualifying bins
 # spanning >= MIN_FIELD_SIZE_BINS contiguous bins are reported as fields. If
 # no detected field backs the cell's peak rate (inside the
 # PLACE_CELL_MIN/MAX_PEAK_FR window), the cell is reclassified as NOT a place cell.
@@ -391,7 +410,9 @@ RUN_CONFIG_VARS = [
     'MAX_GPU_UTIL_PCT', 'MAX_WORKERS',
     'COORD_UNITS',
     'GAUSSIAN_SIGMA_CM',
-    'SI_RATEMAP_TYPE', 'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
+    'SI_RATEMAP_TYPE', 'COHERENCE_STABILITY_RATEMAP_TYPE',
+    'FIRING_RATE_RATEMAP_TYPE', 'PLACE_FIELD_RATEMAP_TYPE',
+    'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
     'ADAPTIVE_MAX_RSQ', 'ADAPTIVE_MIN_OCC_S', 'YARTSEV_DISC_OCC_S', 'SKAGGS_ALPHA',
     'SAVE_SI_RATEMAP',
     'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
@@ -708,37 +729,44 @@ def _si_bin_mask(occ_map: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     return valid_mask
 
 
-def _si_ratemap(spike_map: np.ndarray, occ_map: np.ndarray, fr_raw: np.ndarray,
-                fr_smooth: np.ndarray, valid_mask: np.ndarray,
-                bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
-    """Ratemap and occupancy the SIR / sparsity sums are taken over (see
-    SI_RATEMAP_TYPE). Returns (rate_map, pi_occ): the occupancy-weighted
-    ratemap with the smoothed occupancy as pi weights, or the Yartsev / Skaggs
-    adaptive / Gaussian-smoothed / RAW ratemap with the raw occupancy."""
-    if SI_RATEMAP_TYPE == 'occ_weighted_smooth':
+def _ratemap(map_type: str, spike_map: np.ndarray, occ_map: np.ndarray,
+             valid_mask: np.ndarray, bin_cm: float,
+             fr_raw: np.ndarray | None = None,
+             fr_smooth: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Ratemap of type `map_type` (one of _RATEMAP_TYPES, see the ratemap
+    settings at the top of the file). Returns (rate_map, pi_occ): the
+    occupancy-weighted ratemap with the smoothed occupancy as pi weights, or
+    the Yartsev / Skaggs adaptive / Gaussian-smoothed / RAW ratemap with the
+    raw occupancy. `fr_raw` / `fr_smooth` are the RAW and Gaussian-smoothed
+    maps if already built; otherwise they are computed here when needed."""
+    if map_type == 'occ_weighted_smooth':
         return _occ_weighted_smooth(spike_map, occ_map, valid_mask, bin_cm)
-    if SI_RATEMAP_TYPE == 'Yartsev_adaptive_binned':
+    if map_type == 'Yartsev_adaptive_binned':
         return _yartsev_adaptive_binned_ratemap(spike_map, occ_map, valid_mask)
-    if SI_RATEMAP_TYPE == 'Skaggs_adaptive_binned':
+    if map_type == 'Skaggs_adaptive_binned':
         return _skaggs_adaptive_binned_ratemap(spike_map, occ_map, valid_mask, bin_cm)
-    if SI_RATEMAP_TYPE == 'gaussian_smooth':
+    if fr_raw is None:
+        fr_raw = np.zeros_like(occ_map, dtype=np.float64)
+        np.divide(spike_map, occ_map, out=fr_raw, where=valid_mask)
+    if map_type == 'gaussian_smooth':
+        if fr_smooth is None:
+            fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
         return fr_smooth, occ_map
     return fr_raw, occ_map
 
 
-def _si_map_valid(si_occ: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-    """Bins of the SI_RATEMAP_TYPE map used for coherence and split-half
-    stability: valid bins with a rate estimate in that map (pi weight > 0).
+def _map_valid(pi_occ: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Valid bins with a rate estimate in a _ratemap map (pi weight > 0).
     Drops e.g. adaptive bins whose disc never reached ADAPTIVE_MIN_OCC_S;
     equals valid_mask for 'raw' and 'gaussian_smooth'."""
-    return valid_mask & (si_occ > 0)
+    return valid_mask & (pi_occ > 0)
 
 
 def _compute_sir(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndarray,
                  valid_mask: np.ndarray) -> float:
     """Skaggs spatial information (bits/spike): Σ pi (ri/r̄) log2(ri/r̄), with
     ri from `rate_map` and pi from `pi_occ` normalised over the bins in the
-    sum (see _si_ratemap). `occ_map` (raw occupancy) only selects which bins
+    sum (see _ratemap). `occ_map` (raw occupancy) only selects which bins
     enter the sum (see _si_bin_mask). Shared by the real data and the
     bootstrap shuffles.
     """
@@ -760,7 +788,7 @@ def _compute_sir(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndarray,
 def _compute_sparsity(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndarray,
                       valid_mask: np.ndarray) -> float:
     """Skaggs sparsity: (Σ pi ri)² / Σ pi ri², with ri from `rate_map` and pi
-    from `pi_occ` normalised over the bins in the sum (see _si_ratemap), over
+    from `pi_occ` normalised over the bins in the sum (see _ratemap), over
     the same bins as the SIR sum (see _si_bin_mask).
     """
     sp_mask = _si_bin_mask(occ_map, valid_mask)
@@ -1476,10 +1504,11 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     Spike-to-frame assignments are kept fixed; only the location at each frame
     changes. Equivalent to MATLAB: locs_rand = [locs(rnd:end); locs(1:rnd-1)]
 
-    Both metrics are derived from the single shuffled rate map built here so
-    that each bootstrap iteration only needs one shuffled spike train: SIR and
-    coherence are both computed on the shuffled ratemap chosen by
-    SI_RATEMAP_TYPE (matching the real-data SIR and coherence).
+    Both metrics come from the single shuffled spike map built here, so each
+    bootstrap iteration only needs one shuffled spike train: SIR is computed
+    on the shuffled SI_RATEMAP_TYPE ratemap and coherence on the shuffled
+    COHERENCE_STABILITY_RATEMAP_TYPE ratemap (matching the real-data SIR and
+    coherence; one map serves both when the two types are the same).
 
     with_coherence=False skips the coherence (returned as NaN), so only SIR
     is computed.
@@ -1493,18 +1522,20 @@ def _sir_and_coherence_from_spikes_locshuf(spike_frame_indices: np.ndarray, rnd:
     fr_raw = np.zeros_like(spike_map)
     np.divide(spike_map, occ_map, out=fr_raw, where=valid_mask)
 
-    if SI_RATEMAP_TYPE == 'gaussian_smooth':
-        fr_smooth = _gaussian_smooth(fr_raw, valid_mask, bin_cm)
-    else:
-        fr_smooth = fr_raw   # unused by _si_ratemap for the other SI_RATEMAP_TYPEs
-
-    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, bin_cm)
+    si_rate, si_occ = _ratemap(SI_RATEMAP_TYPE, spike_map, occ_map, valid_mask, bin_cm,
+                               fr_raw=fr_raw)
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
 
-    coherence = (_compute_coherence(si_rate, _si_map_valid(si_occ, valid_mask),
-                                    n_bins_x, n_bins_y)
-                 if with_coherence else float('nan'))
+    if not with_coherence:
+        return sir, float('nan')
 
+    if COHERENCE_STABILITY_RATEMAP_TYPE == SI_RATEMAP_TYPE:
+        cs_rate, cs_occ = si_rate, si_occ
+    else:
+        cs_rate, cs_occ = _ratemap(COHERENCE_STABILITY_RATEMAP_TYPE, spike_map, occ_map,
+                                   valid_mask, bin_cm, fr_raw=fr_raw)
+    coherence = _compute_coherence(cs_rate, _map_valid(cs_occ, valid_mask),
+                                   n_bins_x, n_bins_y)
     return sir, coherence
 
 
@@ -1849,7 +1880,9 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
                             spike_frame: np.ndarray,
                             fields_threshold: list[dict] | None = None,
                             arena_type: str | None = None,
-                            ctx_circular: dict | None = None) -> None:
+                            ctx_circular: dict | None = None,
+                            fr_field: np.ndarray | None = None,
+                            field_valid: np.ndarray | None = None) -> None:
     """Plot the raw trajectory (with spike locations overlaid) beside the
     fixed-bin, Gaussian-smoothed firing-rate map (middle top) and the
     SI_RATEMAP_TYPE firing-rate map (middle bottom) for one cell, and save
@@ -1858,8 +1891,8 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
 
     The bottom map (from `spike_map` / `occ_map`) is recomputed here for
     DISPLAY ONLY -- it does not feed any metric or the field detection. It is
-    the same ratemap the SIR / sparsity use (_si_ratemap); for
-    'Skaggs_adaptive_binned' the title also gives the median disc radius.
+    the same ratemap the SIR / sparsity use (_ratemap with SI_RATEMAP_TYPE);
+    for 'Skaggs_adaptive_binned' the title also gives the median disc radius.
     Bins with no (adaptive / smoothed) occupancy, e.g. an adaptive disc that
     never reached ADAPTIVE_MIN_OCC_S, are left blank.
 
@@ -1867,9 +1900,10 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
     this cell, passed only for confirmed (final-verdict) place cells; it is
     None for every other cell, in which case no extra panel is drawn. When
     given, one extra panel (2-D grid arenas: field boundaries contoured on
-    the rate map) or two extra polar panels (Circle/ring arenas: angular
-    tuning curve + ring rate map, via `ctx_circular`) are appended to this
-    same figure instead of being saved as a separate file.
+    the PLACE_FIELD_RATEMAP_TYPE map `fr_field` / `field_valid`) or two extra
+    polar panels (Circle/ring arenas: angular tuning curve + ring rate map,
+    via `ctx_circular`) are appended to this same figure instead of being
+    saved as a separate file.
     """
     display_map = np.ma.masked_where(~valid_mask, fr_map)
 
@@ -1880,10 +1914,8 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
             med_r = np.nanmedian(radius_cm) if valid_mask.any() else float('nan')
             si_title = f'Skaggs adaptive (alpha={SKAGGS_ALPHA:g}, median r={med_r:.1f} cm)'
         else:
-            fr_raw = np.zeros_like(occ_map)
-            fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
-            fr_si, occ_si = _si_ratemap(spike_map, occ_map, fr_raw, fr_map,
-                                        valid_mask, target_bin_cm)
+            fr_si, occ_si = _ratemap(SI_RATEMAP_TYPE, spike_map, occ_map, valid_mask,
+                                     target_bin_cm, fr_smooth=fr_map)
             si_title = {'raw':                     'Raw (unsmoothed)',
                         'occ_weighted_smooth':     'Occupancy-weighted smoothed',
                         'gaussian_smooth':         'Gaussian-smoothed (SIR map)',
@@ -1940,20 +1972,22 @@ def _plot_and_save_ratemap(fr_map: np.ndarray, spike_map: np.ndarray, occ_map: n
         if arena_type == 'Circle' and ctx_circular is not None:
             ax_line = fig.add_subplot(gs[:, 2], projection='polar')
             ax_ring = fig.add_subplot(gs[:, 3], projection='polar')
-            _plot_ratemap_polar(ax_line, ctx_circular['fr_smooth'], ctx_circular['valid_mask'],
+            _plot_ratemap_polar(ax_line, ctx_circular['fr_field'], ctx_circular['field_valid'],
                                  fields_threshold, ctx_circular['n_bins_theta'],
                                  ctx_circular['bin_width_rad'],
-                                 f'Threshold method, angular ({len(fields_threshold)} field(s))')
-            im_ring = _plot_ratemap_ring(ax_ring, ctx_circular['fr_smooth'], ctx_circular['valid_mask'],
+                                 f'Threshold method, angular, {PLACE_FIELD_RATEMAP_TYPE} '
+                                 f'({len(fields_threshold)} field(s))')
+            im_ring = _plot_ratemap_ring(ax_ring, ctx_circular['fr_field'], ctx_circular['field_valid'],
                                           fields_threshold, ctx_circular['n_bins_theta'],
                                           ctx_circular['bin_width_rad'], ctx_circular['r_min'],
                                           ctx_circular['r_max'], 'Binned rate map (ring)')
             fig.colorbar(im_ring, ax=ax_ring, label='Hz', fraction=0.046, pad=0.1)
         else:
+            assert fr_field is not None and field_valid is not None
             ax_field = fig.add_subplot(gs[:, 2])
             im_field = _plot_ratemap_with_field_boundaries_2d(
-                ax_field, fr_map, valid_mask, fields_threshold, n_bins_x, n_bins_y,
-                f'Threshold method ({len(fields_threshold)} field(s))')
+                ax_field, fr_field, field_valid, fields_threshold, n_bins_x, n_bins_y,
+                f'Threshold method, {PLACE_FIELD_RATEMAP_TYPE} ({len(fields_threshold)} field(s))')
             fig.colorbar(im_field, ax=ax_field, label='Hz', shrink=0.5)
 
     ntt_name = os.path.splitext(os.path.basename(ntt_path))[0]
@@ -2002,10 +2036,10 @@ def _compute_coherence(fr_map: np.ndarray, valid_mask: np.ndarray,
 
 
 def _split_half_maps(ctx: dict, bin_cm: float) -> dict:
-    """First/second-half SI_RATEMAP_TYPE ratemaps on the SAME full-session
-    grid (ctx['beh_bx'] / ctx['beh_by']), each built from its own half's
-    spikes, occupancy and valid bins (see _si_ratemap); valid_first /
-    valid_second are each half's _si_map_valid bins. Shared by
+    """First/second-half COHERENCE_STABILITY_RATEMAP_TYPE ratemaps on the
+    SAME full-session grid (ctx['beh_bx'] / ctx['beh_by']), each built from
+    its own half's spikes, occupancy and valid bins (see _ratemap);
+    valid_first / valid_second are each half's _map_valid bins. Shared by
     _compute_split_half_stability and _plot_and_save_split_half_ratemap so
     the plot shows exactly the maps the stability score is computed from."""
     t           = ctx['t']
@@ -2035,24 +2069,20 @@ def _split_half_maps(ctx: dict, bin_cm: float) -> dict:
     valid_second = _valid_bin_mask(occ_second, _visits_2d(beh_bx[mid:], beh_by[mid:], n_bins_x, n_bins_y))
 
     def _half_map(spike_h, occ_h, valid_h):
-        fr_raw_h = np.zeros_like(occ_h)
-        fr_raw_h[valid_h] = spike_h[valid_h] / occ_h[valid_h]
-        fr_smooth_h = (_gaussian_smooth(fr_raw_h, valid_h, bin_cm)
-                       if SI_RATEMAP_TYPE == 'gaussian_smooth' else fr_raw_h)
-        rate_h, pi_h = _si_ratemap(spike_h, occ_h, fr_raw_h, fr_smooth_h, valid_h, bin_cm)
-        return rate_h, _si_map_valid(pi_h, valid_h)
+        rate_h, pi_h = _ratemap(COHERENCE_STABILITY_RATEMAP_TYPE, spike_h, occ_h, valid_h, bin_cm)
+        return rate_h, _map_valid(pi_h, valid_h)
 
-    fr_first,  si_valid_first  = _half_map(spike_first,  occ_first,  valid_first)
-    fr_second, si_valid_second = _half_map(spike_second, occ_second, valid_second)
+    fr_first,  cs_valid_first  = _half_map(spike_first,  occ_first,  valid_first)
+    fr_second, cs_valid_second = _half_map(spike_second, occ_second, valid_second)
 
-    return dict(valid_first=si_valid_first, valid_second=si_valid_second,
+    return dict(valid_first=cs_valid_first, valid_second=cs_valid_second,
                 fr_first=fr_first, fr_second=fr_second)
 
 
 def _compute_split_half_stability(ctx: dict, bin_cm: float,
                                    min_valid_bins: int = STABILITY_MIN_BINS) -> dict:
     """Split-half spatial stability: Pearson correlation of the
-    SI_RATEMAP_TYPE firing-rate map between the first and second half of the
+    COHERENCE_STABILITY_RATEMAP_TYPE firing-rate map between the first and second half of the
     session (each half's map built within its own valid bins, see
     _split_half_maps).
 
@@ -2106,16 +2136,17 @@ def _plot_and_save_split_half_ratemap(ctx: dict, stability: dict,
     second-half ratemap (bottom-right), with the split-half stability score
     annotated at the bottom.
 
-    All three panels are SI_RATEMAP_TYPE maps. First/second-half maps come
-    from `_split_half_maps` -- the SAME full-session grid and maps
-    `_compute_split_half_stability` correlates (not the independently-binned
-    first/second-half rows computed elsewhere), so this plot is bin-aligned
-    with, and visually explains, the reported stability score.
+    All three panels are COHERENCE_STABILITY_RATEMAP_TYPE maps.
+    First/second-half maps come from `_split_half_maps` -- the SAME
+    full-session grid and maps `_compute_split_half_stability` correlates
+    (not the independently-binned first/second-half rows computed
+    elsewhere), so this plot is bin-aligned with, and visually explains, the
+    reported stability score.
     """
     n_bins_x    = ctx['n_bins_x']
     n_bins_y    = ctx['n_bins_y']
-    fr_full     = ctx['fr_si']
-    valid_full  = ctx['si_valid']
+    fr_full     = ctx['fr_cs']
+    valid_full  = ctx['cs_valid']
 
     if len(ctx['t']) < 2:
         return
@@ -2168,7 +2199,7 @@ def _plot_and_save_split_half_ratemap(ctx: dict, stability: dict,
     ax_second.set_ylabel('y (cm)')
 
     ntt_name = os.path.splitext(os.path.basename(ntt_path))[0]
-    fig.suptitle(f'{ntt_name}\n({SI_RATEMAP_TYPE} ratemap)', fontsize=11)
+    fig.suptitle(f'{ntt_name}\n({COHERENCE_STABILITY_RATEMAP_TYPE} ratemap)', fontsize=11)
 
     r      = stability.get('stability_score')
     p      = stability.get('stability_p_value')
@@ -2294,12 +2325,21 @@ def compute_metrics(csv_path: str, ntt_path: str,
     # ── 7. Smoothed firing rate map ───────────────────────────────────────────
     fr_smooth = _gaussian_smooth(fr_raw, valid_mask, target_bin_cm)
 
-    # ── 7b. SI_RATEMAP_TYPE ratemap (SIR, sparsity, coherence, stability) ─────
+    # ── 7b. Per-metric ratemaps (see the ratemap settings at the top) ────────
     # raw / occupancy-weighted / Gaussian-smoothed / Yartsev or Skaggs adaptive
     # ratemap. pi weights: smoothed occupancy for occ_weighted_smooth, raw
-    # occupancy otherwise.
-    si_rate, si_occ = _si_ratemap(spike_map, occ_map, fr_raw, fr_smooth, valid_mask, target_bin_cm)
-    si_valid = _si_map_valid(si_occ, valid_mask)
+    # occupancy otherwise. Each distinct type is built once.
+    ratemaps = {mt: _ratemap(mt, spike_map, occ_map, valid_mask, target_bin_cm,
+                             fr_raw=fr_raw, fr_smooth=fr_smooth)
+                for mt in {SI_RATEMAP_TYPE, COHERENCE_STABILITY_RATEMAP_TYPE,
+                           FIRING_RATE_RATEMAP_TYPE, PLACE_FIELD_RATEMAP_TYPE}}
+    si_rate,     si_occ     = ratemaps[SI_RATEMAP_TYPE]                    # SIR, sparsity
+    cs_rate,     cs_occ     = ratemaps[COHERENCE_STABILITY_RATEMAP_TYPE]   # coherence, stability
+    firing_rate, firing_occ = ratemaps[FIRING_RATE_RATEMAP_TYPE]           # peak / mean rate
+    field_rate,  field_occ  = ratemaps[PLACE_FIELD_RATEMAP_TYPE]           # place fields
+    cs_valid     = _map_valid(cs_occ,     valid_mask)
+    firing_valid = _map_valid(firing_occ, valid_mask)
+    field_valid  = _map_valid(field_occ,  valid_mask)
 
     # ── 8. Compute metrics ────────────────────────────────────────────────────
     # spike_ts / spike_frame / t / x_cm / y_cm / beh_* / dt_frames: moving
@@ -2314,7 +2354,9 @@ def compute_metrics(csv_path: str, ntt_path: str,
                dt_frames=dt_frames,
                n_bins_x=n_bins_x, n_bins_y=n_bins_y,
                fr_raw=fr_raw, fr_smooth=fr_smooth,
-               fr_si=si_rate, si_valid=si_valid)
+               fr_cs=cs_rate, cs_valid=cs_valid,
+               fr_firing=firing_rate, firing_valid=firing_valid,
+               fr_field=field_rate, field_valid=field_valid)
 
     if not valid_mask.any():
         return ({'n_spikes': n_spikes, 'n_discarded': n_discarded,
@@ -2322,14 +2364,14 @@ def compute_metrics(csv_path: str, ntt_path: str,
                  'peak_fr': 0.0, 'mean_fr': 0.0, 'sir': 0.0,
                  'sparsity': 0.0, 'coherence': float('nan')}, ctx)
 
-    # Peak / mean firing rate: RAW (unsmoothed) ratemap.
-    total_occ_s = occ_map[valid_mask].sum()
-    pi_flat     = occ_map[valid_mask] / total_occ_s
-    ri_flat     = fr_raw[valid_mask]
-    r_mean      = float(np.sum(pi_flat * ri_flat))
-
-    peak_fr = float(fr_raw[valid_mask].max())
-    mean_fr = r_mean
+    # Peak / mean firing rate: FIRING_RATE_RATEMAP_TYPE ratemap (step 7b);
+    # mean is occupancy-weighted with that map's pi weights.
+    if firing_valid.any():
+        pi_flat = firing_occ[firing_valid] / firing_occ[firing_valid].sum()
+        peak_fr = float(firing_rate[firing_valid].max())
+        mean_fr = float(np.sum(pi_flat * firing_rate[firing_valid]))
+    else:
+        peak_fr = mean_fr = 0.0
 
     # SIR: SI_RATEMAP_TYPE ratemap (step 7b).
     sir = _compute_sir(occ_map, si_occ, si_rate, valid_mask)
@@ -2337,8 +2379,8 @@ def compute_metrics(csv_path: str, ntt_path: str,
     # Sparsity = (Σ pi ri)² / Σ pi ri²   (Skaggs et al. 1996), same map, pi and bins as SIR
     sparsity = _compute_sparsity(occ_map, si_occ, si_rate, valid_mask)
 
-    # Spatial coherence: SI_RATEMAP_TYPE map vs 8-neighbour mean (Fisher Z)
-    coherence = _compute_coherence(si_rate, si_valid, n_bins_x, n_bins_y)
+    # Spatial coherence: COHERENCE_STABILITY_RATEMAP_TYPE map vs 8-neighbour mean (Fisher Z)
+    coherence = _compute_coherence(cs_rate, cs_valid, n_bins_x, n_bins_y)
 
     metrics = {
         'n_spikes':    n_spikes,
@@ -2361,8 +2403,9 @@ def compute_metrics(csv_path: str, ntt_path: str,
 
 # ── Place-field isolation – "threshold method" (2-D grid) ──────────────────────
 # Run only on cells that pass the place-cell criteria (see _run_job). Reuses the
-# fr_smooth / occ_map / valid_mask already built by compute_metrics for the full
-# session (ctx['fr_smooth'] etc.) rather than rebuilding the ratemap.
+# PLACE_FIELD_RATEMAP_TYPE map (ctx['fr_field']), FIRING_RATE_RATEMAP_TYPE map
+# (ctx['fr_firing']) and valid_mask already built by compute_metrics for the
+# full session rather than rebuilding the ratemaps.
 
 def _connected_components_8(qualifies: np.ndarray, n_bins_x: int, n_bins_y: int) -> list:
     """8-connected component labelling of the bins where `qualifies` is True."""
@@ -2392,38 +2435,43 @@ def _connected_components_8(qualifies: np.ndarray, n_bins_x: int, n_bins_y: int)
 
 def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_cm: float) -> tuple[list[dict], bool]:
     """"Threshold method" place-field isolation: a bin only qualifies for a
-    field if its Gaussian-smoothed rate is >= METHOD2_RATE_THRESHOLD_FRAC of
-    the cell's peak (smoothed) rate AND above the cell's mean firing rate;
-    8-connected components of qualifying bins spanning >= MIN_FIELD_SIZE_BINS
-    contiguous bins (no discontinuity) are reported as fields (peak bin +
-    rate-weighted centre of mass).
+    field if its rate in the PLACE_FIELD_RATEMAP_TYPE map (ctx['fr_field'],
+    Gaussian-smoothed by default) is >= METHOD2_RATE_THRESHOLD_FRAC of that
+    map's peak rate AND above the cell's mean firing rate; 8-connected
+    components of qualifying bins spanning >= MIN_FIELD_SIZE_BINS contiguous
+    bins (no discontinuity) are reported as fields (peak bin + rate-weighted
+    centre of mass).
 
     Returns (fields, peak_field_verified). `peak_field_verified` is False
-    when the cell's own peak-firing bin (the RAW-map global max that gated
-    it into place-cell status via PLACE_CELL_MIN/MAX_PEAK_FR) does not fall
-    inside any of the detected fields above, AND no other detected field's
-    own raw-map peak falls in that same [PLACE_CELL_MIN_PEAK_FR,
-    PLACE_CELL_MAX_PEAK_FR] window either -- i.e. the place-cell verdict
-    isn't backed by any field that actually spans >= MIN_FIELD_SIZE_BINS
-    contiguous bins at a real (unsmoothed) rate in range. Callers should
-    overrule the place-cell verdict when this is False.
+    when the cell's own peak-firing bin (the FIRING_RATE_RATEMAP_TYPE-map
+    global max -- RAW by default -- that gated it into place-cell status via
+    PLACE_CELL_MIN/MAX_PEAK_FR) does not fall inside any of the detected
+    fields above, AND no other detected field's own peak in that map falls
+    in that same [PLACE_CELL_MIN_PEAK_FR, PLACE_CELL_MAX_PEAK_FR] window
+    either -- i.e. the place-cell verdict isn't backed by any field that
+    actually spans >= MIN_FIELD_SIZE_BINS contiguous bins at a rate in range.
+    Callers should overrule the place-cell verdict when this is False. The
+    field columns peak_fr_hz_raw / field_raw_max_* keep their names but come
+    from the FIRING_RATE_RATEMAP_TYPE map.
     """
-    valid_mask  = ctx['valid_mask']
-    fr_smooth   = ctx['fr_smooth']
-    fr_raw      = ctx['fr_raw']
-    n_bins_x    = ctx['n_bins_x']
-    n_bins_y    = ctx['n_bins_y']
+    valid_mask   = ctx['valid_mask']
+    fr_field     = ctx['fr_field']
+    field_valid  = ctx['field_valid']
+    fr_firing    = ctx['fr_firing']
+    firing_valid = ctx['firing_valid']
+    n_bins_x     = ctx['n_bins_x']
+    n_bins_y     = ctx['n_bins_y']
 
     total_valid_bins = int(valid_mask.sum())
-    if total_valid_bins == 0:
+    if total_valid_bins == 0 or not field_valid.any() or not firing_valid.any():
         return [], False
 
-    peak_fr = float(fr_smooth[valid_mask].max())
+    peak_fr = float(fr_field[field_valid].max())
     mean_fr = float(base_metrics.get('mean_fr', 0.0))
     rate_threshold = METHOD2_RATE_THRESHOLD_FRAC * peak_fr
     min_size_bins  = MIN_FIELD_SIZE_BINS
 
-    qualifies = valid_mask & (fr_smooth >= rate_threshold) & (fr_smooth > mean_fr)
+    qualifies = field_valid & (fr_field >= rate_threshold) & (fr_field > mean_fr)
 
     centre_bin = (n_bins_x / 2.0, n_bins_y / 2.0)
     best_centre_dist  = np.inf
@@ -2439,21 +2487,22 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
 
         bxs   = np.array([b[0] for b in region])
         bys   = np.array([b[1] for b in region])
-        rates = fr_smooth[bxs, bys]
+        rates = fr_field[bxs, bys]
 
         peak_local_idx = int(np.argmax(rates))
         peak_bin = (int(bxs[peak_local_idx]), int(bys[peak_local_idx]))
         peak_val = float(rates[peak_local_idx])
 
-        # Raw (unsmoothed) rate at that SAME bin -- lets you directly see how
-        # much the Gaussian smoothing inflated/deflated the reported peak.
-        peak_val_raw_same_bin = float(fr_raw[peak_bin[0], peak_bin[1]])
+        # FIRING_RATE_RATEMAP_TYPE (raw by default) rate at that SAME bin --
+        # lets you directly see how much the field map's smoothing
+        # inflated/deflated the reported peak.
+        peak_val_raw_same_bin = float(fr_firing[peak_bin[0], peak_bin[1]])
 
-        # Raw (unsmoothed) rate at this field's own highest-raw-rate bin,
-        # which may sit at a different bin than peak_bin above -- reused
-        # below in the peak_field_verified fallback check (see
+        # FIRING_RATE_RATEMAP_TYPE rate at this field's own highest-rate bin
+        # in that map, which may sit at a different bin than peak_bin above
+        # -- reused below in the peak_field_verified fallback check (see
         # detect_place_fields_threshold_2d's docstring).
-        raw_rates          = fr_raw[bxs, bys]
+        raw_rates          = fr_firing[bxs, bys]
         raw_peak_local_idx = int(np.argmax(raw_rates))
         field_raw_max_bin  = (int(bxs[raw_peak_local_idx]), int(bys[raw_peak_local_idx]))
         field_raw_max_val  = float(raw_rates[raw_peak_local_idx])
@@ -2509,16 +2558,17 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
         fields[centre_field_idx]['is_centre_field'] = True
 
     # ── Verify the place-cell peak bin is actually backed by a field ───────
-    # metrics['peak_fr'] (the RAW-map global max that gated this cell into
-    # place-cell status via PLACE_CELL_MIN/MAX_PEAK_FR, see compute_metrics)
-    # is independent of the smoothed-map, >=MIN_FIELD_SIZE_BINS field search
-    # above -- so that peak bin need not fall inside any detected field
-    # (e.g. n_fields == 0, or the peak sits in an isolated bin elsewhere).
-    # When it doesn't, fall back to asking whether some OTHER detected
-    # field's own raw-map peak (field_raw_max_fr_hz above) still lands
-    # inside the place-cell peak-rate window; if none does, nothing actually
-    # backs the place-cell verdict and the caller should overrule it.
-    masked_raw       = np.where(valid_mask, fr_raw, -np.inf)
+    # metrics['peak_fr'] (the FIRING_RATE_RATEMAP_TYPE-map global max that
+    # gated this cell into place-cell status via PLACE_CELL_MIN/MAX_PEAK_FR,
+    # see compute_metrics) is independent of the field-map,
+    # >=MIN_FIELD_SIZE_BINS field search above -- so that peak bin need not
+    # fall inside any detected field (e.g. n_fields == 0, or the peak sits in
+    # an isolated bin elsewhere). When it doesn't, fall back to asking
+    # whether some OTHER detected field's own peak in that map
+    # (field_raw_max_fr_hz above) still lands inside the place-cell
+    # peak-rate window; if none does, nothing actually backs the place-cell
+    # verdict and the caller should overrule it.
+    masked_raw       = np.where(firing_valid, fr_firing, -np.inf)
     global_peak_flat = int(np.argmax(masked_raw))
     global_peak_bin  = tuple(int(v) for v in np.unravel_index(global_peak_flat, masked_raw.shape))
 
@@ -2619,46 +2669,29 @@ def _gaussian_kernel_1d(sigma_bins: float) -> np.ndarray:
     return kernel
 
 
-def _gaussian_smooth_circular(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
-    """Gaussian smoothing on a 1D angular rate map. The axis is circular --
-    the track is a closed loop -- so it is padded by wrapping rather than
-    zero-filling, which would otherwise create a spurious rate dip at the
-    arbitrary theta=0/2*pi seam."""
-    sigma_bins = GAUSSIAN_SIGMA_CM / bin_cm
-    kernel = _gaussian_kernel_1d(sigma_bins)
+def _circular_convolve_pair(a: np.ndarray, b: np.ndarray,
+                           kernel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """1D convolution of two same-length angular maps with one kernel, the
+    circular analogue of _convolve_pair. The axis is circular -- the track
+    is a closed loop -- so it is padded by wrapping rather than zero-filling,
+    which would otherwise create a spurious dip at the arbitrary
+    theta=0/2*pi seam."""
     kr = kernel.shape[0] // 2
+    n_theta = a.shape[0]
+    a_conv, b_conv = _convolve_pair(np.pad(a, (kr, kr), mode='wrap'),
+                                    np.pad(b, (kr, kr), mode='wrap'), kernel)
+    return a_conv[kr:kr + n_theta], b_conv[kr:kr + n_theta]
+
+
+def _gaussian_smooth_circular(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
+    """Gaussian smoothing on a 1D angular rate map, restricted to valid bins
+    and wrapping around the theta seam (see _circular_convolve_pair)."""
+    kernel = _gaussian_kernel_1d(GAUSSIAN_SIGMA_CM / bin_cm)
 
     fr_in   = np.where(valid_mask, fr_map, 0.0)
     mask_in = valid_mask.astype(np.float64)
 
-    def _pad(arr, xp):
-        return xp.pad(arr, (kr, kr), mode='wrap')
-
-    n_theta = fr_map.shape[0]
-
-    if _GPU:
-        fr_gpu   = _pad(cp.asarray(fr_in,   dtype=cp.float64), cp)
-        mask_gpu = _pad(cp.asarray(mask_in, dtype=cp.float64), cp)
-        kern_gpu = cp.asarray(kernel, dtype=cp.float64)
-        _wait_for_gpu_slot()
-        _gpu_semaphore.acquire()
-        try:
-            smoothed_fr_full = cp.asnumpy(
-                cp_convolve(fr_gpu, kern_gpu, mode='constant', cval=0.0)
-            )
-            smoothed_weights_full = cp.asnumpy(
-                cp_convolve(mask_gpu, kern_gpu, mode='constant', cval=0.0)
-            )
-        finally:
-            _gpu_semaphore.release()
-    else:
-        fr_pad   = _pad(fr_in,   np)
-        mask_pad = _pad(mask_in, np)
-        smoothed_fr_full      = convolve(fr_pad,   kernel, mode='constant', cval=0.0)
-        smoothed_weights_full = convolve(mask_pad, kernel, mode='constant', cval=0.0)
-
-    smoothed_fr      = smoothed_fr_full[kr:kr + n_theta]
-    smoothed_weights = smoothed_weights_full[kr:kr + n_theta]
+    smoothed_fr, smoothed_weights = _circular_convolve_pair(fr_in, mask_in, kernel)
 
     smoothed = np.zeros_like(smoothed_fr)
     valid_weights = smoothed_weights > 0
@@ -2667,16 +2700,93 @@ def _gaussian_smooth_circular(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm
     return smoothed
 
 
+def _occ_weighted_smooth_circular(spike_map: np.ndarray, occ_map: np.ndarray,
+                                  valid_mask: np.ndarray,
+                                  bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
+    """1D angular analogue of _occ_weighted_smooth: smooth(spikes) /
+    smooth(occupancy), wrapping around the theta seam. Returns
+    (rate, occ_smooth)."""
+    kernel = _gaussian_kernel_1d(GAUSSIAN_SIGMA_CM / bin_cm)
+
+    spk_smooth, occ_smooth = _circular_convolve_pair(
+        np.where(valid_mask, spike_map, 0.0), np.where(valid_mask, occ_map, 0.0), kernel)
+
+    rate = np.zeros_like(spk_smooth)
+    ok = valid_mask & (occ_smooth > 0)
+    rate[ok] = spk_smooth[ok] / occ_smooth[ok]
+    occ_smooth[~valid_mask] = 0.0
+    return rate, occ_smooth
+
+
+def _adaptive_ratemap_circular(map_type: str, spike_map: np.ndarray, occ_map: np.ndarray,
+                               valid_mask: np.ndarray,
+                               bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
+    """1D angular analogue of the Yartsev / Skaggs adaptive ratemaps. The
+    'disc' around each angular bin is the window of bins within +/- w bins
+    (wrapping around the theta seam), grown w = 0, 1, 2, ... up to the 2-D
+    disc's maximum radius (sqrt(ADAPTIVE_MAX_RSQ - 1) bins, and never past
+    half the ring), with the same stopping criteria:
+      Yartsev : occ_window >= YARTSEV_DISC_OCC_S
+      Skaggs  : r_cm * occ_window * sqrt(spikes_window) >= SKAGGS_ALPHA,
+                r_cm = (w + 0.5) * bin_cm
+    Rate and pi weights as in _adaptive_rate_at."""
+    n_theta = occ_map.shape[0]
+    pi_occ  = np.where(valid_mask, occ_map, 0.0)
+    if not valid_mask.any() or spike_map[valid_mask].sum() <= 0:
+        return np.zeros_like(occ_map, dtype=np.float64), pi_occ
+
+    max_w = min(int(np.floor(np.sqrt(ADAPTIVE_MAX_RSQ - 1))), (n_theta - 1) // 2)
+    widths = np.arange(max_w + 1)
+    # Offsets 0, +1, -1, +2, -2, ...: cumsum row 2w is the window of half-width w.
+    shifts = np.concatenate([[0], np.stack([widths[1:], -widths[1:]], axis=1).ravel()])
+    idx = (np.arange(n_theta)[None, :] + shifts[:, None]) % n_theta
+    spk_win = np.cumsum(np.where(valid_mask, spike_map, 0.0)[idx], axis=0)[0::2]
+    occ_win = np.cumsum(pi_occ[idx], axis=0)[0::2]
+
+    if map_type == 'Yartsev_adaptive_binned':
+        satisfied = occ_win >= YARTSEV_DISC_OCC_S
+    else:
+        r_cm = (widths + 0.5) * bin_cm
+        satisfied = r_cm[:, None] * occ_win * np.sqrt(spk_win) >= SKAGGS_ALPHA
+    k = np.where(satisfied.any(axis=0), satisfied.argmax(axis=0), max_w)
+
+    cols    = np.arange(n_theta)
+    spk_fin = spk_win[k, cols]
+    occ_fin = occ_win[k, cols]
+    rate = np.zeros_like(occ_map, dtype=np.float64)
+    ok = valid_mask & (occ_fin >= ADAPTIVE_MIN_OCC_S)
+    rate[ok] = spk_fin[ok] / occ_fin[ok]
+    pi_occ[~ok] = 0.0
+    return rate, pi_occ
+
+
+def _ratemap_circular(map_type: str, spike_map: np.ndarray, occ_map: np.ndarray,
+                      valid_mask: np.ndarray, bin_cm: float) -> tuple[np.ndarray, np.ndarray]:
+    """1D angular analogue of _ratemap for the Circle track: returns
+    (rate_map, pi_occ) of type `map_type` on the angular bins."""
+    if map_type == 'occ_weighted_smooth':
+        return _occ_weighted_smooth_circular(spike_map, occ_map, valid_mask, bin_cm)
+    if map_type in ('Yartsev_adaptive_binned', 'Skaggs_adaptive_binned'):
+        return _adaptive_ratemap_circular(map_type, spike_map, occ_map, valid_mask, bin_cm)
+    fr_raw = np.zeros_like(occ_map, dtype=np.float64)
+    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
+    if map_type == 'gaussian_smooth':
+        return _gaussian_smooth_circular(fr_raw, valid_mask, bin_cm), occ_map
+    return fr_raw, occ_map
+
+
 def _build_ratemap_circular(ctx: dict, target_bin_cm: float) -> dict:
     """1-D angular ratemap for the Circle (ring) track, built from the same
     tracking/spike data already loaded by compute_metrics (ctx['x_cm'],
     ctx['y_cm'], ctx['spike_frame'], ctx['dt_frames']) -- see module note
     above. Every sample's bearing (theta) around the track's fitted centre
-    is binned; radial distance from centre is discarded. Also reports its
-    own occupancy-weighted mean_fr (rather than reusing the 2-D grid's),
-    so the field-detection mean-rate threshold is self-consistent with the
-    map it's applied to. Uses the immobility-filtered (moving-only) frames
-    and spikes in ctx, same as the 2-D ratemap."""
+    is binned; radial distance from centre is discarded. Builds the
+    PLACE_FIELD_RATEMAP_TYPE (fr_field) and FIRING_RATE_RATEMAP_TYPE
+    (fr_firing) angular maps (see _ratemap_circular), and reports its own
+    occupancy-weighted mean_fr from fr_firing (rather than reusing the 2-D
+    grid's), so the field-detection mean-rate threshold is self-consistent
+    with the map it's applied to. Uses the immobility-filtered (moving-only)
+    frames and spikes in ctx, same as the 2-D ratemap."""
     x_cm        = ctx['x_cm']
     y_cm        = ctx['y_cm']
     spike_frame = ctx['spike_frame']
@@ -2705,20 +2815,23 @@ def _build_ratemap_circular(ctx: dict, target_bin_cm: float) -> dict:
     np.add.at(spike_map, sp_bt,  1.0)
 
     valid_mask = _valid_bin_mask(occ_map, _bin_visit_counts(beh_bt, n_bins_theta))
-    fr_raw = np.zeros_like(occ_map)
-    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
-    fr_smooth = _gaussian_smooth_circular(fr_raw, valid_mask, target_bin_cm)
+    fr_field,  field_occ  = _ratemap_circular(PLACE_FIELD_RATEMAP_TYPE, spike_map, occ_map,
+                                              valid_mask, target_bin_cm)
+    fr_firing, firing_occ = _ratemap_circular(FIRING_RATE_RATEMAP_TYPE, spike_map, occ_map,
+                                              valid_mask, target_bin_cm)
+    field_valid  = _map_valid(field_occ,  valid_mask)
+    firing_valid = _map_valid(firing_occ, valid_mask)
 
-    # Mean rate from the RAW angular map (matches the 2-D mean_fr); field
-    # detection itself runs on fr_smooth.
+    # Mean rate from the FIRING_RATE_RATEMAP_TYPE angular map (matches the
+    # 2-D mean_fr); field detection itself runs on fr_field.
     mean_fr = 0.0
-    if valid_mask.any():
-        total_occ = occ_map[valid_mask].sum()
-        pi_flat   = occ_map[valid_mask] / total_occ
-        mean_fr   = float(np.sum(pi_flat * fr_raw[valid_mask]))
+    if firing_valid.any():
+        pi_flat = firing_occ[firing_valid] / firing_occ[firing_valid].sum()
+        mean_fr = float(np.sum(pi_flat * fr_firing[firing_valid]))
 
     return dict(beh_bt=beh_bt, occ_map=occ_map, valid_mask=valid_mask,
-                fr_raw=fr_raw, fr_smooth=fr_smooth, mean_fr=mean_fr,
+                fr_field=fr_field, field_valid=field_valid,
+                fr_firing=fr_firing, firing_valid=firing_valid, mean_fr=mean_fr,
                 n_bins_theta=n_bins_theta, bin_width_rad=bin_width_rad,
                 cx=cx, cy=cy, r_min=r_min, r_max=r_max, track_width_cm=track_width_cm)
 
@@ -2755,9 +2868,9 @@ def _circular_runs(qualifies: np.ndarray, n_bins_theta: int) -> list:
 
 def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: float) -> tuple[list[dict], bool]:
     """"Threshold method" place-field isolation on the angular ratemap: a bin
-    only qualifies for a field if its Gaussian-smoothed rate is >=
-    METHOD2_RATE_THRESHOLD_FRAC of the cell's peak (smoothed) rate AND above
-    the cell's mean firing rate (both computed from this same angular map,
+    only qualifies for a field if its rate in the PLACE_FIELD_RATEMAP_TYPE
+    angular map is >= METHOD2_RATE_THRESHOLD_FRAC of that map's peak rate AND
+    above the cell's mean firing rate (both computed from the angular maps,
     see _build_ratemap_circular); contiguous runs of qualifying bins spanning
     >= MIN_FIELD_SIZE_BINS bins (no discontinuity, wrapping around the theta
     seam) are reported as fields (peak bin + rate-weighted circular centre
@@ -2768,22 +2881,24 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
     `peak_field_verified` means and why.
     """
     valid_mask     = ctx_circular['valid_mask']
-    fr_smooth      = ctx_circular['fr_smooth']
-    fr_raw         = ctx_circular['fr_raw']
+    fr_field       = ctx_circular['fr_field']
+    field_valid    = ctx_circular['field_valid']
+    fr_firing      = ctx_circular['fr_firing']
+    firing_valid   = ctx_circular['firing_valid']
     n_bins_theta   = ctx_circular['n_bins_theta']
     bin_width_rad  = ctx_circular['bin_width_rad']
     track_width_cm = ctx_circular['track_width_cm']
 
     total_valid_bins = int(valid_mask.sum())
-    if total_valid_bins == 0:
+    if total_valid_bins == 0 or not field_valid.any() or not firing_valid.any():
         return [], False
 
-    peak_fr = float(fr_smooth[valid_mask].max())
+    peak_fr = float(fr_field[field_valid].max())
     mean_fr = float(ctx_circular.get('mean_fr', 0.0))
     rate_threshold = METHOD2_RATE_THRESHOLD_FRAC * peak_fr
     min_size_bins  = MIN_FIELD_SIZE_BINS
 
-    qualifies = valid_mask & (fr_smooth >= rate_threshold) & (fr_smooth > mean_fr)
+    qualifies = field_valid & (fr_field >= rate_threshold) & (fr_field > mean_fr)
     theta_centers_all = (np.arange(n_bins_theta) + 0.5) * bin_width_rad
 
     # Legacy "centre field" heuristic (nearest field to a reference bearing)
@@ -2802,22 +2917,23 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
             continue
 
         bts   = np.array(region)
-        rates = fr_smooth[bts]
+        rates = fr_field[bts]
 
         peak_local_idx = int(np.argmax(rates))
         peak_bt        = int(bts[peak_local_idx])
         peak_val       = float(rates[peak_local_idx])
         peak_theta_rad = theta_centers_all[peak_bt]
 
-        # Raw (unsmoothed) rate at that SAME bin -- lets you directly see how
-        # much the Gaussian smoothing inflated/deflated the reported peak.
-        peak_val_raw_same_bin = float(fr_raw[peak_bt])
+        # FIRING_RATE_RATEMAP_TYPE (raw by default) rate at that SAME bin --
+        # lets you directly see how much the field map's smoothing
+        # inflated/deflated the reported peak.
+        peak_val_raw_same_bin = float(fr_firing[peak_bt])
 
-        # Raw (unsmoothed) rate at this field's own highest-raw-rate bin,
-        # which may sit at a different bin than peak_bt above -- reused
-        # below in the peak_field_verified fallback check (see
+        # FIRING_RATE_RATEMAP_TYPE rate at this field's own highest-rate bin
+        # in that map, which may sit at a different bin than peak_bt above
+        # -- reused below in the peak_field_verified fallback check (see
         # detect_place_fields_threshold_2d's docstring).
-        raw_rates          = fr_raw[bts]
+        raw_rates          = fr_firing[bts]
         raw_peak_local_idx = int(np.argmax(raw_rates))
         field_raw_max_bt   = int(bts[raw_peak_local_idx])
         field_raw_max_val  = float(raw_rates[raw_peak_local_idx])
@@ -2878,7 +2994,7 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
     # ── Verify the place-cell peak bin is actually backed by a field ───────
     # See detect_place_fields_threshold_2d's matching block for the full
     # rationale -- identical logic, just over theta bins instead of (x, y).
-    masked_raw       = np.where(valid_mask, fr_raw, -np.inf)
+    masked_raw       = np.where(firing_valid, fr_firing, -np.inf)
     global_peak_bt   = int(np.argmax(masked_raw))
 
     if any(global_peak_bt in region for region in regions):
@@ -3211,7 +3327,7 @@ def _run_job(args):
     first_row, _        = _build_row('first',  'first_half')
     second_row, _       = _build_row('second', 'second_half')
 
-    # Split-half spatial stability (Pearson r of the SI_RATEMAP_TYPE ratemap between the
+    # Split-half spatial stability (Pearson r of the COHERENCE_STABILITY_RATEMAP_TYPE ratemap between the
     # first and second half of the SESSION) -- computed once here on the
     # full-session grid, not from the independently-binned first/second-half
     # rows above (see _compute_split_half_stability docstring). Reported only
@@ -3329,7 +3445,8 @@ def _run_job(args):
                 full_ctx['spike_frame'],
                 fields_threshold=(fields_threshold if is_place_cell else None),
                 arena_type=(arena_type if is_place_cell else None),
-                ctx_circular=(ctx_circular if is_place_cell else None))
+                ctx_circular=(ctx_circular if is_place_cell else None),
+                fr_field=full_ctx['fr_field'], field_valid=full_ctx['field_valid'])
         except Exception as e:
             with _print_lock:
                 print(f'  RATEMAP PLOT ERROR for {ntt_file}: {e}')

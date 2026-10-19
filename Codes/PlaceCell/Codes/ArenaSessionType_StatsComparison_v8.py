@@ -106,8 +106,8 @@ import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/All_TT_PlaceChar_SiSkaggsAdptBin_CI99_2.xlsx'
-OUTPUT_DIR  = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/SpikeQualityFilt_v1_PlaceCellData/PC_True_SiSkaggsAdptBin_CI99_2'
+INPUT_EXCEL = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/All_TT_PlaceChar_SiSkaggsAdptBin_CohrStabSkaggs.xlsx'
+OUTPUT_DIR  = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/SpikeQualityFilt_v1_PlaceCellData/PC_True_SiSkaggsAdptBin_CohrStabSkaggs/SessionArena_Stats_v8'
 
 STATS_XLSX = os.path.join(OUTPUT_DIR, 'SessionArena_Stats.xlsx')
 STATS_CSV  = os.path.join(OUTPUT_DIR, 'SessionArena_AllStats.csv')
@@ -701,8 +701,9 @@ def _point_colors(metric_col: str, sub: pd.DataFrame, group: str) -> list:
     aligned row-for-row with `sub` (which must still be indexed against the
     original columns, e.g. 'coherence_bootstrap_sig').
 
-    - coherence: gray unless the cell's coherence passed its shuffle test
-      (coherence_bootstrap_sig is True).
+    - coherence: gray only if the cell's coherence failed its shuffle test
+      (coherence_bootstrap_sig is False); untested/blank cells keep the
+      group color.
     - stability_score: gray unless its split-half p-value is <= ALPHA.
     - final_speed_score: gray unless speed_cell is True (False / 'not
       tested' are gray); p-type cells (score > 0) get the darker tone, n-type
@@ -714,7 +715,9 @@ def _point_colors(metric_col: str, sub: pd.DataFrame, group: str) -> list:
     gray = (SIG_GRAY['face'], SIG_GRAY['edge'])
 
     if metric_col == 'coherence':
-        return [base if _to_tri_bool(s) is True else gray
+        # Only an explicit False (failed shuffle) is gray; untested/blank cells
+        # (None) keep the group color.
+        return [gray if _to_tri_bool(s) is False else base
                 for s in sub['coherence_bootstrap_sig']]
 
     if metric_col == 'stability_score':
@@ -730,7 +733,7 @@ def _point_colors(metric_col: str, sub: pd.DataFrame, group: str) -> list:
 
 _SIGNIFICANCE_LEGENDS = {
     'coherence': [
-        ('colored', 'passed shuffle test (p < 0.05)'),
+        ('colored', 'passed shuffle test (p < 0.05) / not tested'),
         ('gray',    'failed shuffle test'),
     ],
     'stability_score': [

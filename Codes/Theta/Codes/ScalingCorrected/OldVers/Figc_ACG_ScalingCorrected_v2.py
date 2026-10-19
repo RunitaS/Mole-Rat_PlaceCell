@@ -86,7 +86,7 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed.
-ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
 OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results__ScaleCorr')
@@ -1406,6 +1406,108 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
 
+def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_size=14,
+                                alpha=1.0, n_bins=25, log_counts=True,
+                                show_edmin_annotation=True):
+    """Movement-pooled counterpart of _draw_freq_peakrange_scatter: frequency
+    vs. normalised autocorrelogram peak range for every accepted epoch, with
+    moving and immobile epochs combined and no speed colouring. Each animal in
+    `animals` is drawn in its own ANIMAL_COLORS (Pastel1) colour, with a thin
+    dark outline so the light colours stay visible on white, plus marginal
+    count histograms and one centroid diamond per animal.
+
+    Same epoch selection as _draw_freq_peakrange_scatter (non-skipped,
+    movement in moving/immobile), so the pooled cloud is exactly the union of
+    the two movement-segregated clouds. With several animals, the one with the
+    most epochs is drawn first so smaller animals' points stay visible on top.
+
+    Returns centroids DataFrame (animal, freq_centroid, peakrangenorm_centroid, n).
+    """
+    scope = df[df['animal'].isin(animals)]
+    n_edmin_rejected = int(scope['skipped_edmin'].sum())
+    pct_edmin_rejected = 100 * n_edmin_rejected / len(scope) if len(scope) else 0.0
+
+    sub = scope[~scope['skipped'] & scope['movement'].isin(['moving', 'immobile'])]
+    if sub.empty:
+        raise ValueError(f'No accepted moving/immobile epochs for {", ".join(animals)}.')
+
+    freq_bins = np.linspace(sub['freq'].min(), sub['freq'].max(), n_bins)
+    pr_bins = np.linspace(0, 1, n_bins)
+    edge = MARKER_EDGE['markeredgecolor']
+
+    draw_order = sorted(animals, key=lambda a: -int((sub['animal'] == a).sum()))
+    for animal_label in draw_order:
+        a_sub = sub[sub['animal'] == animal_label]
+        if a_sub.empty:
+            continue
+        color = to_rgba(animal_color(animal_label), alpha)
+        ax_main.scatter(a_sub['freq'], a_sub['peakrangenorm'], s=point_size,
+                        facecolor=color, edgecolor=edge, linewidth=0.3, zorder=2,
+                        label=f'{animal_label} (n={len(a_sub)})')
+        ax_top.hist(a_sub['freq'], bins=freq_bins, histtype='stepfilled', log=log_counts,
+                    facecolor=color, edgecolor=edge, linewidth=0.5)
+        ax_right.hist(a_sub['peakrangenorm'], bins=pr_bins, histtype='stepfilled',
+                      orientation='horizontal', log=log_counts,
+                      facecolor=color, edgecolor=edge, linewidth=0.5)
+
+    centroids = compute_group_centroids(sub, group_col='animal')
+    for _, crow in centroids.iterrows():
+        ax_main.scatter(crow['freq_centroid'], crow['peakrangenorm_centroid'],
+                        marker='D', s=90, facecolor=animal_color(crow['animal']),
+                        edgecolor='black', linewidth=1, zorder=5)
+    # legend proxy for the per-animal centroid diamonds
+    ax_main.scatter([], [], marker='D', s=90, facecolor='white', edgecolor='black',
+                    linewidth=1, label='centroid')
+
+    ax_main.set_xlabel('Frequency (Hz)')
+    ax_main.set_ylabel('Autocorr. peak range')
+    ax_main.set_ylim(0, 1)
+    ax_main.legend(loc='upper left', frameon=False, fontsize=7)
+    if show_edmin_annotation:
+        ax_main.text(0.98, 0.02,
+                     f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
+                     f'rejected ({n_edmin_rejected}/{len(scope)})',
+                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
+                     color='0.3')
+
+    ax_top.set_ylabel('Count')
+    ax_top.tick_params(labelbottom=False)
+    ax_right.set_xlabel('Count')
+    ax_right.tick_params(labelleft=False)
+    return centroids
+
+
+def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5)):
+    """Frequency vs. normalised autocorrelogram peak range with moving and
+    immobile epochs combined (no movement segregation, no speed colormap) --
+    each animal in its ANIMAL_COLORS colour, with marginal count histograms
+    and per-animal centroid diamonds (see _draw_freq_peakrange_pooled).
+
+    `animals` : one animal label (per-animal figure), a list of labels, or
+                None for every animal in `df` on one cumulative figure.
+
+    Returns (fig, axes_dict, centroids_df).
+    """
+    if animals is None:
+        animals = ordered_animals(df['animal'])
+    elif isinstance(animals, str):
+        animals = [animals]
+
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
+                          wspace=0.05, hspace=0.05)
+    ax_main = fig.add_subplot(gs[1, 0])
+    ax_top = fig.add_subplot(gs[0, 0], sharex=ax_main)
+    ax_right = fig.add_subplot(gs[1, 1], sharey=ax_main)
+
+    centroids = _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals,
+                                            alpha=alpha)
+    ax_top.set_title(f'{animals[0]}: all epochs' if len(animals) == 1
+                     else 'All animals: all epochs')
+
+    return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
+
+
 def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
                                     moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
                                     immobile_cmap='magma', immobile_alpha=1.0,
@@ -1612,6 +1714,8 @@ def save_run_metadata(meta_dir=META_DIR):
         'moving_cmap':              'viridis',
         'immobile_cmap':            'magma',
         'marginal_hist_n_bins':     25,
+        'pooled_plot_colors':       ANIMAL_COLORS,
+        'pooled_scatter_alpha':     1.0,
         'figure_dpi':               200,
     }
     os.makedirs(meta_dir, exist_ok=True)
@@ -1743,6 +1847,58 @@ if __name__ == '__main__':
             print(f'Saved figure -> {split_path}')
         except ValueError as e:
             print(f'  SKIP mobility/immobility split plot for {animal_label}: {e}')
+
+        # moving + immobile epochs pooled (no movement segregation / speed
+        # colouring), in this animal's colour
+        try:
+            fig_pooled, _ax_pooled, _c_pooled = plot_freq_peakrange_pooled(
+                results_df, animals=animal_label)
+            pooled_path = os.path.join(FIGURE_DIR, f'{animal_label}_freq_peakrange_pooled.png')
+            fig_pooled.savefig(pooled_path, dpi=200, bbox_inches='tight')
+            plt.close(fig_pooled)
+            print(f'Saved figure -> {pooled_path}')
+        except ValueError as e:
+            print(f'  SKIP pooled freq-vs-peak-range plot for {animal_label}: {e}')
+
+    # moving + immobile epochs pooled, every animal on one figure in its own
+    # colour, with per-animal centroids
+    try:
+        fig_pooled_all, _ax_pooled_all, pooled_centroids_df = plot_freq_peakrange_pooled(results_df)
+        pooled_all_path = os.path.join(FIGURE_DIR, 'ALL_freq_peakrange_pooled.png')
+        fig_pooled_all.savefig(pooled_all_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_pooled_all)
+        print(f'Saved figure -> {pooled_all_path}')
+        pooled_centroids_path = os.path.join(OUTPUT_DIR, 'acg_theta_continuity_centroids_pooled.csv')
+        pooled_centroids_df.to_csv(pooled_centroids_path, index=False)
+        print(f'Saved pooled (moving + immobile) centroids -> {pooled_centroids_path}')
+    except ValueError as e:
+        print(f'  SKIP cumulative pooled freq-vs-peak-range plot: {e}')
+
+    # Fig. 4-style (moving/immobile, speed-coloured) with every animal's
+    # epochs on one figure -- example epochs picked from the all-animal
+    # moving/immobile centroids
+    try:
+        fig4_all, centroids_all = plot_figure4_style(results_df, animal=None)
+        fig4_all.suptitle('All animals')
+        centroids_all['animal'] = 'ALL'
+        all_centroids.append(centroids_all)
+        fig4_all_path = os.path.join(FIGURE_DIR, 'ALL_figure4_style.png')
+        fig4_all.savefig(fig4_all_path, dpi=200, bbox_inches='tight')
+        plt.close(fig4_all)
+        print(f'Saved figure -> {fig4_all_path}')
+    except ValueError as e:
+        print(f'  SKIP cumulative Fig.4-style plot: {e}')
+
+    # mobility-only / immobility-only / merged, every animal's epochs together
+    try:
+        fig_split_all, _ = plot_freq_peakrange_by_movement(results_df, animal=None)
+        fig_split_all.suptitle('All animals')
+        split_all_path = os.path.join(FIGURE_DIR, 'ALL_freq_peakrange_by_movement.png')
+        fig_split_all.savefig(split_all_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_split_all)
+        print(f'Saved figure -> {split_all_path}')
+    except ValueError as e:
+        print(f'  SKIP cumulative mobility/immobility split plot: {e}')
 
     # freq_est line-overlay of accepted epochs, one line per animal on shared
     # axes for direct comparison

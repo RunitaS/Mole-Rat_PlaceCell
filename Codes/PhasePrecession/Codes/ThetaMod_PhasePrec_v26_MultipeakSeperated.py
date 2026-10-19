@@ -160,6 +160,24 @@ v25 changes (complete field traversals):
     arena / session-type comparisons still use the all-spike fit.
   Per-unit figures go to <session>/ThetaMod_PhasePrecession_v25.
 
+v26 changes (multi-peak fields split into sub-fields):
+  * Right after field detection, every place field is tested for multiple peaks with the
+    KDE method of PlaceCell_MultiPeak_KDE_v2.py (see split_multipeak_fields): a weighted
+    Gaussian KDE of the field's bins (weights = MP_KDE_RATEMAP_TYPE rate map), local maxima
+    >= MP_PEAK_REL_HEIGHT_FRAC of the field's highest KDE peak counted as peaks, and a field
+    with >= 2 peaks cut at the troughs between them by marker-based watershed on the KDE
+    (1-D angular map with wrap-around on the Circle track).
+  * The sub-fields then REPLACE their parent field for everything downstream: each has its
+    own spatial filter band (from its own radius), its own pass gate (pass field-index
+    maximum inside the sub-field, >= PASS_MIN_FIELD_PEAK_FRAC of the sub-field's peak),
+    figures and Excel row. Treating a multi-peak field as one field makes the field index
+    rise and fall once per peak along a single run, which turns into a jittery pass index.
+  * Sub-fields of < MIN_SUBFIELD_SIZE_BINS bins are not analysed (their bins belong to no
+    field); they still get an Excel row with PrecessionSkippedReason set.
+  * Field IDs: '<k>' for a single-peak field, '<k>.<j>' for sub-field j of field k (j = 1 is
+    the highest KDE peak). Figures are <unit>_F<id>_PassIndex.png.
+  Per-unit figures go to <session>/ThetaMod_PhasePrecession_v26.
+
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 """
 
@@ -170,6 +188,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import heapq
 import re
 import shutil
 import textwrap
@@ -198,8 +217,8 @@ from scipy.special import erf
 
 ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\OldVers\PC_True_SiAdptBin_CI99_Bin2") 
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'PhasePrec_Results_v25_CompleteTraversals'
-OUTPUT_EXCEL_NAME = 'theta_phase_v25_CompleteTraversals.xlsx'   # written to RESULTS_FOLDER
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'PhasePrec_Results_v26_MultiPeakSplit'
+OUTPUT_EXCEL_NAME = 'theta_phase_v26_MultiPeakSplit.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 # (no_phase_relation cells share the PhaseLocked folder)
 CLASS_PLOT_FOLDERS = {
@@ -299,6 +318,29 @@ RATEMAP_IMMOBILITY_SPEED_CM_S = 0.5  # frames (and their spikes) below this spee
                                    # map / field detection (IMMOBILITY_SPEED_CMS)
 RING_RADIAL_CLIP_PCTILE = 0.5      # Circle: track width = radial range between these percentiles
                                    # (RADIAL_RANGE_CLIP_PCTILE)
+# --- v26: multi-peak fields split into sub-fields (KDE method of PlaceCell_MultiPeak_KDE_v2;
+# see split_multipeak_fields). Keep the MP_ settings equal to that script's run. ---
+SPLIT_MULTIPEAK_FIELDS = True      # False: every field analysed whole, as in v25
+MIN_SUBFIELD_SIZE_BINS = 9         # sub-fields with fewer bins are not analysed for phase precession
+MP_PEAK_REL_HEIGHT_FRAC = 0.75     # a KDE peak counts if its height is >= this fraction of the field's
+                                   # highest KDE peak (PEAK_REL_HEIGHT_FRAC)
+MP_MIN_TROUGH_DIP_FRAC = 0.0       # ...and the KDE dips below (1 - this) x its height on the way to every
+                                   # higher peak (MIN_TROUGH_DIP_FRAC)
+MP_KDE_BW_METHOD = 0.5             # gaussian_kde bw_method ('scott', 'silverman' or a scalar factor)
+MP_MIN_KDE_POINTS = 3              # fields with fewer non-zero-rate bins get no KDE (single peak)
+# Rate map the KDE is fitted on (weights of the field bins):
+#   'raw'                     : spikes / occupancy, unsmoothed
+#   'gaussian_smooth'         : the Climer rate map the fields are detected on (sigma = SMTH_WIDTH / 2)
+#   'Yartsev_adaptive_binned' : adaptive disc grows until it holds MP_YARTSEV_DISC_OCC_S of occupancy
+#   'Skaggs_adaptive_binned'  : adaptive disc grows until r_cm * occ_s * sqrt(spikes) >= MP_SKAGGS_ALPHA
+MP_KDE_RATEMAP_TYPE = 'Skaggs_adaptive_binned'
+MP_ADAPTIVE_MAX_RSQ = 200          # disc stops growing at r^2 = this - 1 (bins^2)
+MP_ADAPTIVE_MIN_OCC_S = 0.5        # bins whose final disc holds < this occupancy (s) get rate 0
+MP_YARTSEV_DISC_OCC_S = 1.0
+MP_SKAGGS_ALPHA = 200.0
+_MP_KDE_RATEMAP_TYPES = ('raw', 'gaussian_smooth', 'Yartsev_adaptive_binned', 'Skaggs_adaptive_binned')
+if MP_KDE_RATEMAP_TYPE not in _MP_KDE_RATEMAP_TYPES:
+    raise ValueError(f'MP_KDE_RATEMAP_TYPE must be one of {_MP_KDE_RATEMAP_TYPES}, got {MP_KDE_RATEMAP_TYPE!r}')
 BURST_COLLAPSE_FOR_ZTEST = True  # Kempter z-test on one event per burst (spikes < TMI_BURST_MAX_GAP_SEC apart:
                               # circular-mean phase, mean pass index) so bursts are not counted as independent
 SLOPE_BNDS = (-1.0, 0.25)     # (low, high) bound on precession slope (cycles/unit); x spans 2
@@ -715,36 +757,32 @@ def _number_fields(fields):
     return fields
 
 
-def _detect_fields_2d(rmap, occupancy, spk_counts, valid, binside, x_edges, y_edges):
+def _field_record_2d(mask, rmap, raw, valid, binside, xc, yc):
+    """Field dict (peak rates, size, rate-weighted centre of mass) of the 2-D bins in `mask`."""
+    n_bins = int(mask.sum())
+    rates = rmap[mask]
+    bx, by = np.nonzero(mask)
+    area = n_bins * binside ** 2
+    return dict(
+        mask_2d=mask, peak_rate_Hz=float(rates.max()),
+        peak_rate_raw_Hz=float(np.nanmax(raw[mask])),
+        n_bins=n_bins, area_cm2=area, radius_cm=float(np.sqrt(area / np.pi)),
+        pct_of_occupied_area=100.0 * n_bins / int(valid.sum()),
+        com_x_cm=float(np.sum(rates * xc[bx]) / rates.sum()),
+        com_y_cm=float(np.sum(rates * yc[by]) / rates.sum()),
+        com_theta_deg=np.nan, arc_length_cm=np.nan, track_width_cm=np.nan)
+
+
+def _detect_fields_2d(rmap, valid, mean_fr, record):
     """Threshold method on the 2-D map: valid bins with smoothed rate >=
     FIELD_RATE_THRESHOLD_FRAC * peak AND > the mean raw rate, 8-connected
-    components of >= MIN_FIELD_SIZE_BINS bins."""
+    components of >= MIN_FIELD_SIZE_BINS bins. record(mask) -> field dict."""
     peak = float(rmap[valid].max())
-    mean_fr = float(spk_counts[valid].sum() / occupancy[valid].sum())
     qualifies = valid & (rmap >= FIELD_RATE_THRESHOLD_FRAC * peak) & (rmap > mean_fr)
     labels, n_comp = nd_label(qualifies, structure=np.ones((3, 3), dtype=int))
-    xc, yc = 0.5 * (x_edges[1:] + x_edges[:-1]), 0.5 * (y_edges[1:] + y_edges[:-1])
-    with np.errstate(invalid='ignore', divide='ignore'):
-        raw = np.where(occupancy > 0, spk_counts / occupancy, np.nan)
-
-    fields = []
-    for c in range(1, n_comp + 1):
-        mask = labels == c
-        n_bins = int(mask.sum())
-        if n_bins < MIN_FIELD_SIZE_BINS:
-            continue
-        rates = rmap[mask]
-        bx, by = np.nonzero(mask)
-        area = n_bins * binside ** 2
-        fields.append(dict(
-            mask_2d=mask, peak_rate_Hz=float(rates.max()),
-            peak_rate_raw_Hz=float(np.nanmax(raw[mask])),
-            n_bins=n_bins, area_cm2=area, radius_cm=float(np.sqrt(area / np.pi)),
-            pct_of_occupied_area=100.0 * n_bins / int(valid.sum()),
-            com_x_cm=float(np.sum(rates * xc[bx]) / rates.sum()),
-            com_y_cm=float(np.sum(rates * yc[by]) / rates.sum()),
-            com_theta_deg=np.nan, arc_length_cm=np.nan, track_width_cm=np.nan))
-    return _number_fields(fields), mean_fr, peak
+    sizes = np.bincount(labels.ravel(), minlength=n_comp + 1)
+    fields = [record(labels == c) for c in range(1, n_comp + 1) if sizes[c] >= MIN_FIELD_SIZE_BINS]
+    return _number_fields(fields), peak
 
 
 def _detect_fields_circular(pos_ts, pos_xy, moving, spk_xy_moving, binside, smth_width,
@@ -756,7 +794,9 @@ def _detect_fields_circular(pos_ts, pos_xy, moving, spk_xy_moving, binside, smth
     wrapping around the ring); qualifying runs of >= MIN_FIELD_SIZE_BINS bins, wrapping
     across the 0/360 deg seam. Each field also gets a 2-D display mask (occupied 2-D
     bins whose centre bearing falls in the field). Returns (fields, mean_fr, peak,
-    ring) with ring = dict(cx, cy, bin_w, n_bins, labels) for bearing -> field lookup."""
+    ring) with ring = dict(cx, cy, theta_bin, n_bins, record, occ, spk, valid, raw,
+    smooth): theta_bin(xy) -> angular bin, record(run) -> field dict of angular bins
+    `run`, and the angular maps (for the multi-peak KDE)."""
     xy = pos_xy[moving]
     cx, cy = _fit_ring_centre(xy[:, 0], xy[:, 1])
     r = np.hypot(xy[:, 0] - cx, xy[:, 1] - cy)
@@ -790,37 +830,39 @@ def _detect_fields_circular(pos_ts, pos_xy, moving, spk_xy_moving, binside, smth
     grid_tbin = _theta_bin(np.column_stack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
     theta_c = (np.arange(n_t) + 0.5) * bin_w
 
-    fields = []
-    for run in _circular_runs(qualifies):
-        if len(run) < MIN_FIELD_SIZE_BINS:
-            continue
+    def record(run):
         run = np.asarray(run)
         rates = smooth[run]
         arc = len(run) * bin_w * r_med
         area = arc * track_w
         com = np.mod(np.arctan2(np.sum(rates * np.sin(theta_c[run])), np.sum(rates * np.cos(theta_c[run]))),
                      2 * np.pi)
-        fields.append(dict(
+        return dict(
             theta_bins=run, mask_2d=np.isin(grid_tbin, run) & (occupancy_2d > 0),
             peak_rate_Hz=float(rates.max()), peak_rate_raw_Hz=float(np.nanmax(raw[run])),
             n_bins=len(run), area_cm2=area, radius_cm=float(np.sqrt(area / np.pi)),
             pct_of_occupied_area=100.0 * len(run) / int(valid.sum()),
             com_x_cm=float(cx + r_med * np.cos(com)), com_y_cm=float(cy + r_med * np.sin(com)),
-            com_theta_deg=float(np.rad2deg(com)), arc_length_cm=arc, track_width_cm=track_w))
-    fields = _number_fields(fields)
-    labels = np.zeros(n_t, dtype=int)
-    for f in fields:
-        labels[f['theta_bins']] = f['field_number']
-    return fields, mean_fr, peak, dict(cx=cx, cy=cy, theta_bin=_theta_bin, labels=labels)
+            com_theta_deg=float(np.rad2deg(com)), arc_length_cm=arc, track_width_cm=track_w)
+
+    fields = _number_fields([record(run) for run in _circular_runs(qualifies)
+                             if len(run) >= MIN_FIELD_SIZE_BINS])
+    ring = dict(cx=cx, cy=cy, theta_bin=_theta_bin, n_bins=n_t, record=record,
+                occ=occ, spk=spk, valid=valid, raw=np.nan_to_num(raw), smooth=smooth)
+    return fields, mean_fr, peak, ring
 
 
 def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, method=METHOD) -> dict[str, Any]:
     """Climer rate map + field-index map, and the place fields of PlaceCell_Main_v20's
     threshold method on it (2-D, or angular on the Circle track). Immobile frames
     (< RATEMAP_IMMOBILITY_SPEED_CM_S, smoothed speed) and their spikes are left out,
-    as in PlaceCell_Main_v20. Returns a dict with rate_map, occupancy, x/y_edges,
-    field_index_map, fields (numbered, Field 1 = highest peak rate), mean_fr, and
-    field_label(xy) -> field number (0 = outside every field) for positions."""
+    as in PlaceCell_Main_v20. Right after detection, multi-peak fields are split into
+    their sub-fields (split_multipeak_fields), which replace them from here on.
+    Returns a dict with rate_map, occupancy, x/y_edges, field_index_map, fields (the
+    fields / sub-fields to analyse, field_number = 1..n unique label, field_id =
+    '<k>' or '<k>.<j>'), dropped_subfields (sub-fields < MIN_SUBFIELD_SIZE_BINS bins),
+    n_detected_fields, mean_fr, and field_label(xy) -> field_number (0 = outside every
+    analysed field) for positions."""
     _, speed = smooth_positions(pos_ts, pos_xy)
     moving = speed >= RATEMAP_IMMOBILITY_SPEED_CM_S
     spk_xy, spk_idx = spk_pos(pos_ts, pos_xy, spk_ts)
@@ -840,14 +882,51 @@ def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, meth
         fields, mean_fr, peak, ring = _detect_fields_circular(
             pos_ts, pos_xy, moving, spk_xy_moving, binside, smth_width, x_edges, y_edges, occupancy)
         detection = 'Circle (1-D angular)'
+        kde_map = _kde_input_map_circular(ring, binside) if fields and SPLIT_MULTIPEAK_FIELDS else None
 
-        def field_label(p):
-            return ring['labels'][ring['theta_bin'](p)]
+        def analyse(f):
+            return f['theta_bins'], _analyse_field_circular(f['theta_bins'], kde_map)
+
+        sub_record = ring['record']
     else:
         bx, by = _xy_bins(pos_xy[moving])
         valid = (occupancy > 0) & (_visit_counts(bx * ny + by, nx * ny).reshape(nx, ny) >= FIELD_MIN_VISITS)
-        fields, mean_fr, peak = _detect_fields_2d(rmap, occupancy, spk_counts, valid, binside, x_edges, y_edges)
+        xc, yc = 0.5 * (x_edges[1:] + x_edges[:-1]), 0.5 * (y_edges[1:] + y_edges[:-1])
+        with np.errstate(invalid='ignore', divide='ignore'):
+            raw = np.where(occupancy > 0, spk_counts / occupancy, np.nan)
+        mean_fr = float(spk_counts[valid].sum() / occupancy[valid].sum())
+
+        def record(mask):
+            return _field_record_2d(mask, rmap, raw, valid, binside, xc, yc)
+
+        fields, peak = _detect_fields_2d(rmap, valid, mean_fr, record)
         detection = '2-D grid'
+        kde_map = (_kde_input_map_2d(rmap, raw, spk_counts, occupancy, valid, fields, binside)
+                   if fields and SPLIT_MULTIPEAK_FIELDS else None)
+
+        def analyse(f):
+            nodes = np.argwhere(f['mask_2d'])
+            return nodes, _analyse_field_2d([tuple(n) for n in nodes], kde_map)
+
+        def sub_record(nodes):
+            mask = np.zeros((nx, ny), dtype=bool)
+            mask[nodes[:, 0], nodes[:, 1]] = True
+            return record(mask)
+
+    n_detected = len(fields)
+    fields, dropped = split_multipeak_fields(fields, analyse, sub_record)
+    for f in fields + dropped:
+        f['peak_field_index'] = float(np.nanmax(fi_map[f['mask_2d']])) if f['mask_2d'].any() else np.nan
+
+    # Position -> analysed field / sub-field (0 outside, and in sub-fields too small to analyse)
+    if arena == 'Circle':
+        theta_labels = np.zeros(ring['n_bins'], dtype=int)
+        for f in fields:
+            theta_labels[f['theta_bins']] = f['field_number']
+
+        def field_label(p):
+            return theta_labels[ring['theta_bin'](p)]
+    else:
         label_map = np.zeros((nx, ny), dtype=int)
         for f in fields:
             label_map[f['mask_2d']] = f['field_number']
@@ -855,11 +934,272 @@ def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, meth
         def field_label(p):
             return label_map[_xy_bins(p)]
 
-    for f in fields:
-        f['peak_field_index'] = float(np.nanmax(fi_map[f['mask_2d']])) if f['mask_2d'].any() else np.nan
     return dict(rate_map=rmap, occupancy=occupancy, x_edges=x_edges, y_edges=y_edges,
-                field_index_map=fi_map, fields=fields, mean_fr=mean_fr, peak_rate=peak,
+                field_index_map=fi_map, fields=fields, dropped_subfields=dropped,
+                n_detected_fields=n_detected, mean_fr=mean_fr, peak_rate=peak,
                 detection=detection, field_label=field_label)
+
+
+# ============================================================================
+# v26: multi-peak fields -> sub-fields (KDE method of PlaceCell_MultiPeak_KDE_v2.py)
+#
+# Per field: weighted Gaussian KDE of the field's bin centres (weights = firing rate in
+# the MP_KDE_RATEMAP_TYPE map), local maxima inside the field (8-neighbourhood; left/right
+# on the Circle's angular map; the KDE is also evaluated on a 1-bin ring around the field
+# so an edge bin only counts if the KDE really falls off outside it), peaks >=
+# MP_PEAK_REL_HEIGHT_FRAC of the highest counted, and >= 2 peaks -> the field is cut at
+# the troughs by marker-based watershed on the KDE.
+# ============================================================================
+
+def _adaptive_rate(spk_in, valid, spk_disc, occ_disc, disc_r_bins, binside):
+    """Yartsev or Skaggs adaptive-disc rate (MP_KDE_RATEMAP_TYPE) of every bin from the
+    spikes / occupancy inside its candidate discs (disc index 0..n_discs-1 along axis 0,
+    bins flattened along axis 1); the first disc meeting the criterion is used, else the
+    largest. Bins whose final disc holds < MP_ADAPTIVE_MIN_OCC_S of occupancy get rate 0."""
+    rate = np.zeros(valid.shape, dtype=np.float64)
+    if not valid.any() or spk_in[valid].sum() <= 0:
+        return rate
+    if MP_KDE_RATEMAP_TYPE == 'Yartsev_adaptive_binned':
+        satisfied = occ_disc >= MP_YARTSEV_DISC_OCC_S
+    else:   # Skaggs & McNaughton 1998, r = disc radius + half a bin, in cm
+        r_cm = (disc_r_bins + 0.5) * binside
+        satisfied = r_cm[:, None] * occ_disc * np.sqrt(spk_disc) >= MP_SKAGGS_ALPHA
+    k = np.where(satisfied.any(axis=0), satisfied.argmax(axis=0), satisfied.shape[0] - 1)
+    cols = np.arange(valid.size)
+    spk_fin = spk_disc[k, cols].reshape(valid.shape)
+    occ_fin = occ_disc[k, cols].reshape(valid.shape)
+    ok = valid & (occ_fin >= MP_ADAPTIVE_MIN_OCC_S)
+    rate[ok] = spk_fin[ok] / occ_fin[ok]
+    return rate
+
+
+def _kde_input_map_2d(rmap, raw, spk_counts, occupancy, valid, fields, binside):
+    """MP_KDE_RATEMAP_TYPE rate map on the 2-D grid. Only the field bins are used as KDE
+    weights, so the adaptive maps are computed on the fields' bounding box plus the
+    largest disc radius (exact for every field bin); bins outside it are 0."""
+    if MP_KDE_RATEMAP_TYPE == 'raw':
+        return np.where(valid, np.nan_to_num(raw), 0.0)
+    if MP_KDE_RATEMAP_TYPE == 'gaussian_smooth':
+        return rmap
+    pad = int(np.floor(np.sqrt(MP_ADAPTIVE_MAX_RSQ - 1)))
+    ix, iy = np.nonzero(np.any([f['mask_2d'] for f in fields], axis=0))
+    box = (slice(max(ix.min() - pad, 0), ix.max() + pad + 1),
+           slice(max(iy.min() - pad, 0), iy.max() + pad + 1))
+    v = valid[box]
+    spk_in = np.where(v, spk_counts[box], 0.0)
+    occ_in = np.where(v, occupancy[box], 0.0)
+    nbx, nby = v.shape
+
+    # Disc offsets sorted by r^2; disc k (r^2 <= k) holds the first n_enclosed[k] offsets.
+    ax = np.arange(-pad, pad + 1)
+    dx, dy = (a.ravel() for a in np.meshgrid(ax, ax, indexing='ij'))
+    d2 = dx ** 2 + dy ** 2
+    keep = d2 <= MP_ADAPTIVE_MAX_RSQ - 1
+    order = np.argsort(d2[keep], kind='stable')
+    dx, dy, d2 = dx[keep][order], dy[keep][order], d2[keep][order]
+    bx, by = np.meshgrid(np.arange(nbx), np.arange(nby), indexing='ij')
+    gather = (bx.ravel()[None, :] + pad + dx[:, None]) * (nby + 2 * pad) + (by.ravel()[None, :] + pad + dy[:, None])
+    n_enclosed = np.searchsorted(d2, np.arange(MP_ADAPTIVE_MAX_RSQ), side='right')
+    spk_disc = np.cumsum(np.pad(spk_in, pad).ravel()[gather], axis=0)[n_enclosed - 1]
+    occ_disc = np.cumsum(np.pad(occ_in, pad).ravel()[gather], axis=0)[n_enclosed - 1]
+
+    out = np.zeros(valid.shape, dtype=np.float64)
+    out[box] = _adaptive_rate(spk_in, v, spk_disc, occ_disc, np.sqrt(d2[n_enclosed - 1]), binside)
+    return out
+
+
+def _kde_input_map_circular(ring, binside):
+    """MP_KDE_RATEMAP_TYPE rate map on the Circle track's 1-D angular map; the adaptive
+    disc becomes an interval of +-r bins along the track (wrapping around the seam),
+    growing in whole bins up to floor(sqrt(MP_ADAPTIVE_MAX_RSQ - 1))."""
+    valid = ring['valid']
+    if MP_KDE_RATEMAP_TYPE == 'raw':
+        return np.where(valid, ring['raw'], 0.0)
+    if MP_KDE_RATEMAP_TYPE == 'gaussian_smooth':
+        return ring['smooth']
+    spk_in = np.where(valid, ring['spk'], 0.0)
+    occ_in = np.where(valid, ring['occ'], 0.0)
+    n = len(occ_in)
+    r_max = min(int(np.floor(np.sqrt(MP_ADAPTIVE_MAX_RSQ - 1))), (n - 1) // 2)
+    spk_disc = np.empty((r_max + 1, n))
+    occ_disc = np.empty((r_max + 1, n))
+    spk_disc[0], occ_disc[0] = spk_in, occ_in
+    for r in range(1, r_max + 1):
+        spk_disc[r] = spk_disc[r - 1] + np.roll(spk_in, r) + np.roll(spk_in, -r)
+        occ_disc[r] = occ_disc[r - 1] + np.roll(occ_in, r) + np.roll(occ_in, -r)
+    return _adaptive_rate(spk_in, valid, spk_disc, occ_disc, np.arange(r_max + 1, dtype=float), binside)
+
+
+def _watershed(values, adj, seeds):
+    """Marker-based watershed (priority flood, highest value first) over the field nodes
+    0..len(values)-1. adj[i] lists node i's neighbours (indices >= len(values) are
+    outside the field and ignored); seeds[k] gets label k+1. Each node takes the label
+    of the basin that reaches it first while descending the surface, so basins meet at
+    the troughs."""
+    n_field = len(values)
+    labels = np.zeros(n_field, dtype=int)
+    heap = []
+    for k, s in enumerate(seeds, start=1):
+        labels[s] = k
+        heapq.heappush(heap, (-values[s], s))
+    while heap:
+        _, i = heapq.heappop(heap)
+        for j in adj[i]:
+            if j < n_field and labels[j] == 0:
+                labels[j] = labels[i]
+                heapq.heappush(heap, (-values[j], j))
+    return labels
+
+
+def _merge_levels(rate, adj):
+    """Union-find over the field bins in descending KDE order (0-D topological
+    persistence): for every bin, the KDE level at which the region it tops merges into a
+    region with a higher top, i.e. the trough that has to be crossed to reach a higher
+    peak. The field's highest bin never merges (inf)."""
+    n_field = len(rate)
+    parent = np.full(n_field, -1)
+    top = np.arange(n_field)
+    merge = np.full(n_field, np.inf)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in np.argsort(-rate, kind='stable'):
+        parent[i] = i
+        for j in adj[i]:
+            if j >= n_field or parent[j] < 0:
+                continue
+            ri, rj = find(i), find(j)
+            if ri == rj:
+                continue
+            # Higher top survives; exact ties go to the lower bin index (same order as the peaks).
+            ti, tj = top[ri], top[rj]
+            hi, lo = (ri, rj) if (rate[ti], -ti) >= (rate[tj], -tj) else (rj, ri)
+            merge[top[lo]] = rate[i]
+            parent[lo] = hi
+    return merge
+
+
+def _kde_multipeak(pts_ext, n_field, adj, w):
+    """KDE peak search + trough cut for one field (PlaceCell_MultiPeak_KDE_v2._kde_multipeak).
+    pts_ext: (d, n_ext) bin-centre coordinates in bins, the field's n_field bins first,
+    then a 1-bin ring around it; adj: neighbours (indices into pts_ext) of each field bin;
+    w: KDE input rate of each field bin. Returns dict(rate, labels, counted, ref_hz,
+    kde_note); labels[i] = sub-field (1..len(counted)) of field bin i, counted = peak bins
+    in descending KDE height."""
+    d = pts_ext.shape[0]
+    pos = w > 0
+
+    def single(note):
+        peak = int(np.argmax(w))
+        return dict(rate=np.full(n_field, np.nan), labels=np.ones(n_field, dtype=int),
+                    counted=[peak], ref_hz=np.nan, kde_note=note)
+
+    if pos.sum() < MP_MIN_KDE_POINTS:
+        return single(f'{int(pos.sum())} non-zero-rate bin(s) < MP_MIN_KDE_POINTS: no KDE, single peak')
+
+    # Collinear non-zero-rate bins (a 1-bin-wide strip) make the 2-D covariance singular:
+    # fit a 1-D KDE along the field's long (first principal) axis instead.
+    X = pts_ext[:, :n_field][:, pos]
+    evals, evecs = np.linalg.eigh(np.atleast_2d(np.cov(X, aweights=w[pos])))
+    if evals.max() <= 0:
+        return single('all non-zero-rate bins at one location: no KDE, single peak')
+    proj = evecs[:, -1][None, :] if d > 1 and evals.min() <= 1e-6 * evals.max() else np.eye(d)
+    kde = stats.gaussian_kde(proj @ X, bw_method=MP_KDE_BW_METHOD, weights=w[pos])
+
+    # sum_i r_i K(x - x_i), K integrating to 1 over one bin -> rate in Hz
+    rate_ext = kde(proj @ pts_ext) * float(w.sum())
+    rate = rate_ext[:n_field]
+
+    # Local maxima inside the field (>= every neighbour, ring bins included); adjacent
+    # maxima can only be exact ties -- keep one of them.
+    cand = sorted((i for i in range(n_field) if all(rate_ext[i] >= rate_ext[j] for j in adj[i])),
+                  key=lambda i: -rate[i])
+    local_max = []
+    for i in cand:
+        if not any(i in adj[p] for p in local_max):
+            local_max.append(i)
+    if not local_max:          # KDE maximum just outside a non-convex field
+        local_max = [int(np.argmax(rate))]
+
+    # A peak counts if it is tall enough AND a real trough separates it from every higher peak.
+    merge = _merge_levels(rate, adj)
+    ref_hz = float(rate[local_max[0]])
+    counted = [local_max[0]] + [i for i in local_max[1:]
+                                if rate[i] >= MP_PEAK_REL_HEIGHT_FRAC * ref_hz
+                                and merge[i] < (1.0 - MP_MIN_TROUGH_DIP_FRAC) * rate[i]]
+    return dict(rate=rate, labels=_watershed(rate, adj, counted), counted=counted,
+                ref_hz=ref_hz, kde_note='')
+
+
+def _analyse_field_2d(nodes, kde_map):
+    """KDE multi-peak analysis of one 2-D field (nodes = list of (bx, by) bins)."""
+    index = {n: k for k, n in enumerate(nodes)}
+    ext_nodes = list(nodes)
+    adj = []
+    for bx, by in nodes:
+        nbrs = []
+        for ddx in (-1, 0, 1):
+            for ddy in (-1, 0, 1):
+                if ddx == 0 and ddy == 0:
+                    continue
+                nb = (bx + ddx, by + ddy)
+                k = index.get(nb)
+                if k is None:                     # ring bin just outside the field
+                    k = len(ext_nodes)
+                    index[nb] = k
+                    ext_nodes.append(nb)
+                nbrs.append(k)
+        adj.append(nbrs)
+    pts_ext = np.asarray(ext_nodes, dtype=float).T + 0.5
+    idx = np.asarray(nodes)
+    return _kde_multipeak(pts_ext, len(nodes), adj, kde_map[idx[:, 0], idx[:, 1]])
+
+
+def _analyse_field_circular(ordered, kde_map):
+    """KDE multi-peak analysis of one Circle field along the track: `ordered` = its
+    angular bins in track order (as _circular_runs returns them, seam-straddling runs
+    included), analysed as positions 0..L-1 plus one ring bin at each end."""
+    L = len(ordered)
+    pos_ext = np.concatenate([np.arange(L), [-1, L]]).astype(float) + 0.5
+    adj = [[i - 1 if i > 0 else L, i + 1 if i < L - 1 else L + 1] for i in range(L)]
+    return _kde_multipeak(pos_ext[None, :], L, adj, kde_map[np.asarray(ordered)])
+
+
+def split_multipeak_fields(fields, analyse, sub_record):
+    """Replace every multi-peak field by its sub-fields (right after field detection).
+    analyse(field) -> (bins, KDE result) with bins in the order the KDE result's labels
+    refer to; sub_record(bins subset) -> field dict of those bins. Sub-fields of <
+    MIN_SUBFIELD_SIZE_BINS bins are returned separately (not analysed). Every returned
+    field gets parent_field, sub_field (NaN if not split), n_subfields, multi_peak,
+    field_id ('<k>' / '<k>.<j>'), kde_peak_Hz / kde_peak_rel (its KDE peak, and that
+    relative to the parent field's highest), kde_note, and a new field_number: 1..n
+    over the analysed fields / sub-fields (0 for the dropped ones), in parent-field order.
+    Returns (analysed, dropped)."""
+    units, dropped = [], []
+    for f in fields:
+        k = f['field_number']
+        bins, res = analyse(f) if SPLIT_MULTIPEAK_FIELDS else (None, None)
+        n_peaks = len(res['counted']) if res is not None else 1
+        info = dict(parent_field=k, n_subfields=n_peaks, multi_peak=n_peaks >= 2,
+                    kde_note=res['kde_note'] if res is not None else 'multi-peak splitting disabled')
+        if n_peaks < 2:
+            ref = res['ref_hz'] if res is not None else np.nan
+            units.append({**f, **info, 'sub_field': np.nan, 'field_id': str(k),
+                          'kde_peak_Hz': ref, 'kde_peak_rel': 1.0 if np.isfinite(ref) else np.nan})
+            continue
+        for j, c in enumerate(res['counted'], start=1):
+            sub = {**sub_record(bins[res['labels'] == j]), **info, 'sub_field': j, 'field_id': f'{k}.{j}',
+                   'kde_peak_Hz': float(res['rate'][c]), 'kde_peak_rel': float(res['rate'][c] / res['ref_hz'])}
+            (units if sub['n_bins'] >= MIN_SUBFIELD_SIZE_BINS else dropped).append(sub)
+    for i, u in enumerate(units, start=1):
+        u['field_number'] = i
+    for d in dropped:
+        d['field_number'] = 0
+    return units, dropped
 
 
 # ============================================================================
@@ -1575,7 +1915,7 @@ def compute_pass_index(pos_ts, pos_xy, maps, field, phase_spk_ts, lfp_ts, lfp_si
     spk_pass_index, spk_theta_phase = spk_pass_index[spk_valid], spk_theta_phase[spk_valid]
     if len(spk_ts) < MIN_SPIKES_FOR_FIT:
         raise TooFewSpikes(
-            f'field {k}: only {len(spk_ts)} spikes in running (>= {MIN_SPEED_CM_S:g} cm/s) passes '
+            f'field {field["field_id"]}: only {len(spk_ts)} spikes in running (>= {MIN_SPEED_CM_S:g} cm/s) passes '
             f'through the field ({int(good_pass.sum())} passes) < MIN_SPIKES_FOR_FIT={MIN_SPIKES_FOR_FIT}')
 
     # Density-map occupancy uses the same sample selection as the spikes: LFP samples inside
@@ -1614,6 +1954,7 @@ def compute_pass_index(pos_ts, pos_xy, maps, field, phase_spk_ts, lfp_ts, lfp_si
     return {
         'rate_map': rmap, 'occupancy': occupancy, 'x_edges': x_edges, 'y_edges': y_edges,
         'field_index_map': fi_map, 'field': field, 'fields': maps['fields'],
+        'dropped_subfields': maps['dropped_subfields'], 'n_detected_fields': maps['n_detected_fields'],
         'field_detection': maps['detection'],
         'spk_xy': spk_xy,
         **fit,
@@ -2183,14 +2524,17 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
     this_k = results['field']['field_number']
 
     def _outline_fields(ax, color):
-        """This field solid, the cell's other fields dashed, each labelled F<k>."""
-        for f in results['fields']:
+        """This field / sub-field solid, the cell's other analysed ones dashed, sub-fields
+        too small to analyse dotted; each labelled F<field id>."""
+        shown = [(f, f['field_number'] == this_k) for f in results['fields']]
+        shown += [(f, None) for f in results.get('dropped_subfields', [])]
+        for f, this in shown:
             if not f['mask_2d'].any() or min(f['mask_2d'].shape) < 2:
                 continue
-            this = f['field_number'] == this_k
             ax.contour(xc, yc, f['mask_2d'].T.astype(float), levels=[0.5], colors=color,
-                       linewidths=2.0 if this else 1.0, linestyles='solid' if this else 'dashed')
-            ax.text(f['com_x_cm'], f['com_y_cm'], f"F{f['field_number']}", color=color, ha='center',
+                       linewidths=2.0 if this else 1.0,
+                       linestyles='solid' if this else 'dashed' if this is False else 'dotted')
+            ax.text(f['com_x_cm'], f['com_y_cm'], f"F{f['field_id']}", color=color, ha='center',
                     va='center', fontsize=9, fontweight='bold' if this else 'normal')
 
     ax = axes[0, 1]
@@ -2213,8 +2557,11 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
 
     fld = results['field']
     _draw_text_panel(axes[1, 2], [
-        f"FIELD {this_k} of {len(results['fields'])}: peak {fld['peak_rate_Hz']:.2f} Hz, "
+        f"FIELD {fld['field_id']}: peak {fld['peak_rate_Hz']:.2f} Hz, "
         f"{fld['area_cm2']:.0f} cm^2 ({fld['pct_of_occupied_area']:.0f}% of arena), r = {fld['radius_cm']:.1f} cm",
+        (f"sub-field {fld['sub_field']} of {fld['n_subfields']} of multi-peak field {fld['parent_field']} "
+         f"(KDE peak = {fld['kde_peak_rel']:.0%} of field max)" if fld['multi_peak']
+         else f"single-peak field ({fld['kde_note'] or 'not split'})"),
         f"spikes: {results['n_spikes_input']} theta -> {results['n_spikes_running']} running "
         f"-> {results['n_spikes']} in this field's passes",
         f"passes kept = {results['n_passes_kept']} / {results['n_passes_total']};  "
@@ -3038,7 +3385,7 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
     If `edmin_records` is given (and USE_ACG_THETA_EPOCHS), one dict per ACG
     epoch of each LFP file used (Animal, Session, lfp_file, epoch_index, ED_min,
     peakrangenorm, Status) is appended to it, for the pooled ED_min QC plot."""
-    output_dir = data_folder / 'ThetaMod_PhasePrecession_v25'
+    output_dir = data_folder / 'ThetaMod_PhasePrecession_v26'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncs_files = sorted(data_folder.glob('*.ncs'), key=_natural_key)
@@ -3209,14 +3556,19 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
                         maps = None
                         row['PrecessionSkippedReason'] = f'ERROR in place-field detection ({exc})'
                         print(f'  {unit_label}: place-field detection ERROR ({exc})')
-                    if maps is not None and not maps['fields']:
+                    if maps is not None and maps['n_detected_fields'] == 0:
                         row['n_fields'] = 0
                         row['FieldDetection'] = maps['detection']
                         row['PrecessionSkippedReason'] = 'no place field detected (threshold method)'
                         print(f'  {unit_label}: no place field detected -- precession skipped')
                     elif maps is not None:
-                        n_fields = len(maps['fields'])
-                        print(f'  {unit_label}: {n_fields} place field(s) ({maps["detection"]})')
+                        n_fields = maps['n_detected_fields']
+                        dropped = maps['dropped_subfields']
+                        n_multi = len({f['parent_field'] for f in maps['fields'] + dropped if f['multi_peak']})
+                        print(f'  {unit_label}: {n_fields} place field(s) ({maps["detection"]}), '
+                              f'{n_multi} multi-peak -> {len(maps["fields"])} field(s)/sub-field(s) analysed'
+                              + (f', {len(dropped)} sub-field(s) < {MIN_SUBFIELD_SIZE_BINS} bins dropped'
+                                 if dropped else ''))
                         for field in maps['fields']:
                             row_f = _process_field(
                                 row, field, n_fields, maps, pos_ts, pos_xy, spk_ts_overlap,
@@ -3224,6 +3576,14 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
                                 output_dir, file_prefix, plot_label, class_prefix, unit_label,
                                 dict(phase_deg=phase_deg, metrics=metrics, shuffle_tmis=shuffle_tmis))
                             field_rows.append(row_f)
+                        # Sub-fields too small for phase precession: listed, not analysed
+                        for sub in dropped:
+                            field_rows.append({
+                                **row, **_field_columns(sub, n_fields, maps['detection']),
+                                'PrecessionSkippedReason': (
+                                    f'sub-field of {sub["n_bins"]} bins < MIN_SUBFIELD_SIZE_BINS='
+                                    f'{MIN_SUBFIELD_SIZE_BINS}: not analysed')})
+                        field_rows.sort(key=lambda r: (r['ParentField'], np.nan_to_num(r['SubField'])))
 
             rows.extend(field_rows if field_rows else [row])
 
@@ -3231,9 +3591,13 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
 
 
 def _field_columns(field, n_fields, detection):
-    """Excel columns describing one place field (one row per field)."""
+    """Excel columns describing one place field or sub-field (one row per field / sub-field)."""
     return {
-        'Field': field['field_number'], 'n_fields': n_fields, 'MultiField': n_fields > 1,
+        'Field': field['field_id'], 'ParentField': field['parent_field'], 'SubField': field['sub_field'],
+        'n_fields': n_fields, 'MultiField': n_fields > 1,
+        'MultiPeakField': field['multi_peak'], 'n_subfields': field['n_subfields'],
+        'field_kde_peak_Hz': field['kde_peak_Hz'], 'field_kde_peak_rel': field['kde_peak_rel'],
+        'field_kde_note': field['kde_note'],
         'FieldDetection': detection,
         'field_peak_rate_Hz': field['peak_rate_Hz'], 'field_peak_rate_raw_Hz': field['peak_rate_raw_Hz'],
         'field_n_bins': field['n_bins'], 'field_area_cm2': field['area_cm2'],
@@ -3247,12 +3611,16 @@ def _field_columns(field, n_fields, detection):
 def _process_field(row, field, n_fields, maps, pos_ts, pos_xy, spk_ts_overlap,
                    lfp_ts, lfp_sig, lfp_fs, rng, lfp_theta_mask, lfp_phase_unwrapped,
                    output_dir, file_prefix, plot_label, class_prefix, unit_label, theta):
-    """Step 3 for one place field of one unit: pass index + phase-precession fit,
-    figures (<prefix>_F<k>_PassIndex / _FitRShuffle, plus the class-folder copy), and
+    """Step 3 for one place field (or sub-field) of one unit: pass index + phase-precession
+    fit, figures (<prefix>_F<id>_PassIndex / _FitRShuffle, plus the class-folder copy), and
     the Excel row (the unit's Steps 1-2 columns + this field's columns + its fit)."""
-    k = field['field_number']
+    k = field['field_id']
     row_f = {**row, **_field_columns(field, n_fields, maps['detection'])}
-    field_label = f'{plot_label} | Field {k} of {n_fields}'
+    if field['multi_peak']:
+        field_label = (f'{plot_label} | Sub-field {k} (sub-field {field["sub_field"]} of '
+                       f'{field["n_subfields"]} of field {field["parent_field"]} of {n_fields})')
+    else:
+        field_label = f'{plot_label} | Field {k} of {n_fields}'
     try:
         results = compute_pass_index(
             pos_ts, pos_xy, maps, field, spk_ts_overlap, lfp_ts, lfp_sig, lfp_fs, rng,
@@ -3382,11 +3750,23 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     def n_cells_with(mask):
         return int(df.loc[mask, unit_key].drop_duplicates().shape[0])
 
+    multipeak = df['MultiPeakField'] == True                                  # noqa: E712
+    n_multipeak_fields = int(df.loc[multipeak, unit_key + ['ParentField']].drop_duplicates().shape[0])
+    n_subfields = int(multipeak.sum())
+    n_small = int((multipeak & (df['field_n_bins'] < MIN_SUBFIELD_SIZE_BINS)).sum())
     rows = [
         dict(Metric='Cells with > 1 place field (each field analysed separately)',
              Count=n_multi, Denominator=total_cells, DenominatorLabel='total cells',
              Percent=pct(n_multi, total_cells)),
-        dict(Metric='Place fields precession-tested',
+        dict(Metric='Cells with >= 1 multi-peak field (split into sub-fields)',
+             Count=n_cells_with(multipeak), Denominator=total_cells, DenominatorLabel='total cells',
+             Percent=pct(n_cells_with(multipeak), total_cells)),
+        dict(Metric='Multi-peak fields (each split into its sub-fields)',
+             Count=n_multipeak_fields, Denominator=np.nan, DenominatorLabel='', Percent=np.nan),
+        dict(Metric=f'Sub-fields < {MIN_SUBFIELD_SIZE_BINS} bins (not analysed)',
+             Count=n_small, Denominator=n_subfields, DenominatorLabel='sub-fields',
+             Percent=pct(n_small, n_subfields)),
+        dict(Metric='Place fields / sub-fields precession-tested',
              Count=n_fields_tested, Denominator=np.nan, DenominatorLabel='',
              Percent=np.nan),
     ]
@@ -3497,7 +3877,9 @@ def main():
         if edmin_png is not None:
             print(f'ED_min vs. peak range plot saved to {edmin_png}')
 
-    columns = ['Session', 'FolderPath', 'Unit', 'Field', 'n_fields', 'MultiField', 'FieldDetection',
+    columns = ['Session', 'FolderPath', 'Unit', 'Field', 'ParentField', 'SubField', 'n_fields', 'MultiField',
+               'MultiPeakField', 'n_subfields', 'field_kde_peak_Hz', 'field_kde_peak_rel', 'field_kde_note',
+               'FieldDetection',
                'field_peak_rate_Hz', 'field_peak_rate_raw_Hz', 'field_n_bins', 'field_area_cm2',
                'field_pct_of_occupied_area', 'field_radius_cm', 'field_com_x_cm', 'field_com_y_cm',
                'field_com_theta_deg', 'field_arc_length_cm', 'field_track_width_cm',
@@ -3570,6 +3952,15 @@ def main():
         f'frames slower than {RATEMAP_IMMOBILITY_SPEED_CM_S:g} cm/s excluded. Rate map: Climer pass-index '
         f'rate map ({BINSIDE:g} cm bins, Gaussian sigma = {SMTH_WIDTH / 2:g} cm, unvisited bins filled with the '
         f'nearest visited value).',
+        f'Multi-peak fields (v26): right after detection every field is tested for multiple peaks with the '
+        f'KDE method of PlaceCell_MultiPeak_KDE_v2 (KDE of the field bins weighted by the {MP_KDE_RATEMAP_TYPE} '
+        f'map, bw_method={MP_KDE_BW_METHOD}; peaks >= {MP_PEAK_REL_HEIGHT_FRAC:g} x the field\'s highest KDE peak). '
+        'A field with >= 2 peaks (MultiPeakField = True) is cut at the troughs by watershed on the KDE, and its '
+        'sub-fields REPLACE it in everything below (one row each; Field = "<ParentField>.<SubField>", '
+        'sub-field 1 = highest KDE peak; field_* columns describe the sub-field). Sub-fields of '
+        f'< {MIN_SUBFIELD_SIZE_BINS} bins are not analysed (row kept, PrecessionSkippedReason set). n_fields = '
+        'number of fields detected before splitting. Arena / session-type precession comparisons use one value '
+        'per analysed field or sub-field.',
         'Each field is analysed separately: spatial filter band from that field\'s radius (field_radius_cm), '
         'and only passes whose field-index peak lies inside that field (and reaches '
         f'{PASS_MIN_FIELD_PEAK_FRAC:g} x its peak field index) contribute spikes.',
