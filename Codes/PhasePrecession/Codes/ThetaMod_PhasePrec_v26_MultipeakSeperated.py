@@ -209,7 +209,10 @@ from scipy.optimize import minimize_scalar
 from scipy.special import erf
 
 # Variable to optimize: MIN_SPEED_CM_S, PASS_MIN_FIELD_PEAK_FRAC, FILTER_HIGH_PER_RADIUS, POS_SMOOTH_SEC.
+!Add theta modulation passed proportion and absolute cell number. 
+!The plot in place cell char gives supiciusly high number of theta modulated cells.
 
+!For onset, peak, and offset plots, color code the type of phase relationship for each data point.
 # ============================================================================
 # Configuration -- EDIT THESE
 # ============================================================================

@@ -82,7 +82,7 @@ PEAK_REL_HEIGHT_FRAC = 0.75     # a KDE peak is counted if its height is >= this
 MIN_TROUGH_DIP_FRAC  = 0.0      # ...and if the KDE dips below (1 - this) x its height on the
                                 # way to any higher peak (0.0: any real dip; flat ridges and
                                 # plateaus never count as a second peak)
-KDE_BW_METHOD = 0.5   # kernel sigma = 0.25 × the field's weighted std
+KDE_BW_METHOD = 0.2   # kernel sigma = 0.25 × the field's weighted std
 #KDE_BW_METHOD        = 'scott'  # gaussian_kde bw_method ('scott', 'silverman' or a scalar factor)
 MIN_KDE_POINTS       = 3        # fields with fewer bins of non-zero rate (in the KDE input map)
                                 # get no KDE and are reported as single-peak (kde_note says why)
