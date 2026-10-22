@@ -52,6 +52,7 @@ SPEED_MOD_SUBDIR = 'speed modulation_SiAdptBin_CohrStabSkaggs'
 SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_CohrStabSkaggs'
 RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CohrStabSkaggs'
 
+
 # ── Which ratemap each metric uses ────────────────────────────────────────────
 # Each metric group below takes its own ratemap type (options listed further
 # down); groups set to the same type share one map, built once.

@@ -86,7 +86,7 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed.
-ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Backup'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
 OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results__ScaleCorr')
@@ -159,8 +159,14 @@ EPOCH_SEC = 1.0                 # s  -- autocorrelogram epoch length (Supp. Fig.
 
 # Reference sinusoid bank (Supp. Fig. 5b-h uses 4-14 Hz for rat/ferret theta;
 # set to this dataset's theta range, 3-7 Hz).
-ACG_FREQ_RANGE = (3.0, 7.0)     # Hz
-ACG_FREQ_RES = 0.1              # Hz -- step of the reference bank. Not given a specific
+ACG_FREQ_RANGE = (3.0, 7.0)     # Hz -- analysis band: epochs kept only if freq_est falls here
+ACG_FREQ_PAD = (1.0, 3.0)       # Hz added below/above ACG_FREQ_RANGE when building the reference
+                                 # bank (bank = 2-10 Hz), so out-of-band epochs match a padding
+                                 # frequency instead of piling up on the band edges (3 and 7 Hz);
+                                 # epochs matched to a padding frequency are marked 'skipped'
+                                 # (see quantify_xcorr_epochs). Lower pad can't go below ~1.75 Hz
+                                 # with 1 s epochs (no trough after the first side peak).
+ACG_FREQ_RES = 0.1             # Hz -- step of the reference bank. Not given a specific
                                  # numeric value in the supplement; 0.1 Hz gives a fine
                                  # frequency estimate at a modest compute cost -- tighten
                                  # (e.g. 0.05) or loosen (e.g. 0.25) as needed.
@@ -515,7 +521,7 @@ def create_sine_ref_xcorrs(ref_freqs, datsize, fs=FS_ACG, peak_prominence=ACG_PE
 
 def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FREQ_RES,
                           fs=FS_ACG, peak_prominence=ACG_PEAK_PROMINENCE,
-                          ed_min_thresh=ACG_ED_MIN_THRESH):
+                          ed_min_thresh=ACG_ED_MIN_THRESH, freq_pad=ACG_FREQ_PAD):
     """Autocorrelogram peak-range quantification of oscillatory activity.
 
     Python translation of quantify_xcorr_epochs.m (Dunn et al. 2022).
@@ -525,8 +531,13 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
     data_epochs : (winlength, nepochs) array -- each column one LFP epoch,
                   sampled at `fs` Hz. NaNs are allowed (an epoch is skipped
                   if fewer than 2 finite samples remain).
-    freq_range      : (fmin, fmax) Hz, reference sinusoid bank range
+    freq_range      : (fmin, fmax) Hz, analysis band -- epochs whose freq_est
+                      falls outside it are marked 'skipped'
     freq_resolution : Hz step of the reference bank
+    freq_pad        : (below, above) Hz -- the reference bank spans
+                      freq_range widened by these amounts, so epochs whose
+                      true rhythm lies outside freq_range match a padding
+                      frequency instead of being clamped onto fmin/fmax
     fs              : sampling rate (Hz) of `data_epochs`
     ed_min_thresh   : if not None, epochs whose ED_min (normalised distance to
                       the closest-matching reference sinusoid) exceeds this
@@ -539,17 +550,20 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
     result : DataFrame, one row per epoch, columns:
              ED_min, freq, peak1, peak1_idx, trough1, trough1_idx,
              trough2, trough2_idx, peakrange, peakrangenorm, skipped,
-             skipped_edmin
-             ('skipped' covers both too-short epochs and, if `ed_min_thresh`
-             is set, epochs with a poor sinusoid fit; 'skipped_edmin' flags
-             only the latter, so the ED_min-specific rejection rate can be
-             reported separately from too-short-epoch skips)
+             skipped_edmin, skipped_outofband
+             ('skipped' covers too-short epochs, epochs matched to a padding
+             frequency outside `freq_range`, and, if `ed_min_thresh` is set,
+             epochs with a poor sinusoid fit; 'skipped_edmin' and
+             'skipped_outofband' flag only the latter two, so each rejection
+             rate can be reported separately from too-short-epoch skips)
     """
     data_epochs = np.asarray(data_epochs, dtype=np.float64)
     winlength, nepochs = data_epochs.shape
     n_lags = 2 * winlength - 1
 
-    ref_freqs = np.arange(freq_range[0], freq_range[1] + freq_resolution / 2, freq_resolution)
+    bank_range = (freq_range[0] - freq_pad[0], freq_range[1] + freq_pad[1])
+    ref_freqs = np.round(np.arange(bank_range[0], bank_range[1] + freq_resolution / 2,
+                                   freq_resolution), 6)   # round so 0.1 Hz steps compare exactly
     refXC, refED, refRange, refP1range, refT1range, refT2range = create_sine_ref_xcorrs(
         ref_freqs, winlength, fs=fs, peak_prominence=peak_prominence)
 
@@ -566,6 +580,7 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
     peakrangenorm = np.full(nepochs, np.nan)
     skipped = np.zeros(nepochs, dtype=bool)
     skipped_edmin = np.zeros(nepochs, dtype=bool)
+    skipped_outofband = np.zeros(nepochs, dtype=bool)
 
     for n in range(nepochs):
         col = data_epochs[:, n]
@@ -593,6 +608,11 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
         if ed_min_thresh is not None and ED_min[n] > ed_min_thresh:
             skipped[n] = True
             skipped_edmin[n] = True
+
+        # best match is a padding frequency -> rhythm outside the analysis band
+        if not (freq_range[0] <= freq_est[n] <= freq_range[1]):
+            skipped[n] = True
+            skipped_outofband[n] = True
 
         p1_lo, p1_hi = refP1range[:, mi]
         seg = xc_full[p1_lo:p1_hi + 1]
@@ -630,6 +650,7 @@ def quantify_xcorr_epochs(data_epochs, freq_range=ACG_FREQ_RANGE, freq_resolutio
         'peakrangenorm': peakrangenorm,
         'skipped': skipped,
         'skipped_edmin': skipped_edmin,
+        'skipped_outofband': skipped_outofband,
     })
     return XC, result
 
@@ -713,7 +734,8 @@ def classify_epoch_movement(time_us, speed, n_total, nperseg, fs_hz, lfp_start_u
 # %% ==================== Per-file / root-directory processing =====================
 
 def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FREQ_RES,
-                        epoch_sec=EPOCH_SEC, fs_acg=FS_ACG, ed_min_thresh=ACG_ED_MIN_THRESH):
+                        epoch_sec=EPOCH_SEC, fs_acg=FS_ACG, ed_min_thresh=ACG_ED_MIN_THRESH,
+                        freq_pad=ACG_FREQ_PAD):
     """Load one .ncs file, resample/clean it, split it into epochs labelled by
     movement state, and compute the ACG peak-range quantification for every
     clean moving/immobile epoch.
@@ -753,7 +775,7 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     data_epochs = epochs[keep].T   # (nperseg, n_kept), matches quantify_xcorr_epochs layout
     _XC, result = quantify_xcorr_epochs(data_epochs, freq_range, freq_resolution,
                                         fs=fs_acg, peak_prominence=ACG_PEAK_PROMINENCE,
-                                        ed_min_thresh=ed_min_thresh)
+                                        ed_min_thresh=ed_min_thresh, freq_pad=freq_pad)
     result['movement'] = label[keep]
     result['median_speed_cms'] = med_speed[keep]
     result['epoch_index'] = np.where(keep)[0]
@@ -803,10 +825,14 @@ def process_root_directory(root_dir):
             n_immobile = int((res['movement'] == 'immobile').sum())
             n_edmin_rejected = int(res['skipped_edmin'].sum())
             pct_edmin_rejected = 100 * n_edmin_rejected / len(res) if len(res) else 0.0
+            n_outofband = int(res['skipped_outofband'].sum())
+            pct_outofband = 100 * n_outofband / len(res) if len(res) else 0.0
             print(f'  OK: {rel}  [{len(res)} epochs kept: '
                   f'{n_moving} moving, {n_immobile} immobile; '
                   f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected} '
-                  f'({pct_edmin_rejected:.1f}%)]')
+                  f'({pct_edmin_rejected:.1f}%); '
+                  f'freq_est outside {ACG_FREQ_RANGE} rejected {n_outofband} '
+                  f'({pct_outofband:.1f}%)]')
             all_results.append(res)
         except Exception as e:
             print(f'  SKIP: {rel} -- {e}')
@@ -869,6 +895,27 @@ def _mean_count_per_recording(sub, bin_edges):
     return per_file_counts.mean(axis=0), len(files)
 
 
+def _add_rejection_footer(ax, scope):
+    """Two-line footer below `ax`'s x-axis label, over every epoch in `scope`:
+    the percentage whose matched sinusoid fell outside ACG_FREQ_RANGE (i.e. a
+    padding frequency, 'skipped_outofband'), then the total rejected by the
+    ED_min gate and/or the out-of-band check (an epoch failing both is
+    counted once). Drawn in axes coordinates, so it is kept by
+    savefig(bbox_inches='tight') whether or not `ax` was passed in."""
+    n_total = len(scope)
+    n_outofband = int(scope['skipped_outofband'].sum())
+    n_rejected = int((scope['skipped_edmin'] | scope['skipped_outofband']).sum())
+    pct_outofband = 100 * n_outofband / n_total if n_total else 0.0
+    pct_rejected = 100 * n_rejected / n_total if n_total else 0.0
+    band = f'{ACG_FREQ_RANGE[0]:g}-{ACG_FREQ_RANGE[1]:g} Hz'
+    ax.text(0.5, -0.18,
+            f'Sinusoid matched outside {band}: {pct_outofband:.1f}% '
+            f'({n_outofband}/{n_total} epochs)\n'
+            f'Total rejected (ED_min > {ACG_ED_MIN_THRESH:g} and/or outside {band}): '
+            f'{n_rejected}/{n_total} epochs ({pct_rejected:.1f}%)',
+            transform=ax.transAxes, ha='center', va='top', fontsize=8, color='0.2')
+
+
 def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
     """Line-histogram of matched-sinusoid freq_est ('freq' column) for
     accepted (non-skipped) epochs, plotted as the mean epoch count per
@@ -901,6 +948,7 @@ def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
     ax.set_ylabel('Mean epoch count per recording')
     title = f'freq_est of accepted epochs (n={len(accepted)} epochs, {n_files} recordings)'
     ax.set_title(f'{animal}: {title}' if animal else title)
+    _add_rejection_footer(ax, scope)
     fig.tight_layout()
     return fig, ax, accepted['freq']
 
@@ -938,6 +986,7 @@ def plot_freq_est_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title('freq_est of accepted epochs, by animal')
     ax.legend(fontsize=7, frameon=False)
+    _add_rejection_footer(ax, df)
     fig.tight_layout()
     return fig, ax
 
@@ -1703,6 +1752,9 @@ def save_run_metadata(meta_dir=META_DIR):
         'SPEED_THRESH_CMS':         SPEED_THRESH_CMS,
         # ---- ACG reference-sinusoid matching ----
         'ACG_FREQ_RANGE':           ACG_FREQ_RANGE,
+        'ACG_FREQ_PAD':             ACG_FREQ_PAD,
+        'reference_bank_range':     (ACG_FREQ_RANGE[0] - ACG_FREQ_PAD[0],
+                                     ACG_FREQ_RANGE[1] + ACG_FREQ_PAD[1]),
         'ACG_FREQ_RES':             ACG_FREQ_RES,
         'ACG_PEAK_PROMINENCE':      ACG_PEAK_PROMINENCE,
         'ACG_ED_MIN_THRESH':        ACG_ED_MIN_THRESH,
@@ -1744,6 +1796,10 @@ if __name__ == '__main__':
     pct_edmin_rejected = 100 * n_edmin_rejected / len(results_df) if len(results_df) else 0.0
     print(f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected}/{len(results_df)} '
           f'epochs overall ({pct_edmin_rejected:.1f}%)')
+    n_outofband = int(results_df['skipped_outofband'].sum())
+    pct_outofband = 100 * n_outofband / len(results_df) if len(results_df) else 0.0
+    print(f'freq_est outside {ACG_FREQ_RANGE} rejected {n_outofband}/{len(results_df)} '
+          f'epochs overall ({pct_outofband:.1f}%)')
 
     results_path = os.path.join(OUTPUT_DIR, 'acg_theta_continuity_epochs.csv')
     results_df.to_csv(results_path, index=False)
