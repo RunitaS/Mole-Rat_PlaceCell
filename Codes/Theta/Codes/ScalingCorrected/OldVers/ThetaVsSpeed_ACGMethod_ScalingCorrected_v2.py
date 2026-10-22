@@ -30,71 +30,35 @@ Algorithm summary (Supplementary Fig. 5):
 This script is fully self-contained: it reads Neuralynx .ncs files directly
 (no dependency on FOOOF.py) and recursively processes every .ncs file found
 under a single ROOT_DIR (see Configuration below).
-
-Arena / session-type segregation: every .ncs file is tagged with the arena
-type (Circle / Linear / Open) and session type (e.g. Linear 0/90/180/270) of
-the session folder it sits in -- the same folder as that session's .ntt files,
-parsed exactly as ArenaSessionType_StatsComparison_v8.py parses the .ntt
-session paths. After the whole-dataset run, the full pipeline is re-run on
-each arena's epochs (FIGURE_DIR\\ArenaType\\<arena>\\) and each session type's
-epochs (FIGURE_DIR\\SessionType\\<arena>\\<session type>\\), and the ED_min
-rejection prevalence (overall / immobility / mobility epochs, and the
-immobility-vs-mobility split of the rejected epochs) is compared statistically
-across arena types and across each arena's session types (see
-compare_edmin_prevalence).
 """
 
 import os
 import re
-import textwrap
-from itertools import combinations
+import sys
+import shutil
+import socket
+import getpass
+import hashlib
+import inspect
+import platform
+import subprocess
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
-from scipy.stats import (pearsonr, spearmanr, chi2_contingency, fisher_exact,
-                         kruskal, mannwhitneyu)
+from scipy.stats import pearsonr, spearmanr, norm
+import statsmodels.formula.api as smf
 
 import seaborn as sns
 import matplotlib.pyplot as plt
-from matplotlib.colorbar import make_axes
+import matplotlib.patheffects as pe
+import matplotlib.transforms as mtransforms
 from matplotlib.colors import to_rgba
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-
-# %% ==================== Per-animal colours ======================================
-
-# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
-ANIMAL_COLORS = {
-    'Fa8477': '#FBB4AE',  # Pastel1[0] red
-    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
-    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
-    'Fa5834': '#DECBE4',  # Pastel1[3] purple
-}
-
-
-def animal_color(label, default='#888888'):
-    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
-    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
-    label = str(label).upper()
-    for animal_id, color in ANIMAL_COLORS.items():
-        if animal_id[2:].upper() in label:
-            return color
-    return default
-
-
-def ordered_animals(labels):
-    """Unique animal labels in ANIMAL_COLORS order (unknown labels last, sorted)."""
-    labels = list(pd.unique(pd.Series(labels).dropna()))
-    known = [a for a in ANIMAL_COLORS if a in labels]
-    return known + sorted(a for a in labels if a not in known)
-
-
-# Thin dark outline for markers, so the light Pastel1 colours stay visible on white.
-MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 
 
 # %% ==================== Configuration ===========================================
@@ -104,7 +68,7 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_results_SesArenaSeg')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_ThetaVsSpeed_scalingCorrected')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
@@ -195,25 +159,102 @@ ACG_ED_MIN_THRESH = 1.0
 # speed above SPEED_THRESH_CMS -> 'moving', at/below it -> 'immobile'.
 SPEED_THRESH_CMS = 4.0
 
-# ---- Arena / session-type segregation ----
-# Arena and session type of each .ncs file come from its folder path (the
-# session folder it shares with that session's .ntt files), as in
-# ArenaSessionType_StatsComparison_v8.py: the arena is whichever ARENA_TYPES
-# name appears as a folder in the path, the session type is read from the
-# name of the .ncs file's own folder, e.g.
-#   Fa1059\Linear\Day10\3_180\CSC1.ncs  ->  arena 'Linear', session type '180'
-ARENA_TYPES = ['Circle', 'Linear', 'Open']
-# Session types within each arena, in plotting order.
-ARENA_SESSION_TYPES = {
-    'Open':   ['Cntrl', 'Rotate', 'Zero'],
-    'Linear': ['0', '90', '180', '270'],
-    'Circle': ['Stnd', 'NoRot', 'Rot'],
+# ---- Theta vs. speed (mixed models) ----
+# Before the freq/power ~ speed mixed models are fit, the theta-positive
+# (non-skipped) epochs of each recording (.ncs file) are grouped into
+# SPEED_BIN_WIDTH_CMS-wide bins of median epoch speed ([0,2), [2,4), ... cm/s)
+# and reduced to one BIN_AGG_METHOD value per (recording, speed bin) -- see
+# aggregate_by_speed_bin. The model's predictor is the bin center (1, 3, 5,
+# ... cm/s), so it is fit on one value per speed bin visited per recording
+# rather than on thousands of individual epochs. Same binning as
+# ThetaVsSpeed_v6_Ferret_Final.py.
+SPEED_BIN_WIDTH_CMS = 2.0
+BIN_AGG_METHOD = 'median'   # 'median' or 'mean'
+
+# ---- Relative theta power (method of ThetaVsSpeed_v6_Ferret_Final.py) ----
+# epoch_theta_power_rel = the epoch's theta power (mean square of the
+# THETA_BAND band-passed LFP) as % of the recording's total REL_POWER_BAND
+# power (mean square of the REL_POWER_BAND band-passed LFP) -- the
+# time-domain (Parseval) equivalent of the PSD normalization in
+# Fig4a_PSD_v2_Simul.py. Dividing by each recording's own total power removes
+# per-recording gain differences (electrode impedance/placement), so animals
+# are compared on the share of power in theta rather than on absolute uV^2.
+REL_POWER_BAND = (1.0, 100.0)   # Hz -- matches NORM_BAND in Fig4a_PSD_v2_Simul.py
+REL_POWER_FILTER_ORDER = 4
+THETA_POWER_FILTER_ORDER = 5    # Butterworth order of the THETA_BAND band-pass (v6's FILTER_ORDER)
+
+# ---- Plotting: per-animal colors ----
+# Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
 }
-# The full pipeline re-run on each arena / session-type subset, plus the
-# ED_min-prevalence comparison plots, are written under these folders.
-ARENA_FIGURE_DIR   = os.path.join(FIGURE_DIR, 'ArenaType')
-SESSION_FIGURE_DIR = os.path.join(FIGURE_DIR, 'SessionType')
-STATS_ALPHA = 0.05   # significance level for the ED_min-prevalence tests
+# Pastel fills are too light on their own, so every animal-colored line,
+# marker and scatter point gets a thin dark outline in this color/width.
+ANIMAL_EDGE_COLOR = '#333333'
+ANIMAL_EDGE_WIDTH = 0.5
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
+
+
+def ordered_animals(labels):
+    """Unique animal labels in ANIMAL_COLORS order (unknown labels last, sorted)."""
+    labels = list(pd.unique(pd.Series(labels).dropna()))
+    known = [a for a in ANIMAL_COLORS if a in labels]
+    return known + sorted(a for a in labels if a not in known)
+
+
+def outlined(linewidth):
+    """path_effects drawing a thin ANIMAL_EDGE_COLOR outline around a line
+    (and its markers) of width `linewidth`, so pastel lines stay visible."""
+    return [pe.Stroke(linewidth=linewidth + 2 * ANIMAL_EDGE_WIDTH, foreground=ANIMAL_EDGE_COLOR),
+            pe.Normal()]
+
+
+def legend_and_stats_below(ax, stats_text=None, handles=None, labels=None, ncol=None,
+                           fontsize=7, stats_fontsize=8, linespacing=None, pad_in=0.08,
+                           **legend_kw):
+    """Draw `ax`'s legend and an optional stats text block BELOW the axes --
+    legend first, stats under it, both clear of the x tick labels / x-label --
+    so neither covers the data points.
+
+    The offset from the axes is fixed in inches (not axes fraction), so it
+    stays correct after tight_layout() or bbox_inches='tight' resize the
+    axes. `handles`/`labels` default to ax.get_legend_handles_labels(); any
+    legend already on `ax` is replaced. Call before fig.tight_layout().
+    """
+    fig = ax.figure
+    if handles is None:
+        handles, labels = ax.get_legend_handles_labels()
+    if ax.get_legend() is not None:
+        ax.get_legend().remove()
+
+    canvas = fig.canvas
+    renderer = canvas.get_renderer() if hasattr(canvas, 'get_renderer') else fig._get_renderer()
+    # distance (in) from the axes' bottom edge to the bottom of its tick labels + x-label
+    below_in = (ax.get_window_extent(renderer).y0 - ax.get_tightbbox(renderer).y0) / fig.dpi
+    trans = mtransforms.offset_copy(ax.transAxes, fig=fig, y=-(below_in + pad_in), units='inches')
+
+    anchor = trans
+    if handles:
+        anchor = ax.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0),
+                           bbox_transform=trans, ncol=ncol or min(len(handles), 3),
+                           fontsize=fontsize, frameon=False, **legend_kw)
+    if stats_text:
+        ax.annotate(stats_text, xy=(0.5, 0), xycoords=anchor, xytext=(0, -4),
+                    textcoords='offset points', ha='center', va='top',
+                    fontsize=stats_fontsize, linespacing=linespacing, color='0.1',
+                    annotation_clip=False)
 
 
 # %% ==================== .ncs / tracking data import ==============================
@@ -271,6 +312,15 @@ def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
     nyq = fs_hz / 2.0
     b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
     return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
+
+
+def bandpass_filter(x, fs_hz, band, order):
+    """Zero-phase Butterworth band-pass filter. Second-order sections, not
+    (b, a): a narrow (3-7 Hz) band-pass at 1 kHz has poles so close to the
+    unit circle that the (b, a) form rounds them outside it, and filtfilt
+    then blows up to an all-NaN trace."""
+    sos = signal.butter(order, band, btype='band', fs=fs_hz, output='sos')
+    return signal.sosfiltfilt(sos, np.asarray(x, dtype=np.float64))
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -435,51 +485,6 @@ def parse_metadata_from_path(rel_path):
     session = parts[2] if len(parts) >= 4 else (parts[1] if len(parts) >= 3 else 'NA')
     return {'animal': animal, 'date': date, 'session': session,
             'tetrode': tetrode, 'channel': channel}
-
-
-def extract_arena_type(session_path):
-    """Return 'Open', 'Linear', or 'Circle' if one of those appears as a
-    path component of `session_path`, else None.
-    (Same as ArenaSessionType_StatsComparison_v8.extract_arena_type.)"""
-    parts = re.split(r'[\\/]+', str(session_path))
-    for part in parts:
-        for arena in ARENA_TYPES:
-            if part.strip().lower() == arena.lower():
-                return arena
-    return None
-
-
-def extract_session_type(session_path, arena):
-    """Return the session type named in the last folder of `session_path`
-    (e.g. '1_Cntrl' -> 'Cntrl' for Open, '3_180' -> '180' for Linear,
-    '2NoRot' -> 'NoRot' for Circle), or None if it can't be recognized.
-    (Same as ArenaSessionType_StatsComparison_v8.extract_session_type.)"""
-    if arena is None:
-        return None
-    label = re.split(r'[\\/]+', str(session_path).strip())[-1].strip().lower()
-
-    if arena == 'Open':
-        for t in ARENA_SESSION_TYPES['Open']:
-            if t.lower() in label:
-                return t
-    elif arena == 'Linear':
-        m = re.search(r'_(270|180|90|0)$', label)
-        if m:
-            return m.group(1)
-    elif arena == 'Circle':
-        # 'norot' must be tested before 'rot', which it contains.
-        if 'norot' in label:
-            return 'NoRot'
-        if 'stnd' in label:
-            return 'Stnd'
-        if 'rot' in label:
-            return 'Rot'
-    return None
-
-
-def _label(group):
-    """Display label for plots: Linear session types are angles."""
-    return f'{group}°' if str(group).isdigit() else str(group)
 
 
 # %% ==================== Core ACG algorithm (translated from quantify_xcorr_epochs.m) =
@@ -804,8 +809,19 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     'epoch_index'/'file'; filter on '~skipped' downstream as usual.
 
     Returns a DataFrame (one row per epoch) with the quantify_xcorr_epochs
-    columns plus 'movement', 'median_speed_cms', and 'epoch_index'.
+    columns plus 'movement', 'median_speed_cms', 'epoch_index',
+    'epoch_power_uv2' (mean squared amplitude of the epoch's cleaned LFP
+    waveform, in uV^2 -- see the ADBitVolts note on 'epoch_power_uv2' below),
+    'epoch_theta_power_uv2' (mean square of the epoch's THETA_BAND band-passed
+    LFP, uV^2), 'epoch_nontheta_power_uv2' (epoch_power_uv2 minus
+    epoch_theta_power_uv2), 'session_total_power_uv2' (the recording's REL_POWER_BAND
+    power) and 'epoch_theta_power_rel' (theta power as % of that total).
     """
+    # load_ncs converts the raw ADC counts to microvolts via the file header's
+    # ADBitVolts (samples * read_ncs_adbitvolts(fpath) * 1e6); every step below (resample/notch/detrend/
+    # lowpass) is amplitude-preserving, so `lfp` -- and therefore the epoch
+    # power computed from it -- stays correctly scaled in uV / uV^2 rather
+    # than raw ADC counts.
     lfp, lfp_start_us = load_ncs(fpath)
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
@@ -815,8 +831,8 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
     keep_deltatheta = reject_deltatheta_epochs(epochs, fs_acg)
-    keep_artifact = keep_deltatheta & reject_artifact_epochs(
-        epochs, ref_mask=keep_deltatheta)
+    keep_mad = reject_artifact_epochs(epochs, ref_mask=keep_deltatheta)
+    keep_artifact = keep_deltatheta & keep_mad
 
     pos_path = find_position_file(fpath)
     if pos_path is None:
@@ -836,6 +852,29 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
                                         ed_min_thresh=ed_min_thresh)
     result['movement'] = label[keep]
     result['median_speed_cms'] = med_speed[keep]
+    # mean squared amplitude of each kept epoch's cleaned (uV-scaled) LFP
+    # waveform -- a broadband (<=LOWPASS_CUTOFF_HZ) power estimate for the
+    # exact same epochs used for the ACG frequency (freq_est) analysis above
+    result['epoch_power_uv2'] = np.mean(data_epochs ** 2, axis=0)
+    # theta-band power of the same epochs, raw and relative (see
+    # REL_POWER_BAND). The recording's total power is the mean square of the
+    # REL_POWER_BAND trace over every epoch without an amplitude artifact
+    # (keep_mad) -- any movement state, regardless of the delta/theta filter
+    # -- i.e. the whole session as in ThetaVsSpeed_v6_Ferret_Final.py, minus
+    # the large transients that would otherwise inflate one recording's
+    # denominator.
+    theta_epochs, _ = build_epochs(
+        bandpass_filter(lfp, fs_acg, THETA_BAND, THETA_POWER_FILTER_ORDER), nperseg)
+    broadband_epochs, _ = build_epochs(
+        bandpass_filter(lfp, fs_acg, REL_POWER_BAND, REL_POWER_FILTER_ORDER), nperseg)
+    total_power = np.mean(broadband_epochs[keep_mad] ** 2)
+    result['epoch_theta_power_uv2'] = np.mean(theta_epochs[keep] ** 2, axis=1)
+    # power outside THETA_BAND (delta, beta, gamma ... up to LOWPASS_CUTOFF_HZ):
+    # by Parseval the broadband mean square is the sum of its band powers, so
+    # this is what epoch_power_uv2 carries on top of theta
+    result['epoch_nontheta_power_uv2'] = result['epoch_power_uv2'] - result['epoch_theta_power_uv2']
+    result['session_total_power_uv2'] = total_power
+    result['epoch_theta_power_rel'] = 100 * result['epoch_theta_power_uv2'] / total_power
     result['epoch_index'] = np.where(keep)[0]
     # absolute path -- lets get_epoch_waveform() re-fetch this exact epoch's
     # raw waveform later (e.g. for plot_example_epoch), regardless of cwd
@@ -860,10 +899,15 @@ def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
     return epochs[int(epoch_index)]
 
 
-def process_root_directory(root_dir):
+def process_root_directory(root_dir, file_log=None):
     """Recursively find every .ncs under `root_dir`, run process_ncs_for_acg on
     each, and concatenate the per-epoch results, tagging each row with
-    path-derived metadata (parse_metadata_from_path)."""
+    path-derived metadata (parse_metadata_from_path).
+
+    If `file_log` (a list) is given, one dict per .ncs file found (path,
+    tracking .csv used, OK/SKIP status, epoch counts) is appended to it --
+    used by save_run_metadata_excel to record exactly which data went into
+    a run."""
     ncs_files = []
     for root, _dirs, files in os.walk(root_dir):
         for fname in files:
@@ -874,30 +918,42 @@ def process_root_directory(root_dir):
     all_results = []
     for fpath in ncs_files:
         rel = os.path.relpath(fpath, root_dir)
+        log_row = {'relative_path': rel,
+                   'ncs_file': os.path.basename(fpath),
+                   'session_dir': os.path.dirname(os.path.abspath(fpath)),
+                   'abs_path': os.path.abspath(fpath),
+                   **parse_metadata_from_path(rel)}
+        try:
+            log_row['tracking_csv'] = find_position_file(fpath)
+            log_row['ncs_size_bytes'] = os.path.getsize(fpath)
+            log_row['ncs_modified'] = datetime.fromtimestamp(
+                os.path.getmtime(fpath)).isoformat(sep=' ', timespec='seconds')
+        except OSError as e:
+            log_row['tracking_csv'] = f'ERROR: {e}'
         try:
             res = process_ncs_for_acg(fpath)
             meta = parse_metadata_from_path(rel)
             for k, v in meta.items():
                 res[k] = v
-            # arena / session type of the session folder this .ncs shares
-            # with that session's .ntt files
-            session_folder = os.path.dirname(rel)
-            arena = extract_arena_type(session_folder)
-            res['session_folder'] = session_folder
-            res['arena_type'] = arena
-            res['session_type'] = extract_session_type(session_folder, arena)
             n_moving = int((res['movement'] == 'moving').sum())
             n_immobile = int((res['movement'] == 'immobile').sum())
             n_edmin_rejected = int(res['skipped_edmin'].sum())
             pct_edmin_rejected = 100 * n_edmin_rejected / len(res) if len(res) else 0.0
-            print(f'  OK: {rel}  [{arena or "?"} / {res["session_type"].iloc[0] or "?"}; '
-                  f'{len(res)} epochs kept: '
+            print(f'  OK: {rel}  [{len(res)} epochs kept: '
                   f'{n_moving} moving, {n_immobile} immobile; '
                   f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected} '
                   f'({pct_edmin_rejected:.1f}%)]')
             all_results.append(res)
+            log_row.update({'status': 'OK', 'error': '',
+                            'n_epochs_kept': len(res), 'n_moving': n_moving,
+                            'n_immobile': n_immobile,
+                            'n_edmin_rejected': n_edmin_rejected,
+                            'pct_edmin_rejected': round(pct_edmin_rejected, 2)})
         except Exception as e:
             print(f'  SKIP: {rel} -- {e}')
+            log_row.update({'status': 'SKIP', 'error': str(e)})
+        if file_log is not None:
+            file_log.append(log_row)
 
     print(f'-> {len(all_results)} files processed\n')
     if not all_results:
@@ -982,9 +1038,8 @@ def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
     bin_edges = np.linspace(accepted['freq'].min(), accepted['freq'].max(), bins + 1)
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     mean_counts, n_files = _mean_count_per_recording(accepted, bin_edges)
-    color = animal_color(animal, default='#4C72B0') if animal else '#4C72B0'
-    ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2, color=color,
-            **MARKER_EDGE)
+    ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2,
+            color=animal_color(animal, default='#4C72B0'), path_effects=outlined(1.2))
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     title = f'freq_est of accepted epochs (n={len(accepted)} epochs, {n_files} recordings)'
@@ -1019,13 +1074,13 @@ def plot_freq_est_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
         sub = accepted[accepted['animal'] == animal_label]
         mean_counts, n_files = _mean_count_per_recording(sub, bin_edges)
         ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2,
-               color=animal_color(animal_label), **MARKER_EDGE,
+               color=animal_color(animal_label), path_effects=outlined(1.2),
                label=f'{animal_label} (n={len(sub)} epochs, {n_files} rec)')
 
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title('freq_est of accepted epochs, by animal')
-    ax.legend(fontsize=7, frameon=False)
+    legend_and_stats_below(ax, ncol=2)
     fig.tight_layout()
     return fig, ax
 
@@ -1057,9 +1112,8 @@ def plot_edmin_rejected_freq_histogram(df, animal=None, ed_min_thresh=ACG_ED_MIN
     bin_edges = np.linspace(rejected['freq'].min(), rejected['freq'].max(), bins + 1)
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     mean_counts, n_files = _mean_count_per_recording(rejected, bin_edges)
-    color = animal_color(animal, default='#C44E52') if animal else '#C44E52'
-    ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2, color=color,
-            **MARKER_EDGE)
+    ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2,
+            color=animal_color(animal, default='#C44E52'), path_effects=outlined(1.2))
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     title = (f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs '
@@ -1097,23 +1151,24 @@ def plot_edmin_rejected_freq_histogram_overlay(df, ed_min_thresh=ACG_ED_MIN_THRE
         sub = rejected[rejected['animal'] == animal_label]
         mean_counts, n_files = _mean_count_per_recording(sub, bin_edges)
         ax.plot(centers, mean_counts, marker='o', markersize=3, linewidth=1.2,
-               color=animal_color(animal_label), **MARKER_EDGE,
+               color=animal_color(animal_label), path_effects=outlined(1.2),
                label=f'{animal_label} (n={len(sub)} epochs, {n_files} rec)')
 
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title(f'freq_est of ED_min >= {ed_min_thresh:g} rejected epochs, by animal')
-    ax.legend(fontsize=7, frameon=False)
+    legend_and_stats_below(ax, ncol=2)
     fig.tight_layout()
     return fig, ax
 
 
 def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
-                                color=None, point_size=10, alpha=0.3):
+                                color='#4C72B0', point_size=10, alpha=0.8):
     """Scatter of ED_min (fit-quality distance to the closest-matching
     reference sinusoid) vs. peakrangenorm (normalised autocorrelogram peak
     range), to test whether a poor sinusoid fit (high ED_min) predicts a low
-    peak range.
+    peak range. Points are colored per animal (ANIMAL_COLORS, thin dark
+    outline); `color` is only the fallback for an animal with no entry.
 
     Deliberately NOT filtered on 'skipped'/'skipped_edmin' -- that flag is
     itself an ED_min threshold, so filtering on it would truncate exactly the
@@ -1123,14 +1178,9 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     Reports Pearson r and Spearman rho (each with a p-value) and overlays a
     linear least-squares fit line plus the ACG_ED_MIN_THRESH cutoff.
 
-    `color` defaults to the animal's ANIMAL_COLORS entry (or '#4C72B0' when
-    pooled across animals / the animal ID is unknown).
-
     Returns (fig, ax, stats_dict) where stats_dict has keys 'pearson_r',
     'pearson_p', 'spearman_r', 'spearman_p', 'n'.
     """
-    if color is None:
-        color = animal_color(animal, default='#4C72B0') if animal else '#4C72B0'
     scope = df if animal is None else df[df['animal'] == animal]
     sub = scope.dropna(subset=['ED_min', 'peakrangenorm'])
 
@@ -1150,9 +1200,13 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     r_p, p_p = pearsonr(x, y)
     r_s, p_s = spearmanr(x, y)
 
-    # alpha on the fill only, so the thin dark outline stays visible
-    ax.scatter(x, y, s=point_size, facecolor=to_rgba(color, alpha),
-               edgecolor=MARKER_EDGE['markeredgecolor'], linewidth=0.3, zorder=2)
+    for animal_label in ordered_animals(sub['animal']):
+        pts = sub[sub['animal'] == animal_label]
+        # alpha on the fill only, so the dark outline stays fully visible
+        ax.scatter(pts['ED_min'], pts['peakrangenorm'], s=point_size,
+                   facecolor=to_rgba(animal_color(animal_label, default=color), alpha),
+                   edgecolor=ANIMAL_EDGE_COLOR, linewidth=ANIMAL_EDGE_WIDTH, zorder=2,
+                   label=animal_label)
 
     slope, intercept = np.polyfit(x, y, 1)
     x_line = np.array([x.min(), x.max()])
@@ -1166,18 +1220,284 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     ax.set_ylabel('Autocorr. peak range (norm.)')
     title = 'ED_min vs. normalised peak range'
     ax.set_title(f'{animal}: {title}' if animal else title)
-    ax.legend(loc='upper right', fontsize=7, frameon=False)
-
     stats_text = (f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
                  f'Spearman rho = {r_s:.3f} (p = {p_s:.2e})\n'
                  f'n = {len(sub)}')
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
-           fontsize=8, color='0.1',
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
+    legend_and_stats_below(ax, stats_text, markerscale=2)
 
     fig.tight_layout()
     return fig, ax, {'pearson_r': r_p, 'pearson_p': p_p,
                      'spearman_r': r_s, 'spearman_p': p_s, 'n': len(sub)}
+
+
+def fit_freq_speed_mixed_model(df, response='freq', predictor='median_speed_cms', group='animal'):
+    """Random-intercept linear mixed model: response ~ predictor, grouped by
+    `group` (default: animal), so repeated epochs from the same animal don't
+    count as independent observations. Same mixed-model approach as
+    ThetaVsSpeed_v2.py's fit_mixed_model, ported here for the matched-sinusoid
+    freq_est vs. running-speed comparison."""
+    model = smf.mixedlm(f"{response} ~ {predictor}", df, groups=df[group])
+    return model.fit()
+
+
+def save_mixedlm_stats_excel(result, out_path, model_desc=''):
+    """Write a mixedlm result's fixed-effect coefficient table (coef, std
+    err, z, p-value, 95% CI) to an .xlsx file, plus a second sheet with basic
+    model info (formula, n obs, n groups, convergence)."""
+    coef_table = pd.DataFrame({
+        'coef': result.params,
+        'std_err': result.bse,
+        'z': result.tvalues,
+        'p_value': result.pvalues,
+    })
+    ci = result.conf_int()
+    coef_table['CI_2.5%'] = ci[0]
+    coef_table['CI_97.5%'] = ci[1]
+    coef_table.index.name = 'term'
+
+    info = pd.DataFrame({
+        'field': ['model', 'n_obs', 'n_groups', 'converged'],
+        'value': [model_desc, result.nobs, result.model.n_groups, result.converged],
+    })
+
+    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+        coef_table.to_excel(writer, sheet_name='Fixed effects')
+        info.to_excel(writer, sheet_name='Model info', index=False)
+
+
+def aggregate_by_speed_bin(df, response, speed_col='median_speed_cms', recording='file',
+                           group='animal', bin_width=SPEED_BIN_WIDTH_CMS,
+                           agg_method=BIN_AGG_METHOD):
+    """One `agg_method` value of `response` per (recording, speed bin).
+
+    Epochs are grouped by `bin_width`-wide bins of their median speed ([0,w),
+    [w,2w), ... cm/s) within each recording, so the mixed model is fit on a
+    value that summarises a distinct speed rather than on many individual
+    epochs. `speed_within_bin` is the agg_method'd speed of the bin's epochs;
+    `speed_bin_center` ((k + 0.5) * w for bin [k*w, (k+1)*w)) is the model's
+    predictor; `n_epochs` is how many epochs went into the bin.
+    """
+    d = df.dropna(subset=[response, speed_col, group]).copy()
+    d['speed_bin'] = np.floor(d[speed_col] / bin_width)
+    agg = (d.groupby([group, recording, 'speed_bin'])
+            .agg(**{response: (response, agg_method)},
+                 speed_within_bin=(speed_col, agg_method),
+                 n_epochs=(response, 'size'))
+            .reset_index())
+    agg['speed_bin_center'] = (agg['speed_bin'] + 0.5) * bin_width
+    return agg.drop(columns='speed_bin')
+
+
+def _plot_vs_speed_mixedmodel(df, response, ylabel, title, unit, animal=None, ax=None,
+                              figsize=(7, 5), color='#4C72B0'):
+    """Shared body of the *_vs_speed_mixedmodel plots (same style as
+    ThetaVsSpeed_v6_Ferret_Final.py's plot_mixed_model_fit): theta-positive
+    (non-skipped) epochs reduced to one value per (recording,
+    SPEED_BIN_WIDTH_CMS speed bin) (aggregate_by_speed_bin) and scattered per
+    animal against the bin center, the random-intercept mixed model's
+    fixed-effect line + 95% CI band, and the legend plus full model
+    statistics written below the plot.
+
+    The model is always fit across ALL animals; `animal`, if given, only
+    restricts which points are drawn on top of that shared fit.
+    """
+    predictor, group = 'speed_bin_center', 'animal'
+    binned = aggregate_by_speed_bin(df[~df['skipped']], response, group=group)
+    if len(binned) < 2 or binned[group].nunique() < 2:
+        raise ValueError('Not enough theta-positive speed bins / animals to fit a mixed model '
+                         f'(need >=2 animals with valid {response}/median_speed_cms).')
+
+    result = fit_freq_speed_mixed_model(binned, response=response, predictor=predictor, group=group)
+    sub = binned
+    scope = sub if animal is None else sub[sub[group] == animal]
+
+    intercept = result.params['Intercept']
+    slope = result.params[predictor]
+    pvalue = result.pvalues[predictor]
+    slope_se = result.bse[predictor]
+    slope_z = result.tvalues[predictor]
+    slope_ci_low, slope_ci_high = result.conf_int().loc[predictor]
+    cov = result.cov_params()
+
+    x_range = np.linspace(sub[predictor].min(), sub[predictor].max(), 100)
+    y_pred = intercept + slope * x_range
+    se = np.sqrt(
+        cov.loc['Intercept', 'Intercept']
+        + x_range ** 2 * cov.loc[predictor, predictor]
+        + 2 * x_range * cov.loc['Intercept', predictor]
+    )
+    z = norm.ppf(0.975)
+    y_ci_low = y_pred - z * se
+    y_ci_high = y_pred + z * se
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    handles = []
+    for animal_label in ordered_animals(scope[group]):
+        pts = scope[scope[group] == animal_label]
+        handles.append(ax.scatter(pts[predictor], pts[response],
+                                  color=animal_color(animal_label, default=color),
+                                  edgecolor='k', linewidth=0.5, alpha=0.8, s=25,
+                                  label=animal_label))
+    handles += ax.plot(x_range, y_pred, color='black', linewidth=2, label='Mixed Linear Fit')
+    handles.append(ax.fill_between(x_range, y_ci_low, y_ci_high, color='grey', alpha=0.5,
+                                   label='95% CI'))
+    ax.set_xlabel('Speed bin center (cm/s)', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(f'{animal}: {title}' if animal else title, fontsize=14, weight='bold')
+    ax.grid(True, linestyle='--', alpha=0.4)
+
+    details = '\n'.join([
+        f'Model: {response} ~ {predictor} + (1 | {group})   [linear mixed model, REML]',
+        f'Slope β = {slope:.4g} ± {slope_se:.3g} SE {unit} per cm/s,  '
+        f'95% CI [{slope_ci_low:.4g}, {slope_ci_high:.4g}],  z = {slope_z:.2f},  '
+        + (f'p = {pvalue:.3g}' if pvalue > 0 else 'p < 1e-300'),
+        f'Intercept = {intercept:.4g} {unit};  random-intercept var = {result.cov_re.iloc[0, 0]:.3g};  '
+        f'residual var = {result.scale:.3g};  converged = {result.converged}',
+        f'n = {len(sub)} speed bins from {sub["file"].nunique()} recordings, '
+        f'{sub[group].nunique()} animals ({int(sub["n_epochs"].sum())} theta-positive epochs)'
+        + (f';  points shown: {animal} only' if animal else ''),
+        f'bin width = {SPEED_BIN_WIDTH_CMS:g} cm/s,  value per (recording, bin) = {BIN_AGG_METHOD}',
+    ])
+    legend_and_stats_below(ax, details, handles=handles, labels=[h.get_label() for h in handles],
+                           ncol=3, fontsize=9, stats_fontsize=9, linespacing=1.4)
+
+    fig.tight_layout()
+    return fig, ax, result
+
+
+def plot_freq_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5), color='#4C72B0'):
+    """Theta-positive epochs only (non-skipped, i.e. passed artifact/delta-theta
+    rejection and had an acceptable sinusoid fit): scatter of matched-sinusoid
+    frequency ('freq') vs. running speed, one value per (recording,
+    SPEED_BIN_WIDTH_CMS speed bin of 'median_speed_cms'), with a random-intercept mixed-model fit (grouped by animal) overlaid as the
+    fixed-effect line and its 95% CI band -- the same
+    fit_mixed_model/plot_mixed_model_fit stats used in ThetaVsSpeed_v2.py,
+    applied here to the ACG epochs' own freq_est/speed columns instead of the
+    Generalized-Phase instantaneous frequency/speed bins.
+
+    The mixed model is always fit across ALL animals (so the random intercept
+    has more than one group to draw on); `animal`, if given, only restricts
+    which points are drawn on top of that shared fit.
+
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'freq', ylabel='Theta Frequency, freq_est [Hz]',
+        title='Theta Frequency vs. Speed (Mixed Model)', unit='Hz',
+        animal=animal, ax=ax, figsize=figsize, color=color)
+
+
+def plot_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5), color='#55A868'):
+    """Theta-positive epochs only (non-skipped): scatter of per-epoch
+    broadband LFP power ('epoch_power_uv2', mean squared amplitude of the
+    cleaned, ADBitVolts-scaled uV waveform -- see process_ncs_for_acg) vs.
+    running speed, binned like plot_freq_vs_speed_mixedmodel, with a
+    random-intercept mixed-model fit (grouped by animal) overlaid as the
+    fixed-effect line and its 95% CI band. Same
+    fit_mixed_model/plot_mixed_model_fit stats as ThetaVsSpeed_v2.py and
+    plot_freq_vs_speed_mixedmodel above, applied to power instead of freq_est.
+
+    The mixed model is always fit across ALL animals (so the random
+    intercept has more than one group to draw on); `animal`, if given, only
+    restricts which points are drawn on top of that shared fit.
+
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_power_uv2', ylabel='Epoch LFP Power [µV²]',
+        title='Epoch LFP Power vs. Speed (Mixed Model)', unit='µV²',
+        animal=animal, ax=ax, figsize=figsize, color=color)
+
+
+def plot_theta_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5),
+                                         color='#4C72B0'):
+    """Theta-band power ('epoch_theta_power_uv2', mean square of the
+    THETA_BAND band-passed epoch, uV^2 -- no normalization) vs. speed, same
+    binning / mixed model as plot_freq_vs_speed_mixedmodel. The un-normalized
+    counterpart of plot_relpower_vs_speed_mixedmodel.
+
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_theta_power_uv2', ylabel='Theta Power [µV²]',
+        title='Theta Power vs. Speed (no normalization, Mixed Model)', unit='µV²',
+        animal=animal, ax=ax, figsize=figsize, color=color)
+
+
+def plot_relpower_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5),
+                                      color='#4C72B0'):
+    """Relative theta power ('epoch_theta_power_rel', % of the recording's
+    REL_POWER_BAND power -- see REL_POWER_BAND) vs. speed, same binning /
+    mixed model as plot_freq_vs_speed_mixedmodel.
+
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_theta_power_rel',
+        ylabel=f'Relative Theta Power [% of {REL_POWER_BAND[0]:g}–{REL_POWER_BAND[1]:g} Hz power]',
+        title='Theta Power vs. Speed (relative power, Mixed Model)', unit='%',
+        animal=animal, ax=ax, figsize=figsize, color=color)
+
+
+def plot_nontheta_power_vs_speed_mixedmodel(df, animal=None, ax=None, figsize=(7, 5),
+                                            color='#4C72B0'):
+    """Power outside THETA_BAND ('epoch_nontheta_power_uv2' = epoch_power_uv2 -
+    epoch_theta_power_uv2, uV^2) vs. speed, same binning / mixed model as
+    plot_freq_vs_speed_mixedmodel -- the part of the un-filtered power
+    (delta, beta, gamma ...) that is not theta.
+
+    Returns (fig, ax, mixedlm_result).
+    """
+    return _plot_vs_speed_mixedmodel(
+        df, 'epoch_nontheta_power_uv2', ylabel='Non-theta Power [µV²]',
+        title='Non-theta Power vs. Speed (Mixed Model)', unit='µV²',
+        animal=animal, ax=ax, figsize=figsize, color=color)
+
+
+def plot_power_band_comparison_vs_speed(df, animal=None, figsize=(22, 6)):
+    """Side-by-side check of how much of the un-normalized power ~ speed
+    relationship is theta: the same theta-positive epochs' power (a) without
+    band-pass (<= LOWPASS_CUTOFF_HZ), (b) after the THETA_BAND band-pass, and
+    (c) outside THETA_BAND (a minus b) -- each vs. speed with its own binned
+    random-intercept mixed model (see _plot_vs_speed_mixedmodel). If (a)'s
+    slope is driven by faster rhythms (e.g. gamma rising with speed), it shows
+    up in (c) rather than (b).
+
+    Returns (fig, axes, {response: mixedlm_result}).
+    """
+    theta_lbl = f'{THETA_BAND[0]:g}–{THETA_BAND[1]:g} Hz'
+    panels = [
+        ('epoch_power_uv2', f'LFP Power ≤{LOWPASS_CUTOFF_HZ:g} Hz [µV²]',
+         f'(a) ≤{LOWPASS_CUTOFF_HZ:g} Hz, no band-pass'),
+        ('epoch_theta_power_uv2', f'Theta Power {theta_lbl} [µV²]',
+         f'(b) {theta_lbl} band-pass'),
+        ('epoch_nontheta_power_uv2', 'Non-theta Power [µV²]',
+         f'(c) outside {theta_lbl} (a − b)'),
+    ]
+    fig, axes = plt.subplots(1, len(panels), figsize=figsize)
+    results = {}
+    for ax, (col, ylabel, title) in zip(axes, panels):
+        _fig, _ax, results[col] = _plot_vs_speed_mixedmodel(
+            df, col, ylabel=ylabel, title=title, unit='µV²', animal=animal, ax=ax)
+    title = 'Epoch power vs. speed: un-filtered vs. theta band-passed'
+    fig.suptitle(f'{animal}: {title}' if animal else title, fontsize=15, weight='bold')
+    fig.tight_layout()
+    return fig, axes, results
+
+
+# (response column, plot function, output file stem, slope unit) of every
+# theta vs. speed mixed model the driver fits and plots
+SPEED_MODELS = [
+    ('freq',                     plot_freq_vs_speed_mixedmodel,           'freq_est_vs_speed_mixedmodel',             'Hz'),
+    ('epoch_power_uv2',          plot_power_vs_speed_mixedmodel,          'power_vs_speed_mixedmodel',                'uV^2'),
+    ('epoch_theta_power_uv2',    plot_theta_power_vs_speed_mixedmodel,    'theta_power_vs_speed_mixedmodel',          'uV^2'),
+    ('epoch_nontheta_power_uv2', plot_nontheta_power_vs_speed_mixedmodel, 'nontheta_power_vs_speed_mixedmodel',       'uV^2'),
+    ('epoch_theta_power_rel',    plot_relpower_vs_speed_mixedmodel,       'theta_power_relative_vs_speed_mixedmodel', '%'),
+]
 
 
 def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
@@ -1191,6 +1511,11 @@ def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
     ax.set_ylabel('Autocorr. peak range (norm.)')
     ax.set_xlabel('Channel')
     ax.set_title(animal)
+    leg = ax.get_legend()
+    if leg is not None:
+        handles = getattr(leg, 'legend_handles', None) or leg.legendHandles
+        legend_and_stats_below(ax, handles=handles, labels=[t.get_text() for t in leg.get_texts()],
+                               title=leg.get_title().get_text() or None)
     return ax
 
 
@@ -1206,7 +1531,7 @@ def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
 def compute_group_centroids(df, group_col='movement', freq_col='freq',
                             peakrange_col='peakrangenorm'):
     """Mean frequency and mean normalised peak range per movement group --
-    the centroid diamond markers in Dunn et al. Fig. 4e/h."""
+    the green diamond markers in Dunn et al. Fig. 4e/h."""
     clean = df[~df['skipped']]
     out = (clean.groupby(group_col)[[freq_col, peakrange_col]]
                 .mean()
@@ -1250,12 +1575,13 @@ def plot_example_epoch(row, epoch_waveform, ax_trace=None, ax_acg=None,
 
     winlength = len(epoch_waveform)
     t = np.arange(winlength) / fs
-    ax_trace.plot(t, epoch_waveform, color=color, linewidth=1)
+    ax_trace.plot(t, epoch_waveform, color=color, linewidth=1, path_effects=outlined(1))
     ax_trace.set_xlim(0, winlength / fs)
     ax_trace.axis('off')
     if 'median_speed_cms' in row and np.isfinite(row['median_speed_cms']):
+        # dark text -- a pastel (animal-colored) label would be unreadable
         ax_trace.text(0.02, 0.95, f"{row['median_speed_cms']:.1f} cm s$^{{-1}}$",
-                      transform=ax_trace.transAxes, color=color, fontsize=9,
+                      transform=ax_trace.transAxes, color=ANIMAL_EDGE_COLOR, fontsize=9,
                       va='top')
 
     if ax_acg is None:
@@ -1285,24 +1611,17 @@ def plot_example_epoch(row, epoch_waveform, ax_trace=None, ax_acg=None,
 
 def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  mode='both', speed_vmax=50.0, moving_cmap='viridis',
-                                 moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
-                                 immobile_cmap='magma', immobile_alpha=1.0,
+                                 moving_alpha=0.5, immobile_color='black',
                                  immobile_edgecolor='#FFB3BA', immobile_edgewidth=0.8,
-                                 moving_centroid_cmap_pos=0.8, immobile_centroid_color='#FF1493',
                                  n_bins=25, log_counts=True, show_edmin_annotation=True):
     """Shared drawing routine for the Fig. 4e/h-style scatter: frequency vs.
-    normalised autocorrelogram peak range. Immobile epochs are drawn in
-    `immobile_cmap` (coloured by per-epoch running speed over
-    0-`immobile_speed_vmax`, i.e. the immobile speed range) with a pastel-red
-    outline; moving epochs are drawn in `moving_cmap` (coloured by per-epoch
-    running speed over 0-`speed_vmax`) at `moving_alpha` opacity, layered on
-    top -- the two distinct colormaps keep the heavily-overlapping point
-    clouds visually distinguishable. Marginal count histograms follow the
-    same colouring (each bar coloured by its epochs' mean speed), and
-    moving/immobile centroids are marked as diamonds in a bright colour
-    (green from viridis for moving, at position `moving_centroid_cmap_pos`
-    along the colormap; bright pink `immobile_centroid_color` for immobile).
-    An annotation in `ax_main`
+    normalised autocorrelogram peak range. Immobile epochs (speed doesn't
+    meaningfully vary) are drawn solid jet-black with a pastel-red outline;
+    moving epochs are drawn in `moving_cmap` (coloured by per-epoch running
+    speed) at `moving_alpha` opacity, layered on top -- this two-tone scheme
+    keeps the two heavily-overlapping point clouds visually distinguishable.
+    Marginal count histograms follow the same colouring, and moving/immobile
+    centroids are marked as green diamonds. An annotation in `ax_main`
     reports the percentage of epochs (within `animal`'s scope, if given)
     excluded by the ED_min fit-quality threshold (ACG_ED_MIN_THRESH) -- these
     never reach the scatter/centroids since they're filtered out via
@@ -1314,10 +1633,6 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     stay directly comparable to the merged one. Used by
     plot_freq_peakrange_summary(), plot_figure4_style(), and
     plot_freq_peakrange_by_movement().
-
-    Returns (sc_moving, sc_immobile, centroids) -- either scatter handle is
-    None when that group isn't drawn (see `mode`); pass them to
-    _add_speed_colorbars.
     """
     scope = df if animal is None else df[df['animal'] == animal]
     n_edmin_rejected = int(scope['skipped_edmin'].sum())
@@ -1333,15 +1648,12 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     immobile = sub[sub['movement'] == 'immobile'] if show_immobile else sub.iloc[0:0]
     moving = sub[sub['movement'] == 'moving'] if show_moving else sub.iloc[0:0]
 
-    # immobile first (opaque by default) so the semi-transparent moving layer
+    # immobile first (solid, opaque) so the semi-transparent moving layer
     # sits visibly on top rather than being hidden underneath it
-    sc_imm = None
     if show_immobile:
-        imm_speed = np.clip(immobile['median_speed_cms'].to_numpy(), 0, immobile_speed_vmax)
-        sc_imm = ax_main.scatter(immobile['freq'], immobile['peakrangenorm'], c=imm_speed,
-                                 cmap=immobile_cmap, vmin=0, vmax=immobile_speed_vmax, s=16,
-                                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-                                 alpha=immobile_alpha, label='immobile', zorder=2)
+        ax_main.scatter(immobile['freq'], immobile['peakrangenorm'], color=immobile_color,
+                        s=16, edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+                        alpha=1.0, label='immobile', zorder=2)
     sc = None
     if show_moving:
         speed = np.clip(moving['median_speed_cms'].to_numpy(), 0, speed_vmax)
@@ -1353,60 +1665,44 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     shown = {g for g, show in (('moving', show_moving), ('immobile', show_immobile)) if show}
     centroids = centroids_all[centroids_all['movement'].isin(shown)]
     marker_labels = {'moving': 'moving centroid', 'immobile': 'immobile centroid'}
-    # centroid diamonds: bright green from `moving_cmap` (viridis) for moving,
-    # bright pink (`immobile_centroid_color`) for immobile
-    marker_colors = {'moving': plt.get_cmap(moving_cmap)(moving_centroid_cmap_pos),
-                     'immobile': immobile_centroid_color}
     for _, crow in centroids.iterrows():
         ax_main.scatter(crow['freq_centroid'], crow['peakrangenorm_centroid'],
-                        marker='D', s=90, facecolor=marker_colors.get(crow['movement'], 'limegreen'),
+                        marker='D', s=90, facecolor='limegreen',
                         edgecolor='black', linewidth=1, zorder=5,
                         label=marker_labels.get(crow['movement'], crow['movement']))
     ax_main.set_xlabel('Frequency (Hz)')
     ax_main.set_ylabel('Autocorr. peak range')
     ax_main.set_ylim(0, 1)
-    ax_main.legend(loc='upper left', frameon=False, fontsize=7)
-    if show_edmin_annotation:
-        ax_main.text(0.98, 0.02,
-                     f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
-                     f'rejected ({n_edmin_rejected}/{len(scope)})',
-                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
-                     color='0.3')
+    edmin_text = (f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
+                  f'rejected ({n_edmin_rejected}/{len(scope)})') if show_edmin_annotation else None
+    legend_and_stats_below(ax_main, edmin_text, ncol=2, stats_fontsize=7)
 
-    moving_cmap_obj = plt.get_cmap(moving_cmap)
-    immobile_cmap_obj = plt.get_cmap(immobile_cmap)
-
-    def _speed_colored_counts(group, value_col, bin_edges, cmap_obj, vmax):
-        """Per-bin epoch count of `group`, plus each bin's colour from the
-        mean running speed of the epochs that fall in it."""
-        n = len(bin_edges) - 1
-        idx = np.clip(np.digitize(group[value_col], bin_edges) - 1, 0, n - 1)
-        counts = np.zeros(n)
-        colors = np.zeros((n, 4))
-        for b in range(n):
-            m = idx == b
-            counts[b] = m.sum()
-            if m.any():
-                mean_speed = np.clip(group.loc[m, 'median_speed_cms'].mean(), 0, vmax)
-                colors[b] = cmap_obj(mean_speed / vmax)
-        return counts, colors
+    cmap_obj = plt.get_cmap(moving_cmap)
 
     def _movement_hist(value_col, bin_edges):
         centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         widths = np.diff(bin_edges)
-        imm_counts, imm_colors = _speed_colored_counts(
-            immobile, value_col, bin_edges, immobile_cmap_obj, immobile_speed_vmax)
-        mov_counts, mov_colors = _speed_colored_counts(
-            moving, value_col, bin_edges, moving_cmap_obj, speed_vmax)
-        return centers, widths, imm_counts, imm_colors, mov_counts, mov_colors
+
+        imm_idx = np.clip(np.digitize(immobile[value_col], bin_edges) - 1, 0, len(bin_edges) - 2)
+        imm_counts = np.array([(imm_idx == b).sum() for b in range(len(bin_edges) - 1)])
+
+        mov_idx = np.clip(np.digitize(moving[value_col], bin_edges) - 1, 0, len(bin_edges) - 2)
+        mov_counts = np.zeros(len(bin_edges) - 1)
+        mov_colors = np.zeros((len(bin_edges) - 1, 4))
+        for b in range(len(bin_edges) - 1):
+            m = mov_idx == b
+            mov_counts[b] = m.sum()
+            if m.any():
+                mean_speed = np.clip(moving.loc[m, 'median_speed_cms'].mean(), 0, speed_vmax)
+                mov_colors[b] = cmap_obj(mean_speed / speed_vmax)
+        return centers, widths, imm_counts, mov_counts, mov_colors
 
     # bins always span the FULL (both-group) range, so mode='moving' /
     # 'immobile' single-group panels stay axis-comparable with the merged one
     freq_bins = np.linspace(sub['freq'].min(), sub['freq'].max(), n_bins)
-    centers_f, widths_f, imm_f, imm_colors_f, mov_f, colors_f = _movement_hist('freq', freq_bins)
-    ax_top.bar(centers_f, imm_f, width=widths_f, color=imm_colors_f,
-              edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-              alpha=immobile_alpha, zorder=2)
+    centers_f, widths_f, imm_f, mov_f, colors_f = _movement_hist('freq', freq_bins)
+    ax_top.bar(centers_f, imm_f, width=widths_f, color=immobile_color,
+              edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth, alpha=1.0, zorder=2)
     ax_top.bar(centers_f, mov_f, width=widths_f, color=colors_f,
               edgecolor='none', alpha=moving_alpha, zorder=3)
     ax_top.set_ylabel('Count')
@@ -1415,10 +1711,9 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
         ax_top.set_yscale('log')
 
     pr_bins = np.linspace(0, 1, n_bins)
-    centers_p, widths_p, imm_p, imm_colors_p, mov_p, colors_p = _movement_hist('peakrangenorm', pr_bins)
-    ax_right.barh(centers_p, imm_p, height=widths_p, color=imm_colors_p,
-                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-                 alpha=immobile_alpha, zorder=2)
+    centers_p, widths_p, imm_p, mov_p, colors_p = _movement_hist('peakrangenorm', pr_bins)
+    ax_right.barh(centers_p, imm_p, height=widths_p, color=immobile_color,
+                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth, alpha=1.0, zorder=2)
     ax_right.barh(centers_p, mov_p, height=widths_p, color=colors_p,
                  edgecolor='none', alpha=moving_alpha, zorder=3)
     ax_right.set_xlabel('Count')
@@ -1429,49 +1724,17 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     if animal:
         ax_top.set_title(animal)
 
-    return sc, sc_imm, centroids
-
-
-def _add_speed_colorbars(fig, ax_right, sc_moving, sc_immobile, fraction=0.2, pad=0.35,
-                         label_fontsize=None):
-    """Speed colorbar(s) to the right of `ax_right` for whichever of the
-    moving (`sc_moving`) / immobile (`sc_immobile`) scatters were drawn.
-    Space is taken from `ax_right` once (same as a single fig.colorbar call
-    with `fraction`/`pad`) and split vertically when both are present --
-    moving on top, immobile below -- so the panel doesn't shrink twice.
-    """
-    mappables = [(sc, label) for sc, label in (
-        (sc_moving, 'moving speed (cm s$^{-1}$)'),
-        (sc_immobile, 'immobile speed (cm s$^{-1}$)')) if sc is not None]
-    if not mappables:
-        return []
-
-    cax, _kw = make_axes(ax_right, fraction=fraction, pad=pad)
-    pos = cax.get_position()
-    cax.remove()
-
-    n = len(mappables)
-    gap = 0.1 * pos.height if n > 1 else 0.0
-    height = (pos.height - gap * (n - 1)) / n
-    cbars = []
-    for i, (sc, label) in enumerate(mappables):
-        y0 = pos.y1 - (i + 1) * height - i * gap
-        cbar = fig.colorbar(sc, cax=fig.add_axes([pos.x0, y0, pos.width, height]))
-        cbar.set_label(label, fontsize=label_fontsize)
-        cbars.append(cbar)
-    return cbars
+    return sc, centroids
 
 
 def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
-                                moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
-                                immobile_cmap='magma', immobile_alpha=1.0,
+                                moving_alpha=0.5, immobile_color='black',
                                 immobile_edgecolor='#FFB3BA', figsize=(5.5, 5)):
     """Frequency vs. normalised autocorrelogram peak range. Immobile epochs
-    are coloured by per-epoch running speed in `immobile_cmap` with a
-    pastel-red outline; moving epochs are coloured by per-epoch running
-    speed in `moving_cmap` at `moving_alpha` opacity, so the two
-    heavily-overlapping point clouds stay distinguishable. Includes marginal
-    count histograms, one speed colorbar per group, and moving/immobile
+    are solid jet-black with a pastel-red outline; moving epochs are
+    coloured by per-epoch running speed (`moving_cmap`) at `moving_alpha`
+    opacity, so the two heavily-overlapping point clouds stay
+    distinguishable. Includes marginal count histograms and moving/immobile
     centroid markers -- reproduces Dunn et al. Fig. 4e/h.
 
     Returns (fig, axes_dict, centroids_df).
@@ -1483,129 +1746,25 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
     ax_top = fig.add_subplot(gs[0, 0], sharex=ax_main)
     ax_right = fig.add_subplot(gs[1, 1], sharey=ax_main)
 
-    sc, sc_imm, centroids = _draw_freq_peakrange_scatter(
+    sc, centroids = _draw_freq_peakrange_scatter(
         df, ax_main, ax_top, ax_right, animal=animal, speed_vmax=speed_vmax,
         moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-        immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
+        immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor)
 
-    _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
-
-    return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
-
-
-def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_size=14,
-                                alpha=1.0, n_bins=25, log_counts=True,
-                                show_edmin_annotation=True):
-    """Movement-pooled counterpart of _draw_freq_peakrange_scatter: frequency
-    vs. normalised autocorrelogram peak range for every accepted epoch, with
-    moving and immobile epochs combined and no speed colouring. Each animal in
-    `animals` is drawn in its own ANIMAL_COLORS (Pastel1) colour, with a thin
-    dark outline so the light colours stay visible on white, plus marginal
-    count histograms and one centroid diamond per animal.
-
-    Same epoch selection as _draw_freq_peakrange_scatter (non-skipped,
-    movement in moving/immobile), so the pooled cloud is exactly the union of
-    the two movement-segregated clouds. With several animals, the one with the
-    most epochs is drawn first so smaller animals' points stay visible on top.
-
-    Returns centroids DataFrame (animal, freq_centroid, peakrangenorm_centroid, n).
-    """
-    scope = df[df['animal'].isin(animals)]
-    n_edmin_rejected = int(scope['skipped_edmin'].sum())
-    pct_edmin_rejected = 100 * n_edmin_rejected / len(scope) if len(scope) else 0.0
-
-    sub = scope[~scope['skipped'] & scope['movement'].isin(['moving', 'immobile'])]
-    if sub.empty:
-        raise ValueError(f'No accepted moving/immobile epochs for {", ".join(animals)}.')
-
-    freq_bins = np.linspace(sub['freq'].min(), sub['freq'].max(), n_bins)
-    pr_bins = np.linspace(0, 1, n_bins)
-    edge = MARKER_EDGE['markeredgecolor']
-
-    draw_order = sorted(animals, key=lambda a: -int((sub['animal'] == a).sum()))
-    for animal_label in draw_order:
-        a_sub = sub[sub['animal'] == animal_label]
-        if a_sub.empty:
-            continue
-        color = to_rgba(animal_color(animal_label), alpha)
-        ax_main.scatter(a_sub['freq'], a_sub['peakrangenorm'], s=point_size,
-                        facecolor=color, edgecolor=edge, linewidth=0.3, zorder=2,
-                        label=f'{animal_label} (n={len(a_sub)})')
-        ax_top.hist(a_sub['freq'], bins=freq_bins, histtype='stepfilled', log=log_counts,
-                    facecolor=color, edgecolor=edge, linewidth=0.5)
-        ax_right.hist(a_sub['peakrangenorm'], bins=pr_bins, histtype='stepfilled',
-                      orientation='horizontal', log=log_counts,
-                      facecolor=color, edgecolor=edge, linewidth=0.5)
-
-    centroids = compute_group_centroids(sub, group_col='animal')
-    for _, crow in centroids.iterrows():
-        ax_main.scatter(crow['freq_centroid'], crow['peakrangenorm_centroid'],
-                        marker='D', s=90, facecolor=animal_color(crow['animal']),
-                        edgecolor='black', linewidth=1, zorder=5)
-    # legend proxy for the per-animal centroid diamonds
-    ax_main.scatter([], [], marker='D', s=90, facecolor='white', edgecolor='black',
-                    linewidth=1, label='centroid')
-
-    ax_main.set_xlabel('Frequency (Hz)')
-    ax_main.set_ylabel('Autocorr. peak range')
-    ax_main.set_ylim(0, 1)
-    ax_main.legend(loc='upper left', frameon=False, fontsize=7)
-    if show_edmin_annotation:
-        ax_main.text(0.98, 0.02,
-                     f'ED_min > {ACG_ED_MIN_THRESH}: {pct_edmin_rejected:.1f}% '
-                     f'rejected ({n_edmin_rejected}/{len(scope)})',
-                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
-                     color='0.3')
-
-    ax_top.set_ylabel('Count')
-    ax_top.tick_params(labelbottom=False)
-    ax_right.set_xlabel('Count')
-    ax_right.tick_params(labelleft=False)
-    return centroids
-
-
-def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5)):
-    """Frequency vs. normalised autocorrelogram peak range with moving and
-    immobile epochs combined (no movement segregation, no speed colormap) --
-    each animal in its ANIMAL_COLORS colour, with marginal count histograms
-    and per-animal centroid diamonds (see _draw_freq_peakrange_pooled).
-
-    `animals` : one animal label (per-animal figure), a list of labels, or
-                None for every animal in `df` on one cumulative figure.
-
-    Returns (fig, axes_dict, centroids_df).
-    """
-    if animals is None:
-        animals = ordered_animals(df['animal'])
-    elif isinstance(animals, str):
-        animals = [animals]
-
-    fig = plt.figure(figsize=figsize)
-    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
-                          wspace=0.05, hspace=0.05)
-    ax_main = fig.add_subplot(gs[1, 0])
-    ax_top = fig.add_subplot(gs[0, 0], sharex=ax_main)
-    ax_right = fig.add_subplot(gs[1, 1], sharey=ax_main)
-
-    centroids = _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals,
-                                            alpha=alpha)
-    ax_top.set_title(f'{animals[0]}: all epochs' if len(animals) == 1
-                     else 'All animals: all epochs')
+    cbar = fig.colorbar(sc, ax=ax_right, fraction=0.2, pad=0.35) # type: ignore
+    cbar.set_label('moving speed (cm s$^{-1}$)')
 
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
 
 def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
-                                    moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
-                                    immobile_cmap='magma', immobile_alpha=1.0,
+                                    moving_alpha=0.5, immobile_color='black',
                                     immobile_edgecolor='#FFB3BA', figsize=(15, 5)):
     """Three side-by-side Fig. 4e/h-style panels -- mobility only, immobility
     only, and both merged -- sharing the same frequency/peak-range axes and
     bins so the two point clouds can first be inspected on their own, then
-    compared for overlap in the merged panel. Moving epochs are coloured by
-    speed in `moving_cmap`, immobile epochs by speed in `immobile_cmap` (with
-    a pastel-red outline) in every panel.
+    compared for overlap in the merged panel. Immobile epochs are drawn with
+    a pastel-red outline in every panel.
 
     A footer below the panels reports the ED_min fit-quality rejection rate
     (within `animal`'s scope, if given): the overall percentage of epochs
@@ -1620,6 +1779,7 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     outer = fig.add_gridspec(1, 3, wspace=0.6, bottom=0.22, top=0.88)
 
     centroids = None
+    main_axes = []
     for col, (mode, title) in enumerate((('moving', 'Mobility'),
                                          ('immobile', 'Immobility'),
                                          ('both', 'Merged'))):
@@ -1628,16 +1788,17 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
         ax_main = fig.add_subplot(sub_gs[1, 0])
         ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
         ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
+        main_axes.append(ax_main)
 
-        sc, sc_imm, c = _draw_freq_peakrange_scatter(
+        sc, c = _draw_freq_peakrange_scatter(
             df, ax_main, ax_top, ax_right, animal=animal, mode=mode,
             speed_vmax=speed_vmax, moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-            immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-            immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
+            immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor,
             show_edmin_annotation=False)
         ax_top.set_title(title)
-        _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.25, pad=0.45,
-                             label_fontsize=7)
+        if sc is not None:
+            cbar = fig.colorbar(sc, ax=ax_right, fraction=0.25, pad=0.45)
+            cbar.set_label('moving speed (cm s$^{-1}$)', fontsize=7)
         if mode == 'both':
             centroids = c
 
@@ -1663,7 +1824,12 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     pct_immobile_edmin_of_immobile = 100 * n_edmin_immobile / n_immobile_total if n_immobile_total else 0.0
     pct_moving_edmin_of_moving = 100 * n_edmin_moving / n_moving_total if n_moving_total else 0.0
 
-    fig.text(0.5, 0.02,
+    # footer goes just under the lowest panel legend (which sits below each
+    # panel's x-label), so the two never overlap
+    canvas = fig.canvas
+    renderer = canvas.get_renderer() if hasattr(canvas, 'get_renderer') else fig._get_renderer()
+    footer_y = min(ax.get_tightbbox(renderer).y0 for ax in main_axes) / fig.bbox.height - 0.02
+    fig.text(0.5, footer_y,
              f'ED_min > {ACG_ED_MIN_THRESH} rejected {n_edmin_rejected}/{len(scope)} '
              f'epochs overall ({pct_edmin_rejected:.1f}%)\n'
              f'ED_min rejected epochs in immobility ({pct_edmin_immobile:.1f}%) | '
@@ -1672,15 +1838,14 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
              f'{pct_immobile_edmin_of_immobile:.1f}% ({n_edmin_immobile}/{n_immobile_total}) | '
              f'% of total mobility epochs with ED_min > {ACG_ED_MIN_THRESH}: '
              f'{pct_moving_edmin_of_moving:.1f}% ({n_edmin_moving}/{n_moving_total})',
-             ha='center', va='bottom', fontsize=8, color='0.2')
+             ha='center', va='top', fontsize=8, color='0.2')
 
     return fig, centroids
 
 
-def plot_figure4_style(df, animal=None, trace_color='tab:blue',
+def plot_figure4_style(df, animal=None, trace_color=None,
                        speed_vmax=50.0, moving_cmap='viridis',
-                       moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
-                       immobile_cmap='magma', immobile_alpha=1.0,
+                       moving_alpha=0.5, immobile_color='black',
                        immobile_edgecolor='#FFB3BA',
                        moving_row=None, immobile_row=None, figsize=(9, 4)):
     """Full Dunn et al. Fig. 4-style panel group: an example moving epoch
@@ -1690,10 +1855,13 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
 
     If `moving_row` / `immobile_row` aren't given, the epoch within each
     movement group whose (freq, peakrangenorm) is closest to that group's
-    own centroid is used (pick_example_epoch).
+    own centroid is used (pick_example_epoch). `trace_color` defaults to the
+    animal's ANIMAL_COLORS entry ('tab:blue' if it has none).
 
     Returns (fig, centroids_df).
     """
+    if trace_color is None:
+        trace_color = animal_color(animal, default='tab:blue')
     clean = df[~df['skipped']]
     if moving_row is None:
         moving_row = pick_example_epoch(clean, 'moving', animal=animal)
@@ -1722,13 +1890,13 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
     ax_main = fig.add_subplot(sub_gs[1, 0])
     ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
     ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
-    sc, sc_imm, centroids = _draw_freq_peakrange_scatter(
+    sc, centroids = _draw_freq_peakrange_scatter(
         df, ax_main, ax_top, ax_right, animal=animal, speed_vmax=speed_vmax,
         moving_cmap=moving_cmap, moving_alpha=moving_alpha,
-        immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
+        immobile_color=immobile_color, immobile_edgecolor=immobile_edgecolor)
 
-    _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
+    cbar = fig.colorbar(sc, ax=ax_right, fraction=0.2, pad=0.35) # type: ignore
+    cbar.set_label('moving speed (cm s$^{-1}$)')
 
     if animal:
         fig.suptitle(animal)
@@ -1736,15 +1904,114 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
     return fig, centroids
 
 
-# %% ==================== Run metadata ===============================================
+# %% ==================== Run metadata (provenance) =================================
+#
+# Every run writes RUN_METADATA_FILENAME into FIGURE_DIR, recording which code
+# version produced the figures (script path, SHA-256 of its source, git
+# commit + whether it had uncommitted edits, and a full copy of the source),
+# every configuration setting, every .ncs file / session directory processed
+# (with OK/SKIP status), and every output file written.
 
-def _script_path():
-    """Absolute path of this script (falls back to the working directory when
-    run cell-by-cell/interactively, where __file__ isn't defined)."""
-    try:
-        return os.path.abspath(__file__)
-    except NameError:
-        return os.path.join(os.getcwd(), 'Figc_ACG_ScalingCorrected_v3_SessionSegregation.py')
+RUN_METADATA_FILENAME = 'run_metadata_ACG_ThetaVsSpeed.xlsx'
+
+# (section, constant name, description). Values are read from the module
+# globals at write time, so they always reflect what was actually used. Any
+# other UPPERCASE module-level constant not listed here is still recorded
+# (section 'Other'), so a newly added setting can't silently go missing.
+CONFIG_SETTINGS = [
+    ('Paths',              'ROOT_DIR',             'Root directory searched recursively for .ncs files'),
+    ('Paths',              'OUTPUT_DIR',           'Results tables output directory'),
+    ('Paths',              'FIGURE_DIR',           'Figure output directory'),
+    ('Paths',              'META_DIR',             'run_metadata.csv + script copy output directory'),
+    ('Acquisition',        'NATIVE_FS',            'Native Neuralynx .ncs sampling rate (Hz)'),
+    ('Acquisition',        'ADBITVOLTS_NO_HEADER', 'V/count used only when a .ncs header has no -ADBitVolts (simulated files)'),
+    ('Line-noise notch',   'LINE_HARMONICS',       'Notch-filtered frequencies (Hz)'),
+    ('Line-noise notch',   'NOTCH_Q',              'Notch quality factor'),
+    ('Low-pass filter',    'LOWPASS_CUTOFF_HZ',    'Butterworth low-pass cutoff (Hz), zero-phase filtfilt'),
+    ('Low-pass filter',    'LOWPASS_ORDER',        'Butterworth filter order'),
+    ('Artifact rejection', 'MAD_THRESH',           'Robust (MAD) z threshold on epoch peak-to-peak amplitude'),
+    ('Delta/theta filter', 'DELTA_BAND',           'Delta band (Hz); epoch rejected if delta power > theta power'),
+    ('Delta/theta filter', 'THETA_BAND',           'Theta band (Hz)'),
+    ('Tracking / speed',   'POS_JUMP_THRESH_CMS',  'Frame-to-frame jumps above this speed (cm/s) treated as tracking artifacts'),
+    ('Tracking / speed',   'POS_SMOOTH_SIGMA_SMP', 'Gaussian smoothing sigma (samples) on x/y position'),
+    ('Tracking / speed',   'SPEED_THRESH_CMS',     'Epoch median speed > this -> moving, <= this -> immobile (cm/s)'),
+    ('Theta vs. speed',    'SPEED_BIN_WIDTH_CMS',  'Width (cm/s) of the speed bins epochs are grouped into per recording before the mixed models'),
+    ('Theta vs. speed',    'BIN_AGG_METHOD',       "Value per (recording, speed bin): 'median' or 'mean'"),
+    ('Relative power',     'REL_POWER_BAND',       'Band (Hz) whose total power (recording mean square) normalizes theta power'),
+    ('Relative power',     'REL_POWER_FILTER_ORDER', 'Butterworth order of the REL_POWER_BAND band-pass (sosfiltfilt)'),
+    ('Relative power',     'THETA_POWER_FILTER_ORDER', 'Butterworth order of the THETA_BAND band-pass for epoch theta power (sosfiltfilt)'),
+    ('ACG',                'FS_ACG',               'Resample rate for ACG analysis (Hz)'),
+    ('ACG',                'EPOCH_SEC',            'Autocorrelogram epoch length (s)'),
+    ('ACG',                'ACG_FREQ_RANGE',       'Reference sinusoid bank frequency range (Hz)'),
+    ('ACG',                'ACG_FREQ_RES',         'Reference sinusoid bank step (Hz)'),
+    ('ACG',                'ACG_PEAK_PROMINENCE',  'Peak/trough prominence for reference ACG extrema'),
+    ('ACG',                'ACG_ED_MIN_THRESH',    'Epochs with ED_min above this are marked skipped (None = off)'),
+    ('Summary',            'FREQ_HIST_BIN_EDGES',  'freq_est ranges used for freq_est_range_counts.csv'),
+    ('Plotting',           'ANIMAL_COLORS',        'Per-animal colors (Pastel1[0:4]), matched on animal ID'),
+    ('Plotting',           'ANIMAL_EDGE_COLOR',    'Thin dark outline color around animal-colored lines/points'),
+    ('Plotting',           'ANIMAL_EDGE_WIDTH',    'Outline width (pt) around animal-colored lines/points'),
+]
+
+# Processing choices hard-coded in the function bodies (not module constants).
+PIPELINE_NOTES = [
+    ('Processing order',
+     'load .ncs (uV via header -ADBitVolts) -> resample_poly NATIVE_FS->FS_ACG -> notch '
+     '(LINE_HARMONICS) -> linear detrend -> Butterworth low-pass -> non-overlapping EPOCH_SEC '
+     'epochs -> delta/theta rejection -> MAD peak-to-peak rejection (reference stats from '
+     'delta/theta-kept epochs) -> moving/immobile labelling -> ACG peak-range quantification'),
+    ('Delta/theta Welch PSD', "hann window, nperseg = epoch length, noverlap = 0, detrend = 'constant'"),
+    ('Speed per epoch', 'median of tracking-sample speeds within the epoch (nearest sample if none)'),
+    ('Speed binning', 'non-skipped epochs grouped per (animal, file, floor(median_speed_cms / '
+                      'SPEED_BIN_WIDTH_CMS)); BIN_AGG_METHOD of the response per group; '
+                      'predictor = bin center'),
+    ('Mixed models', 'smf.mixedlm: <response> ~ speed_bin_center, groups = animal; responses = freq, '
+                     'epoch_power_uv2, epoch_theta_power_uv2, epoch_nontheta_power_uv2, '
+                     'epoch_theta_power_rel'),
+    ('Theta power', 'epoch_theta_power_uv2 = per-epoch mean square of the THETA_BAND band-passed LFP'),
+    ('Non-theta power', 'epoch_nontheta_power_uv2 = epoch_power_uv2 - epoch_theta_power_uv2'),
+    ('Relative theta power', 'epoch_theta_power_rel = 100 * epoch_theta_power_uv2 / mean square of the '
+                             'REL_POWER_BAND band-passed LFP over all epochs of the recording that '
+                             'passed MAD peak-to-peak rejection'),
+    ('Figure dpi', '200'),
+]
+
+# Functions whose keyword defaults are recorded (sheet 'Function defaults'),
+# so plot/analysis parameters not exposed as module constants are captured too.
+METADATA_FUNCTIONS = [
+    'process_ncs_for_acg', 'quantify_xcorr_epochs', 'create_sine_ref_xcorrs',
+    'reject_deltatheta_epochs', 'reject_artifact_epochs', 'classify_epoch_movement',
+    '_smooth_tracking_position', 'summarize_peak_range', 'compute_freq_range_counts',
+    'plot_freq_est_histogram', 'plot_freq_est_histogram_overlay',
+    'plot_edmin_rejected_freq_histogram', 'plot_edmin_rejected_freq_histogram_overlay',
+    'plot_edmin_vs_peakrangenorm', 'fit_freq_speed_mixed_model',
+    'plot_freq_vs_speed_mixedmodel', 'plot_power_vs_speed_mixedmodel',
+    'plot_theta_power_vs_speed_mixedmodel', 'plot_relpower_vs_speed_mixedmodel',
+    'plot_nontheta_power_vs_speed_mixedmodel', 'plot_power_band_comparison_vs_speed',
+    'aggregate_by_speed_bin', '_draw_freq_peakrange_scatter', 'plot_freq_peakrange_by_movement', 'plot_figure4_style',
+]
+
+
+def get_script_path():
+    """Absolute path of this script -- `__file__` when run as a script,
+    `__vsc_ipynb_file__` when run cell-by-cell in the VS Code Interactive
+    Window. None if neither is available."""
+    for cand in (globals().get('__file__'), globals().get('__vsc_ipynb_file__')):
+        if cand and os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+def snapshot_script(script_path):
+    """Read the script's source at the START of a run (so later edits made
+    while a long run is still going don't get recorded by mistake).
+    Returns (source_text, sha256_hex, modified_time_str)."""
+    if script_path is None:
+        return '', 'UNKNOWN (script path not found)', ''
+    with open(script_path, 'rb') as f:
+        raw = f.read()
+    modified = datetime.fromtimestamp(os.path.getmtime(script_path)).isoformat(
+        sep=' ', timespec='seconds')
+    return raw.decode('utf-8', errors='replace'), hashlib.sha256(raw).hexdigest(), modified
 
 
 def save_run_metadata(meta_dir=META_DIR):
@@ -1753,20 +2020,19 @@ def save_run_metadata(meta_dir=META_DIR):
     run on, and the script's name/directory and run time to a 2-column
     (parameter, value) CSV in `meta_dir`, and save a copy of the script
     itself there, so the results folder records exactly how it was made."""
-    import datetime
-    import shutil
-    script_path = _script_path()
+    script_path = get_script_path() or os.path.join(
+        os.getcwd(), 'ThetaVsSpeed_ACGMethod_ScalingCorrected.py')
     meta = {
         # ---- provenance ----
         'script_name':              os.path.basename(script_path),
         'script_dir':               os.path.dirname(script_path),
-        'run_datetime':             datetime.datetime.now().isoformat(timespec='seconds'),
+        'run_datetime':             datetime.now().isoformat(timespec='seconds'),
         'data_dir (ROOT_DIR)':      ROOT_DIR,
         'OUTPUT_DIR':               OUTPUT_DIR,
         'FIGURE_DIR':               FIGURE_DIR,
         # ---- acquisition ----
         'NATIVE_FS':                NATIVE_FS,
-        'ADBitVolts':               'per-file, from .ncs header (-ADBitVolts)',
+        'ADBitVolts_source':        'per-file .ncs header (-ADBitVolts)',
         'ADBITVOLTS_NO_HEADER':     ADBITVOLTS_NO_HEADER,
         'ncs_dtype':                str(ncs_dtype),
         # ---- LFP cleaning (resample -> notch -> detrend -> low-pass) ----
@@ -1789,31 +2055,32 @@ def save_run_metadata(meta_dir=META_DIR):
         'POS_JUMP_THRESH_CMS':      POS_JUMP_THRESH_CMS,
         'POS_SMOOTH_SIGMA_SMP':     POS_SMOOTH_SIGMA_SMP,
         'SPEED_THRESH_CMS':         SPEED_THRESH_CMS,
-        # ---- arena / session-type segregation ----
-        'arena_session_source':     '.ncs folder path (session folder shared with the .ntt files)',
-        'ARENA_TYPES':              ARENA_TYPES,
-        'ARENA_SESSION_TYPES':      ARENA_SESSION_TYPES,
-        'ARENA_FIGURE_DIR':         ARENA_FIGURE_DIR,
-        'SESSION_FIGURE_DIR':       SESSION_FIGURE_DIR,
-        'STATS_ALPHA':              STATS_ALPHA,
-        'prevalence_tests':         'epoch: chi-square / pairwise Yates or Fisher (Holm); '
-                                    'session: Kruskal-Wallis / pairwise Mann-Whitney U (Holm)',
         # ---- ACG reference-sinusoid matching ----
         'ACG_FREQ_RANGE':           ACG_FREQ_RANGE,
         'ACG_FREQ_RES':             ACG_FREQ_RES,
         'ACG_PEAK_PROMINENCE':      ACG_PEAK_PROMINENCE,
         'ACG_ED_MIN_THRESH':        ACG_ED_MIN_THRESH,
+        # ---- theta vs. speed (mixed model, grouped by animal) ----
+        'SPEED_BIN_WIDTH_CMS':      SPEED_BIN_WIDTH_CMS,
+        'BIN_AGG_METHOD':           BIN_AGG_METHOD,
+        'speed_models':             'smf.mixedlm: <response> ~ speed_bin_center, groups=animal; one '
+                                    'BIN_AGG_METHOD value per (recording, speed bin) of non-skipped epochs',
+        'speed_model_responses':    [m[0] for m in SPEED_MODELS],
+        # ---- theta power / relative-power normalization ----
+        'THETA_POWER_FILTER_ORDER': THETA_POWER_FILTER_ORDER,
+        'REL_POWER_BAND':           REL_POWER_BAND,
+        'REL_POWER_FILTER_ORDER':   REL_POWER_FILTER_ORDER,
+        'rel_power_denominator':    'mean square of REL_POWER_BAND trace over the recording\'s '
+                                    'MAD-artifact-free epochs',
         # ---- summaries / plots ----
         'FREQ_HIST_BIN_EDGES':      FREQ_HIST_BIN_EDGES,
         'freq_est_histogram_bins':  30,
-        'moving_speed_vmax_cms':    50.0,
-        'immobile_speed_vmax_cms':  SPEED_THRESH_CMS,
-        'moving_cmap':              'viridis',
-        'immobile_cmap':            'magma',
+        'scatter_speed_vmax_cms':   50.0,
         'marginal_hist_n_bins':     25,
-        'pooled_plot_colors':       ANIMAL_COLORS,
-        'pooled_scatter_alpha':     1.0,
         'figure_dpi':               200,
+        'ANIMAL_COLORS':            ANIMAL_COLORS,
+        'ANIMAL_EDGE_COLOR':        ANIMAL_EDGE_COLOR,
+        'ANIMAL_EDGE_WIDTH':        ANIMAL_EDGE_WIDTH,
     }
     os.makedirs(meta_dir, exist_ok=True)
     out_path = os.path.join(meta_dir, 'run_metadata.csv')
@@ -1828,590 +2095,224 @@ def save_run_metadata(meta_dir=META_DIR):
         print(f'  Script not found at {script_path} -- no copy saved to {meta_dir}')
 
 
-# %% ==================== Arena / session-type ED_min prevalence stats ==============
-#
-# Compares how often epochs fail the ED_min fit-quality gate ('skipped_edmin')
-# across arena types, and across the session types within each arena -- the
-# same values as the plot_freq_peakrange_by_movement footer:
-#   * % of all epochs with ED_min above threshold
-#   * % of immobility epochs / % of mobility epochs above threshold (each
-#     normalised within its own movement state)
-#   * split of the rejected epochs between immobility and mobility
-# Two levels of test:
-#   * epoch level -- every epoch counted as independent: chi-square test of
-#     independence on the groups x (rejected, kept) table, then pairwise tests
-#     between groups (Yates chi-square, or Fisher's exact when an expected
-#     count is < 5), Holm-Bonferroni corrected within each measure. Also,
-#     within each group, immobility vs. mobility rejection rate (2 x 2),
-#     Holm-corrected across groups.
-#   * session level -- one % per recording session (all its .ncs channels
-#     pooled), Kruskal-Wallis across groups + pairwise Mann-Whitney U (Holm).
-#     Epochs of one session/channel aren't independent, so this is the more
-#     conservative of the two.
-
-# (key, description, rejected-count column, denominator column)
-PREVALENCE_MEASURES = [
-    ('overall',  f'% of all epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-     'n_edmin_rejected', 'n_epochs'),
-    ('immobile', f'% of immobility epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-     'n_immobile_rejected', 'n_immobile'),
-    ('moving',   f'% of mobility epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-     'n_moving_rejected', 'n_moving'),
-    ('rejected_in_immobility', '% of ED_min-rejected epochs that are immobility epochs',
-     'n_immobile_rejected', 'n_edmin_rejected'),
-]
-
-# Arena / session-type bar colours, as in ArenaSessionType_StatsComparison_v8.py
-# (magenta = circular track, cyan = linear track, blue = open arena; session
-# types are shades of their arena's hue).
-GROUP_FACE = {
-    'Open': '#7FB3E5', 'Linear': '#7FFAFA', 'Circle': '#FA7FFA',
-    'Cntrl': '#7FB3E5', 'Rotate': '#0066CC', 'Zero': '#BFBFBF',
-    '0': '#008080', '90': '#00B3B3', '180': '#33D6D6', '270': '#7FFAFA',
-    'Stnd': '#FDC4FD', 'NoRot': '#FA7FFA', 'Rot': '#C000C0',
-}
-IMMOBILE_COLOR, MOVING_COLOR = '#7F8C8D', '#E67E22'   # as in plot_moving_vs_immobile
+def _git(args, cwd):
+    """stdout of `git -C cwd <args>`, or None if git / the repo isn't available."""
+    try:
+        out = subprocess.run(['git', '-C', cwd, *args], capture_output=True,
+                             text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
 
 
-def edmin_counts(df, by):
-    """Epoch and ED_min-rejected-epoch counts (all / immobility / mobility)
-    per group of the `by` columns, plus the PREVALENCE_MEASURES percentages
-    ('pct_<key>' columns, NaN where the denominator is 0) and
-    'pct_rejected_in_mobility'."""
-    rej = df['skipped_edmin'].astype(bool)
-    imm = df['movement'].eq('immobile')
-    mov = df['movement'].eq('moving')
-    flags = pd.DataFrame({
-        'n_epochs': 1, 'n_edmin_rejected': rej,
-        'n_immobile': imm, 'n_immobile_rejected': rej & imm,
-        'n_moving': mov, 'n_moving_rejected': rej & mov,
-    }, index=df.index).astype(int)
-    counts = flags.groupby([df[c] for c in by]).sum().reset_index()
+def collect_code_info(script_path, script_sha256, script_modified):
+    """Code identity (name, directory, hash, git state) + environment rows."""
+    from importlib.metadata import version, PackageNotFoundError
 
-    def _pct(k_col, n_col):
-        return 100 * counts[k_col] / counts[n_col].where(counts[n_col] > 0)
+    rows = [
+        ('Code', 'script_name', os.path.basename(script_path) if script_path else 'UNKNOWN'),
+        ('Code', 'script_dir', os.path.dirname(script_path) if script_path else 'UNKNOWN'),
+        ('Code', 'script_path', script_path or 'UNKNOWN'),
+        ('Code', 'script_modified', script_modified),
+        ('Code', 'script_sha256', script_sha256),
+    ]
 
-    for key, _desc, k_col, n_col in PREVALENCE_MEASURES:
-        counts[f'pct_{key}'] = _pct(k_col, n_col)
-    counts['pct_rejected_in_mobility'] = _pct('n_moving_rejected', 'n_edmin_rejected')
-    return counts
+    if script_path:
+        cwd = os.path.dirname(script_path)
+        repo = _git(['rev-parse', '--show-toplevel'], cwd)
+        if repo:
+            status = _git(['status', '--porcelain', '--', script_path], cwd)
+            if status == '':
+                script_state = 'committed, no local edits (code = HEAD_commit)'
+            elif status and status.startswith('??'):
+                script_state = ('UNTRACKED (script never committed) -- '
+                                'identify version by script_sha256 / Code snapshot sheet')
+            else:
+                script_state = ('MODIFIED since last commit -- '
+                                'identify version by script_sha256 / Code snapshot sheet')
+            rows += [
+                ('Git', 'repo_root', repo),
+                ('Git', 'branch', _git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd)),
+                ('Git', 'HEAD_commit', _git(['rev-parse', 'HEAD'], cwd)),
+                ('Git', 'HEAD_commit_date', _git(['log', '-1', '--format=%ci'], cwd)),
+                ('Git', 'last_commit_touching_script',
+                 _git(['log', '-1', '--format=%H  %ci  %s', '--', script_path], cwd)
+                 or 'none (script not committed)'),
+                ('Git', 'script_state', script_state),
+            ]
+        else:
+            rows.append(('Git', 'repo_root', 'not a git repository (or git unavailable)'))
 
-
-def _holm(pvals):
-    """Holm-Bonferroni adjusted p-values (NaNs stay NaN, not counted)."""
-    p = np.asarray(pvals, dtype=float)
-    out = np.full(p.shape, np.nan)
-    ok = np.where(np.isfinite(p))[0]
-    running = 0.0
-    for rank, i in enumerate(ok[np.argsort(p[ok])]):
-        running = max(running, (len(ok) - rank) * p[i])
-        out[i] = min(1.0, running)
-    return out
-
-
-def _holm_rows(rows):
-    """Fill 'p_holm' of a family of pairwise test rows."""
-    for row, p_adj in zip(rows, _holm([r['p_raw'] for r in rows])):
-        row['p_holm'] = p_adj
+    rows += [
+        ('Environment', 'user', getpass.getuser()),
+        ('Environment', 'hostname', socket.gethostname()),
+        ('Environment', 'platform', platform.platform()),
+        ('Environment', 'python_executable', sys.executable),
+        ('Environment', 'python_version', sys.version.split()[0]),
+    ]
+    for pkg in ('numpy', 'scipy', 'pandas', 'statsmodels', 'matplotlib', 'seaborn', 'openpyxl'):
+        try:
+            rows.append(('Environment', f'{pkg}_version', version(pkg)))
+        except PackageNotFoundError:
+            rows.append(('Environment', f'{pkg}_version', 'not installed'))
     return rows
 
 
-def _test_row(level, measure, comparison, res):
-    row = {'level': level, 'measure': measure, 'comparison': comparison,
-           'test': 'insufficient data', 'stat_name': '', 'statistic': np.nan,
-           'dof': np.nan, 'p_raw': np.nan, 'p_holm': np.nan, 'note': ''}
-    if res:
-        row.update(res)
-    return row
+def _setting_value(v):
+    """Excel-friendly representation of a setting value."""
+    if v is None or isinstance(v, (bool, int, float, str, np.integer, np.floating)):
+        return 'None' if v is None else v
+    return repr(v)
 
 
-def _contingency_test(table):
-    """Test of independence on a groups x categories count table: Fisher's
-    exact for a 2 x 2 table with an expected count < 5, otherwise chi-square
-    (Yates-corrected for 2 x 2). All-zero rows/columns are dropped first.
-    Returns a result dict for _test_row, or None if fewer than 2 rows or
-    columns remain (e.g. no rejected epochs in any group)."""
-    arr = np.asarray(table, dtype=float)
-    if arr.ndim != 2:
-        return None
-    arr = arr[arr.sum(axis=1) > 0]
-    arr = arr[:, arr.sum(axis=0) > 0]
-    if arr.shape[0] < 2 or arr.shape[1] < 2:
-        return None
-    chi2, p, dof, expected = chi2_contingency(arr)
-    n_low = int((expected < 5).sum())
-    if arr.shape == (2, 2) and n_low:
-        odds, p = fisher_exact(arr)
-        return {'test': "Fisher's exact", 'stat_name': 'OR', 'statistic': odds,
-                'p_raw': p, 'note': f'{n_low}/4 expected counts < 5'}
-    note = (f'{n_low}/{expected.size} expected counts < 5 -- chi-square '
-            f'approximation may be unreliable') if n_low else ''
-    return {'test': 'Chi-square' + (' (Yates)' if arr.shape == (2, 2) else ''),
-            'stat_name': 'chi2', 'statistic': chi2, 'dof': dof, 'p_raw': p, 'note': note}
+def collect_settings():
+    """Module-level configuration actually in effect, plus hard-coded pipeline choices."""
+    g = globals()
+    rows = [(sec, name, _setting_value(g.get(name, 'NOT DEFINED')), desc)
+            for sec, name, desc in CONFIG_SETTINGS]
+    listed = {name for _, name, _ in CONFIG_SETTINGS}
+    skip = listed | {'RUN_METADATA_FILENAME', 'CONFIG_SETTINGS', 'PIPELINE_NOTES',
+                     'METADATA_FUNCTIONS', 'SPEED_MODELS'}
+    for name in sorted(g):
+        if name.isupper() and name not in skip and not callable(g[name]) \
+                and not inspect.ismodule(g[name]):
+            rows.append(('Other', name, _setting_value(g[name]), '(not documented in CONFIG_SETTINGS)'))
+    rows += [('Pipeline (hard-coded)', name, value, '') for name, value in PIPELINE_NOTES]
+    return pd.DataFrame(rows, columns=['section', 'setting', 'value', 'description'])
 
 
-def _kruskal_test(vals):
-    """Kruskal-Wallis on {group: values}; None if < 2 groups or all values identical."""
-    if len(vals) < 2:
-        return None
-    try:
-        h, p = kruskal(*vals.values())
-    except ValueError:
-        return None
-    if not np.isfinite(p):
-        return None
-    return {'test': 'Kruskal-Wallis', 'stat_name': 'H', 'statistic': h,
-            'dof': len(vals) - 1, 'p_raw': p}
-
-
-def _mannwhitney_test(a, b):
-    try:
-        u, p = mannwhitneyu(a, b, alternative='two-sided')
-    except ValueError:
-        return None
-    return {'test': 'Mann-Whitney U', 'stat_name': 'U', 'statistic': u, 'p_raw': p}
-
-
-def compare_edmin_prevalence(df, group_col, order, grouping):
-    """ED_min-rejection prevalence (PREVALENCE_MEASURES) compared across the
-    groups `order` of `group_col` ('arena_type' or 'session_type') -- tests
-    described in the section header. `grouping` names the comparison in the
-    output tables (e.g. 'Arena types', 'Linear session types').
-
-    Returns (desc_df, sessions_df, tests_df): per-group counts/percentages,
-    per-session counts/percentages, and one row per test ('comparison' is
-    'omnibus', 'A vs B', or -- for the within-group immobility vs. mobility
-    test -- the group name). 'significant' uses p_holm where it applies,
-    p_raw for omnibus tests.
-    """
-    df = df[df[group_col].isin(order)]
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    present = [g for g in order if (df[group_col] == g).any()]
-
-    desc = (edmin_counts(df, [group_col]).rename(columns={group_col: 'group'})
-            .set_index('group').loc[present].reset_index())
-    sessions = (edmin_counts(df, [group_col, 'session_folder'])
-                .rename(columns={group_col: 'group'}))
-    desc.insert(1, 'n_sessions', desc['group'].map(sessions.groupby('group').size()).to_numpy())
-    desc.insert(2, 'n_files', desc['group'].map(df.groupby(group_col)['file'].nunique()).to_numpy())
-
+def collect_function_defaults():
+    """Keyword defaults of the analysis/plotting functions as actually defined."""
     rows = []
-    for key, _desc, k_col, n_col in PREVALENCE_MEASURES:
-        # epoch level
-        d = desc[desc[n_col] > 0]
-        table = {g: [k, n - k] for g, k, n in zip(d['group'], d[k_col], d[n_col])}
-        rows.append(_test_row('epoch', key, 'omnibus', _contingency_test(list(table.values()))))
-        rows += _holm_rows([_test_row('epoch', key, f'{a} vs {b}',
-                                      _contingency_test([table[a], table[b]]))
-                            for a, b in combinations(table, 2)])
-        # session level
-        vals = {g: sessions.loc[sessions['group'] == g, f'pct_{key}'].dropna().to_numpy(dtype=float)
-                for g in present}
-        vals = {g: v for g, v in vals.items() if len(v)}
-        rows.append(_test_row('session', key, 'omnibus', _kruskal_test(vals)))
-        rows += _holm_rows([_test_row('session', key, f'{a} vs {b}',
-                                      _mannwhitney_test(vals[a], vals[b]))
-                            for a, b in combinations(vals, 2)])
-
-    # within each group: is the rejection rate different between immobility
-    # and mobility epochs?
-    rows += _holm_rows([
-        _test_row('epoch (within group)', 'immobile vs moving', r['group'], _contingency_test([
-            [r['n_immobile_rejected'], r['n_immobile'] - r['n_immobile_rejected']],
-            [r['n_moving_rejected'], r['n_moving'] - r['n_moving_rejected']]]))
-        for _, r in desc.iterrows()])
-
-    tests = pd.DataFrame(rows)
-    tests['significant'] = tests['p_holm'].fillna(tests['p_raw']) < STATS_ALPHA
-    for tbl in (desc, sessions, tests):
-        tbl.insert(0, 'grouping', grouping)
-    return desc, sessions, tests
-
-
-def _stars(p):
-    if p is None or not np.isfinite(p):
-        return ''
-    return '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < STATS_ALPHA else 'n.s.'
-
-
-def _fmt_p(p):
-    """'p < 0.001', 'p = 0.123' or 'p = n/a'."""
-    if p is None or not np.isfinite(p):
-        return 'p = n/a'
-    return 'p < 0.001' if p < 0.001 else f'p = {p:.3f}'
-
-
-def _draw_sig_brackets(ax, groups, pair_tests, y_base, y_step):
-    """Line + stars over each pair of `groups` whose row in `pair_tests`
-    ('comparison' = 'A vs B') has p_holm < STATS_ALPHA, narrower spans
-    lowest so lines don't cross. Returns the y of the highest line, or None."""
-    pos = {g: i for i, g in enumerate(groups)}
-    sig = []
-    for _, r in pair_tests.iterrows():
-        if not (np.isfinite(r['p_holm']) and r['p_holm'] < STATS_ALPHA):
+    for fname in METADATA_FUNCTIONS:
+        func = globals().get(fname)
+        if func is None:
             continue
-        a, b = r['comparison'].split(' vs ')
-        if a in pos and b in pos:
-            x1, x2 = sorted((pos[a], pos[b]))
-            sig.append((x2 - x1, x1, x2, _stars(r['p_holm'])))
-    y = y_base
-    for _span, x1, x2, stars in sorted(sig):
-        ax.plot([x1, x2], [y, y], color='black', linewidth=1, zorder=5)
-        ax.text((x1 + x2) / 2, y, stars, ha='center', va='bottom', fontsize=11,
-                fontweight='bold', zorder=5)
-        y += y_step
-    return y - y_step if sig else None
+        for pname, p in inspect.signature(func).parameters.items():
+            if p.default is not inspect.Parameter.empty:
+                rows.append((fname, pname, _setting_value(p.default)))
+    return pd.DataFrame(rows, columns=['function', 'parameter', 'default_value'])
 
 
-def plot_edmin_prevalence(desc, sessions, tests, title=None):
-    """Four panels comparing the groups of one compare_edmin_prevalence
-    result: % of all / immobility / mobility epochs with ED_min above
-    threshold (bars = all epochs of the group pooled, labelled with
-    rejected/total; dots = individual recording sessions; brackets =
-    epoch-level pairwise tests with Holm p < STATS_ALPHA), and the split of
-    the rejected epochs between immobility and mobility (stacked bars).
-    Omnibus results at both test levels are listed under the panels.
-
-    Returns fig.
-    """
-    groups = list(desc['group'])
-    x = np.arange(len(groups))
-    faces = [GROUP_FACE.get(g, '#BFBFBF') for g in groups]
-    fig, axes = plt.subplots(1, 4, figsize=(4 * (1.6 + 0.7 * len(groups)), 4.6))
-    rng = np.random.default_rng(0)
-
-    def _pair_tests(key):
-        return tests[(tests['level'] == 'epoch') & (tests['measure'] == key)
-                     & (tests['comparison'] != 'omnibus')]
-
-    for ax, (key, measure_desc, k_col, n_col) in zip(axes[:3], PREVALENCE_MEASURES[:3]):
-        pct = desc[f'pct_{key}'].to_numpy(dtype=float)
-        ax.bar(x, np.nan_to_num(pct), width=0.6, color=faces, edgecolor='0.25',
-               linewidth=0.6, zorder=2)
-        top = np.nanmax(pct) if np.isfinite(pct).any() else 0.0
-        for xi, g in zip(x, groups):
-            v = sessions.loc[sessions['group'] == g, f'pct_{key}'].dropna().to_numpy(dtype=float)
-            ax.scatter(xi + rng.uniform(-0.15, 0.15, len(v)), v, s=12, facecolor='white',
-                       edgecolor='0.25', linewidth=0.6, zorder=3)
-            if len(v):
-                top = max(top, v.max())
-        top = top if top > 0 else 1.0
-        y_hi = _draw_sig_brackets(ax, groups, _pair_tests(key), top * 1.08, top * 0.12)
-        ax.set_ylim(0, (y_hi if y_hi is not None else top) * 1.15)
-        ax.set_xticks(x)
-        ax.set_xticklabels([f'{_label(g)}\n{p:.1f}%\n({int(k)}/{int(n)})' if np.isfinite(p)
-                            else f'{_label(g)}\nn/a'
-                            for g, p, k, n in zip(groups, pct, desc[k_col], desc[n_col])],
-                           fontsize=8)
-        ax.set_ylabel('% of epochs')
-        ax.set_title(textwrap.fill(measure_desc, 30), fontsize=9)
-    axes[0].scatter([], [], s=12, facecolor='white', edgecolor='0.25', linewidth=0.6,
-                    label='one session')
-    axes[0].legend(loc='upper right', fontsize=7, frameon=False)
-
-    ax = axes[3]
-    imm = np.nan_to_num(desc['pct_rejected_in_immobility'].to_numpy(dtype=float))
-    mov = np.nan_to_num(desc['pct_rejected_in_mobility'].to_numpy(dtype=float))
-    ax.bar(x, imm, width=0.6, color=IMMOBILE_COLOR, edgecolor='white', linewidth=0.6,
-           label='immobility', zorder=2)
-    ax.bar(x, mov, bottom=imm, width=0.6, color=MOVING_COLOR, edgecolor='white',
-           linewidth=0.6, label='mobility', zorder=2)
-    y_hi = _draw_sig_brackets(ax, groups, _pair_tests('rejected_in_immobility'), 104, 8)
-    ax.set_ylim(0, max(100, y_hi or 100) + 8)
-    ax.set_yticks(np.arange(0, 101, 20))
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'{_label(g)}\n(n={int(n)}\nrejected)'
-                        for g, n in zip(groups, desc['n_edmin_rejected'])], fontsize=8)
-    ax.set_ylabel('% of ED_min-rejected epochs')
-    ax.set_title(textwrap.fill(PREVALENCE_MEASURES[3][1], 30), fontsize=9)
-    ax.legend(loc='upper left', bbox_to_anchor=(1.0, 1.0), fontsize=7, frameon=False)
-
-    for a in axes:
-        a.spines[['top', 'right']].set_visible(False)
-
-    lines = []
-    for key, measure_desc, *_ in PREVALENCE_MEASURES:
-        parts = []
-        for level, name in (('epoch', 'epochs'), ('session', 'sessions')):
-            r = tests[(tests['level'] == level) & (tests['measure'] == key)
-                      & (tests['comparison'] == 'omnibus')]
-            if r.empty or not np.isfinite(r['p_raw'].iloc[0]):
-                parts.append(f'{name}: insufficient data')
+def collect_output_files(output_dir, run_start, tolerance_s=60):
+    """Every file under `output_dir`, flagged by whether it was (re)written
+    during this run -- older leftovers from previous runs are flagged NO."""
+    rows = []
+    t0 = run_start.timestamp() - tolerance_s
+    for root, _dirs, files in os.walk(output_dir):
+        for fname in sorted(files):
+            fpath = os.path.join(root, fname)
+            if fname == RUN_METADATA_FILENAME or fname.startswith('~$'):
                 continue
-            r = r.iloc[0]
-            dof = f', dof={int(r["dof"])}' if np.isfinite(r['dof']) else ''
-            parts.append(f'{name}: {r["test"]} {r["stat_name"]}={r["statistic"]:.2f}{dof}, '
-                         f'{_fmt_p(r["p_raw"])} {_stars(r["p_raw"])}')
-        lines.append(f'{measure_desc} -- ' + ' | '.join(parts))
-    within = tests[tests['level'] == 'epoch (within group)']
-    if len(within):
-        lines.append('Immobility vs mobility rejection rate within each group (Holm): ' +
-                     ', '.join(f'{_label(g)} {_fmt_p(p)} {_stars(p)}'
-                               for g, p in zip(within['comparison'], within['p_holm'])))
-    lines.append('Bars: all epochs of the group pooled; dots: one recording session each; '
-                 f'brackets: pairwise epoch-level tests, Holm p < {STATS_ALPHA:g}')
-    fig.text(0.5, -0.02, '\n'.join(lines), ha='center', va='top', fontsize=7.5, color='0.2')
-
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+            mtime = os.path.getmtime(fpath)
+            rows.append({
+                'file': fname,
+                'relative_path': os.path.relpath(fpath, output_dir),
+                'folder': root,
+                'written_this_run': 'YES' if mtime >= t0 else 'NO (older file)',
+                'modified': datetime.fromtimestamp(mtime).isoformat(sep=' ', timespec='seconds'),
+                'size_bytes': os.path.getsize(fpath),
+            })
+    return pd.DataFrame(rows)
 
 
-# %% ==================== Pipeline (whole dataset or one arena/session subset) ======
+def _excel_safe_df(df):
+    """Strip characters openpyxl rejects and stop strings being read as formulas."""
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
-def _plot_and_save(path, plot_fn, *args, suptitle=None, **kwargs):
-    """Call plot_fn(*args, **kwargs) -- whose (first) return value is the
-    figure -- optionally replace its suptitle, save it to `path`, and return
-    plot_fn's remaining return values as a tuple. If plotting fails (e.g. an
-    arena/session subset with no epochs of one movement state), prints a SKIP
-    line and returns None so the rest of the pipeline still runs."""
-    try:
-        out = plot_fn(*args, **kwargs)
-    except Exception as e:
-        print(f'  SKIP {os.path.basename(path)}: {type(e).__name__}: {e}')
-        plt.close('all')
-        return None
-    fig, rest = (out[0], out[1:]) if isinstance(out, tuple) else (out, ())
-    if suptitle:
-        fig.suptitle(suptitle)
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'Saved figure -> {path}')
-    return rest
+    def _clean(v):
+        if isinstance(v, str):
+            v = ILLEGAL_CHARACTERS_RE.sub('', v)
+            if v.startswith('='):
+                v = ' ' + v
+        return v
+    return df.apply(lambda col: col.map(_clean))
 
 
-def _moving_vs_immobile_fig(df, animal):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    plot_moving_vs_immobile(df, animal, ax=ax)
-    fig.tight_layout()
-    return fig
+def save_run_metadata_excel(out_path, run_start, run_status, script_path, script_source,
+                            script_sha256, script_modified, file_log, results_df=None):
+    """Write the run-provenance workbook (see section header above).
 
-
-def run_pipeline(results_df, output_dir, figure_dir, title=None):
-    """Every summary table and figure of this script for the epochs in
-    `results_df` -- the whole dataset, or one arena / session-type subset of
-    it (run_arena_session_pipelines). Tables are written to `output_dir`,
-    figures to `figure_dir`. `title` (e.g. 'Linear arena') prefixes the
-    figure suptitles.
-
-    Subsetting the epoch table is the same as re-running the pipeline on that
-    subset's .ncs files: every cleaning / rejection step (incl. the MAD
-    artifact threshold) is computed within one .ncs file.
+    Sheets: 'Run info' (code identity, git, environment, run timing/status,
+    headline counts), 'Settings', 'Function defaults', 'Input directories',
+    'Input files', 'Output files', 'Code snapshot' (full source as run).
+    If `out_path` is locked (e.g. open in Excel), a timestamped copy is
+    written next to it instead. Returns the path actually written.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(figure_dir, exist_ok=True)
+    now = datetime.now()
+    run_rows = [
+        ('Run', 'status', run_status),
+        ('Run', 'run_start', run_start.isoformat(sep=' ', timespec='seconds')),
+        ('Run', 'metadata_written', now.isoformat(sep=' ', timespec='seconds')),
+        ('Run', 'elapsed_min', round((now - run_start).total_seconds() / 60, 2)),
+        ('Run', 'root_dir', ROOT_DIR),
+        ('Run', 'output_dir', OUTPUT_DIR),
+        ('Run', 'figure_dir', FIGURE_DIR),
+    ]
+    run_rows += collect_code_info(script_path, script_sha256, script_modified)
 
-    def _fig(name):
-        return os.path.join(figure_dir, name)
+    files_df = pd.DataFrame(file_log)
+    n_ok = int((files_df['status'] == 'OK').sum()) if len(files_df) else 0
+    run_rows += [
+        ('Data', 'n_ncs_found', len(files_df)),
+        ('Data', 'n_ncs_processed_ok', n_ok),
+        ('Data', 'n_ncs_skipped', len(files_df) - n_ok),
+        ('Data', 'n_session_dirs',
+         files_df['session_dir'].nunique() if len(files_df) else 0),
+    ]
+    if results_df is not None and len(results_df):
+        run_rows += [
+            ('Data', 'animals', ', '.join(map(str, sorted(results_df['animal'].unique())))),
+            ('Data', 'n_epochs_kept', len(results_df)),
+            ('Data', 'n_epochs_accepted (non-skipped)', int((~results_df['skipped']).sum())),
+            ('Data', 'n_epochs_edmin_rejected', int(results_df['skipped_edmin'].sum())),
+        ]
+    run_df = pd.DataFrame(run_rows, columns=['section', 'field', 'value'])
 
-    def _title(text):
-        return f'{title}: {text}' if title else text
-
-    summary_df = summarize_peak_range(results_df)
-    summary_path = os.path.join(output_dir, 'acg_theta_continuity_summary.csv')
-    summary_df.to_csv(summary_path, index=False)
-    print(f'Saved summary -> {summary_path}')
-
-    # Matched-sinusoid freq_est histogram, clubbed across ALL epochs (every
-    # animal/channel/movement state pooled together)
-    _plot_and_save(_fig('freq_est_histogram.png'), plot_freq_est_histogram, results_df)
-
-    freq_range_counts_df = compute_freq_range_counts(results_df)
-    freq_range_counts_path = os.path.join(output_dir, 'freq_est_range_counts.csv')
-    freq_range_counts_df.to_csv(freq_range_counts_path, index=False)
-    print(f'Saved freq_est range counts -> {freq_range_counts_path}')
-
-    # freq_est histogram restricted to epochs rejected by the ED_min
-    # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH), clubbed across ALL epochs
-    _plot_and_save(_fig('edmin_rejected_freq_est_histogram.png'),
-                   plot_edmin_rejected_freq_histogram, results_df)
-
-    # ED_min vs. normalised peak range -- test whether a poor sinusoid fit
-    # (high ED_min) predicts a low peak range, clubbed across ALL epochs
-    edmin_pr_stats_rows = []
-    out = _plot_and_save(_fig('edmin_vs_peakrangenorm.png'),
-                         plot_edmin_vs_peakrangenorm, results_df)
-    if out is not None:
-        edmin_pr_stats = out[1]
-        print(f"  (Pearson r={edmin_pr_stats['pearson_r']:.3f}, "
-              f"Spearman rho={edmin_pr_stats['spearman_r']:.3f}, n={edmin_pr_stats['n']})")
-        edmin_pr_stats_rows.append({'animal': 'ALL', **edmin_pr_stats})
-
-    all_centroids = []
-    for animal_label in results_df['animal'].unique():  # type: ignore
-        _plot_and_save(_fig(f'{animal_label}_acg_moving_vs_immobile.png'),
-                       _moving_vs_immobile_fig, results_df, animal_label)
-
-        # freq_est histograms of this animal's accepted / ED_min-rejected epochs
-        _plot_and_save(_fig(f'{animal_label}_freq_est_histogram.png'),
-                       plot_freq_est_histogram, results_df, animal=animal_label)
-        _plot_and_save(_fig(f'{animal_label}_edmin_rejected_freq_est_histogram.png'),
-                       plot_edmin_rejected_freq_histogram, results_df, animal=animal_label)
-
-        # ED_min vs. normalised peak range, this animal only
-        out = _plot_and_save(_fig(f'{animal_label}_edmin_vs_peakrangenorm.png'),
-                             plot_edmin_vs_peakrangenorm, results_df, animal=animal_label)
-        if out is not None:
-            edmin_pr_stats_rows.append({'animal': animal_label, **out[1]})
-
-        # Fig. 4-style: example moving/immobile epochs + freq-vs-peak-range
-        # scatter with movement centroids
-        out = _plot_and_save(_fig(f'{animal_label}_figure4_style.png'),
-                             plot_figure4_style, results_df, animal=animal_label,
-                             suptitle=_title(animal_label))
-        if out is not None:
-            centroids = out[0]
-            centroids['animal'] = animal_label
-            all_centroids.append(centroids)
-
-        # mobility-only / immobility-only / merged, side by side
-        _plot_and_save(_fig(f'{animal_label}_freq_peakrange_by_movement.png'),
-                       plot_freq_peakrange_by_movement, results_df, animal=animal_label,
-                       suptitle=_title(animal_label))
-
-        # moving + immobile epochs pooled (no movement segregation / speed
-        # colouring), in this animal's colour
-        _plot_and_save(_fig(f'{animal_label}_freq_peakrange_pooled.png'),
-                       plot_freq_peakrange_pooled, results_df, animals=animal_label)
-
-    # moving + immobile epochs pooled, every animal on one figure in its own
-    # colour, with per-animal centroids
-    out = _plot_and_save(_fig('ALL_freq_peakrange_pooled.png'),
-                         plot_freq_peakrange_pooled, results_df, suptitle=title)
-    if out is not None:
-        pooled_centroids_path = os.path.join(output_dir, 'acg_theta_continuity_centroids_pooled.csv')
-        out[1].to_csv(pooled_centroids_path, index=False)
-        print(f'Saved pooled (moving + immobile) centroids -> {pooled_centroids_path}')
-
-    # Fig. 4-style (moving/immobile, speed-coloured) with every animal's
-    # epochs on one figure -- example epochs picked from the all-animal
-    # moving/immobile centroids
-    out = _plot_and_save(_fig('ALL_figure4_style.png'), plot_figure4_style, results_df,
-                         animal=None, suptitle=_title('All animals'))
-    if out is not None:
-        centroids_all = out[0]
-        centroids_all['animal'] = 'ALL'
-        all_centroids.append(centroids_all)
-
-    # mobility-only / immobility-only / merged, every animal's epochs together
-    _plot_and_save(_fig('ALL_freq_peakrange_by_movement.png'),
-                   plot_freq_peakrange_by_movement, results_df, animal=None,
-                   suptitle=_title('All animals'))
-
-    # freq_est line-overlays (accepted / ED_min-rejected epochs), one line per
-    # animal on shared axes for direct comparison
-    _plot_and_save(_fig('freq_est_histogram_by_animal_overlay.png'),
-                   plot_freq_est_histogram_overlay, results_df)
-    _plot_and_save(_fig('edmin_rejected_freq_est_histogram_by_animal_overlay.png'),
-                   plot_edmin_rejected_freq_histogram_overlay, results_df)
-
-    if all_centroids:
-        centroids_df = pd.concat(all_centroids, ignore_index=True)
-        centroids_path = os.path.join(output_dir, 'acg_theta_continuity_centroids.csv')
-        centroids_df.to_csv(centroids_path, index=False)
-        print(f'Saved movement centroids -> {centroids_path}')
-
-    edmin_pr_stats_path = os.path.join(output_dir, 'edmin_vs_peakrangenorm_stats.csv')
-    pd.DataFrame(edmin_pr_stats_rows).to_csv(edmin_pr_stats_path, index=False)
-    print(f'Saved ED_min vs. peakrangenorm correlation stats -> {edmin_pr_stats_path}')
-
-
-def run_arena_session_pipelines(results_df):
-    """Re-run the full pipeline (run_pipeline) on each arena type's epochs
-    (ARENA_FIGURE_DIR\\<arena>) and on each session type's epochs within an
-    arena (SESSION_FIGURE_DIR\\<arena>\\<session type>), then compare ED_min
-    prevalence across arena types (ARENA_FIGURE_DIR) and across the session
-    types of each arena (SESSION_FIGURE_DIR\\<arena>). The prevalence tables
-    from every comparison are written to OUTPUT_DIR:
-        edmin_prevalence_by_group.csv     counts / % per arena or session type
-        edmin_prevalence_by_session.csv   counts / % per recording session
-        edmin_prevalence_tests.csv        every omnibus / pairwise test
-    """
-    files = results_df.drop_duplicates('file')
-    no_arena = files.loc[files['arena_type'].isna(), 'session_folder'].unique()
-    if len(no_arena):
-        print(f'WARNING: {len(no_arena)} session folder(s) with no recognizable arena '
-              f'type ({ARENA_TYPES}); excluded from the arena/session-type analysis:')
-        for s in sorted(no_arena):
-            print(f'    {s}')
-    no_type = files.loc[files['arena_type'].notna() & files['session_type'].isna(),
-                        'session_folder'].unique()
-    if len(no_type):
-        print(f'WARNING: {len(no_type)} session folder(s) with no recognizable session '
-              f'type; kept in the arena comparison, excluded from the session-type comparison:')
-        for s in sorted(no_type):
-            print(f'    {s}')
-    if not files['arena_type'].notna().any():
-        print('No .ncs file has a recognizable arena type -- skipping the '
-              'arena/session-type analysis.')
-        return
-    print('\n.ncs files by arena and session type:')
-    print(pd.crosstab(files['arena_type'], files['session_type'].fillna('unrecognized'),
-                      margins=True))
-
-    desc_all, sessions_all, tests_all = [], [], []
-
-    def _compare(df, group_col, order, grouping, fig_dir):
-        desc, sessions, tests = compare_edmin_prevalence(df, group_col, order, grouping)
-        if desc.empty:
-            return
-        desc_all.append(desc)
-        sessions_all.append(sessions)
-        tests_all.append(tests)
-        if len(desc) < 2:
-            print(f'  Only one group for {grouping} -- no comparison plot.')
-            return
-        os.makedirs(fig_dir, exist_ok=True)
-        _plot_and_save(os.path.join(fig_dir, 'edmin_prevalence_comparison.png'),
-                       plot_edmin_prevalence, desc, sessions, tests,
-                       title=f'{grouping}: ED_min > {ACG_ED_MIN_THRESH:g} prevalence')
-
-    for arena in ARENA_TYPES:
-        arena_df = results_df[results_df['arena_type'] == arena]
-        if arena_df.empty:
-            print(f'\nNo epochs for arena {arena}; skipping.')
-            continue
-        print(f'\n{"=" * 70}\nArena: {arena} ({len(arena_df)} epochs, '
-              f'{arena_df["file"].nunique()} .ncs files)\n{"=" * 70}')
-        arena_dir = os.path.join(ARENA_FIGURE_DIR, arena)
-        run_pipeline(arena_df, arena_dir, arena_dir, title=f'{arena} arena')
-
-        for stype in ARENA_SESSION_TYPES[arena]:
-            ses_df = arena_df[arena_df['session_type'] == stype]
-            if ses_df.empty:
-                continue
-            print(f'\n--- {arena} arena, session type {stype} ({len(ses_df)} epochs, '
-                  f'{ses_df["file"].nunique()} .ncs files) ---')
-            ses_dir = os.path.join(SESSION_FIGURE_DIR, arena, stype)
-            run_pipeline(ses_df, ses_dir, ses_dir, title=f'{arena} arena, {_label(stype)} session')
-
-        _compare(arena_df, 'session_type', ARENA_SESSION_TYPES[arena],
-                 f'{arena} session types', os.path.join(SESSION_FIGURE_DIR, arena))
-
-    _compare(results_df, 'arena_type', ARENA_TYPES, 'Arena types', ARENA_FIGURE_DIR)
-
-    if not tests_all:
-        print('No arena/session-type groups to compare.')
-        return
-    for name, parts in (('edmin_prevalence_by_group.csv', desc_all),
-                        ('edmin_prevalence_by_session.csv', sessions_all),
-                        ('edmin_prevalence_tests.csv', tests_all)):
-        path = os.path.join(OUTPUT_DIR, name)
-        pd.concat(parts, ignore_index=True).to_csv(path, index=False, encoding='utf-8-sig')
-        print(f'Saved ED_min prevalence table -> {path}')
-
-    tests = pd.concat(tests_all, ignore_index=True)
-    sig = tests[tests['significant']]
-    if sig.empty:
-        print('\nNo significant ED_min prevalence differences.')
+    if len(files_df):
+        dirs_df = (files_df.groupby('session_dir')
+                   .agg(animal=('animal', 'first'), date=('date', 'first'),
+                        session=('session', 'first'),
+                        n_ncs=('ncs_file', 'count'),
+                        n_ok=('status', lambda s: int((s == 'OK').sum())),
+                        tracking_csv=('tracking_csv', 'first'))
+                   .reset_index())
     else:
-        print(f'\nSignificant ED_min prevalence differences (p < {STATS_ALPHA:g}):')
-        for _, r in sig.iterrows():
-            p = r['p_holm'] if np.isfinite(r['p_holm']) else r['p_raw']
-            print(f"  {r['grouping']:22s} {r['level']:20s} {r['measure']:24s} "
-                  f"{r['comparison']:24s} {r['test']:16s} p={p:.4g}")
+        dirs_df = pd.DataFrame(columns=['session_dir'])
+
+    code_df = pd.DataFrame({'line': np.arange(1, len(script_source.splitlines()) + 1),
+                            'code': script_source.splitlines()})
+
+    sheets = {
+        'Run info': run_df,
+        'Settings': collect_settings(),
+        'Function defaults': collect_function_defaults(),
+        'Input directories': dirs_df,
+        'Input files': files_df,
+        'Output files': collect_output_files(OUTPUT_DIR, run_start),
+        'Code snapshot': code_df,
+    }
+
+    def _write(path):
+        from openpyxl.utils import get_column_letter
+        with pd.ExcelWriter(path, engine='openpyxl') as writer:
+            for name, df in sheets.items():
+                _excel_safe_df(df).to_excel(writer, sheet_name=name, index=False)
+                ws = writer.sheets[name]
+                ws.freeze_panes = 'A2'
+                for i, col in enumerate(df.columns, start=1):
+                    sample = [str(col)] + [str(v) for v in df[col].head(500)]
+                    width = min(max(len(s) for s in sample) + 2, 100)
+                    ws.column_dimensions[get_column_letter(i)].width = width
+
+    try:
+        _write(out_path)
+    except PermissionError:
+        stem, ext = os.path.splitext(out_path)
+        out_path = f"{stem}_{now.strftime('%Y%m%d_%H%M%S')}{ext}"
+        print(f'  Metadata file locked (open in Excel?) -- writing {out_path} instead')
+        _write(out_path)
+    return out_path
 
 
 # %% ==================== Driver =====================================================
@@ -2421,7 +2322,21 @@ if __name__ == '__main__':
     os.makedirs(FIGURE_DIR, exist_ok=True)
     save_run_metadata(META_DIR)
 
-    results_df = process_root_directory(ROOT_DIR)
+    # Snapshot the code before the (long) run starts, so edits made while it
+    # runs aren't mistaken for the version that produced these results.
+    run_start = datetime.now()
+    script_path = get_script_path()
+    script_source, script_sha256, script_modified = snapshot_script(script_path)
+    metadata_path = os.path.join(FIGURE_DIR, RUN_METADATA_FILENAME)
+
+    file_log = []
+    results_df = process_root_directory(ROOT_DIR, file_log=file_log)
+
+    # Written once now (so a crash during plotting still leaves a record of
+    # code/settings/inputs), then overwritten with the final version at the end.
+    metadata_path = save_run_metadata_excel(
+        metadata_path, run_start, 'IN PROGRESS (or crashed during plotting)',
+        script_path, script_source, script_sha256, script_modified, file_log, results_df)
 
     n_edmin_rejected = int(results_df['skipped_edmin'].sum())
     pct_edmin_rejected = 100 * n_edmin_rejected / len(results_df) if len(results_df) else 0.0
@@ -2432,8 +2347,194 @@ if __name__ == '__main__':
     results_df.to_csv(results_path, index=False)
     print(f'Saved {len(results_df)} epoch-level rows -> {results_path}')
 
-    # whole dataset
-    run_pipeline(results_df, OUTPUT_DIR, FIGURE_DIR)
+    summary_df = summarize_peak_range(results_df)
+    summary_path = os.path.join(OUTPUT_DIR, 'acg_theta_continuity_summary.csv')
+    summary_df.to_csv(summary_path, index=False)
+    print(f'Saved summary -> {summary_path}')
 
-    # segregated by arena type and by session type (+ ED_min prevalence stats)
-    run_arena_session_pipelines(results_df)
+    # Matched-sinusoid freq_est histogram, clubbed across ALL epochs (every
+    # animal/channel/movement state pooled together)
+    fig_freqhist, _ax_freqhist, _freq_est = plot_freq_est_histogram(results_df)
+    freqhist_path = os.path.join(FIGURE_DIR, 'freq_est_histogram.png')
+    fig_freqhist.savefig(freqhist_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_freqhist)
+    print(f'Saved figure -> {freqhist_path}')
+
+    freq_range_counts_df = compute_freq_range_counts(results_df)
+    freq_range_counts_path = os.path.join(OUTPUT_DIR, 'freq_est_range_counts.csv')
+    freq_range_counts_df.to_csv(freq_range_counts_path, index=False)
+    print(f'Saved freq_est range counts -> {freq_range_counts_path}')
+
+    # freq_est histogram restricted to epochs rejected by the ED_min
+    # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH), clubbed across ALL
+    # epochs (every animal/channel/movement state pooled together)
+    fig_edminfreq, _ax_edminfreq, _edmin_rejected_freq = plot_edmin_rejected_freq_histogram(results_df)
+    edminfreq_path = os.path.join(FIGURE_DIR, 'edmin_rejected_freq_est_histogram.png')
+    fig_edminfreq.savefig(edminfreq_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edminfreq)
+    print(f'Saved figure -> {edminfreq_path}')
+
+    # ED_min vs. normalised peak range -- test whether a poor sinusoid fit
+    # (high ED_min) predicts a low peak range, clubbed across ALL epochs
+    fig_edmin_pr, _ax_edmin_pr, edmin_pr_stats = plot_edmin_vs_peakrangenorm(results_df)
+    edmin_pr_path = os.path.join(FIGURE_DIR, 'edmin_vs_peakrangenorm.png')
+    fig_edmin_pr.savefig(edmin_pr_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edmin_pr)
+    print(f'Saved figure -> {edmin_pr_path}  '
+          f"(Pearson r={edmin_pr_stats['pearson_r']:.3f}, "
+          f"Spearman rho={edmin_pr_stats['spearman_r']:.3f}, n={edmin_pr_stats['n']})")
+    edmin_pr_stats_rows = [{'animal': 'ALL', **edmin_pr_stats}]
+
+    # Theta-positive (non-skipped) epochs vs. running speed, one value per
+    # (recording, SPEED_BIN_WIDTH_CMS speed bin), mixed-model fit (grouped by
+    # animal): matched-sinusoid freq_est, broadband epoch power (uV^2), and
+    # theta power both un-normalized (uV^2) and relative (% of REL_POWER_BAND
+    # power) -- see SPEED_MODELS
+    speed_binned = {}
+    for response, plot_func, stem, unit in SPEED_MODELS:
+        fig_speed, _ax_speed, speed_result = plot_func(results_df)
+        speed_fig_path = os.path.join(FIGURE_DIR, f'{stem}.png')
+        fig_speed.savefig(speed_fig_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+        plt.close(fig_speed)
+        print(f'Saved figure -> {speed_fig_path}')
+        speed_stats_path = os.path.join(OUTPUT_DIR, f'{stem}_stats.xlsx')
+        save_mixedlm_stats_excel(
+            speed_result, speed_stats_path,
+            model_desc=f'{response} ~ speed_bin_center, groups=animal ({SPEED_BIN_WIDTH_CMS:g} cm/s '
+                       f'speed bins, {BIN_AGG_METHOD} per recording x bin, theta-positive epochs only)')
+        print(f'Saved mixed-model stats -> {speed_stats_path}')
+        print(f"  {response} ~ speed slope = {speed_result.params['speed_bin_center']:.4g} {unit} per cm/s "
+              f"(p = {speed_result.pvalues['speed_bin_center']:.2e})")
+        speed_binned[response] = aggregate_by_speed_bin(results_df[~results_df['skipped']], response)
+
+    speed_binned_path = os.path.join(OUTPUT_DIR, 'theta_vs_speed_binned.xlsx')
+    with pd.ExcelWriter(speed_binned_path, engine='openpyxl') as writer:
+        for response, binned in speed_binned.items():
+            binned.to_excel(writer, sheet_name=response, index=False)
+    print(f'Saved speed-binned values (what the mixed models are fit on) -> {speed_binned_path}')
+
+    # Un-filtered (<= LOWPASS_CUTOFF_HZ) vs. THETA_BAND band-passed vs.
+    # non-theta epoch power, side by side -- is the un-normalized power ~
+    # speed slope theta, or faster rhythms (e.g. gamma)?
+    fig_bands, _axes_bands, _ = plot_power_band_comparison_vs_speed(results_df)
+    bands_path = os.path.join(FIGURE_DIR, 'power_band_comparison_vs_speed_mixedmodel.png')
+    fig_bands.savefig(bands_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig_bands)
+    print(f'Saved figure -> {bands_path}')
+
+    all_centroids = []
+    for animal_label in ordered_animals(results_df['animal']):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plot_moving_vs_immobile(results_df, animal_label, ax=ax)
+        fig.tight_layout()
+        fig_path = os.path.join(FIGURE_DIR, f'{animal_label}_acg_moving_vs_immobile.png')
+        fig.savefig(fig_path, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Saved figure -> {fig_path}')
+
+        # freq_est histogram of this animal's accepted (non-skipped) epochs
+        fig_freqhist_a, _ax_freqhist_a, _freq_est_a = plot_freq_est_histogram(
+            results_df, animal=animal_label)
+        freqhist_a_path = os.path.join(
+            FIGURE_DIR, f'{animal_label}_freq_est_histogram.png')
+        fig_freqhist_a.savefig(freqhist_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_freqhist_a)
+        print(f'Saved figure -> {freqhist_a_path}')
+
+        # freq_est / power / theta power / relative theta power vs. speed,
+        # this animal's speed bins plotted against the shared (all-animals)
+        # mixed-model fit
+        for _response, plot_func, stem, _unit in SPEED_MODELS:
+            try:
+                fig_speed_a, _ax_speed_a, _ = plot_func(results_df, animal=animal_label)
+                speed_a_path = os.path.join(FIGURE_DIR, f'{animal_label}_{stem}.png')
+                fig_speed_a.savefig(speed_a_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+                plt.close(fig_speed_a)
+                print(f'Saved figure -> {speed_a_path}')
+            except ValueError as e:
+                print(f'  SKIP {stem} plot for {animal_label}: {e}')
+        try:
+            fig_bands_a, _axes_bands_a, _ = plot_power_band_comparison_vs_speed(
+                results_df, animal=animal_label)
+            bands_a_path = os.path.join(
+                FIGURE_DIR, f'{animal_label}_power_band_comparison_vs_speed_mixedmodel.png')
+            fig_bands_a.savefig(bands_a_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+            plt.close(fig_bands_a)
+            print(f'Saved figure -> {bands_a_path}')
+        except ValueError as e:
+            print(f'  SKIP power band comparison plot for {animal_label}: {e}')
+
+        # freq_est histogram of this animal's epochs rejected by the ED_min
+        # fit-quality gate (ED_min >= ACG_ED_MIN_THRESH)
+        fig_edminfreq_a, _ax_edminfreq_a, _rej_freq_a = plot_edmin_rejected_freq_histogram(
+            results_df, animal=animal_label)
+        edminfreq_a_path = os.path.join(
+            FIGURE_DIR, f'{animal_label}_edmin_rejected_freq_est_histogram.png')
+        fig_edminfreq_a.savefig(edminfreq_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_edminfreq_a)
+        print(f'Saved figure -> {edminfreq_a_path}')
+
+        # ED_min vs. normalised peak range, this animal only
+        fig_edmin_pr_a, _ax_edmin_pr_a, edmin_pr_stats_a = plot_edmin_vs_peakrangenorm(
+            results_df, animal=animal_label)
+        edmin_pr_a_path = os.path.join(FIGURE_DIR, f'{animal_label}_edmin_vs_peakrangenorm.png')
+        fig_edmin_pr_a.savefig(edmin_pr_a_path, dpi=200, bbox_inches='tight')
+        plt.close(fig_edmin_pr_a)
+        print(f'Saved figure -> {edmin_pr_a_path}')
+        edmin_pr_stats_rows.append({'animal': animal_label, **edmin_pr_stats_a})
+
+        # Fig. 4-style: example moving/immobile epochs + freq-vs-peak-range
+        # scatter with movement centroids
+        try:
+            fig4, centroids = plot_figure4_style(results_df, animal=animal_label)
+            centroids['animal'] = animal_label
+            all_centroids.append(centroids)
+            fig4_path = os.path.join(FIGURE_DIR, f'{animal_label}_figure4_style.png')
+            fig4.savefig(fig4_path, dpi=200, bbox_inches='tight')
+            plt.close(fig4)
+            print(f'Saved figure -> {fig4_path}')
+        except ValueError as e:
+            print(f'  SKIP Fig.4-style plot for {animal_label}: {e}')
+
+        # mobility-only / immobility-only / merged, side by side
+        try:
+            fig_split, _ = plot_freq_peakrange_by_movement(results_df, animal=animal_label)
+            split_path = os.path.join(FIGURE_DIR, f'{animal_label}_freq_peakrange_by_movement.png')
+            fig_split.savefig(split_path, dpi=200, bbox_inches='tight')
+            plt.close(fig_split)
+            print(f'Saved figure -> {split_path}')
+        except ValueError as e:
+            print(f'  SKIP mobility/immobility split plot for {animal_label}: {e}')
+
+    # freq_est line-overlay of accepted epochs, one line per animal on shared
+    # axes for direct comparison
+    fig_freqhist_ov, _ax_freqhist_ov = plot_freq_est_histogram_overlay(results_df)
+    freqhist_ov_path = os.path.join(FIGURE_DIR, 'freq_est_histogram_by_animal_overlay.png')
+    fig_freqhist_ov.savefig(freqhist_ov_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_freqhist_ov)
+    print(f'Saved figure -> {freqhist_ov_path}')
+
+    # freq_est line-overlay of ED_min-rejected epochs, one line per animal on
+    # shared axes for direct comparison
+    fig_edminfreq_ov, _ax_edminfreq_ov = plot_edmin_rejected_freq_histogram_overlay(results_df)
+    edminfreq_ov_path = os.path.join(
+        FIGURE_DIR, 'edmin_rejected_freq_est_histogram_by_animal_overlay.png')
+    fig_edminfreq_ov.savefig(edminfreq_ov_path, dpi=200, bbox_inches='tight')
+    plt.close(fig_edminfreq_ov)
+    print(f'Saved figure -> {edminfreq_ov_path}')
+
+    if all_centroids:
+        centroids_df = pd.concat(all_centroids, ignore_index=True)
+        centroids_path = os.path.join(OUTPUT_DIR, 'acg_theta_continuity_centroids.csv')
+        centroids_df.to_csv(centroids_path, index=False)
+        print(f'Saved movement centroids -> {centroids_path}')
+
+    edmin_pr_stats_df = pd.DataFrame(edmin_pr_stats_rows)
+    edmin_pr_stats_path = os.path.join(OUTPUT_DIR, 'edmin_vs_peakrangenorm_stats.csv')
+    edmin_pr_stats_df.to_csv(edmin_pr_stats_path, index=False)
+    print(f'Saved ED_min vs. peakrangenorm correlation stats -> {edmin_pr_stats_path}')
+
+    metadata_path = save_run_metadata_excel(
+        metadata_path, run_start, 'COMPLETED',
+        script_path, script_source, script_sha256, script_modified, file_log, results_df)
+    print(f'Saved run metadata (code version, settings, inputs, outputs) -> {metadata_path}')

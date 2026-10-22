@@ -64,8 +64,8 @@ Outputs (folder OUTPUT_SUBDIR inside Output_PlaceTrue):
   PeakBins.xlsx  'PeakBins'  one row per cell and ratemap type ('trajectory'
                              rows would repeat the 'raw' ones, so are left out)
                  'Settings'  parameters used for this run
-  figures        <Arena>_PeakSequence_<map>.png/.pdf,
-                 Open_FieldSilhouettes_<animal>_<map>.png/.pdf
+  figures        <Arena>_PeakSequence_<map>.png/.svg,
+                 Open_FieldSilhouettes_<animal>_<map>.png/.svg
                  (<map> = 'trajectory' for the trajectory figures)
 """
 
@@ -88,14 +88,14 @@ from matplotlib.colors import to_rgb
 
 # Output_PlaceTrue folder of the PlaceCell_Main run (root of the confirmed
 # place cells, animal-ID folders onwards, e.g. Fa1059/Linear/Day8/1_90/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CohrStabSkaggs'
+Output_PlaceTrue = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/SpikeQualityFilt_v1_PlaceCellData/PC_True_SiSkaggsAdptBin_Alpha200'
 
 # PlaceCell_Main version whose ratemap / field functions and settings are used
 # -- should be the one that wrote Output_PlaceTrue.
 PLACECELL_MAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    'PlaceCell_Main_v21.py')
 
-OUTPUT_SUBDIR = 'PeakSequence_FieldSilhouettes'
+OUTPUT_SUBDIR = 'Results/PeakSequence_FieldSilhouettes'
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 TRAJECTORY_MAP = 'trajectory'   # unbinned trajectory + spikes, not a ratemap
@@ -122,7 +122,7 @@ TRAJ_SPIKE_COLOR = 'red'  # trajectory map: spike dot colour
 TRAJ_SPIKE_SIZE  = 2      # trajectory map: spike dot size (pt^2)
 TRAJ_ROW_FILL    = 0.9    # trajectory sequence: fraction of each row's height the track spans
 
-FIG_FORMATS = ('png', 'pdf')
+FIG_FORMATS = ('png', 'svg')
 FIG_DPI     = 300
 MAX_WORKERS = 4
 
@@ -505,9 +505,80 @@ def _plot_open(recs: list[dict], animal: str, map_type: str, save_stem: str) -> 
     _save_fig(fig, save_stem)
 
 
+def _plot_sequence_trajectory(recs: list[dict], arena: str, save_stem: str) -> None:
+    """Stacked unbinned trajectories, one row per cell (same order as
+    _plot_sequence): linearised position on x, across-track coordinate squeezed
+    into the row; spikes as dots. Circle paths are broken at the 0/360 seam."""
+    n = len(recs)
+    fig = Figure(figsize=(6, 7))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+
+    def _to_row(v: np.ndarray, lo: float, hi: float, k: int) -> np.ndarray:
+        frac = np.clip((v - lo) / (hi - lo), 0.0, 1.0) if hi > lo else np.full_like(v, 0.5)
+        return k + TRAJ_ROW_FILL * (frac - 0.5)
+
+    for k, r in enumerate(recs, start=1):
+        lo, hi = r['cross_range']
+        pos, cross = (np.asarray(a, dtype=float) for a in r['traj'])
+        row_y = _to_row(cross, lo, hi, k)
+        if arena == 'Circle':
+            jumps = np.flatnonzero(np.abs(np.diff(pos)) > 180.0) + 1
+            pos, row_y = np.insert(pos, jumps, np.nan), np.insert(row_y, jumps, np.nan)
+        ax.plot(pos, row_y, color=TRAJ_LINE_COLOR, linewidth=TRAJ_LW, rasterized=True)
+        sp_pos, sp_cross = r['spikes']
+        ax.scatter(sp_pos, _to_row(np.asarray(sp_cross, dtype=float), lo, hi, k),
+                   s=TRAJ_SPIKE_SIZE, color=TRAJ_SPIKE_COLOR, linewidths=0, zorder=3,
+                   rasterized=True)
+
+    ax.set_ylim(0.5, n + 0.5)
+    ax.set_yticks([1, n] if n > 1 else [1])
+    ax.set_ylabel('Cell')
+    ax.set_xlim(0, max(r['edges'][-1] for r in recs))
+    if arena == 'Circle':
+        ax.set_xticks([0, 90, 180, 270, 360])
+        ax.set_xlabel('Linearized position (deg)')
+    else:
+        ax.set_xlabel('Linearized position (cm)')
+    ax.set_title(f'{arena} track, {_MAP_LABELS[TRAJECTORY_MAP]}\n'
+                 f'n = {n} place cells', fontsize=10)
+    fig.tight_layout()
+    _save_fig(fig, save_stem)
+
+
+def _plot_open_trajectory(recs: list[dict], animal: str, save_stem: str) -> None:
+    """Trajectories of all of the animal's Open sessions (gray, each session
+    drawn once) overlaid, with the spikes of all its cells as dots."""
+    fig = Figure(figsize=(7, 7))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+
+    drawn_sessions = set()
+    for r in recs:
+        if r['session'] not in drawn_sessions:
+            ax.plot(*r['traj'], color=TRAJ_LINE_COLOR, linewidth=TRAJ_LW, rasterized=True)
+            drawn_sessions.add(r['session'])
+    for r in recs:
+        ax.scatter(*r['spikes'], s=TRAJ_SPIKE_SIZE, color=TRAJ_SPIKE_COLOR, linewidths=0,
+                   zorder=3, rasterized=True)
+
+    x_max = max(r['n_bins_x'] for r in recs) * bin_cm
+    y_max = max(r['n_bins_y'] for r in recs) * bin_cm
+    ax.set_xlim(-0.02 * x_max, 1.02 * x_max)
+    ax.set_ylim(-0.02 * y_max, 1.02 * y_max)
+    ax.set_aspect('equal')
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+    ax.set_title(f'{animal}, Open arena, {_MAP_LABELS[TRAJECTORY_MAP]}\n'
+                 f'n = {len(recs)} place cells, {len(drawn_sessions)} sessions', fontsize=10)
+    fig.tight_layout()
+    _save_fig(fig, save_stem)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-_PLOT_ONLY_KEYS = ('field_masks', 'peak_xy_cm', 'profile', 'edges', 'valid')
+_PLOT_ONLY_KEYS = ('field_masks', 'peak_xy_cm', 'profile', 'edges', 'valid',
+                   'traj', 'spikes', 'cross_range')
 
 _TABLE_COLUMNS = ['animal', 'arena', 'session', 'unit', 'session_angle', 'rotated_90ccw',
                   'map_type', 'sequence_rank',
@@ -553,15 +624,24 @@ def run(root: str, output_dir: str, units: list[dict] | None = None) -> pd.DataF
             recs.sort(key=lambda r: (r['peak_pos'], r['field_start_pos']))
             for rank, r in enumerate(recs, start=1):
                 r['sequence_rank'] = rank
-            _plot_sequence(recs, arena, map_type,
-                           os.path.join(output_dir, f'{arena}_PeakSequence_{map_type}'))
+            save_stem = os.path.join(output_dir, f'{arena}_PeakSequence_{map_type}')
+            if map_type == TRAJECTORY_MAP:
+                _plot_sequence_trajectory(recs, arena, save_stem)
+            else:
+                _plot_sequence(recs, arena, map_type, save_stem)
 
         open_recs = [r for r in records if r['arena'] == 'Open' and r['map_type'] == map_type]
         for animal in sorted({r['animal'] for r in open_recs}):
-            _plot_open([r for r in open_recs if r['animal'] == animal], animal, map_type,
-                       os.path.join(output_dir, f'Open_FieldSilhouettes_{animal}_{map_type}'))
+            animal_recs = [r for r in open_recs if r['animal'] == animal]
+            save_stem = os.path.join(output_dir, f'Open_FieldSilhouettes_{animal}_{map_type}')
+            if map_type == TRAJECTORY_MAP:
+                _plot_open_trajectory(animal_recs, animal, save_stem)
+            else:
+                _plot_open(animal_recs, animal, map_type, save_stem)
 
-    df = pd.DataFrame([{k: v for k, v in r.items() if k not in _PLOT_ONLY_KEYS} for r in records],
+    # 'trajectory' records repeat the 'raw' ones (peak, fields), so stay out of the table.
+    df = pd.DataFrame([{k: v for k, v in r.items() if k not in _PLOT_ONLY_KEYS}
+                       for r in records if r['map_type'] != TRAJECTORY_MAP],
                       columns=_TABLE_COLUMNS)
     settings = ([{'parameter': 'script_name', 'value': os.path.basename(__file__)},
                  {'parameter': 'run_timestamp', 'value': datetime.now().isoformat(timespec='seconds')}]

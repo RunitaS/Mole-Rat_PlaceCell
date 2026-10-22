@@ -41,7 +41,7 @@ import numpy as np
 # Configuration -- EDIT THESE
 # ---------------------------------------------------------------------------
 
-ROOT_DIR = Path(r"X:\NMR_group_data\Runita\Analysis\Mean_KDE_Open_PascalOldenburg\LinearTrack_GeoMagVsZero\Data_Control")
+ROOT_DIR = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\5834_LFP_MissingFiles\Open")
 # Cut files are saved into a subfolder created next to each source folder's
 # own files (i.e. inside the same folder the .nev/.ncs/.ntt came from), so
 # there is no separate output root to configure.
