@@ -79,12 +79,12 @@ place_fields_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQlt
 # ── Multi-peak settings ───────────────────────────────────────────────────────
 PEAK_REL_HEIGHT_FRAC = 0.75     # a KDE peak is counted if its height is >= this
                                 # fraction of the field's highest KDE peak
-MIN_TROUGH_DIP_FRAC  = 0.0      # ...and if the KDE dips below (1 - this) x its height on the
+MIN_TROUGH_DIP_FRAC  = 0.2      # ...and if the KDE dips below (1 - this) x its height on the
                                 # way to any higher peak (0.0: any real dip; flat ridges and
                                 # plateaus never count as a second peak)
-KDE_BW_METHOD = 0.2   # kernel sigma = 0.25 × the field's weighted std
+KDE_BW_METHOD = 0.35   # kernel sigma = 0.25 × the field's weighted std
 #KDE_BW_METHOD        = 'scott'  # gaussian_kde bw_method ('scott', 'silverman' or a scalar factor)
-MIN_KDE_POINTS       = 3        # fields with fewer bins of non-zero rate (in the KDE input map)
+MIN_KDE_POINTS       = 5        # fields with fewer bins of non-zero rate (in the KDE input map)
                                 # get no KDE and are reported as single-peak (kde_note says why)
 
 # ── Ratemap the KDE is fitted on (weights of the field bins) ──────────────────
@@ -111,7 +111,7 @@ RUN_STATS = True                # also run MultiPeak_StatsComparison on the outp
 
 # Output folder (inside Output_PlaceTrue) -- named after the KDE input map and
 # the peak cut-off, so runs with different settings don't overwrite each other.
-MULTIPEAK_SUBDIR = (f'MultiPeak_KDE_{KDE_RATEMAP_TYPE}'
+MULTIPEAK_SUBDIR = (f'MultiPeak_KDE_Pk75_Tr02_Sm035{KDE_RATEMAP_TYPE}'
                     f'_Rel{int(round(PEAK_REL_HEIGHT_FRAC * 100))}')
 output_dir   = os.path.join(Output_PlaceTrue, MULTIPEAK_SUBDIR)
 output_excel = os.path.join(output_dir, 'MultiPeak_KDE_Fields.xlsx')

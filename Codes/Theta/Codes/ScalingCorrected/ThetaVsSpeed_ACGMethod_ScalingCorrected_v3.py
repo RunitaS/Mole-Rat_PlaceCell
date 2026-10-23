@@ -2,8 +2,9 @@
 Theta frequency / power vs. running speed, on the epochs of the autocorrelogram
 (ACG) "theta continuity" analysis.
 
-All of the ACG analysis -- .ncs loading and cleaning, epoching, common-noise /
-delta-theta / MAD epoch rejection, moving/immobile labelling and the Dunn et
+All of the ACG analysis -- .ncs loading and cleaning, epoching, common-noise
+(optional, COMMON_NOISE_REMOVAL) / delta-theta / MAD epoch rejection,
+moving/immobile labelling and the Dunn et
 al. 2022 peak-range quantification -- is done by ACG_Utils.py, which must sit
 in ACG_UTILS_DIR (default: this script's folder). ACG_Utils.py is the latest
 version of the main ACG script (e.g. Figc_ACG_ScalingCorrected_v5_CommonNoise.py)
@@ -34,6 +35,7 @@ import subprocess
 from datetime import datetime
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, resample_poly, sosfiltfilt
 from scipy.stats import norm
 import statsmodels.formula.api as smf
 
@@ -73,8 +75,20 @@ acg = importlib.reload(acg)
 # anywhere under this tree (in any subfolder) is processed.
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
 
+# ---- Common-noise (cross-tetrode) epoch rejection ----
+# True:  epochs carrying noise shared by all of a session's .ncs files are
+#        dropped (ACG_Utils.session_common_noise), with per-session diagnostic
+#        figures in COMMON_NOISE_FIG_DIR. ACG_Utils.py must then be a
+#        common-noise version (e.g. Figc_ACG_ScalingCorrected_v5_CommonNoise.py)
+#        providing load_clean_lfp and session_common_noise.
+# False: no common-noise step. ACG_Utils' common-noise functions are never
+#        looked up, so ACG_Utils.py may be a version without them (if it has
+#        them, its COMMON_NOISE_ENABLE is switched off for this run).
+COMMON_NOISE_REMOVAL = False
+
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_ThetaVsSpeed_ACGUtils')
+OUTPUT_DIR = os.path.join(
+    ROOT_DIR, 'ACG_ThetaVsSpeed_' + ('NoiseRemoval' if COMMON_NOISE_REMOVAL else 'NoNoiseRemoval'))
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata. ACG_Utils' own run_metadata.csv
@@ -119,9 +133,21 @@ acg.ROOT_DIR = ROOT_DIR
 acg.OUTPUT_DIR = OUTPUT_DIR
 acg.FIGURE_DIR = FIGURE_DIR
 acg.META_DIR = ACG_META_DIR
-acg.COMMON_NOISE_FIG_DIR = COMMON_NOISE_FIG_DIR
 acg.ARENA_FIGURE_DIR = os.path.join(FIGURE_DIR, 'ArenaType')
 acg.SESSION_FIGURE_DIR = os.path.join(FIGURE_DIR, 'SessionType')
+
+if COMMON_NOISE_REMOVAL:
+    _missing = [f for f in ('load_clean_lfp', 'session_common_noise') if not hasattr(acg, f)]
+    if _missing:
+        raise AttributeError(
+            f'COMMON_NOISE_REMOVAL = True, but {os.path.abspath(acg.__file__)} has no '
+            f'{", ".join(_missing)} -- use a common-noise version of ACG_Utils.py '
+            'or set COMMON_NOISE_REMOVAL = False.')
+    acg.COMMON_NOISE_FIG_DIR = COMMON_NOISE_FIG_DIR
+elif hasattr(acg, 'COMMON_NOISE_ENABLE'):
+    # common-noise version of ACG_Utils.py: its session_common_noise then
+    # returns (None, None), so no epoch is rejected as common noise
+    acg.COMMON_NOISE_ENABLE = False
 
 
 def legend_and_stats_below(ax, stats_text=None, handles=None, labels=None, ncol=None,
@@ -161,6 +187,14 @@ def legend_and_stats_below(ax, stats_text=None, handles=None, labels=None, ncol=
 
 
 # %% ==================== ACG epochs + epoch power ==================================
+
+def bandpass_filter(x, fs_hz, band, order):
+    """Zero-phase Butterworth band-pass in second-order sections (same as the
+    common-noise version of ACG_Utils.bandpass_filter, kept here so the power
+    columns don't depend on ACG_Utils having it)."""
+    sos = butter(order, band, btype='band', fs=fs_hz, output='sos')
+    return sosfiltfilt(sos, np.asarray(x, dtype=np.float64))
+
 
 def add_epoch_power(result, clean_lfp, common_noise=None):
     """Add the per-epoch power columns of the theta vs. speed models to one
@@ -206,9 +240,9 @@ def add_epoch_power(result, clean_lfp, common_noise=None):
     artifact_free = keep_common & acg.reject_artifact_epochs(epochs, ref_mask=mad_ref)
 
     theta_epochs, _ = acg.build_epochs(
-        acg.bandpass_filter(lfp, fs, acg.THETA_BAND, THETA_POWER_FILTER_ORDER), nperseg)
+        bandpass_filter(lfp, fs, acg.THETA_BAND, THETA_POWER_FILTER_ORDER), nperseg)
     broadband_epochs, _ = acg.build_epochs(
-        acg.bandpass_filter(lfp, fs, REL_POWER_BAND, REL_POWER_FILTER_ORDER), nperseg)
+        bandpass_filter(lfp, fs, REL_POWER_BAND, REL_POWER_FILTER_ORDER), nperseg)
     total_power = np.mean(broadband_epochs[artifact_free] ** 2)
 
     result['epoch_power_uv2'] = np.mean(epochs[idx] ** 2, axis=1)
@@ -219,42 +253,76 @@ def add_epoch_power(result, clean_lfp, common_noise=None):
     return result
 
 
+def load_clean_lfp(fpath):
+    """One .ncs file's cleaned LFP before the ACG low-pass, as (lfp, start_us).
+
+    ACG_Utils.load_clean_lfp when ACG_Utils has it; otherwise the same steps
+    ACG_Utils.process_ncs_for_acg / get_epoch_waveform apply (resample to
+    FS_ACG -> notch LINE_HARMONICS -> linear detrend), built from ACG_Utils'
+    own functions and settings."""
+    if hasattr(acg, 'load_clean_lfp'):
+        return acg.load_clean_lfp(fpath)
+    lfp, start_us = acg.load_ncs(fpath)
+    lfp = resample_poly(lfp, int(acg.FS_ACG), int(acg.NATIVE_FS))
+    lfp = acg.notch_filter(lfp, acg.FS_ACG, acg.LINE_HARMONICS, acg.NOTCH_Q)
+    lfp = acg.detrend_signal(lfp, dtype='linear')
+    return lfp, start_us
+
+
 def run_acg_analysis(root_dir):
     """ACG_Utils.process_root_directory on `root_dir`, with the epoch power
     columns (add_epoch_power) added to every file's result.
 
     Each .ncs file's process_ncs_for_acg call is wrapped for the duration of
-    the run, so the power is computed from the cleaned trace ACG_Utils
-    already loaded (no second read of the .ncs) and on the same common-noise
-    mask; the common-noise figures are sent to COMMON_NOISE_FIG_DIR. Both
-    ACG_Utils functions are restored afterwards.
+    the run, so the power is computed on the same epochs as the ACG. With
+    COMMON_NOISE_REMOVAL, the power uses the cleaned trace ACG_Utils already
+    loaded (no second read of the .ncs) and the same common-noise mask, and
+    the common-noise figures are sent to COMMON_NOISE_FIG_DIR. Without it,
+    ACG_Utils' common-noise functions are not touched; if ACG_Utils doesn't
+    pass the cleaned trace in, it is re-loaded here (load_clean_lfp). Every
+    wrapped ACG_Utils function is restored afterwards.
 
-    Returns (results DataFrame, common-noise per-epoch DataFrame,
-    {abs .ncs path: error message} for files ACG_Utils skipped).
+    Returns (results DataFrame, common-noise per-epoch DataFrame -- empty
+    without COMMON_NOISE_REMOVAL, {abs .ncs path: error message} for files
+    ACG_Utils skipped).
     """
-    orig_process = acg.process_ncs_for_acg
-    orig_common_noise = acg.session_common_noise
     file_errors = {}
+    orig_process = acg.process_ncs_for_acg
 
-    def _process(fpath, *args, clean=None, common_noise=None, **kwargs):
+    def _process(fpath, *args, **kwargs):
         try:
+            if COMMON_NOISE_REMOVAL and kwargs.get('clean') is None:
+                kwargs['clean'] = acg.load_clean_lfp(fpath)
+            res = orig_process(fpath, *args, **kwargs)
+            clean = kwargs.get('clean')
             if clean is None:
-                clean = acg.load_clean_lfp(fpath)
-            res = orig_process(fpath, *args, clean=clean, common_noise=common_noise, **kwargs)
-            return add_epoch_power(res, clean[0], common_noise)
+                clean = load_clean_lfp(fpath)
+            return add_epoch_power(res, clean[0], kwargs.get('common_noise'))
         except Exception as e:
             file_errors[os.path.abspath(fpath)] = f'{type(e).__name__}: {e}'
             raise
 
-    def _common_noise(folder_rel, cleaned, **kwargs):
-        kwargs.setdefault('fig_dir', COMMON_NOISE_FIG_DIR)
-        return orig_common_noise(folder_rel, cleaned, **kwargs)
+    wrappers = {'process_ncs_for_acg': _process}
+    if COMMON_NOISE_REMOVAL:
+        orig_common_noise = acg.session_common_noise
 
-    acg.process_ncs_for_acg, acg.session_common_noise = _process, _common_noise
+        def _common_noise(folder_rel, cleaned, **kwargs):
+            kwargs.setdefault('fig_dir', COMMON_NOISE_FIG_DIR)
+            return orig_common_noise(folder_rel, cleaned, **kwargs)
+
+        wrappers['session_common_noise'] = _common_noise
+
+    originals = {name: getattr(acg, name) for name in wrappers}
+    for name, func in wrappers.items():
+        setattr(acg, name, func)
     try:
-        results_df, common_noise_df = acg.process_root_directory(root_dir)
+        out = acg.process_root_directory(root_dir)
     finally:
-        acg.process_ncs_for_acg, acg.session_common_noise = orig_process, orig_common_noise
+        for name, func in originals.items():
+            setattr(acg, name, func)
+    # a common-noise ACG_Utils returns (results, common-noise table); one
+    # without common-noise rejection returns the results only
+    results_df, common_noise_df = out if isinstance(out, tuple) else (out, pd.DataFrame())
     return results_df, common_noise_df, file_errors
 
 
@@ -606,7 +674,8 @@ CONFIG_SETTINGS = [
     ('Paths',           'ACG_META_DIR',             "ACG_Utils' run_metadata.csv + ACG_Utils.py copy"),
     ('Paths',           'COMMON_NOISE_FIG_DIR',     'ACG_Utils per-session common-noise figures'),
     ('Paths',           'ACG_UTILS_DIR',            'Folder ACG_Utils.py is imported from'),
-    ('ACG',             'RUN_ACG_FIGURES',          'Also run ACG_Utils.run_pipeline (ACG summary tables/figures)'),
+    ('ACG',             'COMMON_NOISE_REMOVAL',     'Reject epochs with noise common to all of a session\'s .ncs files (ACG_Utils.session_common_noise)'),
+    ('ACG',             'RUN_ACG_FIGURES',         'Also run ACG_Utils.run_pipeline (ACG summary tables/figures)'),
     ('Theta vs. speed', 'SPEED_BIN_WIDTH_CMS',      'Width (cm/s) of the speed bins epochs are grouped into per recording before the mixed models'),
     ('Theta vs. speed', 'BIN_AGG_METHOD',           "Value per (recording, speed bin): 'median' or 'mean'"),
     ('Relative power',  'REL_POWER_BAND',           'Band (Hz) whose total power (recording mean square) normalizes theta power'),
@@ -617,10 +686,10 @@ CONFIG_SETTINGS = [
 # Processing choices hard-coded in the function bodies (not module constants).
 PIPELINE_NOTES = [
     ('ACG analysis', 'ACG_Utils.process_root_directory(ROOT_DIR): all LFP cleaning, epoching, '
-                     'common-noise / delta-theta / MAD epoch rejection, moving/immobile labelling '
-                     'and ACG peak-range quantification -- settings under section ACG_Utils and in '
-                     'ACG_META_DIR\\run_metadata.csv; common-noise figures redirected to '
-                     'COMMON_NOISE_FIG_DIR'),
+                     'common-noise (only if COMMON_NOISE_REMOVAL) / delta-theta / MAD epoch '
+                     'rejection, moving/immobile labelling and ACG peak-range quantification -- '
+                     'settings under section ACG_Utils and in ACG_META_DIR\\run_metadata.csv; '
+                     'common-noise figures redirected to COMMON_NOISE_FIG_DIR'),
     ('ACG figures', 'ACG_Utils.run_pipeline(results, OUTPUT_DIR, FIGURE_DIR) when RUN_ACG_FIGURES'),
     ('Epoch power', 'add_epoch_power on the cleaned trace ACG_Utils loaded: ACG_Utils low-pass, '
                     'EPOCH_SEC epochs, rows = ACG epoch_index'),
@@ -687,6 +756,7 @@ def save_run_metadata(meta_dir=META_DIR):
         # ---- ACG analysis ----
         'acg_utils_path':           os.path.abspath(acg.__file__),
         'acg_utils_settings':       os.path.join(ACG_META_DIR, 'run_metadata.csv'),
+        'COMMON_NOISE_REMOVAL':     COMMON_NOISE_REMOVAL,
         'RUN_ACG_FIGURES':          RUN_ACG_FIGURES,
         # ---- theta vs. speed (mixed model, grouped by animal) ----
         'SPEED_BIN_WIDTH_CMS':      SPEED_BIN_WIDTH_CMS,
@@ -700,7 +770,8 @@ def save_run_metadata(meta_dir=META_DIR):
         'REL_POWER_BAND':           REL_POWER_BAND,
         'REL_POWER_FILTER_ORDER':   REL_POWER_FILTER_ORDER,
         'rel_power_denominator':    'mean square of REL_POWER_BAND trace over the recording\'s '
-                                    'common-noise-free, MAD-artifact-free epochs',
+                                    + ('common-noise-free, ' if COMMON_NOISE_REMOVAL else '')
+                                    + 'MAD-artifact-free epochs',
         'figure_dpi':               200,
     }
     os.makedirs(meta_dir, exist_ok=True)

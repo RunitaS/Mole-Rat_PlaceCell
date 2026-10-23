@@ -42,15 +42,6 @@ rejection prevalence (overall / immobility / mobility epochs, and the
 immobility-vs-mobility split of the rejected epochs) is compared statistically
 across arena types and across each arena's session types (see
 compare_edmin_prevalence).
-
-Common-noise rejection (v5): noise picked up by the whole headstage/reference
--- a slow drifting oscillation or a burst of high-frequency noise -- appears
-on every tetrode of a session at the same time, each with a slightly
-different waveform. The .ncs files of each session folder are therefore
-processed together: every epoch is scored per channel on slow-band and
-high-frequency-band RMS, and an epoch that is an outlier on (nearly) all
-channels at once is removed from every channel's analysis before the
-per-channel delta/theta and MAD rejection (see detect_common_noise_epochs).
 """
 
 import os
@@ -160,29 +151,6 @@ MAD_THRESH = 5.0
 DELTA_BAND = (1.0, 3.0)  # Hz
 THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 
-# ---- Common-noise (cross-tetrode) epoch rejection ----
-# Headstage/reference noise shows up on every tetrode of a session at the same
-# time but with a slightly different waveform on each, so waveforms aren't
-# matched directly. Instead each channel's epochs are scored on the RMS of two
-# bands (slow drift, high-frequency noise), log-transformed and robust-z-scored
-# within that channel (median/MAD over the whole session). An epoch is
-# rejected on ALL channels of the session folder when, for either band, at
-# least COMMON_NOISE_MIN_FRAC of the channels exceed COMMON_NOISE_Z in that
-# same epoch. The features are computed before the ACG low-pass so the
-# high-frequency band is still visible. Folders with fewer than
-# COMMON_NOISE_MIN_CHANNELS .ncs files can't tell common from local noise and
-# skip this step. Per-session diagnostic figures go to COMMON_NOISE_FIG_DIR.
-COMMON_NOISE_ENABLE       = True
-COMMON_SLOW_BAND          = (0.1, 2.0)      # Hz -- slow drift / slow oscillation
-COMMON_HF_BAND            = (150.0, 400.0)  # Hz -- high-frequency noise
-COMMON_HF_EXTRA_HARMONICS = [250.0, 300.0, 350.0, 400.0]  # notched for the HF feature only
-                                            # (the ACG path notches LINE_HARMONICS, <= 200 Hz)
-COMMON_BAND_ORDER         = 3               # Butterworth order (zero-phase, SOS)
-COMMON_NOISE_Z            = 3.0             # per-channel robust z of log RMS
-COMMON_NOISE_MIN_FRAC     = 1.0             # fraction of channels that must be outliers together
-COMMON_NOISE_MIN_CHANNELS = 2
-COMMON_NOISE_PAD_EPOCHS   = 0               # also reject this many epochs either side of a hit
-
 # ---- Velocity / running-speed epoch gating ----
 # Every .ncs file's session folder is expected to hold one tracking .csv with
 # a UNIX timestamp (us, column A) on the same clock as the .ncs timestamps,
@@ -251,7 +219,6 @@ ARENA_SESSION_TYPES = {
 # ED_min-prevalence comparison plots, are written under these folders.
 ARENA_FIGURE_DIR   = os.path.join(FIGURE_DIR, 'ArenaType')
 SESSION_FIGURE_DIR = os.path.join(FIGURE_DIR, 'SessionType')
-COMMON_NOISE_FIG_DIR = os.path.join(FIGURE_DIR, 'CommonNoise')
 STATS_ALPHA = 0.05   # significance level for the ED_min-prevalence tests
 
 
@@ -312,27 +279,13 @@ def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
     return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
 
 
-def bandpass_filter(x, fs_hz, band, order=COMMON_BAND_ORDER):
-    """Zero-phase Butterworth band-pass in second-order sections (stays
-    numerically stable at the 0.1 Hz lower edge of COMMON_SLOW_BAND)."""
-    sos = signal.butter(order, band, btype='band', fs=fs_hz, output='sos')
-    return signal.sosfiltfilt(sos, np.asarray(x, dtype=np.float64))
+def _robust_high_outliers(x, thresh, ref_mask=None):
+    """Boolean mask of samples that are high outliers by robust (MAD) z-score.
 
-
-def load_clean_lfp(fpath, fs_acg=FS_ACG):
-    """Load one .ncs file and apply the cleaning shared by the ACG and the
-    common-noise detector: resample -> notch -> linear detrend. Stops before
-    the ACG low-pass, which the caller applies. Returns (lfp, start_us)."""
-    lfp, start_us = load_ncs(fpath)
-    lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
-    lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
-    lfp = detrend_signal(lfp, dtype='linear')
-    return lfp, start_us
-
-
-def _robust_z(x, ref_mask=None):
-    """Robust (median/MAD) z-score of every element of `x`. If `ref_mask` is
-    given, the median/MAD are estimated from `x[ref_mask]` only."""
+    If `ref_mask` is given, the median/MAD reference statistics are estimated
+    from `x[ref_mask]` only, so epochs excluded upstream can't skew the
+    robust threshold -- z-scores are still returned for every element of `x`.
+    """
     x = np.asarray(x, dtype=np.float64)
     ref = x if ref_mask is None else x[np.asarray(ref_mask, dtype=bool)]
     if ref.size == 0:
@@ -341,17 +294,8 @@ def _robust_z(x, ref_mask=None):
     mad = np.median(np.abs(ref - med))
     if mad == 0:
         mad = 1e-20
-    return 0.6745 * (x - med) / mad
-
-
-def _robust_high_outliers(x, thresh, ref_mask=None):
-    """Boolean mask of samples that are high outliers by robust (MAD) z-score.
-
-    If `ref_mask` is given, the median/MAD reference statistics are estimated
-    from `x[ref_mask]` only, so epochs excluded upstream can't skew the
-    robust threshold -- z-scores are still returned for every element of `x`.
-    """
-    return _robust_z(x, ref_mask=ref_mask) > thresh
+    robust_z = 0.6745 * (x - med) / mad
+    return robust_z > thresh
 
 
 def find_position_file(ncs_path):
@@ -835,117 +779,6 @@ def reject_artifact_epochs(epochs, mad_thresh=MAD_THRESH, ref_mask=None):
     return ~_robust_high_outliers(p2p, mad_thresh, ref_mask=ref_mask)
 
 
-def common_noise_features(lfp, fs_hz, nperseg):
-    """Per-epoch log10 RMS of one channel's slow band (COMMON_SLOW_BAND) and
-    high-frequency band (COMMON_HF_BAND), from its cleaned pre-low-pass trace
-    (load_clean_lfp). Returns {'slow': (n_total,), 'hf': (n_total,)}."""
-    hf_in = notch_filter(lfp, fs_hz, COMMON_HF_EXTRA_HARMONICS, NOTCH_Q)
-    feats = {}
-    for name, x in (('slow', bandpass_filter(lfp, fs_hz, COMMON_SLOW_BAND)),
-                    ('hf',   bandpass_filter(hf_in, fs_hz, COMMON_HF_BAND))):
-        ep, _ = build_epochs(x, nperseg)
-        feats[name] = np.log10(np.sqrt(np.mean(ep ** 2, axis=1)) + 1e-12)
-    return feats
-
-
-def detect_common_noise_epochs(lfps, fs_hz, nperseg, z_thresh=COMMON_NOISE_Z,
-                               min_frac=COMMON_NOISE_MIN_FRAC,
-                               pad_epochs=COMMON_NOISE_PAD_EPOCHS):
-    """Find epochs carrying noise common to all channels of one session.
-
-    `lfps` holds the cleaned pre-low-pass traces (load_clean_lfp) of every
-    .ncs file in the session folder, all starting at the same timestamp. Each
-    channel's per-epoch band features (common_noise_features) are robust-z-
-    scored within that channel, so channels with different baseline power are
-    comparable. For each band, an epoch is flagged when at least `min_frac`
-    of the channels have z > `z_thresh` in it; it is rejected if either band
-    is flagged (then dilated by `pad_epochs` either side).
-
-    Returns
-    -------
-    reject : (n_total,) bool   True = common-noise epoch
-    table  : DataFrame         one row per epoch: per-band fraction of
-                               channels over threshold, median z across
-                               channels, and the flags
-    z      : {'slow', 'hf'} -> (n_channels, n_total) robust z
-    """
-    n_total = min(len(x) for x in lfps) // nperseg
-    n_ch = len(lfps)
-    z = {k: np.empty((n_ch, n_total)) for k in ('slow', 'hf')}
-    for c, x in enumerate(lfps):
-        feats = common_noise_features(x[:n_total * nperseg], fs_hz, nperseg)
-        for k, v in feats.items():
-            z[k][c] = _robust_z(v)
-
-    min_n = int(np.ceil(min_frac * n_ch - 1e-9))
-    over = {k: z[k] > z_thresh for k in z}
-    flag = {k: over[k].sum(axis=0) >= min_n for k in z}
-    reject = flag['slow'] | flag['hf']
-    if pad_epochs > 0:
-        reject = np.convolve(reject, np.ones(2 * pad_epochs + 1), mode='same') > 0
-
-    table = pd.DataFrame({
-        'epoch_index':   np.arange(n_total),
-        'frac_ch_slow':  over['slow'].mean(axis=0),
-        'frac_ch_hf':    over['hf'].mean(axis=0),
-        'median_z_slow': np.median(z['slow'], axis=0),
-        'median_z_hf':   np.median(z['hf'], axis=0),
-        'common_slow':   flag['slow'],
-        'common_hf':     flag['hf'],
-        'common_noise':  reject,
-    })
-    return reject, table, z
-
-
-def plot_common_noise_session(lfps, names, z, reject, fs_hz, nperseg,
-                              z_thresh=COMMON_NOISE_Z, title=None):
-    """Diagnostic figure for one session folder: per-channel robust z of the
-    slow and high-frequency features over the session (rejected epochs
-    shaded), and the traces of every channel around the worst rejected epoch
-    so the detection can be checked by eye."""
-    n_ch, n_total = z['slow'].shape
-    t_min = (np.arange(n_total) + 0.5) * nperseg / fs_hz / 60
-    fig, axes = plt.subplots(3, 1, figsize=(11, 8), gridspec_kw={'height_ratios': [1, 1, 1.4]})
-    rej_idx = np.where(reject)[0]
-    for ax, key, band in ((axes[0], 'slow', COMMON_SLOW_BAND), (axes[1], 'hf', COMMON_HF_BAND)):
-        for c in range(n_ch):
-            ax.plot(t_min, z[key][c], linewidth=0.6, label=names[c])
-        ax.axhline(z_thresh, color='#C44E52', linestyle='--', linewidth=1)
-        for i in rej_idx:
-            ax.axvspan(t_min[i] - 0.5 * nperseg / fs_hz / 60, t_min[i] + 0.5 * nperseg / fs_hz / 60,
-                       color='0.8', zorder=0, linewidth=0)
-        ax.set_ylabel(f'robust z\n{band[0]:g}-{band[1]:g} Hz RMS')
-        ax.set_xlim(0, t_min[-1] + 0.5 * nperseg / fs_hz / 60)
-    axes[0].legend(fontsize=7, ncol=min(n_ch, 8), loc='upper right', frameon=False)
-    axes[1].set_xlabel('Time (min)')
-    axes[0].set_title(f'{len(rej_idx)}/{n_total} epochs rejected as common noise '
-                      f'({100 * len(rej_idx) / n_total:.1f}%)', fontsize=9)
-
-    ax = axes[2]
-    if len(rej_idx):
-        score = np.maximum(np.median(z['slow'], axis=0), np.median(z['hf'], axis=0))
-        worst = rej_idx[np.argmax(score[rej_idx])]
-        s0 = max(0, (worst - 2) * nperseg)
-        s1 = min(n_total * nperseg, (worst + 3) * nperseg)
-        t = np.arange(s0, s1) / fs_hz
-        seg = [x[s0:s1] - np.median(x[s0:s1]) for x in lfps]
-        step = 1.2 * max(np.ptp(s) for s in seg)
-        for c, s in enumerate(seg):
-            ax.plot(t, s - c * step, linewidth=0.5, color='black')
-            ax.text(t[0], -c * step, names[c] + ' ', ha='right', va='center', fontsize=7)
-        ax.axvspan(worst * nperseg / fs_hz, (worst + 1) * nperseg / fs_hz, color='#F2C6C6', zorder=0)
-        ax.set_yticks([])
-        ax.set_xlabel('Time (s)')
-        ax.set_title(f'Worst rejected epoch ({worst}), all channels, +/-2 epochs '
-                     f'(cleaned, before low-pass)', fontsize=9)
-    else:
-        ax.axis('off')
-    if title:
-        fig.suptitle(title, fontsize=10)
-    fig.tight_layout()
-    return fig
-
-
 def classify_epoch_movement(time_us, speed, n_total, nperseg, fs_hz, lfp_start_us,
                             speed_thresh=SPEED_THRESH_CMS):
     """Per-epoch median running speed and movement label.
@@ -982,15 +815,10 @@ def classify_epoch_movement(time_us, speed, n_total, nperseg, fs_hz, lfp_start_u
 
 def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FREQ_RES,
                         epoch_sec=EPOCH_SEC, fs_acg=FS_ACG, ed_min_thresh=ACG_ED_MIN_THRESH,
-                        freq_pad=ACG_FREQ_PAD, clean=None, common_noise=None):
+                        freq_pad=ACG_FREQ_PAD):
     """Load one .ncs file, resample/clean it, split it into epochs labelled by
     movement state, and compute the ACG peak-range quantification for every
     clean moving/immobile epoch.
-
-    `clean` is an optional (lfp, start_us) from load_clean_lfp, so a session
-    already loaded for common-noise detection isn't read twice. `common_noise`
-    is an optional per-epoch bool mask (detect_common_noise_epochs) of epochs
-    to drop before the delta/theta and MAD rejection.
 
     `ed_min_thresh` is forwarded to quantify_xcorr_epochs -- epochs with a
     poor sinusoid fit (ED_min above threshold) are marked 'skipped' rather
@@ -1000,16 +828,15 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     Returns a DataFrame (one row per epoch) with the quantify_xcorr_epochs
     columns plus 'movement', 'median_speed_cms', and 'epoch_index'.
     """
-    lfp, lfp_start_us = clean if clean is not None else load_clean_lfp(fpath, fs_acg)
+    lfp, lfp_start_us = load_ncs(fpath)
+    lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
+    lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
+    lfp = detrend_signal(lfp, dtype='linear')
     lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
 
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
-    keep_common = np.ones(n_total, dtype=bool)
-    if common_noise is not None:
-        n = min(n_total, len(common_noise))
-        keep_common[:n] = ~np.asarray(common_noise[:n], dtype=bool)
-    keep_deltatheta = keep_common & reject_deltatheta_epochs(epochs, fs_acg)
+    keep_deltatheta = reject_deltatheta_epochs(epochs, fs_acg)
     keep_artifact = keep_deltatheta & reject_artifact_epochs(
         epochs, ref_mask=keep_deltatheta)
 
@@ -1045,117 +872,32 @@ def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
     come from the 'file' / 'epoch_index' columns of a process_ncs_for_acg
     results row.
     """
-    lfp, _ = load_clean_lfp(fpath, fs_acg)
+    lfp, _ = load_ncs(fpath)
+    lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
+    lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
+    lfp = detrend_signal(lfp, dtype='linear')
     lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, _ = build_epochs(lfp, nperseg)
     return epochs[int(epoch_index)]
 
 
-def session_common_noise(folder_rel, cleaned, fs_acg=FS_ACG, epoch_sec=EPOCH_SEC,
-                         fig_dir=COMMON_NOISE_FIG_DIR):
-    """Run detect_common_noise_epochs on one session folder's cleaned traces
-    (`cleaned`: {fpath: (lfp, start_us)}), save its diagnostic figure, and
-    return (reject mask, per-epoch table), or (None, None) when the folder
-    can't be tested (too few channels, or files not starting together)."""
-    if not COMMON_NOISE_ENABLE:
-        return None, None
-    if len(cleaned) < COMMON_NOISE_MIN_CHANNELS:
-        print(f'  Common noise: {folder_rel} has {len(cleaned)} channel(s) '
-              f'(< {COMMON_NOISE_MIN_CHANNELS}) -- not tested')
-        return None, None
-    starts = np.array([s for _lfp, s in cleaned.values()], dtype=np.int64)
-    if starts.max() - starts.min() > 1e6 / fs_acg:
-        print(f'  Common noise: {folder_rel} .ncs files start {starts.max() - starts.min()} us '
-              f'apart -- epochs not aligned, not tested')
-        return None, None
-
-    # Identical traces (the same signal saved under several CSC names) would
-    # each cast a vote in the channel consensus -- keep one copy of each.
-    fpaths = []
-    for f in sorted(cleaned):
-        dup = next((g for g in fpaths if np.array_equal(cleaned[g][0], cleaned[f][0])), None)
-        if dup is None:
-            fpaths.append(f)
-        else:
-            print(f'  Common noise: {os.path.basename(f)} is identical to '
-                  f'{os.path.basename(dup)} -- counted once')
-    if len(fpaths) < COMMON_NOISE_MIN_CHANNELS:
-        print(f'  Common noise: {folder_rel} has {len(fpaths)} distinct channel(s) '
-              f'(< {COMMON_NOISE_MIN_CHANNELS}) -- not tested')
-        return None, None
-    lfps = [cleaned[f][0] for f in fpaths]
-    names = [os.path.splitext(os.path.basename(f))[0] for f in fpaths]
-    nperseg = int(round(fs_acg * epoch_sec))
-    reject, table, z = detect_common_noise_epochs(lfps, fs_acg, nperseg)
-    table.insert(0, 'session_folder', folder_rel)
-    table.insert(1, 'n_channels', len(fpaths))
-    print(f'  Common noise: {folder_rel} -- {int(reject.sum())}/{len(reject)} epochs rejected '
-          f'({100 * reject.mean():.1f}%; slow {int(table["common_slow"].sum())}, '
-          f'HF {int(table["common_hf"].sum())}) across {len(fpaths)} channels')
-
-    os.makedirs(fig_dir, exist_ok=True)
-    fig_name = re.sub(r'[\\/]+', '_', folder_rel) + '_common_noise.png'
-    _plot_and_save(os.path.join(fig_dir, fig_name), plot_common_noise_session,
-                   lfps, names, z, reject, fs_acg, nperseg, title=folder_rel)
-    return reject, table
-
-
 def process_root_directory(root_dir):
     """Recursively find every .ncs under `root_dir`, run process_ncs_for_acg on
     each, and concatenate the per-epoch results, tagging each row with
-    path-derived metadata (parse_metadata_from_path).
-
-    Files are processed one session folder at a time: all of a folder's .ncs
-    files are loaded and cleaned first, epochs carrying noise common to all
-    of them are found (session_common_noise), and those epochs are dropped
-    from every file's ACG analysis.
-
-    Returns (results DataFrame, common-noise per-epoch DataFrame -- empty if
-    no folder was tested)."""
-    folders = {}
+    path-derived metadata (parse_metadata_from_path)."""
+    ncs_files = []
     for root, _dirs, files in os.walk(root_dir):
-        for fname in sorted(files):
+        for fname in files:
             if fname.endswith('.ncs'):
-                folders.setdefault(root, []).append(os.path.join(root, fname))
-    print(f'Found {sum(len(v) for v in folders.values())} .ncs files in '
-          f'{len(folders)} folders under {root_dir}')
+                ncs_files.append(os.path.join(root, fname))
+    print(f'Found {len(ncs_files)} .ncs files under {root_dir}')
 
-    all_results, common_tables = [], []
-    for folder, fpaths in folders.items():
-        folder_rel = os.path.relpath(folder, root_dir)
-        cleaned = {}
-        for fpath in fpaths:
-            try:
-                cleaned[fpath] = load_clean_lfp(fpath)
-            except Exception as e:
-                print(f'  SKIP: {os.path.relpath(fpath, root_dir)} -- {e}')
-        if not cleaned:
-            continue
-        try:
-            common_reject, common_table = session_common_noise(folder_rel, cleaned)
-        except Exception as e:
-            print(f'  Common noise: {folder_rel} failed ({type(e).__name__}: {e}) -- not applied')
-            common_reject, common_table = None, None
-        if common_table is not None:
-            common_tables.append(common_table)
-        all_results += _process_folder_files(root_dir, cleaned, common_reject)
-
-    print(f'-> {len(all_results)} files processed\n')
-    if not all_results:
-        raise ValueError(f'No files processed successfully under {root_dir}')
-    common_df = pd.concat(common_tables, ignore_index=True) if common_tables else pd.DataFrame()
-    return pd.concat(all_results, ignore_index=True), common_df
-
-
-def _process_folder_files(root_dir, cleaned, common_reject):
-    """process_ncs_for_acg on each already-cleaned file of one session folder,
-    with metadata tags; returns the list of per-file result DataFrames."""
     all_results = []
-    for fpath, clean in cleaned.items():
+    for fpath in ncs_files:
         rel = os.path.relpath(fpath, root_dir)
         try:
-            res = process_ncs_for_acg(fpath, clean=clean, common_noise=common_reject)
+            res = process_ncs_for_acg(fpath)
             meta = parse_metadata_from_path(rel)
             for k, v in meta.items():
                 res[k] = v
@@ -1182,7 +924,11 @@ def _process_folder_files(root_dir, cleaned, common_reject):
             all_results.append(res)
         except Exception as e:
             print(f'  SKIP: {rel} -- {e}')
-    return all_results
+
+    print(f'-> {len(all_results)} files processed\n')
+    if not all_results:
+        raise ValueError(f'No files processed successfully under {root_dir}')
+    return pd.concat(all_results, ignore_index=True)
 
 
 # %% ==================== Aggregation / plotting ====================================
@@ -2047,7 +1793,7 @@ def _script_path():
     try:
         return os.path.abspath(__file__)
     except NameError:
-        return os.path.join(os.getcwd(), 'Figc_ACG_ScalingCorrected_v5_CommonNoise.py')
+        return os.path.join(os.getcwd(), 'Figc_ACG_ScalingCorrected_v4_SessionSegregation.py')
 
 
 def save_run_metadata(meta_dir=META_DIR):
@@ -2087,17 +1833,6 @@ def save_run_metadata(meta_dir=META_DIR):
         'welch_noverlap':           0,
         'MAD_THRESH':               MAD_THRESH,
         'MAD_robust_z_constant':    0.6745,
-        # ---- common-noise (cross-tetrode) rejection ----
-        'COMMON_NOISE_ENABLE':       COMMON_NOISE_ENABLE,
-        'COMMON_SLOW_BAND':          COMMON_SLOW_BAND,
-        'COMMON_HF_BAND':            COMMON_HF_BAND,
-        'COMMON_HF_EXTRA_HARMONICS': COMMON_HF_EXTRA_HARMONICS,
-        'COMMON_BAND_ORDER':         COMMON_BAND_ORDER,
-        'COMMON_NOISE_Z':            COMMON_NOISE_Z,
-        'COMMON_NOISE_MIN_FRAC':     COMMON_NOISE_MIN_FRAC,
-        'COMMON_NOISE_MIN_CHANNELS': COMMON_NOISE_MIN_CHANNELS,
-        'COMMON_NOISE_PAD_EPOCHS':   COMMON_NOISE_PAD_EPOCHS,
-        'common_noise_feature':      'log10 RMS per epoch, robust z within channel',
         # ---- tracking / movement labelling ----
         'tracking_csv_columns':     'A=time_us, D=x_cm, E=y_cm',
         'POS_JUMP_THRESH_CMS':      POS_JUMP_THRESH_CMS,
@@ -2738,16 +2473,7 @@ if __name__ == '__main__':
     os.makedirs(FIGURE_DIR, exist_ok=True)
     save_run_metadata(META_DIR)
 
-    results_df, common_noise_df = process_root_directory(ROOT_DIR)
-
-    if not common_noise_df.empty:
-        common_path = os.path.join(OUTPUT_DIR, 'common_noise_epochs.csv')
-        common_noise_df.to_csv(common_path, index=False)
-        n_common = int(common_noise_df['common_noise'].sum())
-        print(f'Common noise rejected {n_common}/{len(common_noise_df)} session epochs '
-              f'({100 * n_common / len(common_noise_df):.1f}%) in '
-              f'{common_noise_df["session_folder"].nunique()} tested folders '
-              f'-> {common_path}')
+    results_df = process_root_directory(ROOT_DIR)
 
     n_edmin_rejected = int(results_df['skipped_edmin'].sum())
     pct_edmin_rejected = 100 * n_edmin_rejected / len(results_df) if len(results_df) else 0.0

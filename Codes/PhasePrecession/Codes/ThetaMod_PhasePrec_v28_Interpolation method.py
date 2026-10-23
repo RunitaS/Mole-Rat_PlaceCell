@@ -201,11 +201,12 @@ v28 changes (pass index from field geometry instead of the field-index Hilbert p
     which the Hilbert phase turns into a jittery pass index. The pass index now depends only on
     the animal's position relative to the field's (or sub-field's) boundary and peak bin.
   * Fields / sub-fields are detected as before (threshold method of PlaceCell_Main_v20/v21, then
-    the KDE multi-peak split). Every bin of an analysed field gets a radial index
-    (see field_radial_index): 0 at the field's peak-rate bin (field['peak_bin']), 1 on the field
-    boundary (field bins with an 8-neighbour outside the field), and in between the bin's distance
-    from the peak divided by the distance from the peak to the boundary along the same ray
-    (straight line from the peak through the bin, continued until it leaves the field). On the
+    the KDE multi-peak split); for the pass index, holes enclosed by a 2-D field are filled
+    (PASS_FILL_FIELD_HOLES). Every bin of an analysed field gets a radial index
+    (see field_radial_index): 0 at the field's peak-rate bin (field['peak_bin']), and otherwise
+    the bin's distance from the peak divided by the distance from the peak to the field boundary
+    along the same ray (straight line from the peak through the bin, continued until it leaves the
+    field), so the last field bin on every ray -- the boundary -- is 1. On the
     Circle track (1-D angular fields) it is the bin's distance from the peak bin over the distance
     from the peak bin to that end of the field. Sub-fields have their own boundary, so moving from
     one sub-field into its neighbour is an exit (+1) from the first and an entry (-1) into the next.
@@ -218,11 +219,11 @@ v28 changes (pass index from field geometry instead of the field-index Hilbert p
     pass index of their nearest position sample; spikes outside the field get none.
   * Pass gate: visits whose closest approach to the peak (minimum radial index) is above
     PASS_MAX_MIN_RADIAL are dropped (1.0 = every visit through the field is kept).
-  * Complete traversals (CP_*): kept visits that pass through the peak bin and enter / exit at
-    pass index <= -1 + COMPLETE_PASS_EDGE_TOL / >= +1 - COMPLETE_PASS_EDGE_TOL.
+  * Complete traversals (CP_*): kept visits that get within COMPLETE_PASS_MAX_MIN_RADIAL of the
+    peak bin and enter / exit at pass index <= -1 + COMPLETE_PASS_EDGE_TOL / >= +1 - COMPLETE_PASS_EDGE_TOL.
   * Burst events average the pass index linearly (it no longer wraps around at +-1).
   * The PassIndex figure's field-index panel is replaced by this field's radial-index map.
-  Per-unit figures go to <session>/ThetaMod_PhasePrecession_v28.
+  * Per-unit figures go to <session>/ThetaMod_PhasePrecession_v28.
 
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 """
@@ -250,7 +251,7 @@ from matplotlib.colors import to_hex
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
 from scipy import signal, stats
-from scipy.ndimage import (gaussian_filter, gaussian_filter1d, distance_transform_edt, binary_erosion,
+from scipy.ndimage import (gaussian_filter, gaussian_filter1d, distance_transform_edt, binary_fill_holes,
                            label as nd_label)
 from scipy.optimize import minimize_scalar
 from scipy.special import erf
@@ -263,7 +264,7 @@ from scipy.special import erf
 # ============================================================================
 #ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
 
-ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\OldVers\PC_True_SiAdptBin_CI99_Bin2") 
+ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\OldVers\PC_True_SiSkaggsAdptBin_Alpha200") 
 # Multi-peak detection within each place field (KDE; see split_multipeak_fields and the MP_ settings).
 # True: multi-peak fields are split into sub-fields; False: every field analysed whole, as in v25.
 SPLIT_MULTIPEAK_FIELDS = True
@@ -274,8 +275,8 @@ REQUIRE_RAYLEIGH_FOR_THETA_MOD = False
 _MP_TAG = 'MultiPeakSplit' if SPLIT_MULTIPEAK_FIELDS else 'NoMultiPeakSplit'
 _THETA_TAG = '_TMIandRayleigh' if REQUIRE_RAYLEIGH_FOR_THETA_MOD else ''
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / f'PhasePrec_Results_v28_{_MP_TAG}{_THETA_TAG}'
-OUTPUT_EXCEL_NAME = f'theta_phase_v28_{_MP_TAG}{_THETA_TAG}.xlsx'   # written to RESULTS_FOLDER
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / f'PhasePrec_Results_Interpol_{_MP_TAG}{_THETA_TAG}'
+OUTPUT_EXCEL_NAME = f'theta_phase_Interpol_{_MP_TAG}{_THETA_TAG}.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 # (no_phase_relation cells share the PhaseLocked folder)
 CLASS_PLOT_FOLDERS = {
@@ -348,11 +349,15 @@ MIN_SPEED_CM_S = 1.0          # spikes (and density-map occupancy) are analysed 
 PASS_MAX_MIN_RADIAL = 1.0     # a field visit is kept only if it gets this close to the peak bin (its minimum
                               # radial index <= this; 0 = must enter the peak bin, 1.0 = keep every visit)
 PASS_RAY_STEP_BINS = 0.05     # step (bins) of the ray march from the peak bin to the field boundary
-# --- v25: complete field traversals (see compute_pass_index / _precession_fit) ---
+PASS_FILL_FIELD_HOLES = True  # 2-D: bins enclosed by a field (failed the rate / visit criteria) count as part of
+                              # it for field visits and the pass index, instead of acting as a boundary inside it
+# --- v25: complete field traversals (see field_pass_index / _precession_fit) ---
 # The whole circular-linear analysis is repeated on spikes from COMPLETE traversals only:
-# kept field visits that enter near pass index -1, pass through the field's peak bin
-# (pass index 0) and exit near +1.
+# kept field visits that enter near pass index -1, pass through or next to the field's
+# peak bin (pass index ~0) and exit near +1.
 COMPLETE_PASS_EDGE_TOL = 0.1  # pass index must start <= -1 + this and end >= +1 - this
+COMPLETE_PASS_MAX_MIN_RADIAL = 0.25  # ...and the visit must get within this radial index of the peak bin
+                              # (0 = must enter the peak bin itself; rare in 2-D with 2 cm bins)
 # --- Place-field definition: "threshold method" of PlaceCell_Main_v20 (see detect_place_fields) ---
 # Applied to the pass-index rate map, which keeps Climer's rate_map.m smoothing (Gaussian
 # sigma = SMTH_WIDTH / 2 = 6 cm, unvisited bins filled with the nearest visited value)
@@ -895,7 +900,8 @@ def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, meth
     '<k>' or '<k>.<j>'), dropped_subfields (sub-fields < MIN_SUBFIELD_SIZE_BINS bins),
     n_detected_fields, mean_fr, field_label(xy) -> field_number (0 = outside every
     analysed field) and bin_id(xy) -> bin (flat 2-D index, or angular bin on the Circle)
-    for positions. Every analysed field also gets radial_index (per bin_id, see
+    for positions (2-D: field bins plus the holes they enclose, see _fill_field_holes).
+    Every analysed field also gets pass_mask_2d, radial_index (per bin_id, see
     field_radial_index) and radial_map_2d (the same on the 2-D grid, for display)."""
     _, speed = smooth_positions(pos_ts, pos_xy)
     moving = speed >= RATEMAP_IMMOBILITY_SPEED_CM_S
@@ -949,6 +955,7 @@ def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, meth
 
     n_detected = len(fields)
     fields, dropped = split_multipeak_fields(fields, analyse, sub_record)
+    _fill_field_holes(fields)
 
     # Position -> analysed field / sub-field (0 outside, and in sub-fields too small to analyse)
     if arena == 'Circle':
@@ -963,7 +970,7 @@ def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, meth
     else:
         label_map = np.zeros((nx, ny), dtype=int)
         for f in fields:
-            label_map[f['mask_2d']] = f['field_number']
+            label_map[f['pass_mask_2d']] = f['field_number']
 
         def field_label(p):
             return label_map[_xy_bins(p)]
@@ -980,7 +987,7 @@ def detect_place_fields(pos_ts, pos_xy, spk_ts, arena, binside, smth_width, meth
     n_bin_ids = ring['n_bins'] if arena == 'Circle' else nx * ny
     for f in fields:
         f['radial_index'] = field_radial_index(f, n_bin_ids)
-        f['radial_map_2d'] = np.where(f['mask_2d'], f['radial_index'][grid_bin_id], np.nan)
+        f['radial_map_2d'] = np.where(f['pass_mask_2d'], f['radial_index'][grid_bin_id], np.nan)
 
     return dict(rate_map=rmap, occupancy=occupancy, x_edges=x_edges, y_edges=y_edges,
                 field_index_map=fi_map, fields=fields, dropped_subfields=dropped,
@@ -1259,9 +1266,11 @@ def _radial_index_2d(mask, peak_flat):
     the bin's distance d from the peak bin over the distance from the peak bin to the field
     boundary along the same ray. The ray from the peak bin centre through the bin centre is
     marched outward (PASS_RAY_STEP_BINS) until it leaves the field (or the grid); the boundary
-    distance is the projection onto the ray of the last field bin it crossed (>= d). Boundary
-    bins (an 8-neighbour outside the field or the grid) are set to 1, the peak bin to 0.
-    Returns a map of the grid's shape, NaN outside the field."""
+    distance is the projection onto the ray of the last field bin it crossed (>= d), so the
+    last field bin on every ray is 1. Boundary bins are not forced to 1: in a narrow field
+    (Linear track, thin sub-field) nearly every bin touches the edge, and forcing them would
+    leave no gradient between the peak and the ends. Returns a map of the grid's shape, NaN
+    outside the field."""
     nx, ny = mask.shape
     px, py = np.unravel_index(peak_flat, mask.shape)
     bx, by = np.nonzero(mask)
@@ -1283,9 +1292,6 @@ def _radial_index_2d(mask, peak_flat):
         rows = np.arange(len(i))
         reach = np.maximum(d[i], (qx[rows, last] - px) * u[:, 0] + (qy[rows, last] - py) * u[:, 1])
         r[i] = d[i] / reach
-    edge = mask & ~binary_erosion(mask, structure=np.ones((3, 3), dtype=bool), border_value=0)
-    r[edge[bx, by]] = 1.0
-    r[d == 0] = 0.0
     out = np.full(mask.shape, np.nan)
     out[bx, by] = r
     return out
@@ -1305,8 +1311,21 @@ def field_radial_index(field, n_bin_ids):
         reach = np.where(pos < ip, ip, len(run) - 1 - ip)
         radial[run] = np.abs(pos - ip) / np.maximum(reach, 1)
     else:
-        radial[:] = _radial_index_2d(field['mask_2d'], field['peak_bin']).ravel()
+        radial[:] = _radial_index_2d(field['pass_mask_2d'], field['peak_bin']).ravel()
     return radial
+
+
+def _fill_field_holes(fields):
+    """pass_mask_2d of every analysed 2-D field: its bins plus the holes they enclose (bins
+    that failed the threshold / visit criteria inside the field, and belong to no other analysed
+    field), if PASS_FILL_FIELD_HOLES. Used for field visits and the radial index, so a hole is
+    not a field boundary in the middle of the field. Circle fields are contiguous runs (no holes)."""
+    taken = np.any([f['mask_2d'] for f in fields], axis=0) if fields else None
+    for f in fields:
+        if PASS_FILL_FIELD_HOLES and 'theta_bins' not in f:
+            f['pass_mask_2d'] = f['mask_2d'] | (binary_fill_holes(f['mask_2d']) & ~taken)
+        else:
+            f['pass_mask_2d'] = f['mask_2d']
 
 
 # ============================================================================
@@ -1802,7 +1821,8 @@ def field_pass_index(pos_ts, pos_xy, maps, field):
     visit's first stay in its closest bin to the peak (the peak bin itself, if entered).
     Returns dict(pass_index, visit (visit number per sample, -1 outside visits), n_visits,
     kept (per visit: minimum radial index <= PASS_MAX_MIN_RADIAL), complete (per visit: kept,
-    through the peak bin, entry <= -1 + COMPLETE_PASS_EDGE_TOL, exit >= 1 - COMPLETE_PASS_EDGE_TOL))."""
+    minimum radial index <= COMPLETE_PASS_MAX_MIN_RADIAL, entry <= -1 + COMPLETE_PASS_EDGE_TOL,
+    exit >= 1 - COMPLETE_PASS_EDGE_TOL))."""
     pos_sm = _pass_trace(pos_ts, pos_xy, maps)['pos_sm']
     in_field = maps['field_label'](pos_sm) == field['field_number']
     bins = maps['bin_id'](pos_sm)
@@ -1825,7 +1845,7 @@ def field_pass_index(pos_ts, pos_xy, maps, field):
         visit[a:b] = v
         r_min[v] = r[i0]
     kept = r_min <= PASS_MAX_MIN_RADIAL
-    complete = (kept & (r_min == 0) & (pass_index[starts] <= -1 + COMPLETE_PASS_EDGE_TOL)
+    complete = (kept & (r_min <= COMPLETE_PASS_MAX_MIN_RADIAL) & (pass_index[starts] <= -1 + COMPLETE_PASS_EDGE_TOL)
                 & (pass_index[stops - 1] >= 1 - COMPLETE_PASS_EDGE_TOL))
     return dict(pass_index=pass_index, visit=visit, n_visits=len(starts), kept=kept, complete=complete)
 
@@ -4528,8 +4548,9 @@ def main():
         'and their number) use one value per recording session; '
         'precession comparisons (r^2, fit R, slope, phase range, phase at pass index) use one value per field.',
         'CP_* columns: the same circular-linear analysis repeated on spikes from complete traversals only '
-        f'(kept field visits that start at pass index <= {-1 + COMPLETE_PASS_EDGE_TOL:g}, pass through the peak bin '
-        f'(pass index 0) and end at >= {1 - COMPLETE_PASS_EDGE_TOL:g}); n_passes_complete = number of such visits. CP_SkippedReason is set when '
+        f'(kept field visits that start at pass index <= {-1 + COMPLETE_PASS_EDGE_TOL:g}, get within radial index '
+        f'{COMPLETE_PASS_MAX_MIN_RADIAL:g} of the peak bin and end at >= {1 - COMPLETE_PASS_EDGE_TOL:g}); '
+        'n_passes_complete = number of such visits. CP_SkippedReason is set when '
         'fewer than MIN_SPIKES_FOR_FIT spikes fall in complete traversals. PrecessionClass, the class plot '
         'folders and all arena / session-type comparisons use the all-spike fit.',
         'OO_* columns (v27): field onset / offset spikes from position tracking, independent of the pass index. '
