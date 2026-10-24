@@ -37,6 +37,14 @@ the mean / median of the per-bin % weighted by each bin's dwell time
 (occupancy_s, moving-only frames). The weighted median is the smallest bin %
 at which the cumulative dwell time reaches half the total. Both are added to
 the PerCell / PerField sheets and to STATS_METRICS.
+Two further summaries refer the weights to the whole ratemap (all valid bins)
+instead of the field bins only (rescaling the weights alone would cancel in the
+weighted mean, so these differ from it by construction):
+  occ_wmean_pct_mapnorm   sum over field bins of % x dwell, divided by the dwell
+                          of ALL valid bins (= occ_wmean_pct_across_bins x the
+                          fraction of map dwell spent in the field); PerCell + PerField
+  occ_wmean_pct_all_bins  occupancy-weighted mean % over EVERY visited valid bin,
+                          in or out of a field; PerCell only
 
 For every .ntt under place_cell_folder (all already classified as place cells,
 so no place-cell check is done here):
@@ -105,7 +113,7 @@ RUN_MAPS = True
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
-MIN_VISIT_S     = 0.0      # visits shorter than this (s) are ignored; 0 = keep every visit
+MIN_VISIT_S     = 0.1      # visits shorter than this (s) are ignored; 0 = keep every visit
 STABILITY_CMAP  = 'jet'
 NON_FIELD_COLOR = '0.75'   # gray for visited bins outside every place field
 
@@ -115,6 +123,8 @@ STATS_METRICS = {
     'median_pct_across_bins': 'Median temporal stability across field bins (% visits with >= 1 spike)',
     'occ_wmean_pct_across_bins':   'Occupancy-weighted mean temporal stability across field bins (% visits with >= 1 spike)',
     'occ_wmedian_pct_across_bins': 'Occupancy-weighted median temporal stability across field bins (% visits with >= 1 spike)',
+    'occ_wmean_pct_mapnorm':  'Field temporal stability weighted by dwell, normalised to whole-map dwell (%)',
+    'occ_wmean_pct_all_bins': 'Occupancy-weighted mean temporal stability across all visited map bins (% visits with >= 1 spike)',
     'pct_at_peak_bin':       'Temporal stability at the raw-ratemap peak bin (% visits with >= 1 spike)',
 }
 asc.CONTINUOUS_TEST = 'KW'   # Kruskal-Wallis + pairwise Mann-Whitney U (Holm)
@@ -352,6 +362,8 @@ def _run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
                     'n_spikes': int(spk_bins[bn]), 'occupancy_s': round(float(occ[bn]), 3)})
         bin_rows.append(row)
 
+    occ_map_total = float(occ[valid].sum())                # dwell (s) over the whole ratemap
+
     def _summary(mask: np.ndarray) -> dict:
         p = pct[mask & has_visits]
         w = occ[mask & has_visits]                         # dwell time (s) per bin
@@ -362,6 +374,8 @@ def _run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
                 'occ_wmean_pct_across_bins':
                     round(float(np.sum(p * w) / w.sum()), 2) if w.sum() > 0 else np.nan,
                 'occ_wmedian_pct_across_bins': round(_weighted_median(p, w), 2),
+                'occ_wmean_pct_mapnorm':
+                    round(float(np.sum(p * w) / occ_map_total), 2) if occ_map_total > 0 else np.nan,
                 'occupancy_s_field_bins': round(float(occ[mask].sum()), 3),
                 'n_visits_total': v, 'n_visits_with_spike_total': fired,
                 'pooled_pct_visits_with_spike': round(100.0 * fired / v, 2) if v else np.nan}
@@ -373,6 +387,16 @@ def _run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
                 'n_fields': len(field_rows), 'n_spikes': metrics.get('n_spikes'),
                 'peak_fr': metrics.get('peak_fr'), 'mean_fr': metrics.get('mean_fr'),
                 'sir': metrics.get('sir'), **_summary(field_mask)}
+
+    # Whole-map occupancy-weighted stability: every visited valid bin, in or out of a field.
+    map_bins = valid & (n_visits > 0)
+    p_map = 100.0 * n_fired[map_bins] / n_visits[map_bins]
+    w_map = occ[map_bins]
+    cell_row.update({'n_map_bins_visited': int(map_bins.sum()),
+                     'occupancy_s_map': round(occ_map_total, 3),
+                     'occ_wmean_pct_all_bins':
+                         round(float(np.sum(p_map * w_map) / w_map.sum()), 2)
+                         if w_map.sum() > 0 else np.nan})
     if is_circle:
         cell_row['peak_bin_theta'] = peak_bn[0]
     else:

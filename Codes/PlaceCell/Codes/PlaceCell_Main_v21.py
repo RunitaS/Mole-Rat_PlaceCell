@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict
 import numpy as np
 import pandas as pd
 from scipy.ndimage import convolve, gaussian_filter1d
-from scipy.stats import pearsonr, t as _t_dist
+from scipy.optimize import differential_evolution, minimize
+from scipy.stats import chi2, pearsonr, t as _t_dist
 
 # Thread-safe Matplotlib imports for parallel rendering
 from matplotlib.figure import Figure
@@ -243,6 +244,11 @@ class _Metrics(TypedDict, total=False):
     coherence_bootstrap_sig:  bool | str | None
     theta_modulated: bool | None
     theta_peak_freq: float | None
+    theta_rhythmicity: float | None
+    theta_skipping:    float | None
+    theta_p_value:     float | None
+    theta_p_skipping:  float | None
+    theta_n_lags:      int | None
     speed_score:     float | None
     speed_p_value:   float | None
     speed_r2:        float | None
@@ -344,9 +350,24 @@ SIR_SHUFFLE_MARGIN_S = 20.0   # min circular-shift offset (s) from either end fo
 STABILITY_MIN_BINS = 5        # min jointly-occupied bins (>= min_occ_s in BOTH halves)
                                # required before a split-half stability r is reported
 
-AUTOCORR_WINDOW_MS  = 500.0   # autocorrelogram half-window (ms)
-AUTOCORR_BIN_MS     = 5.0     # autocorrelogram bin size (ms)
-THETA_POWER_THRESH  = 2.0     # theta peak must exceed N× mean spectrum power
+# Theta rhythmicity of the spike train: maximum-likelihood method of Climer et
+# al. 2015 (Hippocampus 25:460), ported from the authors' MATLAB toolbox
+# mle_rhythmicity rev 2.0 (github.com/jrclimer/mle_rhythmicity). See
+# _compute_theta_modulation.
+THETA_MLE_MAX_LAG_S     = 0.6         # lag window (s), toolbox default
+THETA_MLE_F_RANGE       = (3.0, 7.0)  # Hz, range searched for the rhythm frequency. Toolbox default
+                                      # is (1, 13); set to the mole-rat theta band (THETA_BAND in the
+                                      # Theta scripts) so a significant rhythm is a theta rhythm
+THETA_MLE_ALPHA         = 0.05        # theta_modulated = likelihood-ratio p < THETA_MLE_ALPHA
+THETA_MLE_RUNS          = 3           # global (differential-evolution) searches for the no-skip fit,
+                                      # in place of the toolbox's particle swarm (toolbox runs = 3)
+THETA_MLE_N_STARTS      = 25          # plus local fits from the toolbox's 25-particle starting population
+THETA_MLE_SEED          = 0           # RNG seed for both (reproducible fits)
+THETA_MLE_LAG_BIN_S     = 0.0005      # lags are histogrammed at this resolution before fitting
+                                      # (keeps the fit fast for high-rate units; 0.5 ms = 1.3 deg at 7 Hz)
+THETA_MLE_MOVING_EPOCHS = True        # True: a spike leads lags only if its whole lag window lies in one
+                                      # moving epoch (toolbox 'lead' epoch mode), so no lag spans an
+                                      # immobile gap. False: one epoch = the whole tracked session.
 
 SPEED_MIN_CMS       = 1.0     # lowest speed (cm/s) included in speed-modulation analysis
 SPEED_MAX_CMS       = 90.0   # highest speed (cm/s) included in speed-modulation analysis
@@ -403,7 +424,9 @@ RUN_CONFIG_VARS = [
     'use_min_occ_s', 'min_occ_s', 'use_min_visits', 'min_visits',
     'MAX_GAP_US', 'N_BOOTSTRAP', 'SIR_SHUFFLE_MARGIN_S',
     'STABILITY_MIN_BINS',
-    'AUTOCORR_WINDOW_MS', 'AUTOCORR_BIN_MS', 'THETA_POWER_THRESH',
+    'THETA_MLE_MAX_LAG_S', 'THETA_MLE_F_RANGE', 'THETA_MLE_ALPHA',
+    'THETA_MLE_RUNS', 'THETA_MLE_N_STARTS',
+    'THETA_MLE_SEED', 'THETA_MLE_LAG_BIN_S', 'THETA_MLE_MOVING_EPOCHS',
     'SPEED_MIN_CMS', 'SPEED_MAX_CMS', 'SPEED_BIN_CMS', 'SPEED_SMOOTH_S',
     'SPEED_MIN_BIN_FRAC', 'SPEED_N_SHUFFLE', 'SPEED_SHUFFLE_MARGIN_S',
     'POS_JUMP_THRESH_CMS', 'POS_SMOOTH_SIGMA_SMP', 'IMMOBILITY_SPEED_CMS',
@@ -805,63 +828,175 @@ def _compute_sparsity(occ_map: np.ndarray, pi_occ: np.ndarray, rate_map: np.ndar
 
 # ── Theta modulation ──────────────────────────────────────────────────────────
 
-def _compute_theta_modulation(
-    spike_ts_us: np.ndarray,
-    window_ms:   float = AUTOCORR_WINDOW_MS,
-    bin_ms:      float = AUTOCORR_BIN_MS,
-    thresh:      float = THETA_POWER_THRESH,
-) -> tuple[bool, float]:
-    """FFT-based theta modulation test on the spike autocorrelogram.
+# Climer et al. 2015 maximum-likelihood rhythmicity test, ported from the
+# authors' toolbox (mle_rhythmicity rev 2.0: mle_rhythmicity.m,
+# cif_generator.m, epoch_data.m). Every lag from a spike to a later spike
+# within (0, max_lag) is modelled by a conditional intensity (cif), normalised
+# over the window into a probability density. Parameters as in the toolbox:
+# tau / c are log10 time constants (s) of the overall decay and of the rhythm
+# decay, b the flat baseline, f the rhythm frequency (Hz), s cycle skipping
+# (0 = none, 1 = every other cycle), r the rhythm depth; the reported
+# rhythmicity is a = (1 - b) * r.
 
-    Mirrors the MATLAB logic:
-      1. Build a ±window_ms autocorrelogram with bin_ms resolution.
-      2. One-sided power spectrum via FFT.
-      3. theta_modulated = peak_power(3–7 Hz) > thresh × mean(full spectrum).
+_THETA_NULL = {'theta_modulated': None, 'theta_peak_freq': None,
+               'theta_rhythmicity': None, 'theta_skipping': None,
+               'theta_p_value': None, 'theta_p_skipping': None,
+               'theta_n_lags': None}
 
-    Returns (theta_modulated, dominant_freq_in_theta_band_hz).
-    spike_ts_us must be in microseconds (raw .ntt timestamps).
+_THETA_LOG10_BOUNDS = (-3.0, 10.0)   # tau, c (toolbox: (-inf, 10]); 10^-3 s = 1 ms time constant
+
+
+def _theta_cif(t, tau, b, c, f, s, r):
+    """Full (skipping) cif, toolbox cif_generator('full'):
+    (1-b) e^(-t/10^tau) (r e^(-t/10^c) K(t) + 1) + b. s = 0 is the toolbox's
+    no-skip model (K = cos 2 pi f t) and r = 0 its flat (non-rhythmic) model."""
+    q = np.sqrt(max(1.0 - s, 0.0))
+    k = ((2 + 2 * q - s) * np.cos(2 * np.pi * f * t) + 4 * s * np.cos(np.pi * f * t)
+         + 2 - 2 * q - 3 * s) / 4.0
+    return (1 - b) * np.exp(-t * 10.0 ** -tau) * (r * np.exp(-t * 10.0 ** -c) * k + 1) + b
+
+
+def _exp_cos_integral(k, w, T):
+    """Integral of e^(-k t) cos(w t) over [0, T]."""
+    return (k - np.exp(-k * T) * (k * np.cos(w * T) - w * np.sin(w * T))) / (k * k + w * w)
+
+
+def _theta_cif_integral(T, tau, b, c, f, s, r):
+    """Integral of _theta_cif over [0, T] in closed form (toolbox skipping_integral)."""
+    q      = np.sqrt(max(1.0 - s, 0.0))
+    decay  = 10.0 ** -tau
+    k      = decay + 10.0 ** -c
+    rhythm = ((2 + 2 * q - s) * _exp_cos_integral(k, 2 * np.pi * f, T)
+              + 4 * s * _exp_cos_integral(k, np.pi * f, T)
+              + (2 - 2 * q - 3 * s) * _exp_cos_integral(k, 0.0, T)) / 4.0
+    return b * T + (1 - b) * -np.expm1(-decay * T) / decay + r * (1 - b) * rhythm
+
+
+def _moving_epochs_us(t_us: np.ndarray) -> np.ndarray:
+    """(n, 2) [start, end] µs of each run of consecutive moving frames. A step
+    > 2 frames (immobile frames removed in compute_metrics, or a tracking gap;
+    same cap as dt_frames) starts a new epoch."""
+    breaks = np.flatnonzero(np.diff(t_us) > 2e6 / fps)
+    starts = np.r_[0, breaks + 1]
+    ends   = np.r_[breaks, len(t_us) - 1]
+    return np.column_stack([t_us[starts], t_us[ends]])
+
+
+def _compute_theta_modulation(spike_ts_us: np.ndarray, epochs_us: np.ndarray) -> dict:
+    """Climer et al. 2015 MLE rhythmicity test on the spike train.
+
+      1. Lags: every spike whose window [t, t + max_lag] lies inside one epoch
+         leads; its lags are all later spikes within (0, max_lag) (toolbox
+         epoch_data, 'lead' mode). Lags are histogrammed at THETA_MLE_LAG_BIN_S
+         and the likelihood evaluated at the bin centres.
+      2. Flat model (tau, b) fitted.
+      3. Starting frequency: best pure sinusoid cos(2 pi f t) + 1 on a 200-point
+         grid over THETA_MLE_F_RANGE, then refined.
+      4. No-skip model (tau, b, c, f, r) with b <= 0.5: THETA_MLE_RUNS
+         differential-evolution searches (the toolbox uses a particle swarm)
+         plus local fits from THETA_MLE_N_STARTS starts drawn like the
+         toolbox's swarm; the best is refined with b <= 1.
+      5. Full model (+ s) started from the no-skip fit with s = 0.05, and from
+         2f with s = 0.95 if 2f is in range; the better fit is kept.
+      6. Likelihood-ratio tests: rhythmic (full vs flat, chi-square df 4) and
+         skipping (full vs no-skip, df 1).
+
+    theta_modulated = rhythmic p < THETA_MLE_ALPHA. theta_peak_freq is the
+    fitted rhythm frequency f (Hz); theta_rhythmicity is a = (1 - b) r.
+    spike_ts_us / epochs_us in microseconds (raw .ntt timestamps).
     """
-    if len(spike_ts_us) < 10:
-        return False, float('nan')
+    max_lag    = THETA_MLE_MAX_LAG_S
+    f_lo, f_hi = THETA_MLE_F_RANGE
+    spk        = np.sort(np.asarray(spike_ts_us, dtype=np.float64)) * 1e-6
+    ep         = np.asarray(epochs_us, dtype=np.float64).reshape(-1, 2) * 1e-6
 
-    spike_ms = np.sort(spike_ts_us) * 1e-3          # µs → ms
-    n_bins   = int(round(2.0 * window_ms / bin_ms))
-    autocorr = np.zeros(n_bins, dtype=np.float64)
+    # 1. Lead spikes and their lags
+    e_idx = np.searchsorted(ep[:, 0], spk, side='right') - 1
+    lead  = np.flatnonzero((e_idx >= 0) & (spk + max_lag <= ep[np.maximum(e_idx, 0), 1]))
+    hi    = np.searchsorted(spk, spk[lead] + max_lag, side='left')   # targets < lead + max_lag
+    n_tgt = hi - lead - 1
+    first = np.cumsum(n_tgt) - n_tgt
+    rep   = np.repeat(lead, n_tgt)
+    tgt   = rep + 1 + np.arange(int(n_tgt.sum())) - np.repeat(first, n_tgt)
+    lags  = spk[tgt] - spk[rep]
+    lags  = lags[lags > 0]
+    n_lags = int(lags.size)
+    if n_lags < 10:
+        return {**_THETA_NULL, 'theta_n_lags': n_lags}
 
-    for i in range(len(spike_ms)):
-        t_ref = spike_ms[i]
-        lo    = int(np.searchsorted(spike_ms, t_ref - window_ms, side='left'))
-        hi    = int(np.searchsorted(spike_ms, t_ref + window_ms, side='right'))
-        diffs = spike_ms[lo:hi] - t_ref
-        diffs = diffs[diffs != 0.0]
-        if len(diffs) == 0:
-            continue
-        bin_idx = ((diffs + window_ms) / bin_ms).astype(int)
-        np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
-        np.add.at(autocorr, bin_idx, 1)
+    counts, edges = np.histogram(lags, bins=int(round(max_lag / THETA_MLE_LAG_BIN_S)),
+                                 range=(0.0, max_lag))
+    keep = counts > 0
+    t_c  = (0.5 * (edges[:-1] + edges[1:]))[keep]
+    n_c  = counts[keep].astype(np.float64)
 
-    # One-sided power spectrum
-    fs      = 1000.0 / bin_ms                       # sampling freq in Hz
-    N       = len(autocorr)
-    f_axis  = np.arange(N, dtype=float) * (fs / N)
-    half    = N // 2
-    f_axis  = f_axis[:half]
-    
-    # MEAN CENTER autocorr to remove DC offset before FFT
-    autocorr_centered = autocorr - autocorr.mean()
-    power   = np.abs(np.fft.fft(autocorr_centered)[:half]) ** 2
+    def _ll(cif_vals, integral):
+        return float(np.sum(n_c * np.log(np.maximum(cif_vals, 1e-300)))
+                     - n_lags * np.log(integral))
 
-    # Peak in theta band (3–7 Hz)
-    theta_mask = (f_axis >= 3.0) & (f_axis <= 7.0)
-    if not theta_mask.any():
-        return False, float('nan')
+    def _nll(p):   # p = (tau, b, c, f, s, r)
+        return -_ll(_theta_cif(t_c, *p), _theta_cif_integral(max_lag, *p))
 
-    theta_power = power[theta_mask]
-    peak_power  = float(theta_power.max())
-    peak_freq   = float(f_axis[theta_mask][np.argmax(theta_power)])
+    def _fit(nll, x0, bounds):
+        res = minimize(nll, x0, method='L-BFGS-B', bounds=bounds)
+        return np.asarray(res.x, dtype=np.float64), -float(res.fun)
 
-    theta_modulated = peak_power > thresh * float(power.mean())
-    return theta_modulated, round(peak_freq, 2)
+    tau_b = c_b = _THETA_LOG10_BOUNDS
+
+    # 2. Flat model; start: tau completes 95% of its decay by max_lag
+    p_flat, ll_flat = _fit(lambda p: _nll((p[0], p[1], 0.0, f_lo, 0.0, 0.0)),
+                           [-np.log10(np.log(1 / 0.95) / max_lag), 0.1],
+                           [tau_b, (0.0, 1.0)])
+
+    # 3. Starting frequency from a pure sinusoid
+    def _nll_pure(f):
+        w = 2 * np.pi * f
+        return -_ll(np.cos(w * t_c) + 1, np.sin(w * max_lag) / w + max_lag)
+    f_grid = np.linspace(f_lo, f_hi, 200)
+    f0 = f_grid[int(np.argmin([_nll_pure(f) for f in f_grid]))]
+    f0 = float(_fit(lambda p: _nll_pure(p[0]), [f0], [(f_lo, f_hi)])[0][0])
+
+    # 4. No-skip model (s = 0), p = (tau, b, c, f, r)
+    def _nll_noskip(p):
+        return _nll((p[0], p[1], p[2], p[3], 0.0, p[4]))
+    search_bounds = [tau_b, (0.0, 0.5), c_b, (f_lo, f_hi), (0.0, 1.0)]
+    rng    = np.random.default_rng(THETA_MLE_SEED)
+    n      = THETA_MLE_N_STARTS
+    starts = np.column_stack([rng.uniform(-2, 1, n), rng.uniform(0, 0.4, n),
+                              rng.uniform(-2, 1, n),
+                              rng.uniform(max(0.9 * f0, f_lo), min(1.1 * f0, f_hi), n),
+                              rng.uniform(0.25, 0.75, n)])
+    starts = [*starts, *(differential_evolution(_nll_noskip, search_bounds, seed=THETA_MLE_SEED + i,
+                                                init='latinhypercube', tol=1e-8,
+                                                polish=False).x
+                         for i in range(THETA_MLE_RUNS))]
+    fits = [_fit(_nll_noskip, x0, search_bounds) for x0 in starts]
+    p_ns, _ = max(fits, key=lambda fit: fit[1])
+    p_ns, ll_noskip = _fit(_nll_noskip, p_ns, [tau_b, (0.0, 1.0), c_b, (f_lo, f_hi), (0.0, 1.0)])
+
+    # 5. Full model, p = (tau, b, c, f, s, r)
+    tau, b, c, f, r = p_ns
+    full_bounds = [tau_b, (0.0, 1.0), c_b, (f_lo, f_hi), (0.0, 1.0), (0.0, 1.0)]
+    x0s = [[tau, b, c, f, 0.05, r]]
+    if 2 * f <= f_hi:
+        x0s.append([tau, b, c, 2 * f, 0.95, r])
+    p_full, ll_full = max((_fit(_nll, x0, full_bounds) for x0 in x0s), key=lambda fit: fit[1])
+    if ll_full < ll_noskip:   # nested models: never report a worse fit than no-skip
+        p_full, ll_full = np.array([tau, b, c, f, 0.0, r]), ll_noskip
+    ll_noskip = max(ll_noskip, ll_flat)
+    ll_full   = max(ll_full, ll_noskip)
+
+    # 6. Likelihood-ratio tests
+    p_rhythmic = float(chi2.sf(2 * (ll_full - ll_flat), 4))
+    p_skipping = float(chi2.sf(2 * (ll_full - ll_noskip), 1))
+    _, b, _, f, s, r = p_full
+    return {'theta_modulated':   bool(p_rhythmic < THETA_MLE_ALPHA),
+            'theta_peak_freq':   round(float(f), 2),
+            'theta_rhythmicity': round(float((1 - b) * r), 4),
+            'theta_skipping':    round(float(s), 4),
+            'theta_p_value':     p_rhythmic,
+            'theta_p_skipping':  p_skipping,
+            'theta_n_lags':      n_lags}
 
 
 # ── Tracking position smoothing ───────────────────────────────────────────────
@@ -3116,7 +3251,7 @@ def _run_job(args):
         'bootstrap_mean': None, 'bootstrap_p95': None, 'bootstrap_sig': None,
         'coherence_bootstrap_mean': None, 'coherence_bootstrap_p95': None,
         'coherence_bootstrap_sig': None,
-        'theta_modulated': None, 'theta_peak_freq': None,
+        **_THETA_NULL,
         'speed_score': None, 'speed_p_value': None, 'speed_r2': None,
         'speed_beta': None, 'speed_f0': None, 'speed_modulated': None,
         'speed_shuffle_mean': None, 'speed_shuffle_lo': None,
@@ -3163,21 +3298,19 @@ def _run_job(args):
         metrics['coherence_bootstrap_p95']  = bootst.get('coherence_bootstrap_p95')
         metrics['coherence_bootstrap_sig']  = bootst.get('coherence_bootstrap_sig')
 
-        # Theta modulation
+        # Theta modulation (Climer et al. 2015 MLE rhythmicity, see
+        # _compute_theta_modulation): moving spikes, lags within moving epochs
         spike_ts = ctx.get('spike_ts') if ctx else None
+        metrics.update(_THETA_NULL)
         if spike_ts is not None and len(spike_ts) >= 10:
             try:
-                theta_mod, theta_freq = _compute_theta_modulation(spike_ts)
-                metrics['theta_modulated'] = theta_mod
-                metrics['theta_peak_freq'] = theta_freq
+                epochs = (_moving_epochs_us(ctx['t']) if THETA_MLE_MOVING_EPOCHS
+                          else np.array([[ctx['t_all'][0], ctx['t_all'][-1]]]))
+                metrics.update(_compute_theta_modulation(spike_ts, epochs))
             except Exception as e:
                 with _print_lock:
                     print(f'  THETA ERROR in {ntt_file} [{label}]: {e}')
-                metrics['theta_modulated'] = None
-                metrics['theta_peak_freq'] = None
-        else:
-            metrics['theta_modulated'] = None
-            metrics['theta_peak_freq'] = None
+                metrics.update(_THETA_NULL)
 
         # Speed modulation — full session only (not run on first/second half splits).
         # Uses the contiguous, pre-immobility-filter track and spikes (ctx['*_all']):
@@ -3531,7 +3664,8 @@ if __name__ == "__main__":
                     'stability_score', 'stability_p_value', 'stability_n_bins',
                     'bootstrap_mean', 'bootstrap_p95', 'bootstrap_sig',
                     'coherence_bootstrap_mean', 'coherence_bootstrap_p95', 'coherence_bootstrap_sig',
-                    'theta_modulated', 'theta_peak_freq',
+                    'theta_modulated', 'theta_peak_freq', 'theta_rhythmicity', 'theta_skipping',
+                    'theta_p_value', 'theta_p_skipping', 'theta_n_lags',
                     'speed_score', 'speed_p_value', 'speed_r2', 'speed_beta', 'speed_f0', 'speed_modulated',
                     'speed_shuffle_mean', 'speed_shuffle_lo', 'speed_shuffle_hi',
                     'speed_shuffle_p', 'speed_modulated_shuffle', 'speed_shuffle_ran',
