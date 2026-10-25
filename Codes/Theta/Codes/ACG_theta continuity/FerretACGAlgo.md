@@ -152,6 +152,40 @@ Since ρ ≈ 1 for essentially any reference in a reasonable band (all reference
 Bottom line: you can prove ED_min > 1 unconditionally only in the "far / uncorrelated" regime (c ≤ 0). <Near the true frequency, ED_min is a smooth function that dips below 1 over a margin of order 1/(epoch duration) around the match> — which is exactly the quantity your simulation script is measuring numerically rather than asserting analytically.
 
 
+
+## correction for ed_min theory:
+
+The algebra is correct, but the conclusion is not. The step that turns the algebra into "1.0 is a sensible cutoff" depends on an assumption that real LFP doesn't meet. I checked each claim against the formula in your code and with a simulation using your pipeline settings (1 s epochs, 1 kHz, 2–10 Hz bank).
+
+Claim by claim
+1. The identity: correct. normED² = ρ² − 2ρc + 1 = (ρ − c)² + (1 − c²), with ρ = ‖x‖/‖r‖ and c the cosine similarity between the data ACG and the reference ACG. It is the same result as my earlier derivation (normED < 1 ⟺ ⟨x, r⟩ > ½‖x‖²), just written differently.
+
+2. "If c ≤ 0 then ED_min > 1 is guaranteed": true but almost never relevant. Both ACGs equal 1 at zero lag and are mostly positive near it, so real epochs essentially never have c ≤ 0. In every case I simulated, c stayed well above 0. The theorem holds but never applies to your data.
+
+3. "ρ ≈ 1, so ED_min < 1 means c > ½": this is the main error. The justification given is that all reference ACGs have similar norms. That's true (‖r‖² is 329–350), but it compares references to each other. ρ compares the data ACG with a reference, and for real signals it is nowhere near 1:
+
+Signal	ρ	c (shape match)	c actually needed (ρ/2)	ED_min
+pure 5 Hz sinusoid	0.997	0.998	0.498	0.058
+white noise	0.077	0.086	0.039	0.996 (passes)
+pink 1/f noise	0.254	0.545	0.127	0.898 (passes)
+brown 1/f² noise	0.740	0.363	0.370	0.995 (on the line)
+theta + white, SNR 0.25	0.213	0.953	0.107	0.799
+theta + brown, SNR 1	0.668	0.802	0.334	0.616
+The real condition is c > ρ/2, and ρ depends on the data. A noisy epoch with a sharply decaying ACG has small ρ, so it passes with almost no shape match: white noise passes with c = 0.086. The decomposition in the pasted text shows this directly. For any fixed c > 0, the lowest possible normED is √(1 − c²), reached at ρ = c, and that is always below 1. So any positively correlated ACG with low enough energy passes, whatever its shape. ED_min mixes an energy-mismatch term (ρ − c)² with a shape-mismatch term (1 − c²), and for noise the energy term dominates.
+
+4. The frequency-gap ("Fejér") section: right in general, wrong in detail, and about a different question.
+
+It's correct that c falls off smoothly as the reference frequency moves away from the true one, on a scale of about 1/T.
+It's wrong that c reaches zero or below near |Δf| ≈ 1/T. For a pure sinusoid, c = 0.152 at 1 Hz and is still 0.039 at 2 Hz. So "c ≤ 0, so ED_min > 1 is guaranteed" never happens there.
+A pure sinusoid does cross ED_min = 1 at about Δf ≈ 0.58 Hz, but only because ρ really is ≈ 1 for that case, so the c > ½ rule happens to hold.
+This section only covers a perfect sinusoid matched at the wrong frequency. That was the question behind ED_min_FrequencyBank_Simulation.py, which does exist and does use brentq as described. It says nothing about whether a noisy epoch is sinusoidal, which is what your threshold is for.
+Bottom line
+Proven: ED_min > 1 when c ≤ 0, which never happens in practice.
+Not proven, and false for noise: ED_min < 1 means "matched". The "c > ½" reading only holds when the data is already nearly a pure sinusoid.
+So the pasted text does not justify 1.0. My earlier simulation stands: 97% of white- and pink-noise epochs pass at 1.0.
+A better metric: if you want a criterion based on shape, threshold on c, the cosine similarity with the best-matching reference. It ignores energy, so it doesn't have the ρ problem. In the table, noise gives c ≈ 0.09–0.55 and theta gives c ≈ 0.80–0.95, a much cleaner split than ED_min gives. Pink noise reaching 0.55 shows the cutoff still has to come from an aperiodic-noise null, as before, not from a round number. I can add c as a column alongside ED_min in your script so you can compare their distributions on real data.
+
+
 # Soraya Dunn MATLAB code:
 
 function [XC, xcTbl] = quantify_xcorr_epochs(data_epochs,freq_range,freq_resolution)
