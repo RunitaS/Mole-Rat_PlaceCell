@@ -111,7 +111,7 @@ RUN_STATS = True                # also run MultiPeak_StatsComparison on the outp
 
 # Output folder (inside Output_PlaceTrue) -- named after the KDE input map and
 # the peak cut-off, so runs with different settings don't overwrite each other.
-MULTIPEAK_SUBDIR = (f'MultiPeak_KDE_Pk75_Tr02_Sm035{KDE_RATEMAP_TYPE}'
+MULTIPEAK_SUBDIR = (f'MultiPeak_KDE_Pk75_Tr02_Sm035_v2{KDE_RATEMAP_TYPE}'
                     f'_Rel{int(round(PEAK_REL_HEIGHT_FRAC * 100))}')
 output_dir   = os.path.join(Output_PlaceTrue, MULTIPEAK_SUBDIR)
 output_excel = os.path.join(output_dir, 'MultiPeak_KDE_Fields.xlsx')
