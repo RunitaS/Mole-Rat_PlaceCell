@@ -125,7 +125,7 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BroadBandFitting')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BroadBandFitting_20HzHighcut')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
@@ -172,13 +172,16 @@ RECORD_TS_MEDIAN_N = 251             # records (~4 s) -- median filter on the re
 LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]  # harmonics below Nyquist (FS_ACG/2 = 500 Hz)
 NOTCH_Q        = 30.0
 
-# ---- Low-pass filtering ----
+# ---- Band-pass filtering ----
 # The raw .ncs trace is broadband (acquired 1-500 Hz). Restrict the signal
-# used for ACG/reference-sinusoid matching to <100 Hz so high-frequency
-# content (well above the 3-7 Hz theta band of interest) can't distort the
-# autocorrelogram shape.
-LOWPASS_CUTOFF_HZ = 100.0  # Hz
-LOWPASS_ORDER = 4          # Butterworth order (zero-phase via filtfilt)
+# used for ACG/reference-sinusoid matching to the span of the reference bank
+# (ACG_REF_BANK, up to 20 Hz) so content the bank can't represent (beta/gamma,
+# EMG) can't distort the autocorrelogram shape. The low cut sits below 1 Hz so
+# the 1-3 Hz DELTA_BAND used by the delta/theta epoch filter is not attenuated;
+# it also removes the DC offset of each epoch before autocorrelation.
+BANDPASS_LOWCUT_HZ  = 0.5   # Hz
+BANDPASS_HIGHCUT_HZ = 20.0  # Hz
+BANDPASS_ORDER = 4          # Butterworth order (zero-phase via sosfiltfilt)
 
 # ---- Artifact rejection (epoch-wise peak-to-peak, robust MAD outlier) ----
 MAD_THRESH = 5.0
@@ -334,12 +337,13 @@ def detrend_signal(x, dtype='linear'):
     return signal.detrend(np.asarray(x, dtype=np.float64), type=dtype) # type: ignore
 
 
-def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
-    """Zero-phase Butterworth low-pass filter (filtfilt, so no phase distortion
-    of the theta-band content the ACG matching cares about)."""
-    nyq = fs_hz / 2.0
-    b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
-    return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
+def bandpass_filter(x, fs_hz, lowcut_hz, highcut_hz, order=4):
+    """Zero-phase Butterworth band-pass filter (sosfiltfilt, so no phase
+    distortion of the theta-band content the ACG matching cares about; SOS
+    form because a sub-Hz low cut at 1 kHz is numerically unstable as b/a)."""
+    sos = signal.butter(order, [lowcut_hz, highcut_hz], btype='bandpass',
+                        fs=fs_hz, output='sos')
+    return signal.sosfiltfilt(sos, np.asarray(x, dtype=np.float64))
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -926,7 +930,7 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
-    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+    lfp = bandpass_filter(lfp, fs_acg, BANDPASS_LOWCUT_HZ, BANDPASS_HIGHCUT_HZ, BANDPASS_ORDER)
 
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
@@ -966,7 +970,7 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
 
 
 def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
-    """Re-derive the cleaned (resampled / notch-filtered / detrended / low-pass
+    """Re-derive the cleaned (resampled / notch-filtered / detrended / band-pass
     filtered) waveform of one specific epoch from its source .ncs file, for
     illustrative plotting (plot_example_epoch). `fpath` + `epoch_index` should
     come from the 'file' / 'epoch_index' columns of a process_ncs_for_acg
@@ -976,7 +980,7 @@ def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
     lfp = detrend_signal(lfp, dtype='linear')
-    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+    lfp = bandpass_filter(lfp, fs_acg, BANDPASS_LOWCUT_HZ, BANDPASS_HIGHCUT_HZ, BANDPASS_ORDER)
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, _ = build_epochs(lfp, nperseg)
     return epochs[int(epoch_index)]
@@ -1911,13 +1915,14 @@ def save_run_metadata(meta_dir=META_DIR):
         'REJECT_PARTIAL_RECORD_EPOCHS': REJECT_PARTIAL_RECORD_EPOCHS,
         'TIMESTAMP_GAP_TOL_US':     TIMESTAMP_GAP_TOL_US,
         'RECORD_TS_MEDIAN_N':       RECORD_TS_MEDIAN_N,
-        # ---- LFP cleaning (resample -> notch -> detrend -> low-pass) ----
+        # ---- LFP cleaning (resample -> notch -> detrend -> band-pass) ----
         'FS_ACG':                   FS_ACG,
         'LINE_HARMONICS':           LINE_HARMONICS,
         'NOTCH_Q':                  NOTCH_Q,
         'detrend_type':             'linear',
-        'LOWPASS_CUTOFF_HZ':        LOWPASS_CUTOFF_HZ,
-        'LOWPASS_ORDER':            LOWPASS_ORDER,
+        'BANDPASS_LOWCUT_HZ':       BANDPASS_LOWCUT_HZ,
+        'BANDPASS_HIGHCUT_HZ':      BANDPASS_HIGHCUT_HZ,
+        'BANDPASS_ORDER':           BANDPASS_ORDER,
         # ---- epoching / epoch rejection ----
         'EPOCH_SEC':                EPOCH_SEC,
         'DELTA_BAND':               DELTA_BAND,

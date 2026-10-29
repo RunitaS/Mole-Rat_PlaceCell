@@ -17,6 +17,10 @@ file), at three levels:
      (ANIMAL_CONTROLLED_COMPARISONS):
          Circle vs Open : Fa8477, Fa5834
          Linear vs Open : Fa1059, Fa23BD
+     Each plot shows these comparisons side by side (left to right in the
+     order of ANIMAL_CONTROLLED_COMPARISONS), each panel with its own
+     within-comparison statistics; the comparisons are not tested against
+     each other.
 
 All levels use the same tests (below). All statistics tables are saved to a
 NEW workbook (+ one long-format CSV) in OUTPUT_DIR, together with the plots:
@@ -25,14 +29,17 @@ NEW workbook (+ one long-format CSV) in OUTPUT_DIR, together with the plots:
     OUTPUT_DIR\\SessionType\\<arena>\\Histograms\\
     OUTPUT_DIR\\ArenaType\\                         box/bar plots, arena types
     OUTPUT_DIR\\ArenaType\\Histograms\\
-    OUTPUT_DIR\\AnimalControlledArenaType\\<A>_vs_<B>\\              box/bar plots
-    OUTPUT_DIR\\AnimalControlledArenaType\\<A>_vs_<B>\\Histograms\\
+    OUTPUT_DIR\\AnimalControlledArenaType\\         box/bar plots, the comparisons side by side
+    OUTPUT_DIR\\AnimalControlledArenaType\\Histograms\\
     OUTPUT_DIR\\AnimalControlledArenaType\\AnimalControlled_Stats.xlsx  level-3 tables only
     OUTPUT_DIR\\SessionArena_Stats.xlsx             sheets 'Ses<arena>_*', 'Arena_*' and
                                                     'AC<A><B>_*' (level 3)
     OUTPUT_DIR\\SessionArena_AllStats.csv
 
-INPUT_EXCEL is only read, not modified.
+INPUT_EXCEL is only read, not modified. The place-field shape columns
+(PlaceFieldShape_Utils.SHAPE_COLUMNS) are written to a COPY of it,
+FIELD_SHAPE_EXCEL ('<INPUT_EXCEL name>_FldShp.xlsx', same folder), in the
+first empty columns of its 'PlaceFields' sheet.
 
 Arena type and session type are both extracted from the folder path stored in
 the 'session' column (column A) of the 'Full' and 'PlaceFields' sheets, e.g.
@@ -65,9 +72,29 @@ Metrics compared (all restricted to place_cell == True):
     - pct_area         Percentage area occupied by fields per cell (sum of
                         each field's pct_of_occupied_area)
 
+  Sheet 'PlaceFields' (one value per field, from 'bin_coords'; see
+  PlaceFieldShape_Utils.py):
+    - fld_max_width_cm   Maximum field width (axis with the most bins)
+    - fld_min_width_cm   Minimum field width (axis with the fewest bins)
+    - fld_axis_angle_deg Angle between the max- and min-width axes
+    - fld_width_ratio    Max width / min width
+    - fld_mean_width_cm  Mean of the max and min widths
+    Circular-track fields are 1-D (angular bins) and have no 2-D shape, so
+    these are compared for Linear and Open only.
+
   Proportions: place-cell yield, theta modulation, coherence shuffle
   significance, split-half stability significance, speed cells, and the
   p-Speed / n-Speed / non-speed classification.
+
+Box-plot points: each point (one unit in one session; for field shape, one
+field) is filled with its group's hue, darker for a higher spatial
+information score (SHADE_METRIC, ranked within the comparison; the lightest
+shade is a tint, SHADE_LIGHT_MIX, so it stays visible). The shades
+are computed separately for every comparison -- each SessionType\\<arena>
+folder, ArenaType, and each AnimalControlledArenaType pair -- and a cell
+keeps its shade in all box plots of that comparison. Significance is shown by
+the marker: o passed / X failed (coherence shuffle, split-half stability),
+^ / v p- / n-type speed cell, X not a speed cell.
 
 Repeated measures: every row is one unit in one session, and a unit recorded
 in several sessions of a day (same animal + day + unit label) appears once per
@@ -100,13 +127,16 @@ Parameters to edit (below):
 
 import os
 import re
+import tempfile
 import textwrap
-from dataclasses import dataclass
+import colorsys
+from dataclasses import dataclass, replace
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
 from scipy import stats
+from PIL import Image
 
 import matplotlib
 matplotlib.use('Agg')
@@ -114,13 +144,19 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
+from matplotlib.colors import to_hex, to_rgb
 
 import CellClusteredStats_Utils as ccs
+import PlaceFieldShape_Utils as pfs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
 INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Alpha200.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\PlaceCellChar'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\PlaceCellChar_v2'
+
+# Copy of INPUT_EXCEL with the place-field shape columns added to its
+# 'PlaceFields' sheet.
+FIELD_SHAPE_EXCEL = os.path.splitext(INPUT_EXCEL)[0] + '_FldShp.xlsx'
 
 STATS_XLSX = os.path.join(OUTPUT_DIR, 'SessionArena_Stats.xlsx')
 STATS_CSV  = os.path.join(OUTPUT_DIR, 'SessionArena_AllStats.csv')
@@ -137,14 +173,16 @@ ALPHA       = 0.05
 
 # Animal-controlled arena comparisons (level 3): {name: (animals, arenas)}.
 # Each compares the given arenas using only the cells of the given animals,
-# which were recorded in all of those arenas. 'name' is the sub-folder of
-# ANIMAL_CONTROLLED_DIR; animal IDs are matched case-insensitively against the
-# animal parsed from the session path (CellClusteredStats_Utils.ANIMAL_PATTERN).
+# which were recorded in all of those arenas. Animal IDs are matched
+# case-insensitively against the animal parsed from the session path
+# (CellClusteredStats_Utils.ANIMAL_PATTERN). The plots of all comparisons are
+# saved side by side (left to right in this order) in ANIMAL_CONTROLLED_DIR.
 ANIMAL_CONTROLLED_DIR = 'AnimalControlledArenaType'
 ANIMAL_CONTROLLED_COMPARISONS = {
     'Circle_vs_Open': (['Fa8477', 'Fa5834'], ['Circle', 'Open']),
     'Linear_vs_Open': (['Fa1059', 'Fa23BD'], ['Linear', 'Open']),
 }
+PANEL_GAP_IN = 0.3   # white gap between the side-by-side panels (inches)
 
 # True: a unit with the same label recorded in two arenas on the same day
 # (same animal + day + unit) is treated as the SAME cell. Only correct if that
@@ -180,6 +218,15 @@ FIELD_METRICS = {
     'pct_area':       'Percentage area occupied by fields per cell',
 }
 
+# Place-field shape, one value per field (PlaceFieldShape_Utils.py).
+FIELD_SHAPE_METRICS = {
+    'fld_max_width_cm':   'Maximum place-field width (cm)',
+    'fld_min_width_cm':   'Minimum place-field width (cm)',
+    'fld_axis_angle_deg': 'Angle between max- and min-width axes (deg)',
+    'fld_width_ratio':    'Place-field width ratio (max / min)',
+    'fld_mean_width_cm':  'Mean place-field width (cm)',
+}
+
 # Stability score is also compared within each stability type (split-half
 # significance, stability_p_value <= ALPHA, and the sign of the score); one
 # extra box plot per type, 'Full_stability_score_<type>.png'.
@@ -210,11 +257,14 @@ CATEGORICAL_METRICS_PLACE_CELLS = {
 class Grouping:
     """What the groups being compared are: the column holding the group label,
     the groups in plotting order, a plural noun for the stats text, and an
-    optional prefix for plot titles (e.g. 'Linear arena')."""
+    optional prefix for plot titles (e.g. 'Linear arena'). `shade` is the
+    per-cell shading of this comparison, {(session, unit): t} (cell_shades),
+    set by run_comparison."""
     col: str
     order: list
     noun: str
     title: str = ''
+    shade: dict = None
 
 
 ARENA_GROUPING = Grouping('arena_type', ARENA_TYPES, 'arena types')
@@ -375,8 +425,12 @@ def _tag_groups(df: pd.DataFrame, what: str) -> pd.DataFrame:
 
 
 def load_sheets():
+    """Read 'Full' and 'PlaceFields', add the field-shape columns to the
+    latter and save them to FIELD_SHAPE_EXCEL (a copy of INPUT_EXCEL)."""
     full   = pd.read_excel(INPUT_EXCEL, sheet_name='Full')
-    fields = pd.read_excel(INPUT_EXCEL, sheet_name='PlaceFields')
+    fields = pfs.add_field_shape(pd.read_excel(INPUT_EXCEL, sheet_name='PlaceFields'))
+    pfs.save_shape_columns(INPUT_EXCEL, FIELD_SHAPE_EXCEL, fields)
+    print(f'Place-field shape columns saved to {FIELD_SHAPE_EXCEL}')
     return full, fields
 
 
@@ -405,6 +459,16 @@ def build_field_metrics_df(full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataF
         merged[col] = merged[col].fillna(0.0)
 
     return _tag_groups(merged, 'place cell(s) (field analysis)')
+
+
+def build_field_shape_df(full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataFrame:
+    """One row per place field of a place cell, with its shape columns.
+    Fields with no 2-D shape (circular track) are dropped."""
+    place_cells = full[full['place_cell'].apply(_to_bool)][['session', 'unit']].drop_duplicates()
+    df = fields[['session', 'unit', 'field_number'] + pfs.SHAPE_COLUMNS].merge(
+        place_cells, on=['session', 'unit'], how='inner')
+    df = df.dropna(subset=['fld_max_width_cm'])
+    return _tag_groups(df, 'place field(s) (field-shape analysis)')
 
 
 def build_all_units_df(full: pd.DataFrame) -> pd.DataFrame:
@@ -535,7 +599,7 @@ plt.rcParams.update({
 
 # Per-group colors. face = fill for boxes/bars/histograms/points; dark / light
 # = deeper and paler tones of that shade, used for p-type / n-type speed cells
-# (see _point_colors, plot_speed_direction); edge = point outline.
+# (see plot_speed_direction); edge = point outline.
 def _shade(face, dark, light):
     return {'face': face, 'edge': PAL_BLACK, 'dark': dark, 'light': light}
 
@@ -570,6 +634,49 @@ _DEFAULT_COLOR = {'face': PAL_GRAY, 'edge': PAL_BLACK, 'dark': PAL_GRAY, 'light'
 # Points that failed their significance/shuffle test are always drawn in this
 # neutral gray (the reference figures' "discarded" gray), regardless of group.
 SIG_GRAY = {'face': PAL_GRAY, 'edge': PAL_BLACK}
+
+# Per-cell shading: every point in the box plots is filled with its group's
+# hue, darker for a higher SHADE_METRIC (spatial information score). The
+# shades are computed once per comparison -- each SessionType\<arena> folder,
+# ArenaType, and each animal-controlled pair -- from that comparison's place
+# cells, and a cell (one unit in one session) keeps its shade in every box
+# plot of that comparison (all fields of a cell share the cell's shade).
+SHADE_METRIC    = 'sir'
+SHADE_SCALE     = 'rank'          # 'rank': percentile of the score; 'linear': min-max of the score
+# Lowest score: the group's pure hue mixed with SHADE_LIGHT_MIX white (kept
+# well below 1 so it stays visible); highest score: the pure hue scaled to
+# SHADE_DARK_KEEP of its brightness. Shades in between are blended linearly.
+SHADE_LIGHT_MIX = 0.45
+SHADE_DARK_KEEP = 0.35
+
+# Point markers for the significance metrics (the fill stays the cell's shade).
+MARKER_PASS, MARKER_FAIL, MARKER_P, MARKER_N = 'o', 'X', '^', 'v'
+MARKER_SIZE = {MARKER_PASS: 22}   # others: 30 (they look smaller at equal area)
+
+
+def cell_shades(df: pd.DataFrame) -> dict:
+    """{(session, unit): t}, t from 0 (lowest SHADE_METRIC in `df`) to 1
+    (highest); rows with no score are left out."""
+    v = pd.to_numeric(df[SHADE_METRIC], errors='coerce')
+    ok = v.notna()
+    v = v[ok]
+    if SHADE_SCALE == 'rank':
+        t = (v.rank(method='average') - 1) / max(len(v) - 1, 1)
+    elif SHADE_SCALE == 'linear':
+        span = v.max() - v.min()
+        t = (v - v.min()) / span if span > 0 else v * 0 + 0.5
+    else:
+        raise ValueError(f"SHADE_SCALE must be 'rank' or 'linear', not {SHADE_SCALE!r}")
+    return dict(zip(zip(df.loc[ok, 'session'], df.loc[ok, 'unit']), t))
+
+
+def _cell_color(group: str, t: float) -> str:
+    """The group's hue at shade position t (0 = lightest tint, 1 = darkest)."""
+    h, _l, s = colorsys.rgb_to_hls(*to_rgb(_color(group)['face']))
+    pure  = np.array(colorsys.hls_to_rgb(h, 0.5, s))
+    light = pure + (1.0 - pure) * SHADE_LIGHT_MIX
+    dark  = pure * SHADE_DARK_KEEP
+    return to_hex(light + (dark - light) * t)
 
 
 def _color(group: str) -> dict:
@@ -743,76 +850,72 @@ def _draw_sig_brackets(ax, pos_by_group: dict, posthoc_df, y_base: float,
     return y - y_step if sig else None
 
 
-# Metrics whose individual points are shaded by p-value/shuffle-test status
-# rather than plain group color -- see _point_colors. Also drives which plots
-# get a significance legend.
+# Metrics whose individual points get a marker by p-value/shuffle-test status
+# -- see _point_styles. Also drives which plots get a significance legend.
 SIGNIFICANCE_METRICS = {'coherence', 'stability_score', 'final_speed_score'}
 
 
-def _point_colors(metric_col: str, sub: pd.DataFrame, group: str) -> list:
-    """Per-point (face, edge) colors for one group's jittered scatter dots,
-    aligned row-for-row with `sub` (which must still be indexed against the
-    original columns, e.g. 'coherence_bootstrap_sig').
+def _point_styles(metric_col: str, sub: pd.DataFrame, group: str, shades: dict) -> list:
+    """Per-point (face, marker) for one group's jittered scatter points,
+    aligned row-for-row with `sub` (which must still hold the original
+    columns, e.g. 'coherence_bootstrap_sig').
 
-    - coherence: gray only if the cell's coherence failed its shuffle test
-      (coherence_bootstrap_sig is False); untested/blank cells keep the
-      group color.
-    - stability_score: gray unless its split-half p-value is <= ALPHA.
-    - final_speed_score: gray unless speed_cell is True (False / 'not
-      tested' are gray); p-type cells (score > 0) get the darker tone, n-type
-      cells (score < 0) the lighter tone.
-    - everything else: plain group face/edge for every point.
+    face: the cell's shade (`shades`, see cell_shades); the plain group color
+    for cells with no shade. marker:
+    - coherence: MARKER_FAIL only if the cell's coherence failed its shuffle
+      test (coherence_bootstrap_sig is False); untested/blank cells keep
+      MARKER_PASS.
+    - stability_score: MARKER_FAIL unless its split-half p-value is <= ALPHA.
+    - final_speed_score: MARKER_P / MARKER_N for p-type (score > 0) / n-type
+      (score < 0) speed cells, MARKER_FAIL for the rest (speed_cell False /
+      'not tested').
+    - everything else: MARKER_PASS.
     """
-    c = _color(group)
-    base = (c['face'], c['edge'])
-    gray = (SIG_GRAY['face'], SIG_GRAY['edge'])
+    shades = shades or {}
+    base = _color(group)['face']
+    faces = [_cell_color(group, shades[k]) if k in shades else base
+             for k in zip(sub['session'], sub['unit'])]
 
     if metric_col == 'coherence':
-        # Only an explicit False (failed shuffle) is gray; untested/blank cells
-        # (None) keep the group color.
-        return [gray if _to_tri_bool(s) is False else base
-                for s in sub['coherence_bootstrap_sig']]
-
-    if metric_col == 'stability_score':
+        markers = [MARKER_FAIL if _to_tri_bool(s) is False else MARKER_PASS
+                   for s in sub['coherence_bootstrap_sig']]
+    elif metric_col == 'stability_score':
         p = pd.to_numeric(sub['stability_p_value'], errors='coerce')
-        return [base if (pd.notna(v) and v <= ALPHA) else gray for v in p]
-
-    if metric_col == 'final_speed_score':
-        tone = {'p': (c['dark'], c['edge']), 'n': (c['light'], c['edge'])}
-        return [tone.get(k, gray) for k in sub['speed_class']]
-
-    return [base] * len(sub)
+        markers = [MARKER_PASS if (pd.notna(v) and v <= ALPHA) else MARKER_FAIL for v in p]
+    elif metric_col == 'final_speed_score':
+        markers = [{'p': MARKER_P, 'n': MARKER_N}.get(k, MARKER_FAIL) for k in sub['speed_class']]
+    else:
+        markers = [MARKER_PASS] * len(sub)
+    return list(zip(faces, markers))
 
 
 _SIGNIFICANCE_LEGENDS = {
     'coherence': [
-        ('colored', 'passed shuffle test (p < 0.05) / not tested'),
-        ('gray',    'failed shuffle test'),
+        (MARKER_PASS, 'passed shuffle test (p < 0.05) / not tested'),
+        (MARKER_FAIL, 'failed shuffle test'),
     ],
     'stability_score': [
-        ('colored', f'p ≤ {ALPHA:g}'),
-        ('gray',    f'p > {ALPHA:g}'),
+        (MARKER_PASS, f'p ≤ {ALPHA:g}'),
+        (MARKER_FAIL, f'p > {ALPHA:g}'),
     ],
     'final_speed_score': [
-        ('dark',  'p-type speed cell (positive)'),
-        ('light', 'n-type speed cell (negative)'),
-        ('gray',  'not a speed cell / not tested'),
+        (MARKER_P,    'p-type speed cell (positive)'),
+        (MARKER_N,    'n-type speed cell (negative)'),
+        (MARKER_FAIL, 'not a speed cell / not tested'),
     ],
 }
 
 
-def _add_significance_legend(ax_info, metric_col: str, ref: dict):
-    """Draw the significance legend into the borderless panel below the plot,
-    using the tones of the color dict `ref` as examples."""
+def _add_significance_legend(ax_info, metric_col: str, face: str):
+    """Draw the significance (marker) legend into the borderless panel below
+    the plot, with `face` as the example fill."""
     entries = _SIGNIFICANCE_LEGENDS.get(metric_col)
     if not entries:
         return
-    tone_face = {'colored': ref['face'], 'dark': ref['dark'],
-                 'light': ref['light'], 'gray': SIG_GRAY['face']}
-    handles = [Line2D([0], [0], marker='o', linestyle='None', markersize=8,
-                       markerfacecolor=tone_face[tone], markeredgecolor=PAL_BLACK,
+    handles = [Line2D([0], [0], marker=marker, linestyle='None', markersize=8,
+                       markerfacecolor=face, markeredgecolor=PAL_BLACK,
                        markeredgewidth=0.5, label=label)
-               for tone, label in entries]
+               for marker, label in entries]
     ax_info.legend(handles=handles, loc='upper center', fontsize=FS_LEGEND, ncol=1)
 
 
@@ -835,6 +938,11 @@ def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: 
 
     has_legend = metric_col in SIGNIFICANCE_METRICS
     fig_w = _bar_fig_width(len(present))
+    if grp.shade:
+        stats_lines = list(stats_lines or []) + [
+            f'Point shade: the cell\'s {FULL_METRICS[SHADE_METRIC].lower()} '
+            f'({"rank" if SHADE_SCALE == "rank" else "value"} within this comparison), '
+            f'darker = higher']
     stats_lines = _wrap_stats(stats_lines, fig_w)
     fig, ax, ax_info = _new_fig(
         (fig_w, 5.5), stats_lines=stats_lines,
@@ -853,12 +961,14 @@ def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: 
 
     rng = np.random.default_rng(0)
     for pos, g, vals in zip(positions, present, data):
-        colors = _point_colors(metric_col, subsets[g], g)
-        faces  = [fc for fc, _ec in colors]
-        edges  = [ec for _fc, ec in colors]
-        jitter = rng.uniform(-0.12, 0.12, size=len(vals))
-        ax.scatter(np.full(len(vals), pos) + jitter, vals, s=22,
-                   facecolors=faces, edgecolors=edges, linewidths=0.5, zorder=3)
+        styles  = _point_styles(metric_col, subsets[g], g, grp.shade)
+        faces   = np.array([fc for fc, _m in styles])
+        markers = np.array([m for _fc, m in styles])
+        x = pos + rng.uniform(-0.12, 0.12, size=len(vals))
+        for m in dict.fromkeys(markers):
+            sel = markers == m
+            ax.scatter(x[sel], vals[sel], s=MARKER_SIZE.get(m, 30), marker=m,
+                       facecolors=faces[sel], edgecolors=PAL_BLACK, linewidths=0.5, zorder=3)
 
     # Significance lines above significantly different pairs of groups.
     y_lo, y_hi = ax.get_ylim()
@@ -871,7 +981,7 @@ def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: 
         ax.set_ylim(y_lo, max(y_hi, top + 0.08 * span))
 
     if has_legend:
-        _add_significance_legend(ax_info, metric_col, _color(present[0]))
+        _add_significance_legend(ax_info, metric_col, _cell_color(present[0], 0.5))
     _draw_stats(ax_info, stats_lines)
 
     tick_labels = [f'{_label(g)}\n(n={len(subsets[g])})' for g in present]
@@ -1272,7 +1382,7 @@ def _print_significant(tbl: pd.DataFrame, title: str, metric_width: int, test_wi
 
 
 def run_comparison(grp: Grouping, full_df: pd.DataFrame, field_df: pd.DataFrame,
-                   all_units_df: pd.DataFrame, plots_dir: str) -> dict:
+                   shape_df: pd.DataFrame, all_units_df: pd.DataFrame, plots_dir: str) -> dict:
     """Compare every metric across the groups of `grp` -- statistics, box/bar
     plots in `plots_dir` and histograms in `plots_dir`/Histograms. The
     dataframes must already be restricted to the cells to compare. Returns
@@ -1286,15 +1396,20 @@ def run_comparison(grp: Grouping, full_df: pd.DataFrame, field_df: pd.DataFrame,
         print('No place cells; skipping.')
         return {}
 
+    # Each cell's shade, from this comparison's place cells only.
+    grp = replace(grp, shade=cell_shades(full_df))
+
     # ── Continuous metrics ──────────────────────────────────────────────────
     full_desc, full_omnibus, full_posthoc = run_all_comparisons(
         full_df, FULL_METRICS, 'Full', grp, plots_dir)
     field_desc, field_omnibus, field_posthoc = run_all_comparisons(
         field_df, FIELD_METRICS, 'Fields', grp, plots_dir)
+    shape_desc, shape_omnibus, shape_posthoc = run_all_comparisons(
+        shape_df, FIELD_SHAPE_METRICS, 'FieldShape', grp, plots_dir)
 
-    desc_df    = pd.concat([full_desc, field_desc], ignore_index=True)
-    omnibus_df = pd.concat([full_omnibus, field_omnibus], ignore_index=True)
-    posthoc_df = pd.concat([full_posthoc, field_posthoc], ignore_index=True)
+    desc_df    = pd.concat([full_desc, field_desc, shape_desc], ignore_index=True)
+    omnibus_df = pd.concat([full_omnibus, field_omnibus, shape_omnibus], ignore_index=True)
+    posthoc_df = pd.concat([full_posthoc, field_posthoc, shape_posthoc], ignore_index=True)
 
     extra_desc, extra_omnibus, extra_posthoc = run_all_comparisons(
         full_df, EXTRA_FULL_METRICS, 'Full', grp, plots_dir)
@@ -1359,6 +1474,9 @@ def run_comparison(grp: Grouping, full_df: pd.DataFrame, field_df: pd.DataFrame,
     for col, label in FIELD_METRICS.items():
         plot_histogram_by_group(field_df, col, label,
                                 os.path.join(hist_dir, f'Hist_Fields_{col}.png'), grp)
+    for col, label in FIELD_SHAPE_METRICS.items():
+        plot_histogram_by_group(shape_df, col, label,
+                                os.path.join(hist_dir, f'Hist_FieldShape_{col}.png'), grp)
     for col, label in SPEED_METRICS.items():
         plot_speed_histograms_by_group(full_df, col, label,
                                        os.path.join(hist_dir, f'Hist_Speed_{col}.png'), grp)
@@ -1383,38 +1501,88 @@ def run_comparison(grp: Grouping, full_df: pd.DataFrame, field_df: pd.DataFrame,
     }
 
 
-def run_animal_controlled(full_df: pd.DataFrame, field_df: pd.DataFrame,
+def _stitch_side_by_side(paths: list, out_path: str):
+    """Save the images `paths` side by side (top-aligned, PANEL_GAP_IN apart,
+    on white) as one image. A missing image (None) leaves a blank space as
+    wide as the widest one, so every comparison keeps its position."""
+    imgs = []
+    for p in paths:
+        if p is None:
+            imgs.append(None)
+            continue
+        with Image.open(p) as im:
+            imgs.append(im.convert('RGB'))
+    present = [im for im in imgs if im is not None]
+    blank_w = max(im.width for im in present)
+    widths = [im.width if im is not None else blank_w for im in imgs]
+    gap = int(round(PANEL_GAP_IN * FIG_DPI))
+    canvas = Image.new('RGB', (sum(widths) + gap * (len(imgs) - 1),
+                               max(im.height for im in present)), 'white')
+    x = 0
+    for im, w in zip(imgs, widths):
+        if im is not None:
+            canvas.paste(im, (x, 0))
+        x += w + gap
+    canvas.save(out_path, dpi=(FIG_DPI, FIG_DPI))
+
+
+def _combine_side_by_side(src_dirs: list, out_dir: str):
+    """For every .png found in any of `src_dirs` (by path relative to it,
+    e.g. 'Histograms\\Hist_Full_sir.png'), save the versions from all
+    `src_dirs` side by side, in that order, to the same path in `out_dir`."""
+    rel_paths = sorted({os.path.relpath(os.path.join(root, f), d)
+                        for d in src_dirs for root, _dirs, files in os.walk(d)
+                        for f in files if f.lower().endswith('.png')})
+    for rel in rel_paths:
+        out_path = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        srcs = [os.path.join(d, rel) for d in src_dirs]
+        _stitch_side_by_side([p if os.path.isfile(p) else None for p in srcs], out_path)
+    print(f'\n{len(rel_paths)} side-by-side plots '
+          f'({" | ".join(os.path.basename(d) for d in src_dirs)}) saved to {out_dir}')
+
+
+def run_animal_controlled(full_df: pd.DataFrame, field_df: pd.DataFrame, shape_df: pd.DataFrame,
                           all_units_df: pd.DataFrame, out_dir: str) -> dict:
     """Level 3: for each entry of ANIMAL_CONTROLLED_COMPARISONS, compare its
     arenas using only the cells of its animals (same tests/plots as the
-    arena-type comparison). Plots go to out_dir\\<name>; the tables are also
-    saved to out_dir\\AnimalControlled_Stats.xlsx. Returns {sheet_name: table}."""
+    arena-type comparison). Each plot is saved to out_dir (histograms to
+    out_dir\\Histograms) with the comparisons side by side, each with its own
+    statistics -- the comparisons are not tested against each other. The
+    tables are also saved to out_dir\\AnimalControlled_Stats.xlsx. Returns
+    {sheet_name: table}."""
     all_tables = {}
-    for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
-        grp = animal_controlled_grouping(animals, arenas)
-        wanted = {a.lower() for a in animals}
+    # Each comparison's plots are first saved to its own temporary folder,
+    # then combined side by side.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+            grp = animal_controlled_grouping(animals, arenas)
+            wanted = {a.lower() for a in animals}
 
-        def _select(d):
-            return d[d['animal'].astype(str).str.lower().isin(wanted)
-                     & d['arena_type'].isin(grp.order)]
+            def _select(d):
+                return d[d['animal'].astype(str).str.lower().isin(wanted)
+                         & d['arena_type'].isin(grp.order)]
 
-        sel_full = _select(full_df)
-        print(f'\n{name}: place cells per animal and arena (Full sheet):')
-        print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
-        for arena in grp.order:
-            missing = [a for a in animals
-                       if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
-                               & (sel_full['arena_type'] == arena)).any()]
-            if missing:
-                print(f'WARNING: no place cells of {missing} in the {arena} arena.')
+            sel_full = _select(full_df)
+            print(f'\n{name}: place cells per animal and arena (Full sheet):')
+            print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
+            for arena in grp.order:
+                missing = [a for a in animals
+                           if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
+                                   & (sel_full['arena_type'] == arena)).any()]
+                if missing:
+                    print(f'WARNING: no place cells of {missing} in the {arena} arena.')
 
-        tables = run_comparison(grp, sel_full, _select(field_df), _select(all_units_df),
-                                os.path.join(out_dir, name))
-        tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
-        for tname, tbl in tables.items():
-            if len(tbl):
-                tbl.insert(0, 'animals', ', '.join(animals))
-            all_tables[f'{tag}_{tname}'] = tbl
+            tables = run_comparison(grp, sel_full, _select(field_df), _select(shape_df),
+                                    _select(all_units_df), os.path.join(tmp_dir, name))
+            tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
+            for tname, tbl in tables.items():
+                if len(tbl):
+                    tbl.insert(0, 'animals', ', '.join(animals))
+                all_tables[f'{tag}_{tname}'] = tbl
+
+        _combine_side_by_side([os.path.join(tmp_dir, name) for name in ANIMAL_CONTROLLED_COMPARISONS],
+                              out_dir)
 
     if all_tables:
         os.makedirs(out_dir, exist_ok=True)
@@ -1432,6 +1600,7 @@ if __name__ == '__main__':
 
     full_df      = build_full_metrics_df(full)
     field_df     = build_field_metrics_df(full, fields)
+    shape_df     = build_field_shape_df(full, fields)
     all_units_df = build_all_units_df(full)
 
     print('\nPlace cells by arena and session type (Full sheet):')
@@ -1449,7 +1618,7 @@ if __name__ == '__main__':
             return d[(d['arena_type'] == arena) & d['session_type'].isin(grp.order)]
 
         tables = run_comparison(grp, _in_arena(full_df), _in_arena(field_df),
-                                _in_arena(all_units_df),
+                                _in_arena(shape_df), _in_arena(all_units_df),
                                 os.path.join(OUTPUT_DIR, 'SessionType', arena))
         for name, tbl in tables.items():
             if len(tbl) and 'arena_type' not in tbl.columns:
@@ -1457,14 +1626,15 @@ if __name__ == '__main__':
             all_tables[f'Ses{arena}_{name}'] = tbl
 
     # ── 2. Arena types as a whole (all session types pooled) ────────────────
-    tables = run_comparison(ARENA_GROUPING, full_df, field_df, all_units_df,
+    tables = run_comparison(ARENA_GROUPING, full_df, field_df, shape_df, all_units_df,
                             os.path.join(OUTPUT_DIR, 'ArenaType'))
     for name, tbl in tables.items():
         all_tables[f'Arena_{name}'] = tbl
 
     # ── 3. Arena types, only animals recorded in all compared arenas ────────
     all_tables.update(run_animal_controlled(
-        full_df, field_df, all_units_df, os.path.join(OUTPUT_DIR, ANIMAL_CONTROLLED_DIR)))
+        full_df, field_df, shape_df, all_units_df,
+        os.path.join(OUTPUT_DIR, ANIMAL_CONTROLLED_DIR)))
 
     # ── Save all statistics (new workbook + one long-format CSV) ────────────
     # Sheet names are capped at 31 characters by Excel.

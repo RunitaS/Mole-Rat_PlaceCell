@@ -53,16 +53,31 @@ classification with chi-square tests. Place-cell yield is left out: only place c
 PLACE_CELL_DIR, so non-place cells have no zone.
 
 TEMPORAL STABILITY (TS_METRICS, every panel above): from TEMPORAL_STABILITY_EXCEL, the
-output of TemporalStabilityMap_v4_OccWgh.py (per field bin: % of visits with >= 1 spike). Only
-each cell's HIGHEST-PEAK FIELD is used: the field holding the field bin with the highest raw rate
-(n_spikes / occupancy_s of the PerBin sheet); that bin is the field's peak bin. Per cell:
+output of TemporalStabilityMap_v6_MapPassStability.py (per field bin: % of visits with >= 1
+spike). Except for ts_occ_wmean_pct_all_bins, only each cell's HIGHEST-PEAK FIELD is used: the
+field holding the field bin with the highest raw rate (n_spikes / occupancy_s of the PerBin
+sheet); that bin is the field's peak bin. Per cell:
   ts_mean_pct         mean   % across the bins of that field (PerField mean_pct_across_bins)
   ts_median_pct       median % across the bins of that field (PerField median_pct_across_bins)
   ts_occ_wmean_pct    occupancy-weighted mean / median % across the bins of that field, each bin
   ts_occ_wmedian_pct  weighted by its dwell time (PerField occ_wmean_pct_across_bins /
                       occ_wmedian_pct_across_bins), so poorly sampled bins count less
+  ts_occ_wmean_pct_mapnorm   sum over the bins of that field of % x dwell, divided by the dwell
+                      of ALL valid bins of the map (= ts_occ_wmean_pct x the fraction of map
+                      dwell spent in the field; PerField occ_wmean_pct_mapnorm)
+  ts_occ_wmean_pct_all_bins  occupancy-weighted mean % over EVERY visited valid bin of the map,
+                      in or out of a field (PerCell occ_wmean_pct_all_bins; not field-specific)
   ts_pct_at_peak_bin  % at the field's peak bin (PerBin pct_visits_with_spike)
-The cell's zone is still that of its raw-map peak bin above. Same CONTINUOUS_TEST, box plots
+  LAP (PASS) STABILITY: a pass is one entry -> exit run through a field; it is stable if it holds
+  >= LAP_MIN_SPIKES spikes (v6's MIN_SPIKES_PER_PASS). Score = stable passes / passes (0-1).
+  ts_lap_stability            that field's score (PerField lap_stability_score)
+  ts_lap_stability_pooled     passes through EVERY field of the cell pooled (PerCell
+                              lap_stability_score; not field-specific)
+  ts_lap_stability_field_mean mean of the per-field scores of the cell, every field weighted
+                              equally (PerCell mean_lap_stability_across_fields)
+The two map-wide measures have no median: rescaling the weights leaves a weighted median
+unchanged, and PerBin holds field bins only. The cell's zone is still that of its raw-map peak
+bin above. Same CONTINUOUS_TEST, box plots
 (TemporalStability_<metric>.png) and histograms as the other continuous metrics; tables
 <prefix>_TS_Desc / _TS_Omnibus / _TS_PostHoc. Cells absent from TEMPORAL_STABILITY_EXCEL (no
 field detected there) are left out of these tests only.
@@ -111,13 +126,18 @@ import matplotlib.pyplot as plt                      # noqa: E402
 
 INPUT_EXCEL    = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Alpha200.xlsx'
 PLACE_CELL_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
-OUTPUT_DIR     = os.path.join(PLACE_CELL_DIR, 'Results', 'EdgeCentreZone')
+OUTPUT_DIR     = os.path.join(PLACE_CELL_DIR, 'Results', 'EdgeCentreZone_DistFunc')
 
-# Output of TemporalStabilityMap_v4_OccWgh.py (PerField + PerBin sheets) on PLACE_CELL_DIR.
-TEMPORAL_STABILITY_EXCEL = os.path.join(PLACE_CELL_DIR, 'Results', 'TemporalStabilityStats',
-                                        'TemporalStability.xlsx')
+# Output of TemporalStabilityMap_v6_MapPassStability.py (PerCell + PerField + PerBin sheets) on
+# PLACE_CELL_DIR.
+TEMPORAL_STABILITY_EXCEL = os.path.join(PLACE_CELL_DIR, 'Results', 'TemporalStability.xlsx')
 
-# Temporal stability of each cell's highest-peak field, compared between the zones.
+# MIN_SPIKES_PER_PASS of the v6 run that made TEMPORAL_STABILITY_EXCEL (plot labels only: the
+# lap stability scores are read from the workbook).
+LAP_MIN_SPIKES = 5
+
+# Temporal stability of each cell's highest-peak field (ts_occ_wmean_pct_all_bins: whole map),
+# compared between the zones.
 TS_METRICS = {
     'ts_mean_pct':        'Temporal stability, mean across the bins of the highest-peak field '
                           '(% visits with >= 1 spike)',
@@ -127,12 +147,22 @@ TS_METRICS = {
                           'highest-peak field (% visits with >= 1 spike)',
     'ts_occ_wmedian_pct': 'Temporal stability, occupancy-weighted median across the bins of the '
                           'highest-peak field (% visits with >= 1 spike)',
-    'ts_pct_at_peak_bin': 'Temporal stability at the peak bin of the highest-peak field '
+    'ts_occ_wmean_pct_mapnorm':  'Temporal stability of the highest-peak field weighted by dwell, '
+                                 'normalised to whole-map dwell (%)',
+    'ts_occ_wmean_pct_all_bins': 'Temporal stability, occupancy-weighted mean across all visited '
+                                 'map bins (% visits with >= 1 spike)',
+    'ts_pct_at_peak_bin':'Temporal stability at the peak bin of the highest-peak field '
                           '(% visits with >= 1 spike)',
+    'ts_lap_stability':   f'Lap stability of the highest-peak field (fraction of passes with '
+                          f'>= {LAP_MIN_SPIKES} spikes)',
+    'ts_lap_stability_pooled':     f'Lap stability, passes pooled over all fields (fraction of '
+                                   f'passes with >= {LAP_MIN_SPIKES} spikes)',
+    'ts_lap_stability_field_mean': f'Mean lap stability across fields (fraction of passes with '
+                                   f'>= {LAP_MIN_SPIKES} spikes)',
 }
 
 # A session is analysed only if BOTH zones hold >= this % of its dwell time.
-MIN_ZONE_DWELL_PCT = 20.0
+MIN_ZONE_DWELL_PCT = 40.0
 
 # Test for the continuous metrics ('KW' or 'LMM'; see ArenaSessionType_StatsComparison_v10.py).
 CONTINUOUS_TEST = 'KW'
@@ -147,7 +177,7 @@ ZONES = {
 # Arena geometry (as in v27_5 ARENA_CONFIGS)
 BIN_CM                        = 2.0
 OPEN_DIAMETER_CM              = 60.0
-OPEN_EDGE_ZONE_THRESHOLD_CM   = 9.25
+OPEN_EDGE_ZONE_THRESHOLD_CM   = 4#9.25
 LINEAR_LENGTH_CM              = 80.0
 LINEAR_WIDTH_CM               = 8.0
 LINEAR_EDGE_ZONE_THRESHOLD_CM = 2.0
@@ -611,11 +641,21 @@ def attach_zones(df: pd.DataFrame, cells_df: pd.DataFrame, what: str) -> pd.Data
 # ── Temporal stability of each cell's highest-peak field ────────────────────
 
 def load_temporal_stability(path: str) -> pd.DataFrame:
-    """One row per cell of TemporalStabilityMap_v4_OccWgh.py's output: its highest-peak field
-    (the field holding the field bin with the highest raw rate, n_spikes / occupancy_s; first
-    bin on ties), that field's peak bin, and the TS_METRICS of both. Keyed by _skey / _ukey."""
+    """One row per cell of TemporalStabilityMap_v6_MapPassStability.py's output: its highest-peak
+    field (the field holding the field bin with the highest raw rate, n_spikes / occupancy_s;
+    first bin on ties), that field's peak bin, the TS_METRICS of both and the cell's whole-map
+    occupancy-weighted mean (PerCell). Keyed by _skey / _ukey."""
     bins = pd.read_excel(path, sheet_name='PerBin')
     fields = pd.read_excel(path, sheet_name='PerField')
+    cells = pd.read_excel(path, sheet_name='PerCell')
+    for sheet, df, cols in (('PerField', fields, ['occ_wmean_pct_mapnorm', 'n_passes',
+                                                  'n_passes_with_min_spikes', 'lap_stability_score']),
+                            ('PerCell', cells, ['occ_wmean_pct_all_bins', 'lap_stability_score',
+                                                'mean_lap_stability_across_fields'])):
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise KeyError(f'{sheet} sheet of {path} has no column(s) {missing}; it must be the '
+                           f'output of TemporalStabilityMap_v6_MapPassStability.py.')
 
     bins['ts_peak_bin_rate_hz'] = bins['n_spikes'] / bins['occupancy_s'].where(bins['occupancy_s'] > 0)
     bins = bins.dropna(subset=['ts_peak_bin_rate_hz'])
@@ -628,14 +668,26 @@ def load_temporal_stability(path: str) -> pd.DataFrame:
     n_fields = fields.groupby(['session', 'unit']).size().rename('ts_n_fields').reset_index()
     fields = fields[['session', 'unit', 'field_number', 'n_field_bins', 'mean_pct_across_bins',
                      'median_pct_across_bins', 'occ_wmean_pct_across_bins',
-                     'occ_wmedian_pct_across_bins']].rename(columns={
+                     'occ_wmedian_pct_across_bins', 'occ_wmean_pct_mapnorm', 'n_passes',
+                     'n_passes_with_min_spikes', 'lap_stability_score']].rename(columns={
         'field_number': 'ts_field_number', 'n_field_bins': 'ts_n_field_bins',
         'mean_pct_across_bins': 'ts_mean_pct', 'median_pct_across_bins': 'ts_median_pct',
         'occ_wmean_pct_across_bins': 'ts_occ_wmean_pct',
-        'occ_wmedian_pct_across_bins': 'ts_occ_wmedian_pct'})
+        'occ_wmedian_pct_across_bins': 'ts_occ_wmedian_pct',
+        'occ_wmean_pct_mapnorm': 'ts_occ_wmean_pct_mapnorm',
+        'n_passes': 'ts_n_passes', 'n_passes_with_min_spikes': 'ts_n_passes_with_min_spikes',
+        'lap_stability_score': 'ts_lap_stability'})
+    cells = cells.drop_duplicates(['session', 'unit'])[
+        ['session', 'unit', 'n_map_bins_visited', 'occupancy_s_map', 'occ_wmean_pct_all_bins',
+         'lap_stability_score', 'mean_lap_stability_across_fields']].rename(columns={
+        'n_map_bins_visited': 'ts_n_map_bins_visited', 'occupancy_s_map': 'ts_occupancy_s_map',
+        'occ_wmean_pct_all_bins': 'ts_occ_wmean_pct_all_bins',
+        'lap_stability_score': 'ts_lap_stability_pooled',
+        'mean_lap_stability_across_fields': 'ts_lap_stability_field_mean'})
 
     out = (peak.merge(fields, on=['session', 'unit', 'ts_field_number'], how='left')
-               .merge(n_fields, on=['session', 'unit'], how='left'))
+               .merge(n_fields, on=['session', 'unit'], how='left')
+               .merge(cells, on=['session', 'unit'], how='left'))
     out['ts_peak_bin_rate_hz'] = out['ts_peak_bin_rate_hz'].round(4)
     out['_skey'] = out['session'].map(_session_key)
     out['_ukey'] = out['unit'].map(_unit_key)

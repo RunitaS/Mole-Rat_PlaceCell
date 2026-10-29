@@ -17,6 +17,10 @@ file), at three levels:
      (ANIMAL_CONTROLLED_COMPARISONS):
          Circle vs Open : Fa8477, Fa5834
          Linear vs Open : Fa1059, Fa23BD
+     Each plot shows these comparisons side by side (left to right in the
+     order of ANIMAL_CONTROLLED_COMPARISONS), each panel with its own
+     within-comparison statistics; the comparisons are not tested against
+     each other.
 
 All levels use the same tests (below). All statistics tables are saved to a
 NEW workbook (+ one long-format CSV) in OUTPUT_DIR, together with the plots:
@@ -25,8 +29,8 @@ NEW workbook (+ one long-format CSV) in OUTPUT_DIR, together with the plots:
     OUTPUT_DIR\\SessionType\\<arena>\\Histograms\\
     OUTPUT_DIR\\ArenaType\\                         box/bar plots, arena types
     OUTPUT_DIR\\ArenaType\\Histograms\\
-    OUTPUT_DIR\\AnimalControlledArenaType\\<A>_vs_<B>\\              box/bar plots
-    OUTPUT_DIR\\AnimalControlledArenaType\\<A>_vs_<B>\\Histograms\\
+    OUTPUT_DIR\\AnimalControlledArenaType\\         box/bar plots, the comparisons side by side
+    OUTPUT_DIR\\AnimalControlledArenaType\\Histograms\\
     OUTPUT_DIR\\AnimalControlledArenaType\\AnimalControlled_Stats.xlsx  level-3 tables only
     OUTPUT_DIR\\SessionArena_Stats.xlsx             sheets 'Ses<arena>_*', 'Arena_*' and
                                                     'AC<A><B>_*' (level 3)
@@ -123,6 +127,7 @@ Parameters to edit (below):
 
 import os
 import re
+import tempfile
 import textwrap
 import colorsys
 from dataclasses import dataclass, replace
@@ -131,6 +136,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 from scipy import stats
+from PIL import Image
 
 import matplotlib
 matplotlib.use('Agg')
@@ -146,7 +152,7 @@ import PlaceFieldShape_Utils as pfs
 # ── Parameters ──────────────────────────────────────────────────────────────
 
 INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Alpha200.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\PlaceCellChar'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\PlaceCellChar_v2'
 
 # Copy of INPUT_EXCEL with the place-field shape columns added to its
 # 'PlaceFields' sheet.
@@ -167,14 +173,16 @@ ALPHA       = 0.05
 
 # Animal-controlled arena comparisons (level 3): {name: (animals, arenas)}.
 # Each compares the given arenas using only the cells of the given animals,
-# which were recorded in all of those arenas. 'name' is the sub-folder of
-# ANIMAL_CONTROLLED_DIR; animal IDs are matched case-insensitively against the
-# animal parsed from the session path (CellClusteredStats_Utils.ANIMAL_PATTERN).
+# which were recorded in all of those arenas. Animal IDs are matched
+# case-insensitively against the animal parsed from the session path
+# (CellClusteredStats_Utils.ANIMAL_PATTERN). The plots of all comparisons are
+# saved side by side (left to right in this order) in ANIMAL_CONTROLLED_DIR.
 ANIMAL_CONTROLLED_DIR = 'AnimalControlledArenaType'
 ANIMAL_CONTROLLED_COMPARISONS = {
     'Circle_vs_Open': (['Fa8477', 'Fa5834'], ['Circle', 'Open']),
     'Linear_vs_Open': (['Fa1059', 'Fa23BD'], ['Linear', 'Open']),
 }
+PANEL_GAP_IN = 0.3   # white gap between the side-by-side panels (inches)
 
 # True: a unit with the same label recorded in two arenas on the same day
 # (same animal + day + unit) is treated as the SAME cell. Only correct if that
@@ -1493,38 +1501,88 @@ def run_comparison(grp: Grouping, full_df: pd.DataFrame, field_df: pd.DataFrame,
     }
 
 
+def _stitch_side_by_side(paths: list, out_path: str):
+    """Save the images `paths` side by side (top-aligned, PANEL_GAP_IN apart,
+    on white) as one image. A missing image (None) leaves a blank space as
+    wide as the widest one, so every comparison keeps its position."""
+    imgs = []
+    for p in paths:
+        if p is None:
+            imgs.append(None)
+            continue
+        with Image.open(p) as im:
+            imgs.append(im.convert('RGB'))
+    present = [im for im in imgs if im is not None]
+    blank_w = max(im.width for im in present)
+    widths = [im.width if im is not None else blank_w for im in imgs]
+    gap = int(round(PANEL_GAP_IN * FIG_DPI))
+    canvas = Image.new('RGB', (sum(widths) + gap * (len(imgs) - 1),
+                               max(im.height for im in present)), 'white')
+    x = 0
+    for im, w in zip(imgs, widths):
+        if im is not None:
+            canvas.paste(im, (x, 0))
+        x += w + gap
+    canvas.save(out_path, dpi=(FIG_DPI, FIG_DPI))
+
+
+def _combine_side_by_side(src_dirs: list, out_dir: str):
+    """For every .png found in any of `src_dirs` (by path relative to it,
+    e.g. 'Histograms\\Hist_Full_sir.png'), save the versions from all
+    `src_dirs` side by side, in that order, to the same path in `out_dir`."""
+    rel_paths = sorted({os.path.relpath(os.path.join(root, f), d)
+                        for d in src_dirs for root, _dirs, files in os.walk(d)
+                        for f in files if f.lower().endswith('.png')})
+    for rel in rel_paths:
+        out_path = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        srcs = [os.path.join(d, rel) for d in src_dirs]
+        _stitch_side_by_side([p if os.path.isfile(p) else None for p in srcs], out_path)
+    print(f'\n{len(rel_paths)} side-by-side plots '
+          f'({" | ".join(os.path.basename(d) for d in src_dirs)}) saved to {out_dir}')
+
+
 def run_animal_controlled(full_df: pd.DataFrame, field_df: pd.DataFrame, shape_df: pd.DataFrame,
                           all_units_df: pd.DataFrame, out_dir: str) -> dict:
     """Level 3: for each entry of ANIMAL_CONTROLLED_COMPARISONS, compare its
     arenas using only the cells of its animals (same tests/plots as the
-    arena-type comparison). Plots go to out_dir\\<name>; the tables are also
-    saved to out_dir\\AnimalControlled_Stats.xlsx. Returns {sheet_name: table}."""
+    arena-type comparison). Each plot is saved to out_dir (histograms to
+    out_dir\\Histograms) with the comparisons side by side, each with its own
+    statistics -- the comparisons are not tested against each other. The
+    tables are also saved to out_dir\\AnimalControlled_Stats.xlsx. Returns
+    {sheet_name: table}."""
     all_tables = {}
-    for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
-        grp = animal_controlled_grouping(animals, arenas)
-        wanted = {a.lower() for a in animals}
+    # Each comparison's plots are first saved to its own temporary folder,
+    # then combined side by side.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+            grp = animal_controlled_grouping(animals, arenas)
+            wanted = {a.lower() for a in animals}
 
-        def _select(d):
-            return d[d['animal'].astype(str).str.lower().isin(wanted)
-                     & d['arena_type'].isin(grp.order)]
+            def _select(d):
+                return d[d['animal'].astype(str).str.lower().isin(wanted)
+                         & d['arena_type'].isin(grp.order)]
 
-        sel_full = _select(full_df)
-        print(f'\n{name}: place cells per animal and arena (Full sheet):')
-        print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
-        for arena in grp.order:
-            missing = [a for a in animals
-                       if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
-                               & (sel_full['arena_type'] == arena)).any()]
-            if missing:
-                print(f'WARNING: no place cells of {missing} in the {arena} arena.')
+            sel_full = _select(full_df)
+            print(f'\n{name}: place cells per animal and arena (Full sheet):')
+            print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
+            for arena in grp.order:
+                missing = [a for a in animals
+                           if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
+                                   & (sel_full['arena_type'] == arena)).any()]
+                if missing:
+                    print(f'WARNING: no place cells of {missing} in the {arena} arena.')
 
-        tables = run_comparison(grp, sel_full, _select(field_df), _select(shape_df),
-                                _select(all_units_df), os.path.join(out_dir, name))
-        tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
-        for tname, tbl in tables.items():
-            if len(tbl):
-                tbl.insert(0, 'animals', ', '.join(animals))
-            all_tables[f'{tag}_{tname}'] = tbl
+            tables = run_comparison(grp, sel_full, _select(field_df), _select(shape_df),
+                                    _select(all_units_df), os.path.join(tmp_dir, name))
+            tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
+            for tname, tbl in tables.items():
+                if len(tbl):
+                    tbl.insert(0, 'animals', ', '.join(animals))
+                all_tables[f'{tag}_{tname}'] = tbl
+
+        _combine_side_by_side([os.path.join(tmp_dir, name) for name in ANIMAL_CONTROLLED_COMPARISONS],
+                              out_dir)
 
     if all_tables:
         os.makedirs(out_dir, exist_ok=True)
