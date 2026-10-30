@@ -223,6 +223,11 @@ v29 changes (lap-stability criterion per field):
     too unstable to assess: it gets no phase-precession analysis (no onset / offset spikes, pass
     index, fit or figures) and is left out of every precession comparison. Its row keeps the
     lap_* columns and PrecessionSkippedReason. Steps 1-2 (theta modulation) are unchanged.
+  * Spikes are matched to ACG theta-positive epochs on the absolute (PTP-synced) .ntt / .ncs
+    timestamps, via the epoch's LFP samples, not by time elapsed since the first LFP sample
+    (see times_in_ok_epochs).
+  * load_ncs keeps only each record's NumValidSamples samples, so stale buffer values in partial
+    records no longer enter the LFP or push the sample clock ahead of the true timestamps.
   Per-unit figures go to <session>/ThetaMod_PhasePrecession_v29.
 
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
@@ -275,7 +280,7 @@ REQUIRE_RAYLEIGH_FOR_THETA_MOD = False
 _MP_TAG = 'MultiPeakSplit' if SPLIT_MULTIPEAK_FIELDS else 'NoMultiPeakSplit'
 _THETA_TAG = '_TMIandRayleigh' if REQUIRE_RAYLEIGH_FOR_THETA_MOD else ''
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / f'PhasePrec_Results_LapStabilityCrit_{_MP_TAG}{_THETA_TAG}'
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / f'PhasePrec_Results_LapStabCrit_MultiPk_v2_{_MP_TAG}{_THETA_TAG}'
 OUTPUT_EXCEL_NAME = f'theta_phase_v29_{_MP_TAG}{_THETA_TAG}.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
 # (no_phase_relation cells share the PhaseLocked folder)
@@ -536,9 +541,10 @@ def _header_field(header_text: str, name: str, default=None, cast=float):
 def load_ncs(path: Path):
     """Load a Neuralynx .ncs file. Returns (samples_uV, timestamps_s, fs_hz).
 
-    Assumes continuously-sampled, full 512-sample records (standard for an
-    uninterrupted Neuralynx CSC recording), matching the rest of this repo's
-    .ncs readers.
+    Only each record's first NumValidSamples samples are kept: the rest of a partial
+    record holds stale buffer values, and the next record's timestamp starts right after
+    the valid ones. Each sample's time is its record's absolute (PTP-synced) timestamp
+    plus its offset within the record.
     """
     header_text = _read_header_text(path)
     adbitvolts = _header_field(header_text, 'ADBitVolts', default=DEFAULT_ADBITVOLTS)
@@ -560,8 +566,9 @@ def load_ncs(path: Path):
 
     sample_period_us = 1e6 / fs
     offsets_us = np.arange(NCS_SAMPLES_PER_RECORD) * sample_period_us
-    timestamps_us = (records['TimeStamp'][:, None].astype(np.float64) + offsets_us[None, :]).ravel()
-    samples_uV = (records['Samples'].astype(np.float64) * adbitvolts * 1e6).ravel()
+    valid = np.arange(NCS_SAMPLES_PER_RECORD)[None, :] < records['NumValidSamples'][:, None]
+    timestamps_us = (records['TimeStamp'][:, None].astype(np.float64) + offsets_us[None, :])[valid]
+    samples_uV = (records['Samples'].astype(np.float64) * adbitvolts * 1e6)[valid]
 
     return samples_uV, timestamps_us / 1e6, fs
 
@@ -1394,8 +1401,9 @@ def acg_theta_epoch_mask(lfp_clean, return_peakrange=False):
     """Per-epoch theta-positive mask for one LFP trace, already cleaned by
     clean_lfp (resampled to ACG_FS, notched, detrended).
 
-    Epoch i spans [t0 + i*ACG_EPOCH_SEC, t0 + (i+1)*ACG_EPOCH_SEC) where t0 is
-    the first LFP sample's time. Returns (ok, ed_min): boolean mask and ED_min
+    Epoch i is the i-th block of ACG_EPOCH_SEC * ACG_FS consecutive samples; use
+    times_in_ok_epochs to match absolute times to epochs by the samples' timestamps.
+    Returns (ok, ed_min): boolean mask and ED_min
     per epoch (NaN where the epoch was rejected before/without an ACG fit).
     With return_peakrange=True, returns (ok, ed_min, peakrangenorm), adding each
     fitted epoch's autocorrelogram peak range normalised by its matched reference
@@ -1454,12 +1462,24 @@ def acg_theta_epoch_mask(lfp_clean, return_peakrange=False):
     return (ok, ed_min, peakrangenorm) if return_peakrange else (ok, ed_min)
 
 
-def times_in_ok_epochs(t_s, t0_s, epoch_ok):
-    """Boolean mask over times `t_s` (s) that fall inside a theta-positive epoch."""
-    idx = np.floor((np.asarray(t_s) - t0_s) / ACG_EPOCH_SEC).astype(np.int64)
-    inb = (idx >= 0) & (idx < len(epoch_ok))
-    out = np.zeros(len(idx), dtype=bool)
-    out[inb] = epoch_ok[idx[inb]]
+def times_in_ok_epochs(t_s, lfp_ts, lfp_fs, epoch_ok):
+    """Boolean mask over absolute times `t_s` (s, on the same PTP-synced clock as
+    `lfp_ts`) that fall inside a theta-positive epoch. Epoch i is the i-th block of
+    ACG_EPOCH_SEC * ACG_FS LFP samples, so each time is matched to its nearest LFP
+    sample by timestamp and takes that sample's epoch, which stays correct across
+    recording gaps. Times with no LFP sample within one inter-sample interval (see
+    spikes_with_lfp_sample) belong to no epoch."""
+    t_s = np.asarray(t_s, dtype=np.float64)
+    out = np.zeros(len(t_s), dtype=bool)
+    if len(t_s) == 0 or len(lfp_ts) == 0:
+        return out
+    idx = np.searchsorted(lfp_ts, t_s)
+    left = np.clip(idx - 1, 0, len(lfp_ts) - 1)
+    right = np.clip(idx, 0, len(lfp_ts) - 1)
+    nearest = np.where(np.abs(t_s - lfp_ts[left]) <= np.abs(lfp_ts[right] - t_s), left, right)
+    epoch = nearest // int(round(ACG_FS * ACG_EPOCH_SEC))
+    inb = (epoch < len(epoch_ok)) & spikes_with_lfp_sample(t_s, lfp_ts, lfp_fs)
+    out[inb] = epoch_ok[epoch[inb]]
     return out
 
 
@@ -2595,7 +2615,7 @@ def _draw_tmi_null(ax_s, tmi, is_sig, shuffle_tmis):
     """Draw the TMI shuffle-test null distribution with the observed TMI and
     the null's (1 - ALPHA) percentile."""
     color = 'red' if is_sig else '#4D4D4D'
-    thresh = float(np.percentile(shuffle_tmis, 100 * (1 - 0.01))) #ALPHA)))
+    thresh = float(np.percentile(shuffle_tmis, 100 * (1 - ALPHA)))
     ax_s.hist(shuffle_tmis, bins=40, color='#D9D9D9', edgecolor='black', linewidth=0.5)
     ax_s.axvline(thresh, color='0.3', linestyle='--', linewidth=1.5,
                  label=f'shuffle {100 * (1 - ALPHA):g}th pct = {thresh:.3f}')
@@ -4069,7 +4089,7 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
             if USE_ACG_THETA_EPOCHS:
                 acg_epoch_ok, acg_ed_min, acg_peakrange = acg_theta_epoch_mask(
                     lfp_sig, return_peakrange=True)
-                lfp_theta_mask = times_in_ok_epochs(lfp_ts, lfp_ts[0], acg_epoch_ok)
+                lfp_theta_mask = times_in_ok_epochs(lfp_ts, lfp_ts, lfp_fs, acg_epoch_ok)
                 n_fit = int(np.isfinite(acg_ed_min).sum())
                 print(f'  ACG theta-positive epochs (ED_min < {ACG_ED_MIN_THRESH:g}): '
                       f'{int(acg_epoch_ok.sum())}/{len(acg_epoch_ok)} '
@@ -4125,7 +4145,7 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
             # ---- ACG theta-positive spike selection (Steps 1-3 use only these spikes) ----
             spk_ts_all = spk_ts
             if USE_ACG_THETA_EPOCHS:
-                spk_ts = spk_ts_all[times_in_ok_epochs(spk_ts_all, lfp_ts[0], acg_epoch_ok)]
+                spk_ts = spk_ts_all[times_in_ok_epochs(spk_ts_all, lfp_ts, lfp_fs, acg_epoch_ok)]
                 row['n_spikes_ACGtheta'] = len(spk_ts)
                 row['ACGtheta_epoch_frac'] = (float(acg_epoch_ok.mean()) if len(acg_epoch_ok)
                                                else np.nan)
