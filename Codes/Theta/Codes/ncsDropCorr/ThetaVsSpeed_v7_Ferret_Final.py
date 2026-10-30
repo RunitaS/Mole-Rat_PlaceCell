@@ -68,7 +68,7 @@ ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\Spik
 OUTPUT_PARQUET = os.path.join(ROOT_DIR, 'ThetaVsSpeed_NcsDropCorr_out.parquet')
 
 # Speed vs. theta stats (mixed-model plots + summary) are written here.
-OUTPUT_DIR = Path(ROOT_DIR) / 'ThetaVsSpeed_Ferret_NcsDropCorr'
+OUTPUT_DIR = Path(ROOT_DIR) / 'Results' / 'ThetaVsSpeed' / 'ThetaVsSpeed_Ferret_NcsDropCorr'
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
 META_DIR = OUTPUT_DIR / 'meta'
