@@ -158,7 +158,7 @@ PCM_CONFIG_VARS = [
     'use_min_occ_s', 'min_occ_s', 'use_min_visits', 'min_visits',
     'IMMOBILITY_SPEED_CMS', 'POS_SMOOTH_SIGMA_SMP', 'POS_JUMP_THRESH_CMS',
     'ADAPTIVE_MAX_RSQ', 'ADAPTIVE_MIN_OCC_S', 'SKAGGS_ALPHA',
-    'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'RADIAL_RANGE_CLIP_PCTILE',
+    'MIN_FIELD_SIZE_BINS', 'MIN_FIELD_SPIKES', 'METHOD2_RATE_THRESHOLD_FRAC', 'RADIAL_RANGE_CLIP_PCTILE',
 ]
 
 
@@ -249,6 +249,7 @@ def _grid_record(unit: dict, metrics: dict, ctx: dict, map_type: str) -> dict:
             'firing_valid': ctx['firing_valid'],
             'fr_field':     rate,
             'field_valid':  pcm._map_valid(pi_occ, ctx['valid_mask']),
+            'spike_map':    ctx['spike_map'],
             'fr_raw':       ctx['fr_raw'],
             'raw_valid':    pcm._map_valid(ctx['occ_map'], ctx['valid_mask'])}
     if unit['rotated_90ccw']:

@@ -41,17 +41,17 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
 root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\QualFiltData_AllCells'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiSkaggsAdptBin_CohrStabSkaggs.xlsx'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CohrStabSkaggs'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 
 # Per-unit figure subfolders, created next to each .ntt file
-SPEED_MOD_SUBDIR = 'speed modulation_SiAdptBin_CohrStabSkaggs'
-SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_CohrStabSkaggs'
-RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_CohrStabSkaggs'
+SPEED_MOD_SUBDIR = 'speed modulation_Final'
+SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_Final'
+RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_Final'
 
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
@@ -186,10 +186,12 @@ if not RUN_COHERENCE_SHUFFLE:
 # _circular). A bin qualifies for a field if its firing rate in the
 # PLACE_FIELD_RATEMAP_TYPE map is >= METHOD2_RATE_THRESHOLD_FRAC of that map's
 # peak rate AND above the cell's mean firing rate; 8-connected components of qualifying bins
-# spanning >= MIN_FIELD_SIZE_BINS contiguous bins are reported as fields. If
-# no detected field backs the cell's peak rate (inside the
-# PLACE_CELL_MIN/MAX_PEAK_FR window), the cell is reclassified as NOT a place cell.
+# spanning >= MIN_FIELD_SIZE_BINS contiguous bins and holding >= MIN_FIELD_SPIKES
+# spikes are reported as fields. If no detected field backs the cell's peak rate
+# (inside the PLACE_CELL_MIN/MAX_PEAK_FR window), the cell is reclassified as NOT
+# a place cell.
 MIN_FIELD_SIZE_BINS = 9               # a field must span >= 9 contiguous 8-connected bins
+MIN_FIELD_SPIKES    = 10              # a field must hold >= 10 moving spikes across its bins
 METHOD2_RATE_THRESHOLD_FRAC = 0.20    # bins must be >= 20% of the cell's peak smoothed rate
 
 # ── Stage 3: per-field area cap ───────────────────────────────────────────────
@@ -439,7 +441,7 @@ RUN_CONFIG_VARS = [
     'USE_SI_MIN_OCC', 'SI_MIN_OCC_S',
     'ADAPTIVE_MAX_RSQ', 'ADAPTIVE_MIN_OCC_S', 'YARTSEV_DISC_OCC_S', 'SKAGGS_ALPHA',
     'SAVE_SI_RATEMAP',
-    'MIN_FIELD_SIZE_BINS', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
+    'MIN_FIELD_SIZE_BINS', 'MIN_FIELD_SPIKES', 'METHOD2_RATE_THRESHOLD_FRAC', 'PLACE_FIELD_MAX_AREA_PCT',
     'PLACE_FIELDS_MAX_TOTAL_AREA_PCT',
     'PLACE_CELL_MIN_SPIKES', 'PLACE_CELL_MIN_PEAK_FR', 'PLACE_CELL_MAX_PEAK_FR',
     'PLACE_CELL_MIN_SIR', 'PLACE_CELL_REQUIRE_SIR_BOOTSTRAP',
@@ -2575,8 +2577,9 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
     Gaussian-smoothed by default) is >= METHOD2_RATE_THRESHOLD_FRAC of that
     map's peak rate AND above the cell's mean firing rate; 8-connected
     components of qualifying bins spanning >= MIN_FIELD_SIZE_BINS contiguous
-    bins (no discontinuity) are reported as fields (peak bin + rate-weighted
-    centre of mass).
+    bins (no discontinuity) and holding >= MIN_FIELD_SPIKES spikes
+    (ctx['spike_map'], moving spikes only) are reported as fields (peak bin +
+    rate-weighted centre of mass).
 
     Returns (fields, peak_field_verified). `peak_field_verified` is False
     when the cell's own peak-firing bin (the FIRING_RATE_RATEMAP_TYPE-map
@@ -2585,7 +2588,8 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
     fields above, AND no other detected field's own peak in that map falls
     in that same [PLACE_CELL_MIN_PEAK_FR, PLACE_CELL_MAX_PEAK_FR] window
     either -- i.e. the place-cell verdict isn't backed by any field that
-    actually spans >= MIN_FIELD_SIZE_BINS contiguous bins at a rate in range.
+    actually spans >= MIN_FIELD_SIZE_BINS contiguous bins, with >=
+    MIN_FIELD_SPIKES spikes, at a rate in range.
     Callers should overrule the place-cell verdict when this is False. The
     field columns peak_fr_hz_raw / field_raw_max_* keep their names but come
     from the FIRING_RATE_RATEMAP_TYPE map.
@@ -2595,6 +2599,7 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
     field_valid  = ctx['field_valid']
     fr_firing    = ctx['fr_firing']
     firing_valid = ctx['firing_valid']
+    spike_map    = ctx['spike_map']
     n_bins_x     = ctx['n_bins_x']
     n_bins_y     = ctx['n_bins_y']
 
@@ -2623,6 +2628,11 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
 
         bxs   = np.array([b[0] for b in region])
         bys   = np.array([b[1] for b in region])
+
+        n_spikes_field = int(spike_map[bxs, bys].sum())
+        if n_spikes_field < MIN_FIELD_SPIKES:
+            continue
+
         rates = fr_field[bxs, bys]
 
         peak_local_idx = int(np.argmax(rates))
@@ -2684,6 +2694,8 @@ def detect_place_fields_threshold_2d(base_metrics: dict, ctx: dict, target_bin_c
             'bin_coords':            bin_coords_str,
             'total_occupied_bins':   total_valid_bins,
             'min_field_size_bins':   min_size_bins,
+            'field_n_spikes':        n_spikes_field,
+            'min_field_spikes':      MIN_FIELD_SPIKES,
             'rate_threshold_hz':     round(rate_threshold, 4),
             'mean_fr_threshold_hz':  round(mean_fr, 4),
             'is_centre_field':       False,
@@ -2965,7 +2977,7 @@ def _build_ratemap_circular(ctx: dict, target_bin_cm: float) -> dict:
         pi_flat = firing_occ[firing_valid] / firing_occ[firing_valid].sum()
         mean_fr = float(np.sum(pi_flat * fr_firing[firing_valid]))
 
-    return dict(beh_bt=beh_bt, occ_map=occ_map, valid_mask=valid_mask,
+    return dict(beh_bt=beh_bt, occ_map=occ_map, spike_map=spike_map, valid_mask=valid_mask,
                 fr_field=fr_field, field_valid=field_valid,
                 fr_firing=fr_firing, firing_valid=firing_valid, mean_fr=mean_fr,
                 n_bins_theta=n_bins_theta, bin_width_rad=bin_width_rad,
@@ -3009,8 +3021,10 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
     above the cell's mean firing rate (both computed from the angular maps,
     see _build_ratemap_circular); contiguous runs of qualifying bins spanning
     >= MIN_FIELD_SIZE_BINS bins (no discontinuity, wrapping around the theta
-    seam) are reported as fields (peak bin + rate-weighted circular centre
-    of mass, the angular analogue of detect_place_fields_threshold_2d).
+    seam) and holding >= MIN_FIELD_SPIKES spikes (ctx_circular['spike_map'],
+    moving spikes only) are reported as fields (peak bin + rate-weighted
+    circular centre of mass, the angular analogue of
+    detect_place_fields_threshold_2d).
 
     Returns (fields, peak_field_verified) -- see
     detect_place_fields_threshold_2d's docstring for what
@@ -3021,6 +3035,7 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
     field_valid    = ctx_circular['field_valid']
     fr_firing      = ctx_circular['fr_firing']
     firing_valid   = ctx_circular['firing_valid']
+    spike_map      = ctx_circular['spike_map']
     n_bins_theta   = ctx_circular['n_bins_theta']
     bin_width_rad  = ctx_circular['bin_width_rad']
     track_width_cm = ctx_circular['track_width_cm']
@@ -3053,6 +3068,11 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
             continue
 
         bts   = np.array(region)
+
+        n_spikes_field = int(spike_map[bts].sum())
+        if n_spikes_field < MIN_FIELD_SPIKES:
+            continue
+
         rates = fr_field[bts]
 
         peak_local_idx = int(np.argmax(rates))
@@ -3118,6 +3138,8 @@ def detect_place_fields_threshold_circular(ctx_circular: dict, target_bin_cm: fl
             'bin_coords':                 bin_coords_str,
             'total_occupied_bins':        total_valid_bins,
             'min_field_size_bins':        min_size_bins,
+            'field_n_spikes':             n_spikes_field,
+            'min_field_spikes':           MIN_FIELD_SPIKES,
             'rate_threshold_hz':          round(rate_threshold, 4),
             'mean_fr_threshold_hz':       round(mean_fr, 4),
             'is_centre_field':            False,
@@ -3687,6 +3709,7 @@ if __name__ == "__main__":
                      'peak_fr_hz', 'peak_fr_hz_raw',
                      'n_bins', 'area_cm2', 'pct_of_occupied_area',
                      'total_occupied_bins', 'min_field_size_bins',
+                     'field_n_spikes', 'min_field_spikes',
                      'rate_threshold_hz', 'mean_fr_threshold_hz', 'is_centre_field',
                      # field_raw_max_fr_hz = the highest RAW rate anywhere in
                      # this field (its own bin, field_raw_max_bin_x/y or

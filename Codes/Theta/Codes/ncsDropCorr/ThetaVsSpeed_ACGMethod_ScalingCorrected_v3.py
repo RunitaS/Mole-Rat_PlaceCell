@@ -88,7 +88,7 @@ COMMON_NOISE_REMOVAL = False
 
 # Where results/figures are written (default: alongside ROOT_DIR).
 OUTPUT_DIR = os.path.join(
-    ROOT_DIR, 'ACG_ThetaVsSpeed_NcsDropCorr_' + ('NoiseRemoval' if COMMON_NOISE_REMOVAL else 'NoNoiseRemoval'))
+    ROOT_DIR, 'Results', 'ThetaVsSpeed', 'ACG_ThetaVsSpeed_NcsDropCorr_' + ('NoiseRemoval' if COMMON_NOISE_REMOVAL else 'NoNoiseRemoval'))
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata. ACG_Utils' own run_metadata.csv
