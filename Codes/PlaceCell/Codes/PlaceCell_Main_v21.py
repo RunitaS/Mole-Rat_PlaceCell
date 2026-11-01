@@ -142,7 +142,7 @@ YARTSEV_DISC_OCC_S  = 1.0     # occupancy (s) a disc must enclose (Yartsev / Gri
 # out-of-field (< 20% peak) in all three arenas, below the 10th-percentile
 # place-field radius (~3.7 cm; median ~6.5 cm); no bin reaches ADAPTIVE_MAX_RSQ.
 # 100 gives 3.8 cm in-field / 5.0-5.5 cm out-of-field (more smoothing).
-SKAGGS_ALPHA        = 50.0    # cm * s * sqrt(spike)
+SKAGGS_ALPHA        = 200.0    # cm * s * sqrt(spike)
 #
 # SAVE_SI_RATEMAP = True plots the SI_RATEMAP_TYPE ratemap (whichever type is
 # used for SIR / sparsity; display only) below the Gaussian-smoothed map in the
