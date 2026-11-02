@@ -63,7 +63,7 @@ from ncs_repair import load_repaired_uv
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed, paired with the
 # single tracking .csv that lives in the same folder.
-ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 OUTPUT_PARQUET = os.path.join(ROOT_DIR, 'ThetaVsSpeed_NcsDropCorr_out.parquet')
 
@@ -167,7 +167,7 @@ POWER_MEASURES = [
 # then the x/y traces are Gaussian-smoothed with sigma POS_SMOOTH_SIGMA_SMP
 # (in samples). Tracking .csv column layout: UNIX timestamp in us (col A),
 # x in cm (col D), y in cm (col E).
-POS_JUMP_THRESH_CMS = 80.0
+POS_JUMP_THRESH_CMS = 90.0
 POS_SMOOTH_SIGMA_SMP = 1.0
 
 # Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.

@@ -59,13 +59,17 @@ Open arena (one plot per animal and map type)
   the animal's Open sessions.
   'trajectory': the trajectories of all the animal's Open sessions (gray)
   overlaid, with the spikes of all its cells as red dots.
+  One more plot per map type pools all animals in one map, every field in its
+  animal's colour (legend = fields and cells per animal), drawn in a shuffled
+  order (POOLED_DRAW_SEED) so that no animal always ends up on top.
 
 Outputs (folder OUTPUT_SUBDIR inside Output_PlaceTrue):
   PeakBins.xlsx  'PeakBins'  one row per cell and ratemap type ('trajectory'
                              rows would repeat the 'raw' ones, so are left out)
                  'Settings'  parameters used for this run
   figures        <Arena>_PeakSequence_<map>.png/.svg,
-                 Open_FieldSilhouettes_<animal>_<map>.png/.svg
+                 Open_FieldSilhouettes_<animal>_<map>.png/.svg,
+                 Open_FieldSilhouettes_AllAnimals_<map>.png/.svg
                  (<map> = 'trajectory' for the trajectory figures)
 """
 
@@ -83,12 +87,13 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import to_rgb
+from matplotlib.patches import Patch
 
 # ── Directories (edit these per run) ──────────────────────────────────────────
 
 # Output_PlaceTrue folder of the PlaceCell_Main run (root of the confirmed
 # place cells, animal-ID folders onwards, e.g. Fa1059/Linear/Day8/1_90/...)
-Output_PlaceTrue = r'X:/NMR_group_data/Runita/Analysis/Thesis/Corr_Data_SpkQltyFilt/SpikeQualityFilt/SpikeQualityFilt_v1_PlaceCellData/PC_True_SiSkaggsAdptBin_Alpha200'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # PlaceCell_Main version whose ratemap / field functions and settings are used
 # -- should be the one that wrote Output_PlaceTrue.
@@ -115,6 +120,7 @@ FIELD_ALPHA    = 0.4      # Open: silhouette fill alpha
 OUTLINE_LW     = 0.5      # Open: silhouette outline width (pt)
 OUTLINE_DARKEN = 0.45     # Open: outline / peak dot = animal colour darkened by this fraction
 PEAK_DOT_SIZE  = 10       # Open: peak-bin dot size (pt^2)
+POOLED_DRAW_SEED = 0      # Open, all animals pooled: seed of the shuffled drawing order
 
 TRAJ_LINE_COLOR  = '0.6'  # trajectory map: path colour
 TRAJ_LW          = 0.3    # trajectory map: path width (pt)
@@ -149,7 +155,7 @@ RUN_CONFIG_VARS = [
     'Output_PlaceTrue', 'PLACECELL_MAIN_PATH', 'OUTPUT_SUBDIR', 'MAP_TYPES',
     'ROTATE_SESSION_ANGLES', 'LINEAR_TRACK_LENGTH_CM', 'LINEAR_LENGTH_TOL_CM',
     'EXCLUDE_PARTIAL_TRACKS', 'NORMALIZE_ROWS', 'SEQUENCE_CMAP',
-    'FIELD_ALPHA', 'OUTLINE_LW', 'OUTLINE_DARKEN', 'PEAK_DOT_SIZE',
+    'FIELD_ALPHA', 'OUTLINE_LW', 'OUTLINE_DARKEN', 'PEAK_DOT_SIZE', 'POOLED_DRAW_SEED',
     'TRAJ_LINE_COLOR', 'TRAJ_LW', 'TRAJ_SPIKE_COLOR', 'TRAJ_SPIKE_SIZE', 'TRAJ_ROW_FILL',
 ]
 # PlaceCell_Main settings that shape the maps and fields used here.
@@ -460,17 +466,15 @@ def _darken(color: str, frac: float) -> tuple:
     return tuple(c * (1.0 - frac) for c in to_rgb(color))
 
 
-def _plot_open(recs: list[dict], animal: str, map_type: str, save_stem: str) -> None:
-    """All fields of all cells as overlapping silhouettes, dot at each cell's peak
-    bin; gray outline = bins visited (valid) in any of these sessions."""
-    fill = animal_color(animal)
-    edge = _darken(fill, OUTLINE_DARKEN)
-
+def _plot_open(recs: list[dict], label: str, map_type: str, save_stem: str) -> None:
+    """All fields of all cells as overlapping silhouettes in their animal's colour,
+    dot at each cell's peak bin; gray outline = bins visited (valid) in any of these
+    sessions. `label` names the animal, or the pool when `recs` span several (legend)."""
     fig = Figure(figsize=(7, 7))
     FigureCanvasAgg(fig)
     ax = fig.add_subplot(111)
 
-    def _outline(mask: np.ndarray, **kwargs) -> None:
+    def _outline(mask: np.ndarray, fill: str | None = None, **kwargs) -> None:
         # Contour at 0.5 between bin centres of a zero-padded mask = mask edge.
         xc = (np.arange(-1, mask.shape[0] + 1) + 0.5) * bin_cm
         yc = (np.arange(-1, mask.shape[1] + 1) + 0.5) * bin_cm
@@ -480,8 +484,10 @@ def _plot_open(recs: list[dict], animal: str, map_type: str, save_stem: str) -> 
         ax.contour(xc, yc, m, levels=[0.5], **kwargs)
 
     for r in recs:
+        fill = animal_color(r['animal'])
         for mask in r['field_masks']:
-            _outline(mask, alpha=FIELD_ALPHA, colors=[edge], linewidths=OUTLINE_LW)
+            _outline(mask, fill=fill, alpha=FIELD_ALPHA,
+                     colors=[_darken(fill, OUTLINE_DARKEN)], linewidths=OUTLINE_LW)
 
     n_x = max(r['n_bins_x'] for r in recs)
     n_y = max(r['n_bins_y'] for r in recs)
@@ -491,7 +497,11 @@ def _plot_open(recs: list[dict], animal: str, map_type: str, save_stem: str) -> 
     _outline(visited, colors=['0.6'], linewidths=0.8)
 
     peaks = np.array([r['peak_xy_cm'] for r in recs])
-    ax.scatter(peaks[:, 0], peaks[:, 1], s=PEAK_DOT_SIZE, color=edge, linewidths=0, zorder=3)
+    animals = sorted({r['animal'] for r in recs})
+    dot_colors = [_darken(animal_color(r['animal']), OUTLINE_DARKEN) for r in recs]
+    ax.scatter(peaks[:, 0], peaks[:, 1], s=PEAK_DOT_SIZE,
+               color=dot_colors if len(animals) > 1 else dot_colors[0],
+               linewidths=0, zorder=3)
 
     x_max, y_max = n_x * bin_cm, n_y * bin_cm
     ax.set_xlim(-0.02 * x_max, 1.02 * x_max)
@@ -500,8 +510,18 @@ def _plot_open(recs: list[dict], animal: str, map_type: str, save_stem: str) -> 
     ax.set_xlabel('x (cm)')
     ax.set_ylabel('y (cm)')
     n_fields = sum(r['n_fields'] for r in recs)
-    ax.set_title(f'{animal}, Open arena, {_MAP_LABELS[map_type]}\n'
+    ax.set_title(f'{label}, Open arena, {_MAP_LABELS[map_type]}\n'
                  f'n = {len(recs)} place cells, {n_fields} fields', fontsize=10)
+    if len(animals) > 1:
+        handles = []
+        for a in animals:
+            a_recs = [r for r in recs if r['animal'] == a]
+            handles.append(Patch(facecolor=to_rgb(animal_color(a)) + (FIELD_ALPHA,),
+                                 edgecolor=_darken(animal_color(a), OUTLINE_DARKEN),
+                                 label=f'{a}: {sum(r["n_fields"] for r in a_recs)} fields, '
+                                       f'{len(a_recs)} cells'))
+        ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, -0.09),
+                  ncol=2, frameon=False, fontsize=8)
     fig.tight_layout()
     _save_fig(fig, save_stem)
 
@@ -547,9 +567,10 @@ def _plot_sequence_trajectory(recs: list[dict], arena: str, save_stem: str) -> N
     _save_fig(fig, save_stem)
 
 
-def _plot_open_trajectory(recs: list[dict], animal: str, save_stem: str) -> None:
-    """Trajectories of all of the animal's Open sessions (gray, each session
-    drawn once) overlaid, with the spikes of all its cells as dots."""
+def _plot_open_trajectory(recs: list[dict], label: str, save_stem: str) -> None:
+    """Trajectories of all the Open sessions in `recs` (gray, each session drawn
+    once) overlaid, with the spikes of all their cells as dots. `label` names the
+    animal, or the pool when `recs` span several."""
     fig = Figure(figsize=(7, 7))
     FigureCanvasAgg(fig)
     ax = fig.add_subplot(111)
@@ -570,7 +591,7 @@ def _plot_open_trajectory(recs: list[dict], animal: str, save_stem: str) -> None
     ax.set_aspect('equal')
     ax.set_xlabel('x (cm)')
     ax.set_ylabel('y (cm)')
-    ax.set_title(f'{animal}, Open arena, {_MAP_LABELS[TRAJECTORY_MAP]}\n'
+    ax.set_title(f'{label}, Open arena, {_MAP_LABELS[TRAJECTORY_MAP]}\n'
                  f'n = {len(recs)} place cells, {len(drawn_sessions)} sessions', fontsize=10)
     fig.tight_layout()
     _save_fig(fig, save_stem)
@@ -639,6 +660,16 @@ def run(root: str, output_dir: str, units: list[dict] | None = None) -> pd.DataF
                 _plot_open_trajectory(animal_recs, animal, save_stem)
             else:
                 _plot_open(animal_recs, animal, map_type, save_stem)
+
+        if open_recs:
+            # All animals in one map, shuffled so that no animal always ends up on top.
+            order = np.random.default_rng(POOLED_DRAW_SEED).permutation(len(open_recs))
+            pooled_recs = [open_recs[i] for i in order]
+            save_stem = os.path.join(output_dir, f'Open_FieldSilhouettes_AllAnimals_{map_type}')
+            if map_type == TRAJECTORY_MAP:
+                _plot_open_trajectory(pooled_recs, 'All animals', save_stem)
+            else:
+                _plot_open(pooled_recs, 'All animals', map_type, save_stem)
 
     # 'trajectory' records repeat the 'raw' ones (peak, fields), so stay out of the table.
     df = pd.DataFrame([{k: v for k, v in r.items() if k not in _PLOT_ONLY_KEYS}

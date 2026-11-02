@@ -102,14 +102,16 @@ Metrics compared (all restricted to place_cell == True):
   'TemporalStability_<metric>.png'; sheets '*_TS_Desc', '*_TS_Omnibus',
   '*_TS_PostHoc'). Switched off with INCLUDE_TEMPORAL_STABILITY = False.
   The cells are every .ntt under TS_PLACE_CELL_FOLDER (the Output_PlaceTrue
-  folder of a PlaceCell_Main_v21 run; all already place cells). With
-  RUN_TS_MAPS = True, each cell is processed as follows (else the PerCell sheet
-  of an existing TS_OUTPUT_EXCEL is used):
+  folder of a PlaceCell_Main_v21 run; all already place cells). Everything is
+  computed in this script from each cell's .ntt + tracking file (no precomputed
+  temporal stability table is read), as follows:
     1. Rebuild the session trajectory, spike positions and bin grid with
        PlaceCell_Main_v21.compute_metrics (same cleaning, smoothing, immobility
        filter and spike assignment as the run that detected the fields).
     2. Detect its place fields with PlaceCell_Main_v21's threshold method
-       (detect_place_fields_threshold_2d / _circular) on those maps.
+       (detect_place_fields_threshold_2d / _circular) on those maps. A cell
+       with no field under the current criteria is kept: its field metrics are
+       NaN, its whole-map and peak-bin metrics and its map are still produced.
     3. For every field bin, split the trajectory into visits: a visit is one
        contiguous run of tracking frames inside that bin (entry -> exit), the
        same definition PlaceCell_Main_v21 uses for its visit count. Visits
@@ -152,8 +154,8 @@ Metrics compared (all restricted to place_cell == True):
     stability map (field bins coloured by %, each field labelled with its lap
     stability; visited non-field bins gray; never-visited bins blank; Circle
     track drawn as a ring of angular bins).
-  Per-cell / per-field / per-bin results: TS_OUTPUT_EXCEL (sheets PerCell,
-  PerField, PerBin). Example maps (animal-controlled comparisons only): per
+  Per-cell / per-field / per-bin results: OUTPUT_DIR\\TS_RESULTS_XLSX (sheets
+  PerCell, PerField, PerBin; output only, never read). Example maps (animal-controlled comparisons only): per
   arena, the N_EXAMPLE_MAPS cells with the highest (Best) and lowest (Worst)
   EXAMPLE_METRIC and the N_EXAMPLE_MAPS closest to the arena mean (Mean),
   copied with a banner naming the animal, session and unit to
@@ -206,9 +208,12 @@ Metrics compared (all restricted to place_cell == True):
   independent; the LMM's cell random effect accounts for them).
   Per-field / per-sub-field / per-cell results: MULTIPEAK_EXCEL (sheets
   Fields, SubFields, Cells, Settings). Figure per cell, in MP_RATEMAP_DIR\\
-  MultiPeak or SinglePeak: Gaussian-smoothed ratemap (field bins only, field
-  outlines black, trough cuts white, counted peaks as stars), the KDE input
-  map, and the field KDE. Example maps (animal-controlled comparisons only):
+  MultiPeak or SinglePeak: the unbinned trajectory (gray, whole session) with the
+  cell's spikes (red, moving frames only: the spikes behind the ratemaps),
+  Gaussian-smoothed ratemap (field bins only, field outlines black, trough cuts
+  white, counted peaks as stars), the KDE input map, and the field KDE (Circle
+  track: trajectory + spikes, angular ring, field profiles along the track angle).
+  Example maps (animal-controlled comparisons only):
   per arena, best / mean / worst N_EXAMPLE_MAPS cells by MP_EXAMPLE_METRIC,
   saved as 'MultiPeak_<comparison>_<arena>_<Best|Mean|Worst><rank>_...png' in
   OUTPUT_DIR\\AnimalControlledArenaType\\ExampleMaps\\.
@@ -310,8 +315,8 @@ Parameters to edit (below):
     INPUT_EXCEL  = path to the output_excel file from
                    PlaceCellChar_FieldDetect_Main_v3.py (read only)
     OUTPUT_DIR   = new folder for all statistics tables and plots
-    INCLUDE_TEMPORAL_STABILITY, RUN_TS_MAPS, TS_PLACE_CELL_FOLDER,
-    TS_OUTPUT_EXCEL = temporal stability (see above)
+    INCLUDE_TEMPORAL_STABILITY, TS_PLACE_CELL_FOLDER = temporal stability
+    (see above)
     INCLUDE_MULTIPEAK, RUN_MULTIPEAK_KDE, MP_PLACE_CELL_FOLDER, the KDE
     peak / trough / bandwidth settings and the MP_ ratemap settings =
     multi-peak fields (see above)
@@ -374,8 +379,8 @@ import PlaceCell_Main_v21 as pc   # temporal stability maps
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Alpha200.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\PlaceCellChar_v2'
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Main\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final0\Results\PC_Char'
 
 # Copy of INPUT_EXCEL with the place-field shape columns added to its
 # 'PlaceFields' sheet.
@@ -394,16 +399,13 @@ RUN_SNAPSHOT_SUBDIR = 'RunSnapshots'
 # False: no temporal stability comparison at all.
 INCLUDE_TEMPORAL_STABILITY = True
 
-# True: build the temporal stability maps + TS_OUTPUT_EXCEL, then compare them.
-# False: skip the maps and compare the PerCell sheet of an existing TS_OUTPUT_EXCEL.
-RUN_TS_MAPS = True
-
 # Place-cell folder (Output_PlaceTrue of a PlaceCell_Main_v21 run): every .ntt under
 # it is analysed; each session folder also holds its tracking file.
-TS_PLACE_CELL_FOLDER = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+TS_PLACE_CELL_FOLDER = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
-# Per-cell / per-field / per-bin temporal stability table.
-TS_OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\TemporalStability.xlsx'
+# Per-cell / per-field / per-bin temporal stability table, written to OUTPUT_DIR
+# on every run (output only: the analysis never reads it back).
+TS_RESULTS_XLSX = 'TemporalStability.xlsx'
 
 # Temporal stability figures go in this subfolder of each session folder (next to the .ntt).
 TEMPORAL_STABILITY_SUBDIR = 'temporal_stability'
@@ -661,7 +663,7 @@ CATEGORICAL_METRICS_PLACE_CELLS = {
     'speed_cell_final':         'Speed cells (% of place cells)',
 }
 
-# Temporal stability, one value per cell (PerCell columns of TS_OUTPUT_EXCEL).
+# Temporal stability, one value per cell (PerCell columns from run_ts_maps).
 TEMPORAL_STABILITY_METRICS = {
     'mean_pct_across_bins':   'Mean temporal stability across field bins (% visits with >= 1 spike)',
     'median_pct_across_bins': 'Median temporal stability across field bins (% visits with >= 1 spike)',
@@ -2016,8 +2018,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
 
     if not fields:
         with _print_lock:
-            print(f'  [SKIP] no place field detected for {unit}')
-        return None, [], []
+            print(f'  [NO FIELD] no place field detected for {unit}; field metrics are NaN')
 
     field_mask = np.zeros(grid, dtype=bool)
     field_id   = np.zeros(grid, dtype=np.int64)       # field_number per bin, 0 = no field
@@ -2077,7 +2078,8 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
                     round(float(np.sum(p * w) / w.sum()), 2) if w.sum() > 0 else np.nan,
                 'occ_wmedian_pct_across_bins': round(_weighted_median(p, w), 2),
                 'occ_wmean_pct_mapnorm':
-                    round(float(np.sum(p * w) / occ_map_total), 2) if occ_map_total > 0 else np.nan,
+                    round(float(np.sum(p * w) / occ_map_total), 2)
+                    if occ_map_total > 0 and w.sum() > 0 else np.nan,
                 'occupancy_s_field_bins': round(float(occ[mask].sum()), 3),
                 'n_visits_total': v, 'n_visits_with_spike_total': fired,
                 'pooled_pct_visits_with_spike': round(100.0 * fired / v, 2) if v else np.nan,
@@ -2146,7 +2148,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
     _plot_rate(ax_smooth, fig, ctx['fr_smooth'], ctx['valid_mask'], extent,
                f'Gaussian-smoothed (sigma = {pc.GAUSSIAN_SIGMA_CM:g} cm)')
 
-    stab_title = 'Temporal stability (field bins)'
+    stab_title = 'Temporal stability (field bins)' if fields else 'No place field detected'
     if is_circle:
         assert ctx_circ is not None
         ax_stab = fig.add_subplot(n_rows, n_cols, 4, projection='polar')
@@ -2183,7 +2185,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
     ntt_name = os.path.splitext(unit)[0]
     lap_line = '  |  '.join(f"F{fr['field_number']}: {fr['n_passes_with_min_spikes']}/"
                             f"{fr['n_passes']} passes = {fr['lap_stability_score']}"
-                            for fr in field_rows)
+                            for fr in field_rows) or 'no fields'
     fig.suptitle(f"{session}  |  {ntt_name}\n"
                  f"{cell_row['n_fields']} field(s), {cell_row['n_field_bins']} bins  |  "
                  f"mean across bins = {cell_row['mean_pct_across_bins']}%, "
@@ -2210,7 +2212,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
 
 def run_ts_maps() -> pd.DataFrame:
     """Temporal stability map for every .ntt under TS_PLACE_CELL_FOLDER; writes
-    TS_OUTPUT_EXCEL and returns its PerCell table."""
+    OUTPUT_DIR\\TS_RESULTS_XLSX and returns its PerCell table."""
     jobs = []
     for dirpath, _, filenames in os.walk(TS_PLACE_CELL_FOLDER):
         jobs += [(dirpath, unit) for unit in sorted(filenames) if unit.lower().endswith('.ntt')]
@@ -2236,30 +2238,25 @@ def run_ts_maps() -> pd.DataFrame:
     bin_rows   = [b for _, r in results for b in r[2]]
 
     cell_df = pd.DataFrame(cell_rows)
-    os.makedirs(os.path.dirname(TS_OUTPUT_EXCEL), exist_ok=True)
-    with pd.ExcelWriter(TS_OUTPUT_EXCEL, engine='openpyxl') as writer:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    results_xlsx = os.path.join(OUTPUT_DIR, TS_RESULTS_XLSX)
+    with pd.ExcelWriter(results_xlsx, engine='openpyxl') as writer:
         cell_df.to_excel(writer,                  sheet_name='PerCell',  index=False)
         pd.DataFrame(field_rows).to_excel(writer, sheet_name='PerField', index=False)
         pd.DataFrame(bin_rows).to_excel(writer,   sheet_name='PerBin',   index=False)
 
     print(f'\nDone. {len(cell_rows)}/{len(jobs)} temporal stability map(s) plotted.')
-    print(f'Temporal stability results saved to {TS_OUTPUT_EXCEL}')
+    print(f'Temporal stability results saved to {results_xlsx}')
     return cell_df
 
 
 def build_temporal_stability_df() -> pd.DataFrame:
-    """PerCell temporal stability table (rebuilt with run_ts_maps if
-    RUN_TS_MAPS, else read from TS_OUTPUT_EXCEL), tagged with arena type,
-    session type, animal and cell_id like the other dataframes."""
-    if RUN_TS_MAPS:
-        cell_df = run_ts_maps()
-    else:
-        print(f'Loading PerCell sheet of {TS_OUTPUT_EXCEL} ...')
-        cell_df = pd.read_excel(TS_OUTPUT_EXCEL, sheet_name='PerCell')
-    missing = [c for c in TEMPORAL_STABILITY_METRICS if c not in cell_df.columns]
-    if missing:
-        raise KeyError(f'PerCell table has no column(s) {missing}; '
-                       f'rebuild it with RUN_TS_MAPS = True.')
+    """PerCell temporal stability table computed here by run_ts_maps, tagged
+    with arena type, session type, animal and cell_id like the other dataframes."""
+    cell_df = run_ts_maps()
+    if cell_df.empty:
+        raise RuntimeError(f'No temporal stability results from the .ntt files under '
+                           f'{TS_PLACE_CELL_FOLDER}.')
     return _tag_groups(cell_df, 'place cell(s) (temporal stability)')
 
 
@@ -2568,6 +2565,7 @@ def _mp_build_unit_ratemap(track: dict, ntt_path: str) -> dict:
     fr_smooth = _mp_gaussian_smooth(fr_raw, valid_mask, MP_BIN_CM)
 
     return dict(x_cm=track['x_cm'][moving], y_cm=track['y_cm'][moving],
+                x_cm_all=track['x_cm'], y_cm_all=track['y_cm'],
                 spike_frame=spike_frame, dt_frames=dt_frames,
                 occ_map=occ_map, spike_map=spike_map, valid_mask=valid_mask,
                 fr_raw=fr_raw, fr_smooth=fr_smooth,
@@ -3144,6 +3142,19 @@ def _field_summary_title(plot_fields: list) -> str:
                      f"{'s' if len(pf['counted']) != 1 else ''}" for pf in plot_fields)
 
 
+def _mp_plot_trajectory(ax, ctx: dict, scale: float, unit: str) -> None:
+    """Unbinned trajectory of the whole session (gray) and the cell's spikes (red;
+    moving frames only, the spikes behind the ratemaps). Positions (cm) are divided
+    by `scale`; the axes are labelled in `unit`."""
+    sf = ctx['spike_frame']
+    ax.plot(ctx['x_cm_all'] / scale, ctx['y_cm_all'] / scale, color='0.6', linewidth=0.5)
+    ax.plot(ctx['x_cm'][sf] / scale, ctx['y_cm'][sf] / scale, '.', color='red', markersize=3)
+    ax.set_aspect('equal')
+    ax.set_title(f'Trajectory (gray) + {len(sf)} spikes (red)', fontsize=10)
+    ax.set_xlabel(f'x {unit}')
+    ax.set_ylabel(f'y {unit}')
+
+
 def _mp_plot_cell_2d(ctx: dict, plot_fields: list, title: str, save_path: str) -> None:
     nx, ny     = ctx['n_bins_x'], ctx['n_bins_y']
     valid_mask = ctx['valid_mask']
@@ -3164,12 +3175,19 @@ def _mp_plot_cell_2d(ctx: dict, plot_fields: list, title: str, save_path: str) -
     cuts     = _label_cut_segments(sub_id)
     extent   = (0, nx, 0, ny)
 
-    fig = Figure(figsize=(19, 5.8))
+    fig = Figure(figsize=(25, 5.8))
     FigureCanvasAgg(fig)
-    axes = fig.subplots(1, 3)
-    panels = ((axes[0], ctx['fr_smooth'], f'Gaussian-smoothed ratemap (σ = {MP_GAUSSIAN_SIGMA_CM} cm)'),
-              (axes[1], ctx['kde_in'],    f'KDE input map: {KDE_RATEMAP_TYPE}'),
-              (axes[2], kde_map,          f'Field KDE ({KDE_BW_METHOD}), peaks ≥ {PEAK_REL_HEIGHT_FRAC:.0%} of field max'))
+    axes = fig.subplots(1, 4)
+
+    # Same axis units and limits as the ratemaps; the hidden colorbar keeps the panel sizes equal.
+    _mp_plot_trajectory(axes[0], ctx, MP_BIN_CM, 'bin')
+    axes[0].set_xlim(0, nx)
+    axes[0].set_ylim(0, ny)
+    fig.colorbar(ScalarMappable(), ax=axes[0], fraction=0.046, pad=0.04).ax.set_visible(False)
+
+    panels = ((axes[1], ctx['fr_smooth'], f'Gaussian-smoothed ratemap (σ = {MP_GAUSSIAN_SIGMA_CM} cm)'),
+              (axes[2], ctx['kde_in'],    f'KDE input map: {KDE_RATEMAP_TYPE}'),
+              (axes[3], kde_map,          f'Field KDE ({KDE_BW_METHOD}), peaks ≥ {PEAK_REL_HEIGHT_FRAC:.0%} of field max'))
     for ax, data, panel_title in panels:
         ax.imshow(bg.T, origin='lower', extent=extent, cmap=_MP_GRAY_CMAP,
                   vmin=0, vmax=1, interpolation='nearest')
@@ -3218,7 +3236,7 @@ def _nan_at_wrap(deg: np.ndarray, *ys: np.ndarray):
             *(np.insert(y.astype(float), breaks, np.nan) for y in ys))
 
 
-def _mp_plot_cell_circular(cc: dict, plot_fields: list, title: str, save_path: str) -> None:
+def _mp_plot_cell_circular(ctx: dict, cc: dict, plot_fields: list, title: str, save_path: str) -> None:
     n          = cc['n_bins_theta']
     bw         = cc['bin_width_rad']
     r_min      = cc['r_min']
@@ -3231,10 +3249,11 @@ def _mp_plot_cell_circular(cc: dict, plot_fields: list, title: str, save_path: s
     for pf in plot_fields:
         in_field[pf['nodes']] = True
 
-    fig = Figure(figsize=(14, 5.8))
+    fig = Figure(figsize=(21, 5.8))
     FigureCanvasAgg(fig)
-    ax_ring = fig.add_subplot(1, 2, 1, projection='polar')
-    ax_lin  = fig.add_subplot(1, 2, 2)
+    _mp_plot_trajectory(fig.add_subplot(1, 3, 1), ctx, 1.0, '(cm)')
+    ax_ring = fig.add_subplot(1, 3, 2, projection='polar')
+    ax_lin  = fig.add_subplot(1, 3, 3)
 
     # ── Ring heatmap ──────────────────────────────────────────────────────────
     theta_mesh, r_mesh = np.meshgrid(np.arange(n + 1) * bw, np.array([r_min, r_max]))
@@ -3386,7 +3405,7 @@ def _mp_run_session(args):
         try:
             title = f'{session}  |  {unit}'
             if cc is not None:
-                _mp_plot_cell_circular(cc, plot_fields, title, save_path)
+                _mp_plot_cell_circular(ctx, cc, plot_fields, title, save_path)
             else:
                 _mp_plot_cell_2d(ctx, plot_fields, title, save_path)
         except Exception as e:

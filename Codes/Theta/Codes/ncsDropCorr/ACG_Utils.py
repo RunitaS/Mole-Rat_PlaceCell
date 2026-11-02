@@ -172,7 +172,7 @@ THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 # interpolated over, then the x/y traces are Gaussian-smoothed with sigma
 # POS_SMOOTH_SIGMA_SMP (in samples). Matches the protocol in
 # PlaceCellCharacterization_SpeedModv3.py.
-POS_JUMP_THRESH_CMS  = 80.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
+POS_JUMP_THRESH_CMS  = 90.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
 POS_SMOOTH_SIGMA_SMP = 1.0    # Gaussian smoothing sigma (in samples) applied to x/y tracking position
 
 # The original MATLAB (create_sine_ref_xcorrs.m) hardcodes its reference-sine
