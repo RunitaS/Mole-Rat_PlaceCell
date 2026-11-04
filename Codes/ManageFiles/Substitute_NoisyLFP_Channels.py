@@ -14,7 +14,7 @@ import shutil
 # ==== USER CONFIGURATION =====================================================
 # Hardcode the root folder to search. All subfolders and sub-subfolders will
 # be scanned for session folders containing the clean-channel .ncs files below.
-ROOT_DIR = r"X:/NMR_group_data/Runita/AllData_Backup/AllSortedData/Tetrode/Fa23BD/Linear/Day1/LFP_ToCUt"  # <-- EDIT THIS PATH
+ROOT_DIR = r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Fa23BD"  # <-- EDIT THIS PATH
 
 # Mapping of {destination filename (noisy channel to fill in): source filename
 # (clean channel to copy from)}, applied within every session folder.
@@ -23,7 +23,7 @@ COPY_MAP = {
      "CSC6ch2.ncs": "CSC8ch2.ncs",
      "CSC4ch2.ncs": "CSC1ch2.ncs",
      "CSC3ch2.ncs": "CSC2ch2.ncs",
-     "CSC7ch2.ncs": "CSC2ch2.ncs",
+     "CSC7ch2.ncs": "CSC8ch2.ncs",
  }
 
 # COPY_MAP = {

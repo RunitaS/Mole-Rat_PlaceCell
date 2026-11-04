@@ -111,10 +111,10 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed.
-ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_NoiseRemoval_EdgePad_NcsDropCorr')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG' , 'ACG_theta_continuity_NoiseRemoval_EdgePad_NcsDropCorr')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.

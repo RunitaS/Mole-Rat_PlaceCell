@@ -844,21 +844,35 @@ def _run_cell(args) -> tuple[list[dict], list[dict], list[dict]]:
             print(f'  [SKIP] no valid occupancy for {unit}')
         return [], [], []
 
-    res = analyse_cell(metrics, ctx, bin_cm)
-    if res is None:
+    ntt_name = os.path.splitext(unit)[0]
+    save_path = os.path.join(dirpath, LAP_SUBDIR, f'{ntt_name}_lap_raster_openfield.png')
+    rows = lap_raster_cell(metrics, ctx, dirpath, session, unit, save_path)
+    if rows is None:
         with _print_lock:
             print(f'  [SKIP] no place field detected for {unit}')
         return [], [], []
+    with _print_lock:
+        print(f'  [SAVED] {save_path}')
+    return rows
+
+
+def lap_raster_cell(metrics: dict, ctx: dict, dirpath: str, session: str, unit: str,
+                    save_path: str) -> tuple[list[dict], list[dict], list[dict]] | None:
+    """Open-field lap raster figure for one place cell from its compute_metrics
+    output (run with this module's pc settings), saved to save_path. session
+    labels the figure and the rows. Returns (field_rows, pass_rows,
+    epoch_rows), or None if no place field is detected."""
+    bin_cm = pc.target_bin_cm
+    res = analyse_cell(metrics, ctx, bin_cm)
+    if res is None:
+        return None
 
     base = {'session': session, 'unit': unit,
             'session_type': os.path.basename(dirpath).split('_', 1)[-1]}
     summaries = [_field_summary(base, fld, fld['passes'], ctx) for fld in res['fields']]
 
     ntt_name = os.path.splitext(unit)[0]
-    save_path = os.path.join(dirpath, LAP_SUBDIR, f'{ntt_name}_lap_raster_openfield.png')
     make_figure(res, ctx, metrics, summaries, bin_cm, f'{session}  |  {ntt_name}', save_path)
-    with _print_lock:
-        print(f'  [SAVED] {save_path}')
 
     pass_rows = [{**base, 'field_number': fld['field_number'], 'pass_number': i,
                   **{k: v for k, v in p.items() if not k.startswith('_')}}

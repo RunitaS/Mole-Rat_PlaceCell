@@ -380,7 +380,7 @@ import PlaceCell_Main_v21 as pc   # temporal stability maps
 # ── Parameters ──────────────────────────────────────────────────────────────
 
 INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Main\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final0\Results\PC_Char'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Char'
 
 # Copy of INPUT_EXCEL with the place-field shape columns added to its
 # 'PlaceFields' sheet.

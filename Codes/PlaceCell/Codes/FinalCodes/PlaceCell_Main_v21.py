@@ -39,20 +39,19 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # ── Directories (edit these per run) ──────────────────────────────────────────
-
-root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\QualFiltData_AllCells'
-output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
+root_folder  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
+output_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\All_TT_PlaceChar_SiSkaggsAdptBin_Final_OnlyPC.xlsx'
 
 # Destination for .ntt + tracking files of confirmed place cells (folder pattern
 # replicated from the animal-ID folder onwards, e.g. Fa1059/Open/<session>/...)
-Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
+Output_PlaceTrue = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final_Backup'
+SAVE_PLACE_TRUE_COPY = False   # False: don't copy confirmed place cells' files to Output_PlaceTrue
 
 
 # Per-unit figure subfolders, created next to each .ntt file
 SPEED_MOD_SUBDIR = 'speed modulation_Final'
 SHUFFLING_SUBDIR = 'shuffling_SiAdptBin_Final'
 RATEMAPS_SUBDIR  = 'ratemaps_SiAdptBin_Final'
-
 
 # ── Which ratemap each metric uses ────────────────────────────────────────────
 # Each metric group below takes its own ratemap type (options listed further
@@ -420,7 +419,7 @@ GAUSSIAN_SIGMA_CM = 3 #1.5 * 2.1
 # appear in the run-metadata CSV. Add new config variables here as they're
 # introduced so they get captured automatically.
 RUN_CONFIG_VARS = [
-    'root_folder', 'output_excel', 'Output_PlaceTrue',
+    'root_folder', 'output_excel', 'Output_PlaceTrue', 'SAVE_PLACE_TRUE_COPY',
     'SPEED_MOD_SUBDIR', 'SHUFFLING_SUBDIR', 'RATEMAPS_SUBDIR',
     'fps', 'target_bin_cm', 'arena_width_cm',
     'use_min_occ_s', 'min_occ_s', 'use_min_visits', 'min_visits',
@@ -2270,11 +2269,12 @@ def _compute_split_half_stability(ctx: dict, bin_cm: float,
 def _plot_and_save_split_half_ratemap(ctx: dict, stability: dict,
                                        ntt_path: str, target_bin_cm: float) -> None:
     """Combined figure for a confirmed place cell: full-session ratemap
-    (top, spanning both columns), first-half ratemap (bottom-left) and
+    (top-left, on the colour scale shared with the halves; top-right, the
+    same map scaled to its own peak), first-half ratemap (bottom-left) and
     second-half ratemap (bottom-right), with the split-half stability score
     annotated at the bottom.
 
-    All three panels are COHERENCE_STABILITY_RATEMAP_TYPE maps.
+    All four panels are COHERENCE_STABILITY_RATEMAP_TYPE maps.
     First/second-half maps come from `_split_half_maps` -- the SAME
     full-session grid and maps `_compute_split_half_stability` correlates
     (not the independently-binned first/second-half rows computed
@@ -2305,24 +2305,35 @@ def _plot_and_save_split_half_ratemap(ctx: dict, stability: dict,
                (disp_second.max() if disp_second.count() else 0.0))
     vmax = float(vmax) if vmax > 0 else 1.0
 
+    # Full-session map scaled to its own peak, for reference: matches the
+    # Gaussian-smoothed panel of the main ratemap figure. The other three
+    # panels share `vmax`, which is usually set by a half's (noisier) peak.
+    own_vmax = float(disp_full.max()) if disp_full.count() and disp_full.max() > 0 else 1.0
+
     fig = Figure(figsize=(10, 10))
     FigureCanvasAgg(fig)
-    # 4-column grid: the full-session map occupies the two middle columns
-    # (centered over the figure), each half-session map takes two columns.
+    # 4-column grid: top row = full-session map on the shared scale (left)
+    # and on its own scale (right); bottom row = the two half-session maps.
     gs = fig.add_gridspec(2, 4)
 
-    ax_full   = fig.add_subplot(gs[0, 1:3])
+    ax_full   = fig.add_subplot(gs[0, 0:2])
+    ax_own    = fig.add_subplot(gs[0, 2:4])
     ax_first  = fig.add_subplot(gs[1, 0:2])
     ax_second = fig.add_subplot(gs[1, 2:4])
 
     im = ax_full.imshow(disp_full.T, origin='lower', extent=extent,
                          cmap='jet', interpolation='nearest', vmin=0, vmax=vmax)
-    ax_full.set_title('Full session')
+    ax_full.set_title('Full session (shared scale)')
     ax_full.set_xlabel('x (cm)')
     ax_full.set_ylabel('y (cm)')
-    # Colorbar in an inset axes so it doesn't shrink/shift the centered map.
-    cax = ax_full.inset_axes([1.03, 0.0, 0.04, 1.0])
-    fig.colorbar(im, cax=cax, label='firing rate (Hz)')
+    fig.colorbar(im, ax=ax_full, label='firing rate (Hz)')
+
+    im_own = ax_own.imshow(disp_full.T, origin='lower', extent=extent,
+                            cmap='jet', interpolation='nearest', vmin=0, vmax=own_vmax)
+    ax_own.set_title(f'Full session (own scale, peak = {own_vmax:.2f} Hz)')
+    ax_own.set_xlabel('x (cm)')
+    ax_own.set_ylabel('y (cm)')
+    fig.colorbar(im_own, ax=ax_own, label='firing rate (Hz)')
 
     ax_first.imshow(disp_first.T, origin='lower', extent=extent,
                      cmap='jet', interpolation='nearest', vmin=0, vmax=vmax)
@@ -3781,38 +3792,42 @@ if __name__ == "__main__":
     # ── Copy .ntt + tracking files for confirmed place cells ───────────────────
     # Replicates the folder structure from the animal-ID folder onwards
     # (Fa1059 / Fa23BD / Fa8477 / Fa5384) under Output_PlaceTrue.
+    # Skipped when SAVE_PLACE_TRUE_COPY is False.
 
-    place_rows = df_full[df_full['place_cell'] == True]  # noqa: E712
-    copied_tracking_dirs = set()
+    if SAVE_PLACE_TRUE_COPY:
+        place_rows = df_full[df_full['place_cell'] == True]  # noqa: E712
+        copied_tracking_dirs = set()
 
-    for _, row in place_rows.iterrows():
-        session = row['session']
-        dirpath = root_folder if session == '.' else os.path.join(root_folder, session)
-        ntt_path = os.path.join(dirpath, row['unit'])
+        for _, row in place_rows.iterrows():
+            session = row['session']
+            dirpath = root_folder if session == '.' else os.path.join(root_folder, session)
+            ntt_path = os.path.join(dirpath, row['unit'])
 
-        rel = _animal_relpath(dirpath)
-        if rel is None:
-            print(f'  [SKIP] Could not locate animal-ID folder in path: {dirpath}')
-            continue
+            rel = _animal_relpath(dirpath)
+            if rel is None:
+                print(f'  [SKIP] Could not locate animal-ID folder in path: {dirpath}')
+                continue
 
-        dest_dir = os.path.join(Output_PlaceTrue, rel)
-        os.makedirs(dest_dir, exist_ok=True)
+            dest_dir = os.path.join(Output_PlaceTrue, rel)
+            os.makedirs(dest_dir, exist_ok=True)
 
-        if os.path.isfile(ntt_path):
-            shutil.copy2(ntt_path, dest_dir)
-        else:
-            print(f'  [SKIP] .ntt file not found: {ntt_path}')
+            if os.path.isfile(ntt_path):
+                shutil.copy2(ntt_path, dest_dir)
+            else:
+                print(f'  [SKIP] .ntt file not found: {ntt_path}')
 
-        if dirpath not in copied_tracking_dirs:
-            csv_path = dir_to_csv.get(dirpath)
-            if csv_path and os.path.isfile(csv_path):
-                shutil.copy2(csv_path, dest_dir)
-            # Also copy all .nev and .ncs files from the session folder
-            for fname in os.listdir(dirpath):
-                if fname.lower().endswith(('.nev', '.ncs')):
-                    src = os.path.join(dirpath, fname)
-                    if os.path.isfile(src):
-                        shutil.copy2(src, dest_dir)
-            copied_tracking_dirs.add(dirpath)
+            if dirpath not in copied_tracking_dirs:
+                csv_path = dir_to_csv.get(dirpath)
+                if csv_path and os.path.isfile(csv_path):
+                    shutil.copy2(csv_path, dest_dir)
+                # Also copy all .nev and .ncs files from the session folder
+                for fname in os.listdir(dirpath):
+                    if fname.lower().endswith(('.nev', '.ncs')):
+                        src = os.path.join(dirpath, fname)
+                        if os.path.isfile(src):
+                            shutil.copy2(src, dest_dir)
+                copied_tracking_dirs.add(dirpath)
 
-    print(f'Place-cell files copied to : {Output_PlaceTrue}')
+        print(f'Place-cell files copied to : {Output_PlaceTrue}')
+    else:
+        print('Place-cell file copy skipped (SAVE_PLACE_TRUE_COPY = False)')

@@ -13,7 +13,7 @@ PIPELINE (run_full_pipeline), per arena:
      percentile envelope of the shuffles, after smoothing both sides with the same 2D Gaussian KDE
      (Scott's rule, edge-corrected over the bins the cells validly sampled; the KDEs are computed
      but not plotted). Bins above the envelope are shown in GREEN_ABOVE (over-represented), below it
-     in MAGENTA_BELOW (under-represented).
+     in PINK_BELOW (under-represented).
   3. RAYLEIGH (open field and circular track) -- the peak proportion map's envelope bins tested for
      a preferred direction around the arena: over- and under-represented bins separately, for the
      shuffle-only bins and the occupancy-controlled bins, 4 tests per arena. See the RAYLEIGH section.
@@ -45,16 +45,16 @@ METHOD 2 -- BIN-SHUFFLE POINTWISE ENVELOPE (stage 2), per map kind x arena:
      SHUFFLE_RENORMALISE_ON_COMMON_DOMAIN, rescaled to integrate to 1 there (common_densities).
   Step 4 -- repeat N_SHUFFLE (1000) times.
   Step 5 -- pointwise percentile envelope: bins where the real (renormalised) density lies above
-     the 97.5th (green) or below the 2.5th (magenta) percentile of the N_SHUFFLE shuffled densities
+     the 97.5th (green) or below the 2.5th (pink) percentile of the N_SHUFFLE shuffled densities
      (SHUFFLE_ENVELOPE). Per bin, with no multiple-comparison correction. Envelope bins are split
      into 8-connected clusters (wrapping on the circular track).
   OCCUPANCY-CONTROLLED SCORE (occupancy_controlled_score), for the peak proportion map: every
      bin's envelope result in the firing map (Fr) is compared with the same bin's envelope result in
      the mean occupancy map (Occ) of the same run (+ = above, - = below, 0 = inside the envelope):
          Fr + & Occ + / Fr - & Occ - / both 0 ->  0     (gray)
-         Fr +, Occ 0  -> +1   (GREEN_ABOVE)          Fr -, Occ 0  -> -1   (MAGENTA_BELOW)
-         Fr 0, Occ -  -> +0.5 (GREEN_LIGHT)          Fr 0, Occ +  -> -0.5 (MAGENTA_LIGHT)
-         Fr +, Occ -  -> +1.5 (GREEN_DARK)           Fr -, Occ +  -> -1.5 (MAGENTA_DARK)
+         Fr +, Occ 0  -> +1   (GREEN_ABOVE)          Fr -, Occ 0  -> -1   (PINK_BELOW)
+         Fr 0, Occ -  -> +0.5 (GREEN_LIGHT)          Fr 0, Occ +  -> -0.5 (PINK_LIGHT)
+         Fr +, Occ -  -> +1.5 (GREEN_DARK)           Fr -, Occ +  -> -1.5 (PINK_DARK)
      i.e. score = 0 if Fr = Occ, else Fr - 0.5 Occ. A bin outside one map's common domain counts as
      0 in that map. Plotted as the last column of ShuffleEnvelope_peak.png.
 What this null tests: shuffling removes all spatial structure but not occupancy -- the shuffled
@@ -207,9 +207,9 @@ from matplotlib.lines import Line2D
 # ============================================================================
 
 
-ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+ROOT_DIRECTORY = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 #ROOT_DIRECTORY = r'C:\Runita\NMR\analysis\AllSort_Results\PlaceCell\Data'
-OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Quad_V7_Shuffle')   # + /Raw, /AdptBin (MEAN_MAP_RATES)
+OUTPUT_DIR = os.path.join(ROOT_DIRECTORY, 'MeanRM_Peak')   # + /Raw, /AdptBin (MEAN_MAP_RATES)
 
 USE_BIN_COVERAGE_CRITERION = False
 COVERAGE_FRACTION = 0.01
@@ -374,18 +374,18 @@ SHUFFLE_MAX_WORKERS = 4        # worker processes over the (map kind, arena) job
 SHUFFLE_RENORMALISE_ON_COMMON_DOMAIN = True
 SHUFFLE_COMMON_BANDWIDTH = True   # shuffled KDEs use the real KDE's bandwidth matrix H (False = own Scott H)
 MIN_CLUSTER_BINS    = 1        # clusters smaller than this are not reported
-GREEN_ABOVE   = '#39FF14'         # fluorescent green: real ABOVE the shuffle envelope
-MAGENTA_BELOW = '#FF00FF'         # fluorescent magenta: real BELOW the shuffle envelope
-# Occupancy-controlled score colours (see the header): light = GREEN_ABOVE / MAGENTA_BELOW half-way
-# to white (+-0.5), dark = at 60 % intensity (+-1.5).
-GREEN_LIGHT   = '#9CFF8A'
-GREEN_DARK    = '#22990C'
-MAGENTA_LIGHT = '#FF80FF'
-MAGENTA_DARK  = '#990099'
+GREEN_ABOVE = '#44BF70'         # viridis(0.70) green: real ABOVE the shuffle envelope
+PINK_BELOW  = '#B73779'         # magma(0.50) pink: real BELOW the shuffle envelope
+# Occupancy-controlled score colours (see the header): lighter (+-0.5) and darker (+-1.5) shades of
+# GREEN_ABOVE / PINK_BELOW taken from the same colour map.
+GREEN_LIGHT = '#B0DD2F'         # viridis(0.88)
+GREEN_DARK  = '#1E9C89'         # viridis(0.55)
+PINK_LIGHT  = '#EA5661'         # magma(0.64)
+PINK_DARK   = '#782281'         # magma(0.35)
 OCC_SCORE_COLOURS = {1.5: GREEN_DARK, 1.0: GREEN_ABOVE, 0.5: GREEN_LIGHT,
-                     -0.5: MAGENTA_LIGHT, -1.0: MAGENTA_BELOW, -1.5: MAGENTA_DARK}
+                     -0.5: PINK_LIGHT, -1.0: PINK_BELOW, -1.5: PINK_DARK}
 # Bin weight of the occupancy-controlled Rayleigh tests and weighted arm preference, by |score| (dark /
-# full / light; the same weights for the green and the magenta bins).
+# full / light; the same weights for the green and the pink bins).
 OCC_SCORE_WEIGHTS = {1.5: 1.5, 1.0: 1.0, 0.5: 0.5}
 
 # --- Rayleigh tests of the envelope bins (open field, circular track; see the RAYLEIGH section) ---
@@ -1388,7 +1388,7 @@ _MAP_KINDS = {
                   'Mean occupancy map', 'Mean normalised occupancy (a.u.)', 3),
 }
 
-# What 'higher' / 'lower' (green / magenta) bins mean for each map kind, in figure titles.
+# What 'higher' / 'lower' (green / pink) bins mean for each map kind, in figure titles.
 _KIND_QUANTITY = {'peak': 'firing', 'occupancy': 'occupancy'}
 
 
@@ -1700,8 +1700,8 @@ def run_shuffle_envelope(arena_handlers: dict, arena_results: dict, out_dir: str
 # ============================================================================
 # Four tests per arena on the RAYLEIGH_MAP_KIND map's envelope bins, over- and under-represented
 # separately:
-#   shuffle only:          green / magenta envelope bins, each with bin weight 1
-#   occupancy-controlled:  green (score > 0) / magenta (score < 0) score bins, each with bin weight
+#   shuffle only:          green / pink envelope bins, each with bin weight 1
+#   occupancy-controlled:  green (score > 0) / pink (score < 0) score bins, each with bin weight
 #                          OCC_SCORE_WEIGHTS[|score|] (dark 1.5, full 1, light 0.5)
 # OPEN FIELD: the bin weight is multiplied by a wall weight, distance of the bin centre from the arena
 #   centre / arena radius (0 at the centre, 1 at the wall). CIRCULAR TRACK: no wall weight (the track
@@ -1728,7 +1728,7 @@ _RAYLEIGH_FILE = {'open_field': 'Rayleigh_OpenField', 'circular_track': 'Rayleig
 _RAYLEIGH_BINS = {'shuffle': 'Shuffle only', 'occ_controlled': 'Occupancy-controlled'}
 # direction -> (figure label, bar colour, envelope bins, sign of the occupancy-controlled score)
 _RAYLEIGH_DIRECTIONS = {'over': ('Over-represented', GREEN_ABOVE, 'env_above', 1.0),
-                        'under': ('Under-represented', MAGENTA_BELOW, 'env_below', -1.0)}
+                        'under': ('Under-represented', PINK_BELOW, 'env_below', -1.0)}
 _RAYLEIGH_TESTS = [(bins, direction) for bins in _RAYLEIGH_BINS for direction in _RAYLEIGH_DIRECTIONS]
 
 
@@ -1787,7 +1787,7 @@ def rayleigh_test(angles: np.ndarray, w: np.ndarray) -> dict:
 
 
 def _occ_score_bin_weights(occ_score: np.ndarray, sign: float) -> np.ndarray:
-    """Per bin OCC_SCORE_WEIGHTS[|score|] of the green (sign = 1) / magenta (sign = -1) score bins, else 0."""
+    """Per bin OCC_SCORE_WEIGHTS[|score|] of the green (sign = 1) / pink (sign = -1) score bins, else 0."""
     w = np.zeros_like(occ_score)
     for v, weight in OCC_SCORE_WEIGHTS.items():
         w[sign * occ_score == v] = weight
@@ -1840,7 +1840,7 @@ def run_rayleigh(arena: str, handler, envelope: dict, n_cells: int, out_dir: str
 # 90 / 270 deg sessions the vertical (|) arm; within an arm the physical space is the same and only
 # the magnetic north (mN) side differs (LINEAR_MN_SIDE). Per session type (its own Method 2 run) x
 # map kind x direction, the pointwise-envelope bins -- higher firing (green) = real density above
-# the SHUFFLE_ENVELOPE[1] percentile of the shuffled densities, lower firing (magenta) = below the
+# the SHUFFLE_ENVELOPE[1] percentile of the shuffled densities, lower firing (pink) = below the
 # SHUFFLE_ENVELOPE[0] percentile -- are split at the middle of the track length:
 #   horizontal arm: topographic index = (n left  - n right) / n envelope bins
 #   vertical arm:   topographic index = (n top   - n down)  / n envelope bins
@@ -1855,7 +1855,7 @@ def run_rayleigh(arena: str, handler, envelope: dict, n_cells: int, out_dir: str
 # back to their real side, not re-tested on a rotated map.
 # OCCUPANCY-CONTROLLED WEIGHTED version (linear_arm_preference_occ_weighted; peak proportion map only):
 # the same split and indices on the occupancy-controlled score bins instead of the plain envelope
-# bins. Higher firing = the green bins (score > 0), lower firing = the magenta bins (score < 0);
+# bins. Higher firing = the green bins (score > 0), lower firing = the pink bins (score < 0);
 # every bin counts with the weight OCC_SCORE_WEIGHTS[|score|] (dark 1.5, full 1, light 0.5), gray
 # bins (score 0) not at all:
 #   topographic index = (W side 1 - W side 2) / W,  magnetic index = (W mN side - W mS side) / W
@@ -2106,8 +2106,8 @@ def plot_mean_occupancy_maps(arena_handlers: dict, arena_results: dict, save_pat
 
 def plot_shuffle_kind(title: str, cbar_label: str, arena_handlers: dict, summaries: dict, save_path: str,
                       scores: dict | None = None):
-    """Rows = arenas; columns = pooled map, pointwise percentile envelope bins (fluorescent green =
-    real above the envelope, magenta = below), and with scores ({arena: occupancy_controlled_score
+    """Rows = arenas; columns = pooled map, pointwise percentile envelope bins (green =
+    real above the envelope, pink = below), and with scores ({arena: occupancy_controlled_score
     output}; the firing map) the occupancy-controlled score (OCC_SCORE_COLOURS)."""
     arenas = [a for a in _ARENA_ORDER if a in summaries]
     ratios = [_SHUFFLE_ROW_HEIGHT[a] for a in arenas]
@@ -2131,9 +2131,9 @@ def plot_shuffle_kind(title: str, cbar_label: str, arena_handlers: dict, summari
         ax = fig.add_subplot(gs[r, 1])
         colours = np.tile(to_rgba('0.88'), (handler.n_bins, 1))
         colours[s['env_above']] = to_rgba(GREEN_ABOVE)
-        colours[s['env_below']] = to_rgba(MAGENTA_BELOW)
+        colours[s['env_below']] = to_rgba(PINK_BELOW)
         _draw_bins(ax, handler, seen, facecolors=colours)
-        ax.set_title(f"Pointwise envelope: real > {hi:g}th (green) / < {lo:g}th (magenta)\n"
+        ax.set_title(f"Pointwise envelope: real > {hi:g}th (green) / < {lo:g}th (pink)\n"
                      f"percentile of the shuffles ({int(s['env_above'].sum())} / "
                      f"{int(s['env_below'].sum())} bins; not corrected for multiple bins)", fontsize=9)
 
@@ -2154,7 +2154,7 @@ def plot_shuffle_kind(title: str, cbar_label: str, arena_handlers: dict, summari
                      fontsize=9)
 
     handles = [matplotlib.patches.Patch(color=GREEN_ABOVE, label=f'Real > {hi:g}th percentile of shuffles'),
-               matplotlib.patches.Patch(color=MAGENTA_BELOW, label=f'Real < {lo:g}th percentile of shuffles')]
+               matplotlib.patches.Patch(color=PINK_BELOW, label=f'Real < {lo:g}th percentile of shuffles')]
     if scores is not None:
         score_labels = {1.5: 'Fr +, Occ −', 1.0: 'Fr +, Occ 0', 0.5: 'Fr 0, Occ −',
                         -0.5: 'Fr 0, Occ +', -1.0: 'Fr −, Occ 0', -1.5: 'Fr −, Occ +'}
@@ -2239,12 +2239,18 @@ def plot_rayleigh(arena: str, tests: dict, centres: np.ndarray, n_cells: int, sa
 
 # --- Stage 4: linear track arm preference figure ---
 
-ARM_COLOURS = {'horizontal': '#4C78A8', 'vertical': '#E8853D'}
+# Bar (fill, outline) per linear session type: dark / light cyan, thick white / black outline.
+CYAN_DARK, CYAN_LIGHT = '#008B8B', '#8EE8EE'
+LINEAR_STYPE_STYLES = {'0':   (CYAN_DARK, 'white'),
+                       '90':  (CYAN_DARK, 'black'),
+                       '180': (CYAN_LIGHT, 'white'),
+                       '270': (CYAN_LIGHT, 'black')}
+LINEAR_STYPE_EDGE_LW = 2.5
 
 
 _ARM_INDEX_COLS = (('topographic_index', 'Topographic preference index'),
                    ('magnetic_index', 'Magnetic north preference index'))
-_DIRECTION_COLOURS = {'higher': GREEN_ABOVE, 'lower': MAGENTA_BELOW}
+_DIRECTION_COLOURS = {'higher': GREEN_ABOVE, 'lower': PINK_BELOW}
 
 
 def _arm_pref_rule(measure: str, direction: str) -> str:
@@ -2252,7 +2258,7 @@ def _arm_pref_rule(measure: str, direction: str) -> str:
     if measure == 'envelope':
         lo, hi = SHUFFLE_ENVELOPE
         return (f'real > {hi:g}th' if direction == 'higher' else f'real < {lo:g}th') + ' pct of the shuffled KDEs'
-    colour = 'green' if direction == 'higher' else 'magenta'
+    colour = 'green' if direction == 'higher' else 'pink'
     weights = ' / '.join(f'{w:g}' for w in OCC_SCORE_WEIGHTS.values())
     return f'occ.-controlled {colour} bins, weight dark / full / light = {weights}'
 
@@ -2272,7 +2278,7 @@ def _arm_pref_session_types(df: pd.DataFrame) -> list:
 
 def _arm_pref_panel(ax, sub: pd.DataFrame, stypes: list, c: int, direction: str, title: str):
     """One bar panel: index _ARM_INDEX_COLS[c] per session type of sub (one direction, indexed by
-    session type), bar colour = arm, strip on top = direction colour."""
+    session type), bar fill / outline = LINEAR_STYPE_STYLES, strip on top = direction colour."""
     col, ylab = _ARM_INDEX_COLS[c]
     ticks = []
     for i, t in enumerate(stypes):
@@ -2286,7 +2292,8 @@ def _arm_pref_panel(ax, sub: pd.DataFrame, stypes: list, c: int, direction: str,
             ax.text(i, 0.04, 'no sig.\nbins', ha='center', va='bottom', fontsize=8, color='0.4')
             continue
         v = float(row[col])
-        ax.bar(i, v, width=0.6, color=ARM_COLOURS[LINEAR_ARM[t]])
+        fill, edge = LINEAR_STYPE_STYLES[t]
+        ax.bar(i, v, width=0.6, facecolor=fill, edgecolor=edge, linewidth=LINEAR_STYPE_EDGE_LW)
         ax.text(i, v + (0.04 if v >= 0 else -0.04), _arm_pref_bar_label(v, row),
                 ha='center', va='bottom' if v >= 0 else 'top', fontsize=8)
     ax.axhline(0.0, color='0.3', lw=0.8)
@@ -2301,12 +2308,41 @@ def _arm_pref_panel(ax, sub: pd.DataFrame, stypes: list, c: int, direction: str,
                                               color=_DIRECTION_COLOURS[direction], clip_on=False))
 
 
+def _draw_linear_track_schematic(ax):
+    """+ maze schematic (raw tracking frame): each linear session type as a stripe along its arm
+    (LINEAR_ARM) in its LINEAR_STYPE_STYLES fill / outline, labelled at its magnetic-north end
+    (LINEAR_MN_SIDE)."""
+    L, w, pad = 1.0, 0.16, 0.12            # arm half-length, stripe width, label gap
+    ax.add_patch(matplotlib.patches.Rectangle((-L, -2 * w), 2 * L, 4 * w, color='0.85', zorder=1))
+    ax.add_patch(matplotlib.patches.Rectangle((-2 * w, -L), 4 * w, 2 * L, color='0.85', zorder=1))
+    for arm in ('horizontal', 'vertical'):
+        types = [t for t in ARENA_SESSION_TYPES['linear_track'] if LINEAR_ARM[t] == arm]
+        for t, o in zip(types, (w, -w)):
+            fill, edge = LINEAR_STYPE_STYLES[t]
+            style = dict(facecolor=fill, edgecolor=edge, linewidth=LINEAR_STYPE_EDGE_LW * 0.6)
+            if arm == 'horizontal':
+                ax.add_patch(matplotlib.patches.Rectangle((-L, o - w / 2), 2 * L, w, zorder=2, **style))
+            else:
+                ax.add_patch(matplotlib.patches.Rectangle((o - w / 2, -L), w, 2 * L, zorder=3, **style))
+            x, y, ha, va = {'left':   (-L - pad, o, 'right', 'center'),
+                            'right':  (L + pad, o, 'left', 'center'),
+                            'top':    (o, L + pad, 'center', 'bottom'),
+                            'bottom': (o, -L - pad, 'center', 'top')}[LINEAR_MN_SIDE[t]]
+            ax.text(x, y, f'{t}°\nmN', ha=ha, va=va, fontsize=9, fontweight='bold', ma='center',
+                    bbox=dict(boxstyle='round,pad=0.25', facecolor=fill, edgecolor=edge,
+                              linewidth=LINEAR_STYPE_EDGE_LW * 0.6))
+    ax.set_xlim(-1.75, 1.75)
+    ax.set_ylim(-1.6, 1.6)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_title('Session types\n(label at mN end)', fontsize=10)
+
+
 def _arm_pref_finish(fig, suptitle: str, save_path: str, rect: tuple):
-    handles = [matplotlib.patches.Patch(color=ARM_COLOURS[a], label=f'{a.capitalize()} arm')
-               for a in ('horizontal', 'vertical')]
-    fig.legend(handles=handles, loc='lower center', ncol=2, frameon=False, fontsize=10)
+    """Suptitle, layout within rect, + maze schematic in the space right of rect, save."""
     _wrapped_suptitle(fig, suptitle)
     fig.tight_layout(rect=rect)
+    _draw_linear_track_schematic(fig.add_axes((rect[2] + 0.005, 0.2, 0.995 - rect[2], 0.6)))
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
     print(f'[SAVED] {save_path}')
@@ -2316,19 +2352,19 @@ def plot_linear_arm_preference_envelope(df: pd.DataFrame, title: str, direction:
                                         quantity: str = 'firing', title_prefix: str = '',
                                         measure: str = 'envelope'):
     """One map kind, one direction of a measure of _ARM_PREF_MEASURES (envelope: higher = real above
-    the upper percentile of the shuffles, lower = below the lower one; occ_weighted: green / magenta
+    the upper percentile of the shuffles, lower = below the lower one; occ_weighted: green / pink
     occupancy-controlled bins, weighted). Columns: topographic | magnetic index."""
     _, _, name, formula = _ARM_PREF_MEASURES[measure]
     stypes = _arm_pref_session_types(df)
     sub = df[df['direction'] == direction].set_index('session_type')
-    fig, axs = plt.subplots(1, 2, figsize=(11, 5.0), sharey=True)
+    fig, axs = plt.subplots(1, 2, figsize=(13, 5.0), sharey=True)
     for c in range(2):
         _arm_pref_panel(axs[c], sub, stypes, c, direction,
                         f'{"Topographic" if c == 0 else "Magnetic"} -- {name} {direction.upper()} '
                         f'{quantity}\n({_arm_pref_rule(measure, direction)})')
     _arm_pref_finish(fig, f'{title_prefix}Linear track arm preference, {name}, {direction} {quantity} -- {title}: '
                           f'{formula}, track split at its middle; raw tracking '
-                          f'frame (x right, y up)', save_path, (0, 0.07, 1, 0.98))
+                          f'frame (x right, y up)', save_path, (0, 0.02, 0.8, 0.98))
 
 
 # --- Stage 5: per-animal comparison figures ---

@@ -17,6 +17,13 @@ Fig1def_spike_quality_v2.py; cluster 0 is excluded as before):
   peak_amp_uV           – peak amplitude (best channel, mean waveform)
 
 The re-computed values replace the originals for those units in every plot.
+
+The mean firing rate of every unit is added as
+  mean_fr_hz            – n_spikes / recording duration of its session
+with the duration taken from Events.nev ('Starting Recording' → 'Stopping Recording';
+a missing one is replaced by the first / last event of the file). Sessions without
+events use the span of the *_cm.csv tracking timestamps.
+
 Outputs (next to OUTPUT_EXCEL):
   <name>_MTclean.xlsx            – corrected metrics table + before/after table for MT units
   quality_plots_MTclean/         – one histogram per metric, an all-metrics grid,
@@ -156,6 +163,53 @@ def load_ntt_waveforms(ntt_path: str):
     spike_data = np.memmap(ntt_path, dtype=NTT_DTYPE, mode='r', offset=NTT_HEADER_BYTES)
     spike_data = spike_data[spike_data['cell_number'] != 0]  # type: ignore[index]
     return spike_data['waveforms'].astype(np.float64) * uv_scale  # type: ignore[operator]
+
+
+# ── Recording duration (Events.nev, tracking fallback) ────────────────────────
+
+NEV_DTYPE = np.dtype([
+    ('stx',           '<i2'),
+    ('pkt_id',        '<i2'),
+    ('pkt_data_size', '<i2'),
+    ('timestamp',     '<u8'),
+    ('event_id',      '<i2'),
+    ('ttl',           '<u2'),
+    ('crc',           '<i2'),
+    ('dummy1',        '<i2'),
+    ('dummy2',        '<i2'),
+    ('extra',         '<i4', (8,)),
+    ('event_str',     'S128'),
+])
+
+
+def recording_duration_s(session_dir: str):
+    """
+    (duration in s, source) of a session's recording.
+    Events.nev 'Starting Recording' → 'Stopping Recording'; when one of the two is
+    missing, the first / last event of the file is used instead (in the sessions
+    concerned these match the spike times to < 1 s, while the video can run on for
+    many minutes after the acquisition stopped). Without events: span of the
+    *_cm.csv tracking timestamps.
+    """
+    nev_path = os.path.join(session_dir, 'Events.nev')
+    if os.path.isfile(nev_path):
+        ev = np.fromfile(nev_path, dtype=NEV_DTYPE, offset=NTT_HEADER_BYTES)
+        if len(ev):
+            ts   = ev['timestamp'].astype(np.int64)
+            strs = [s.split(b'\x00')[0].decode('latin-1').strip() for s in ev['event_str']]
+            start = [t for t, s in zip(ts, strs) if s == 'Starting Recording']
+            stop  = [t for t, s in zip(ts, strs) if s == 'Stopping Recording']
+            t0 = start[0] if start else ts.min()
+            t1 = stop[-1] if stop else ts.max()
+            source = 'nev' if (start and stop) else 'nev_first_last_event'
+            if t1 > t0:
+                return (t1 - t0) / 1e6, source
+    csvs = [f for f in os.listdir(session_dir) if f.endswith('_cm.csv')] if os.path.isdir(session_dir) else []
+    if csvs:
+        t = pd.read_csv(os.path.join(session_dir, csvs[0]), usecols=['time'])['time'].to_numpy(dtype=np.int64)
+        if len(t) > 1:
+            return (t[-1] - t[0]) / 1e6, 'tracking'
+    return float('nan'), 'missing'
 
 
 # ── Metric functions (identical definitions to Fig1def_spike_quality_v2.py) ───
@@ -365,6 +419,15 @@ for idx in mt_rows:
                           f'{session} | {unit}',
                           metrics['n_mt_spikes_excluded'], metrics['n_spikes_clean'])
 
+# ── Mean firing rate (all spikes of the unit / recording duration) ────────────
+
+session_dur = {s: recording_duration_s(os.path.join(ROOT_FOLDER, str(s))) for s in df[session_col].unique()}
+df['recording_duration_s'] = df[session_col].map(lambda s: session_dur[s][0])
+df['duration_source']      = df[session_col].map(lambda s: session_dur[s][1])
+df['mean_fr_hz']           = pd.to_numeric(df['n_spikes'], errors='coerce') / df['recording_duration_s']
+src_counts = pd.Series([v[1] for v in session_dur.values()]).value_counts()
+print('\nRecording duration source (sessions): ' + ', '.join(f'{k} = {v}' for k, v in src_counts.items()))
+
 # ── Save corrected table + before/after table ─────────────────────────────────
 
 mt_after   = df.loc[mt_rows, RECOMPUTED_KEYS + ['n_spikes_clean', 'n_mt_spikes_excluded']]
@@ -385,7 +448,7 @@ print(f'\nCorrected metrics saved: {CLEAN_EXCEL}')
 # ── Histograms of all quality metrics ─────────────────────────────────────────
 
 def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_colors=(), thr_labels=(),
-                   n_bins=30, legend=True, amp=None, amp_norm=None):
+                   n_bins=30, legend=True, amp=None, amp_norm=None, log_x=False):
     """
     Stacked histogram (rejected in gray at the bottom, accepted in colour on top),
     with multi-trigger units (values re-computed on clean spikes) marked as a rug
@@ -393,9 +456,13 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
     If `amp` is given, every accepted unit is drawn as its own unit-height block,
     coloured by its peak amplitude (AMP_CMAP / amp_norm) and stacked low → high
     amplitude within each bin.
+    If `log_x`, bins are log-spaced on a log x-axis (values <= 0 are left out).
     """
     values   = np.asarray(values, dtype=float)
     valid    = ~np.isnan(values)
+    n_nonpos = int((values[valid] <= 0).sum()) if log_x else 0
+    if log_x:
+        valid &= values > 0
     vals     = values[valid]
     acc      = np.asarray(accepted, dtype=bool)[valid]
     mt       = np.asarray(is_mt, dtype=bool)[valid]
@@ -410,7 +477,11 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
         ax.set_xlabel(xlabel, color=INK_PRIMARY)
         return
 
-    bin_edges   = np.histogram_bin_edges(vals, bins=n_bins)
+    if log_x:
+        bin_edges = np.geomspace(vals.min(), vals.max(), n_bins + 1)
+        ax.set_xscale('log')
+    else:
+        bin_edges = np.histogram_bin_edges(vals, bins=n_bins)
     bin_widths  = np.diff(bin_edges)
     bin_centers = bin_edges[:-1] + bin_widths / 2
     n_rej, _ = np.histogram(vals[~acc], bins=bin_edges)
@@ -452,6 +523,10 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
                label=f'Median {median_v:.3f}')
     ax.set_xlabel(xlabel, color=INK_PRIMARY)
     ax.set_ylabel('Number of units', color=INK_PRIMARY)
+    if n_nonpos:
+        ax.text(0.99, 0.98, f'{n_nonpos} units with value 0 not shown (log axis)',
+                transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, ha='right', va='top',
+                zorder=7, bbox=dict(facecolor=SURFACE, edgecolor='none', pad=1.5))
 
     if legend:
         handles, labels = ax.get_legend_handles_labels()
@@ -475,6 +550,8 @@ histogram_specs = [
     # (file suffix, df column, title, xlabel, thresholds, threshold colours, threshold labels)
     ('NSpikes',  'n_spikes',             'Number of Spikes',             'Spikes per unit',
      (), (), ()),
+    ('MeanFR',   'mean_fr_hz',           'Mean Firing Rate',             'Mean firing rate  (Hz; spikes / recording duration)',
+     (), (), ()),
     ('SNR',      'snr',                  'SNR Distribution',             'SNR  (A_peak / σ_noise)',
      (SNR_LOW_BAD, SNR_LOW_OK, SNR_HIGH_GOOD), (COLOR_THR_BAD, COLOR_THR_MARGINAL, COLOR_THR_GOOD),
      (f'Too low {SNR_LOW_BAD}', f'Marginal {SNR_LOW_OK}', f'High {SNR_HIGH_GOOD}')),
@@ -496,6 +573,7 @@ histogram_specs = [
     ('CSImod',   'csi_modified',         'CSI modified (no amplitude criterion)', 'CSI modified  (% of ISIs in [3–20 ms])',
      (10.0,), (COLOR_THR_BAD,), ('CSI = 10%',)),
 ]
+LOG_X_COLS = {'mean_fr_hz'}      # strongly right-skewed: log-spaced bins on a log axis
 
 accepted_flags = df['accepted'].values
 mt_flags       = df.index.isin(recomputed_ok)
@@ -530,7 +608,8 @@ for suffix, col, title, xlabel, thr, thr_c, thr_l in histogram_specs:
     _style_axes(ax)
     draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags, mt_flags,
                    xlabel, thr, thr_c, thr_l,
-                   amp=peak_amps if color_by_amp else None, amp_norm=amp_norm)
+                   amp=peak_amps if color_by_amp else None, amp_norm=amp_norm,
+                   log_x=col in LOG_X_COLS)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
     if color_by_amp:
         _amp_colorbar(fig.colorbar(ScalarMappable(norm=amp_norm, cmap=AMP_CMAP), ax=ax,
@@ -549,7 +628,8 @@ for ax, (suffix, col, title, xlabel, thr, thr_c, thr_l) in zip(axes, specs_prese
     _style_axes(ax)
     draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags, mt_flags,
                    xlabel, thr, thr_c, thr_l, legend=False,
-                   amp=peak_amps if col != 'peak_amp_uV' else None, amp_norm=amp_norm)
+                   amp=peak_amps if col != 'peak_amp_uV' else None, amp_norm=amp_norm,
+                   log_x=col in LOG_X_COLS)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
 for ax in axes[len(specs_present):]:
     ax.set_visible(False)

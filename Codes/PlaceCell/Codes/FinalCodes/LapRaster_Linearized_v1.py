@@ -503,33 +503,17 @@ def _field_summary(base: dict, fld: dict, disp: dict, passes: list[dict], lin: d
             'spearman_p': round(float(pval), 4) if not np.isnan(pval) else np.nan}
 
 
-def _run_cell(args) -> tuple[list[dict], list[dict]]:
-    """Lap raster figure for one place cell. Returns (field_rows, pass_rows)."""
-    idx, total, dirpath, unit = args
-    session  = os.path.relpath(dirpath, place_cell_folder)
-    ntt_path = os.path.join(dirpath, unit)
+def lap_raster_cell(metrics: dict, ctx: dict, dirpath: str, session: str, unit: str,
+                    save_path: str) -> tuple[list[dict], list[dict]] | None:
+    """Lap raster figure for one place cell from its compute_metrics output,
+    saved to save_path. Arena and session type come from dirpath (the session
+    folder); session labels the figure and the rows. Returns (field_rows,
+    pass_rows), or None if no place field is detected."""
     arena, session_type = _arena_and_session(dirpath)
-    with _print_lock:
-        print(f'[{idx}/{total}]  {session}  |  {unit}')
-
-    csv_path = _find_tracking_csv(dirpath)
-    if csv_path is None:
-        with _print_lock:
-            print(f'  [SKIP] no single tracking file found in {dirpath}')
-        return [], []
-
     bin_cm = pc.target_bin_cm
-    metrics, ctx = pc.compute_metrics(csv_path, ntt_path, pc.arena_width_cm, bin_cm)
-    if not ctx or not ctx['valid_mask'].any():
-        with _print_lock:
-            print(f'  [SKIP] no valid occupancy for {unit}')
-        return [], []
-
     lin = _linearize(metrics, ctx, arena, session_type, bin_cm)
     if lin is None:
-        with _print_lock:
-            print(f'  [SKIP] no place field detected for {unit}')
-        return [], []
+        return None
 
     spike_frame = ctx['spike_frame']
     t_s = (ctx['t'] - ctx['t_all'][0]) * 1e-6          # s from session start
@@ -596,18 +580,45 @@ def _run_cell(args) -> tuple[list[dict], list[dict]]:
                  fontsize=11)
     fig.subplots_adjust(left=0.08, right=0.98, top=1 - 1.2 / (sum(heights) + 1.6), bottom=0.04)
 
-    save_dir = os.path.join(dirpath, LAP_SUBDIR)
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'{ntt_name}_lap_raster.png')
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, dpi=150)
-    with _print_lock:
-        print(f'  [SAVED] {save_path}')
 
     field_rows = [s for _, _, _, s in per_field]
     pass_rows = [{**base, 'field_number': fld['field_number'], 'pass_number': i,
                   **{k: v for k, v in p.items() if k not in ('start', 'end')}}
                  for fld, _, passes, _ in per_field for i, p in enumerate(passes, start=1)]
     return field_rows, pass_rows
+
+
+def _run_cell(args) -> tuple[list[dict], list[dict]]:
+    """Lap raster figure for one place cell. Returns (field_rows, pass_rows)."""
+    idx, total, dirpath, unit = args
+    session  = os.path.relpath(dirpath, place_cell_folder)
+    ntt_path = os.path.join(dirpath, unit)
+    with _print_lock:
+        print(f'[{idx}/{total}]  {session}  |  {unit}')
+
+    csv_path = _find_tracking_csv(dirpath)
+    if csv_path is None:
+        with _print_lock:
+            print(f'  [SKIP] no single tracking file found in {dirpath}')
+        return [], []
+
+    metrics, ctx = pc.compute_metrics(csv_path, ntt_path, pc.arena_width_cm, pc.target_bin_cm)
+    if not ctx or not ctx['valid_mask'].any():
+        with _print_lock:
+            print(f'  [SKIP] no valid occupancy for {unit}')
+        return [], []
+
+    save_path = os.path.join(dirpath, LAP_SUBDIR, f'{os.path.splitext(unit)[0]}_lap_raster.png')
+    rows = lap_raster_cell(metrics, ctx, dirpath, session, unit, save_path)
+    if rows is None:
+        with _print_lock:
+            print(f'  [SKIP] no place field detected for {unit}')
+        return [], []
+    with _print_lock:
+        print(f'  [SAVED] {save_path}')
+    return rows
 
 
 # ── Batch ─────────────────────────────────────────────────────────────────────

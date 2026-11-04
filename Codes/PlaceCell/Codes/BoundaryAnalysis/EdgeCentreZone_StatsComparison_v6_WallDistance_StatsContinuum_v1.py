@@ -38,6 +38,17 @@ of an arena, 3. the animal-controlled arena comparisons):
     tests (Kruskal-Wallis / Mann-Whitney or LMM; chi-square), e.g. Circle vs Linear vs Open
     cells at distance 0.
   Trend p-values are also Holm-corrected across the metrics of a group (p_holm_metrics).
+  Matched rows (animal-controlled comparisons only): the two arenas at every wall distance BOTH
+    arenas have (Circle vs Open: row 0, i.e. every Circle cell vs the Open cells peaking at
+    distance 0; Linear vs Open: row 0 and row 1 separately, and rows 0 + 1 pooled):
+    continuous  Mann-Whitney U (TREND_TEST 'Spearman'; + rank-biserial r, > 0: first arena
+                higher) or rank LMM likelihood-ratio test, random intercepts animal / day / cell
+                (TREND_TEST 'LMM')
+    yes/no      Fisher's exact test ('Spearman') or logistic GEE clustered by cell when some
+                cell repeats, else Fisher ('LMM')
+    Holm-Bonferroni twice: p_holm_tests over the tests of one metric (row 0, row 1, pooled) and
+    p_holm_metrics over the metrics of one test. The pooled test does not control for the
+    arenas' different shares of row-0 and row-1 cells.
 Speed direction is tested as two yes/no outcomes (p-type, n-type speed cell).
 
 Metrics (v6's metric_specs: v10's continuous metrics, stability score per stability type,
@@ -47,6 +58,8 @@ PLOTS (OUTPUT_DIR\\Arena, \\SessionType\\<arena>, \\AnimalControlledArenaType\\<
 metric, x = wall_dist; every group's cells as points (shaded by significance as in v10) and their
 median + IQR per distance (continuous), or % yes with Wilson 95 % CI per distance (yes/no); the
 groups side by side at each distance, the trend / pooled / matched-distance tests underneath.
+\\AnimalControlledArenaType\\<name>\\MatchedRows: one per metric, the two arenas side by side at
+each shared row (and the pooled rows), stars = p_holm_tests.
 OUTPUT_DIR\\WallDistanceSchematic_<arena>.png: the bins of each arena shaded by wall_dist.
 
 Outputs (OUTPUT_DIR):
@@ -58,6 +71,7 @@ Outputs (OUTPUT_DIR):
                             Trend             within-group trend test of every metric
                             Pooled            group-adjusted distance effect + interaction
                             Matched_Omnibus / Matched_PostHoc  groups at the same distance
+                            MatchedRows       animal-controlled arenas at the shared rows
                             Desc              descriptives per group and distance
   WallDistance_AllStats.csv all of the above statistics tables in one long-format CSV
 
@@ -84,21 +98,23 @@ import statsmodels.formula.api as smf
 
 # EdgeCentreZone_StatsComparison_v6_intmZoneOpen.py (geometry, tracking, raw-map peak bin, cell
 # matching, temporal stability) lives in this folder, or in its OldVer\ folder once superseded;
-# it puts v10 and CellClusteredStats_Utils on the path.
+# it puts v10 and CellClusteredStats_Utils on the path, but from OldVer\ it points one folder too
+# low, so Codes\ (CellClusteredStats_Utils) and Codes\OldVers\ (v10) are added here too.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:0] = [_HERE, os.path.join(_HERE, 'OldVer')]
+_CODES = os.path.dirname(_HERE)
+sys.path[:0] = [_HERE, os.path.join(_HERE, 'OldVer'), _CODES, os.path.join(_CODES, 'OldVers')]
 import EdgeCentreZone_StatsComparison_v6_intmZoneOpen as ez   # noqa: E402
 asc, ccs = ez.asc, ez.ccs
 import matplotlib.pyplot as plt                              # noqa: E402
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL    = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Alpha200.xlsx'
-PLACE_CELL_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+INPUT_EXCEL    = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
+PLACE_CELL_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 OUTPUT_DIR     = os.path.join(PLACE_CELL_DIR, 'Results', 'WallDistanceContinuum')
 
 # Output of TemporalStabilityMap_v6_MapPassStability.py on PLACE_CELL_DIR.
-TEMPORAL_STABILITY_EXCEL = os.path.join(PLACE_CELL_DIR, 'Results', 'TemporalStability.xlsx')
+TEMPORAL_STABILITY_EXCEL = os.path.join(PLACE_CELL_DIR, 'Results', 'PC_Char' , 'TemporalStability.xlsx')
 
 # 'Spearman': Spearman correlation per group, linear model on ranks for the pooled tests,
 #             logistic regression -- rows treated as independent (like v6's 'KW').
@@ -489,6 +505,58 @@ def matched_distance(subs: list, m, labels: list) -> tuple:
     return omni_rows, posthoc
 
 
+def common_rows(arenas: list, units: dict) -> list:
+    """Wall distances that exist in every arena of `arenas` (Circle + Open: [0]; Linear + Open:
+    [0, 1])."""
+    return sorted(set.intersection(*(set(np.unique(units[a][units[a] >= 0]).tolist())
+                                     for a in arenas)))
+
+
+def two_arena_test(sub: pd.DataFrame, m, labels: list) -> dict:
+    """labels[0] vs labels[1] (column 'grp') on the rows of `sub`. Continuous: Mann-Whitney U
+    (TREND_TEST 'Spearman') or rank LMM likelihood-ratio test, random intercepts animal / day /
+    cell ('LMM'). Yes/no: Fisher's exact test ('Spearman') or CellClusteredStats_Utils'
+    compare_binary ('LMM': logistic GEE clustered by cell if some cell repeats, else Fisher)."""
+    a, b = labels
+    ya = sub.loc[sub['grp'] == a, '_y'].to_numpy(float)
+    yb = sub.loc[sub['grp'] == b, '_y'].to_numpy(float)
+    row = dict(group_a=a, group_b=b, n_a=len(ya), n_b=len(yb), n_cells=sub['cell_id'].nunique(),
+               n_cells_in_both=int((sub.groupby('cell_id')['grp'].nunique() > 1).sum()))
+    if m.kind == 'box':
+        row.update(median_a=np.median(ya) if len(ya) else np.nan,
+                   median_b=np.median(yb) if len(yb) else np.nan)
+    else:
+        row.update(pct_a=100.0 * ya.mean() if len(ya) else np.nan,
+                   pct_b=100.0 * yb.mean() if len(yb) else np.nan)
+    if len(ya) < 2 or len(yb) < 2:
+        return dict(row, test='n/a', text='fewer than 2 values in an arena')
+    if np.ptp(np.r_[ya, yb]) == 0:
+        return dict(row, test='n/a', text='metric is constant')
+
+    if m.kind == 'box':
+        if TREND_TEST == 'LMM':
+            return dict(row, **rank_model_test(sub, 'y ~ C(grp)', 'y ~ 1'))
+        u, p = stats.mannwhitneyu(ya, yb, alternative='two-sided')
+        rbc = 2.0 * u / (len(ya) * len(yb)) - 1.0      # > 0: labels[0] higher
+        return dict(row, test='Mann-Whitney U', statistic=float(u), stat_name='U',
+                    p_value=float(p), rank_biserial=float(rbc),
+                    model_note='Mann-Whitney U (rows treated as independent)',
+                    text=f'U = {u:.1f}, r_rb = {rbc:+.2f}, {_p_str(p)}')
+
+    if TREND_TEST == 'LMM':
+        omni, ph, _table = ccs.compare_binary(sub, 'grp', labels, '_y',
+                                              lambda v: None if pd.isna(v) else bool(v))
+        r = ph[0]
+        odds, p, test, note = r['odds_ratio'], r['p_raw'], r['test'], omni['model_note']
+    else:
+        table = [[int(ya.sum()), int(len(ya) - ya.sum())], [int(yb.sum()), int(len(yb) - yb.sum())]]
+        odds, p = stats.fisher_exact(table)
+        test, note = "Fisher's exact", "Fisher's exact test (rows treated as independent)"
+    return dict(row, test=test, statistic=float(odds), stat_name='OR', p_value=float(p),
+                odds_ratio=float(odds), model_note=note,
+                text=f'OR = {odds:.3g}, {_p_str(p)}')
+
+
 def describe(sub: pd.DataFrame, m) -> list:
     """Descriptives of one group's metric at every distance."""
     rows = []
@@ -628,6 +696,96 @@ def plot_binary_trend(groups: list, m, res: dict, noun: str, out_path: str, titl
     ax.set_ylim(0, 105)
     ax.set_yticks(np.arange(0, 101, 20))
     _finish_trend(fig, ax, ax_info, handles, max_d, '% of cells', f'{title}: {m.label}', out_path)
+
+
+def plot_matched_rows(groups: list, m, sub: pd.DataFrame, res: list, sets: list,
+                      out_path: str, title: str):
+    """The two arenas side by side at every row of `sets` (and the pooled rows): cells as points
+    with median + IQR (continuous), or % yes with Wilson 95 % CI (yes/no); stars of the
+    Holm-corrected (over the tests of this metric) p above each row."""
+    if not len(sub):
+        return
+    fig_w = max(5.0, 1.8 * len(sets) + asc.AXIS_PAD_W)
+    lines = []
+    for (name, _ds), r in zip(sets, res):
+        if m.kind == 'box':
+            desc = (f'{r["group_a"]} n={r["n_a"]}, median {r.get("median_a", np.nan):.3g} vs '
+                    f'{r["group_b"]} n={r["n_b"]}, median {r.get("median_b", np.nan):.3g}')
+        else:
+            desc = (f'{r["group_a"]} n={r["n_a"]}, {r.get("pct_a", np.nan):.1f} % vs '
+                    f'{r["group_b"]} n={r["n_b"]}, {r.get("pct_b", np.nan):.1f} %')
+        lines.append(f'{name}: {desc}: {r["text"]}; p(Holm, tests) = '
+                     f'{asc._fmt_p(r.get("p_holm_tests"))}, p(Holm, metrics) = '
+                     f'{asc._fmt_p(r.get("p_holm_metrics"))}')
+    notes = {r['model_note'] for r in res if isinstance(r.get('model_note'), str)}
+    lines += sorted(notes)
+    n_both = max(r['n_cells_in_both'] for r in res)
+    if n_both:
+        lines.append(f'{n_both} cell(s) in both arenas (same unit, same day).')
+    lines.append('Stars: p Holm-corrected over the tests of this metric.'
+                 + (' Error bars: Wilson 95 % CI.' if m.kind != 'box' else ''))
+    lines = asc._wrap_stats(lines, fig_w)
+    fig, ax, ax_info = asc._new_fig((fig_w, 5.0), legend_rows=1, stats_lines=lines)
+    ez._draw_stats_top(ax_info, lines, 1)
+
+    rng = np.random.default_rng(0)
+    offs = (-0.2, 0.2)
+    handles = []
+    for g, off in zip(groups, offs):
+        c = asc._color(g.key)
+        for i, (_name, ds) in enumerate(sets):
+            at = sub[(sub['grp'] == g.label) & sub['wall_dist'].isin(ds)]
+            if not len(at):
+                continue
+            y = at['_y'].to_numpy(float)
+            if m.kind == 'box':
+                colors = asc._point_colors(m.col, at, g.key)
+                ax.scatter(i + off + rng.uniform(-0.06, 0.06, len(y)), y, s=14, alpha=0.75,
+                           facecolors=[fc for fc, _ec in colors],
+                           edgecolors=[ec for _fc, ec in colors], linewidths=0.4, zorder=2)
+                med, q1, q3 = np.median(y), np.percentile(y, 25), np.percentile(y, 75)
+                ax.errorbar(i + off, med, yerr=[[med - q1], [q3 - med]], fmt='D', color=c['dark'],
+                            markersize=7, markeredgecolor=asc.PAL_BLACK, markeredgewidth=0.6,
+                            elinewidth=1.4, capsize=4, zorder=4)
+            else:
+                lo, hi = _wilson(y.sum(), len(y))
+                pct = 100.0 * y.mean()
+                yerr = np.clip([[pct - 100.0 * lo], [100.0 * hi - pct]], 0, None)
+                ax.errorbar(i + off, pct, yerr=yerr, fmt='D', color=c['dark'],
+                            markerfacecolor=c['face'], markersize=7,
+                            markeredgecolor=asc.PAL_BLACK, markeredgewidth=0.6, elinewidth=1.4,
+                            capsize=4, zorder=4)
+        handles.append(Line2D([0], [0], marker='D', linestyle='', color=c['dark'],
+                              markerfacecolor=c['dark'], markeredgecolor=asc.PAL_BLACK,
+                              markeredgewidth=0.6, label=g.label))
+
+    # Head room for the stars above the data.
+    if m.kind != 'box':
+        ax.set_ylim(0, 118)
+        ax.set_yticks(np.arange(0, 101, 20))
+    else:
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo, hi + 0.15 * (hi - lo))
+    for i, r in enumerate(res):
+        p = r.get('p_holm_tests')
+        ax.annotate(asc._stars(p) if pd.notna(p) else 'n/a', xy=(i, 0.98),
+                    xycoords=('data', 'axes fraction'), ha='center', va='top',
+                    fontsize=asc.FS_LABEL, fontweight='bold')
+    if len(sets) > 2:          # pooled rows, set apart from the single rows
+        ax.axvline(len(sets) - 1.5, color=asc.PAL_GRAY, linestyle=(0, (3, 3)), linewidth=0.8)
+
+    ax_info.legend(handles=handles, loc='upper center', ncol=len(handles), fontsize=asc.FS_LEGEND)
+    ax.set_xticks(range(len(sets)))
+    ax.set_xticklabels([name for name, _ds in sets], fontsize=asc.FS_TICK)
+    ax.set_xlim(-0.6, len(sets) - 0.4)
+    ax.set_xlabel(f'Wall distance (bins of {BIN_CM:g} cm) both arenas have', fontsize=asc.FS_LABEL,
+                  labelpad=6)
+    ax.set_ylabel(textwrap.fill(m.label, 30) if m.kind == 'box' else '% of cells',
+                  fontsize=asc.FS_LABEL, labelpad=8)
+    asc._set_title(ax, f'{title}: {m.label}')
+    asc._style_axes(ax)
+    fig.tight_layout()
+    asc._save(fig, out_path)
 
 
 def plot_peak_distribution(full_df: pd.DataFrame, sessions_df: pd.DataFrame, geoms: dict,
@@ -811,6 +969,58 @@ def run_comparison(info: dict, groups: list, metrics: list, noun: str, title: st
     print(f'  Plots saved to {plots_dir}')
 
 
+def run_matched_rows(info: dict, groups: list, rows: list, metrics: list, title: str,
+                     plots_dir: str, tables: dict):
+    """The two arenas of an animal-controlled comparison at every row in `rows` (the wall
+    distances both arenas have) and, with >= 2 rows, over those rows pooled (two_arena_test).
+    p_holm_tests: Holm over the tests of one metric; p_holm_metrics: Holm over the metrics of
+    one test. Table rows go to tables['MatchedRows'], plots to `plots_dir`."""
+    groups = [g for g in groups if len(g.full_df)]
+    print(f'\n{"-" * 70}\n{title}: arenas at the rows both have ({", ".join(map(str, rows))})')
+    if len(groups) != 2 or not rows:
+        print('  Need 2 arenas with place cells and >= 1 shared row; skipping.')
+        return
+    labels = [g.label for g in groups]
+    for g in groups:
+        n = g.full_df['wall_dist'].value_counts()
+        print(f'  {g.label}: ' + ', '.join(f'row {d}={int(n.get(d, 0))}' for d in rows))
+    sets = [(f'Row {d}', [d]) for d in rows]
+    if len(rows) >= 2:
+        sets.append((f'Rows {"+".join(map(str, rows))}', rows))
+
+    out, subs = [], {}
+    for m in metrics:
+        sub = pd.concat([g.values(m) for g in groups], ignore_index=True)
+        subs[m.stem] = sub = sub[sub['wall_dist'].isin(rows)]
+        for name, ds in sets:
+            r = two_arena_test(sub[sub['wall_dist'].isin(ds)], m, labels)
+            out.append(dict(info, _stem=m.stem, metric=m.label, metric_col=m.col,
+                            stab_type=m.stab_type or '', kind=m.kind, rows=name, **r))
+    df = pd.DataFrame(out)
+    if 'p_value' not in df.columns:
+        df['p_value'] = np.nan
+    df['p_holm_tests'] = df.groupby('_stem')['p_value'].transform(
+        lambda p: ccs.holm(p.to_numpy(float)))
+    df['p_holm_metrics'] = df.groupby('rows')['p_value'].transform(
+        lambda p: ccs.holm(p.to_numpy(float)))
+    df['significant_holm_tests'] = df['p_holm_tests'] < asc.ALPHA
+    df['significant_holm_metrics'] = df['p_holm_metrics'] < asc.ALPHA
+    tables['MatchedRows'] += df.drop(columns=['_stem', 'text']).to_dict('records')
+
+    sig = df[df['p_value'] < asc.ALPHA]
+    print(f'  {labels[0]} vs {labels[1]}, p < {asc.ALPHA}: {len(sig)}')
+    for r in sig.itertuples():
+        print(f'    {r.rows:10s} {r.metric[:55]:55s} p = {asc._fmt_p(r.p_value)} (Holm tests '
+              f'{asc._fmt_p(r.p_holm_tests)}, metrics {asc._fmt_p(r.p_holm_metrics)})')
+
+    os.makedirs(plots_dir, exist_ok=True)
+    for m in metrics:
+        res = df[df['_stem'] == m.stem].to_dict('records')
+        plot_matched_rows(groups, m, subs[m.stem], res, sets,
+                          os.path.join(plots_dir, f'{m.stem}.png'), title)
+    print(f'  Plots saved to {plots_dir}')
+
+
 def main():
     asc.CONTINUOUS_TEST = 'LMM' if TREND_TEST == 'LMM' else 'KW'   # matched-distance tests
     asc.METRIC_TRANSFORM = TREND_TRANSFORM
@@ -842,7 +1052,7 @@ def main():
     print(pd.crosstab(full_df['arena_type'], full_df['wall_dist'], margins=True).to_string())
 
     tables = {k: [] for k in ('DistCounts', 'Trend', 'Pooled', 'Matched_Omnibus',
-                              'Matched_PostHoc', 'Desc')}
+                              'Matched_PostHoc', 'MatchedRows', 'Desc')}
 
     def _sel(d, arena, extra=None):
         mask = d['arena_type'] == arena
@@ -876,9 +1086,12 @@ def main():
             return d['animal'].astype(str).str.lower().isin(wanted)
         groups = [DistGroup(a, a, _sel(full_df, a, _of), _sel(field_df, a, _of))
                   for a in asc.ARENA_TYPES if a in arenas]
-        run_comparison(dict(level='AnimalControlled', comparison=name, animals=', '.join(animals)),
-                       groups, metrics, 'arena', f'Wall distance, {" + ".join(animals)} only',
-                       os.path.join(OUTPUT_DIR, asc.ANIMAL_CONTROLLED_DIR, name), tables)
+        info = dict(level='AnimalControlled', comparison=name, animals=', '.join(animals))
+        plots_dir = os.path.join(OUTPUT_DIR, asc.ANIMAL_CONTROLLED_DIR, name)
+        title = f'Wall distance, {" + ".join(animals)} only'
+        run_comparison(info, groups, metrics, 'arena', title, plots_dir, tables)
+        run_matched_rows(info, groups, common_rows([g.label for g in groups], units), metrics,
+                         title, os.path.join(plots_dir, 'MatchedRows'), tables)
 
     # ── Save ────────────────────────────────────────────────────────────────
     stat_tables = {k: pd.DataFrame(v) for k, v in tables.items()}

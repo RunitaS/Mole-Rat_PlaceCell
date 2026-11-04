@@ -59,21 +59,19 @@ ROOT_FOLDER/PhasePrec_Results. One row per unit is appended to a single summary
 table written to RESULTS_FOLDER/theta_phase.xlsx, covering Step 1's polar-plot statistics
 (MRL, preferred phase, Rayleigh p), Step 2's TMI and its shuffle p-value,
 and Step 3's phase-precession fit (rho, p, slope, PrecessionClass) where it ran.
-Step 3's significance is two gates, not a fixed slope-magnitude window: first
-fit_R (residual MRL about the fitted line) must beat a burst-preserving
-phase-permutation null (shuffle_fit_r_significance, USE_FIT_R_GATE; p in
-fit_R_shuffle_p), then Kempter et al.'s (2012) asymptotic z-test on the
-circular-linear correlation must give p < ALPHA. A significant fit with slope below
--SLOPE_THRESH_DEG_PER_PASS (22 deg/pass) is labeled phase_precessing
-(is_precessing); above +22 deg/pass, phase_succeeding (is_recessing); a
-significant fit with |slope| <= 22 deg/pass is labeled phase_locked
-(is_phase_locked); a non-significant fit is labeled no_phase_relation. Each
-cell's PassIndex plot is also copied to RESULTS_FOLDER/PhasePrecessing_Plots,
-PhaseSucceeding_Plots or PhaseLocked_Plots (beside the Excel file; no_phase_relation
-cells go to PhaseLocked_Plots too), in a 'fit R pass' or 'fit R fail' subfolder
-according to the fit_R shuffle test (CLASS_PLOT_FOLDERS, FIT_R_SUBFOLDERS). Every cell the fit_R gate is run on also gets a <unit>_FitRShuffle.png
+Step 3's significance follows Climer's pass_index.m: Kempter et al.'s (2012) asymptotic
+z-test on the circular-linear correlation of all analysed spikes must give p < ALPHA
+(USE_FIT_R_GATE and BURST_COLLAPSE_FOR_ZTEST off). A significant fit with a negative
+slope is labeled phase_precessing (is_precessing); with a positive slope,
+phase_processing (is_recessing); a non-significant fit is labeled no_phase_relation
+(SLOPE_THRESH_DEG_PER_PASS = 0, so phase_locked stays empty). Each cell's PassIndex
+plot is also copied to RESULTS_FOLDER/PhasePrecessing_Plots, PhaseProcessing_Plots or
+NoPhaseRelation_Plots (beside the Excel file; CLASS_PLOT_FOLDERS). If USE_FIT_R_GATE
+is turned back on, fit_R must also beat a burst-preserving phase-permutation null
+(shuffle_fit_r_significance; p in fit_R_shuffle_p): plots then go to a 'fit R pass' or
+'fit R fail' subfolder (FIT_R_SUBFOLDERS) and each cell also gets a <unit>_FitRShuffle.png
 (phase vs pass index with the fit, and the fit_R shuffle null), saved next to its
-other figures in <session>/ThetaMod_PhasePrecession_LFPshuffle and in its class folder.
+other figures and in its class folder.
 
 Per-unit plots (polar plot from Step 1, and the 6-panel Pass Index summary
 from Step 3, when run) are saved to
@@ -192,8 +190,24 @@ v27 changes:
     and OO_* Excel columns (visit / spike counts, circular-mean phase and MRL of each).
   * Proportion and absolute number of theta-modulated (ThetaModulated) units pooled per arena
     / session type, with a chi-square test across groups and pairwise Fisher exact tests
-    (Holm): <prefix>_ThetaModProportion.png and 'ThetaModCells_Pool*' sheets.
+    (Holm): <prefix>_ThetaModProportion.png and 'ThetaModCells_Pool*' sheets. The same per animal,
+    in the animal colours, with arenas pooled (AnimalComparison_ThetaModProportion.png) and within
+    the Open and Linear arenas (AnimalComparison_<arena>_ThetaModProportion.png); 'Animal_ThetaModCells_Pool*'
+    sheets.
   Per-unit figures go to <session>/ThetaMod_PhasePrecession_v27.
+
+v27 Climer-criteria changes (compared against jrclimer/Pass_Index, pass_index.m):
+  * Significance is p < ALPHA from the Kempter z-test on all analysed spikes: no fit_R shuffle
+    gate (USE_FIT_R_GATE = False), no burst collapse (BURST_COLLAPSE_FOR_ZTEST = False). The
+    corrected kempter_lincirc is kept, not Climer's (which uses phi = s*x, without the 2*pi).
+  * No slope bounds by default (SLOPE_BNDS = None; anglereg still grid-searches +-4 cycles over
+    the spikes' pass-index extent), and no steepness gate (MAX_FIT_LINES = inf).
+  * The class is the sign of a significant slope (SLOPE_THRESH_DEG_PER_PASS = 0): negative =
+    phase_precessing, positive = phase_processing (the former phase_succeeding).
+  * Only the field with the highest peak (smoothed) rate of each cell is analysed
+    (PEAK_FIELD_ONLY); the other fields get no fit, figure or Excel row. n_fields still counts
+    all detected fields.
+  Output names carry _ClimerPeak so these runs never overwrite earlier ones.
 
 Requires: numpy, scipy, pandas, matplotlib, openpyxl (for writing .xlsx).
 """
@@ -234,26 +248,29 @@ from scipy.special import erf
 # ============================================================================
 #ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Data_v2_Accepted")
 
-ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\OldVers\PC_True_SiAdptBin_CI99_Bin2") 
+ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final") 
 # Multi-peak detection within each place field (KDE; see split_multipeak_fields and the MP_ settings).
 # True: multi-peak fields are split into sub-fields; False: every field analysed whole, as in v25.
 SPLIT_MULTIPEAK_FIELDS = False
+# Fields analysed in Step 3. True: only the field with the highest peak (smoothed) rate of each cell;
+# False: every field.
+PEAK_FIELD_ONLY = True
 # Theta-modulation criterion gating Step 3 (phase precession) and the pooled TMI comparison.
 # False: TMI shuffle test only (p < ALPHA); True: TMI shuffle test AND Rayleigh test (both p < ALPHA).
 REQUIRE_RAYLEIGH_FOR_THETA_MOD = False
 # Output names follow the toggles, so one setting's run never overwrites another's results
 _MP_TAG = 'MultiPeakSplit' if SPLIT_MULTIPEAK_FIELDS else 'NoMultiPeakSplit'
 _THETA_TAG = '_TMIandRayleigh' if REQUIRE_RAYLEIGH_FOR_THETA_MOD else ''
+_CLIMER_TAG = '_ClimerPeak' if PEAK_FIELD_ONLY else '_Climer'   # Climer significance / slope criteria
 # All pooled results (Excel/CSV files, comparison plots, per-class plot copies) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / f'PhasePrec_Results_v27_{_MP_TAG}{_THETA_TAG}'
-OUTPUT_EXCEL_NAME = f'theta_phase_v27_v2_{_MP_TAG}{_THETA_TAG}.xlsx'   # written to RESULTS_FOLDER
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / f'PhasePrec_PassIndex{_MP_TAG}{_THETA_TAG}{_CLIMER_TAG}'
+OUTPUT_EXCEL_NAME = f'theta_phase_v27_v2_{_MP_TAG}{_THETA_TAG}{_CLIMER_TAG}.xlsx'   # written to RESULTS_FOLDER
 # PrecessionClass -> folder (in RESULTS_FOLDER, beside the Excel file) receiving a copy of each cell's PassIndex plot
-# (no_phase_relation cells share the PhaseLocked folder)
 CLASS_PLOT_FOLDERS = {
-    'phase_precessing': 'PhasePrecessing_Plots_FitRShuffle',
-    'phase_succeeding': 'PhaseSucceeding_Plots_FitRShuffle',
-    'phase_locked': 'PhaseLocked_Plots_FitRShuffle',
-    'no_phase_relation': 'PhaseLocked_Plots_FitRShuffle',
+    'phase_precessing': 'PhasePrecessing_Plots',
+    'phase_processing': 'PhaseProcessing_Plots',
+    'phase_locked': 'PhaseLocked_Plots',
+    'no_phase_relation': 'NoPhaseRelation_Plots',
 }
 # fit_R_Significant -> subfolder of each CLASS_PLOT_FOLDERS folder (used only when the fit_R shuffle was run)
 FIT_R_SUBFOLDERS = {True: 'fit R pass', False: 'fit R fail'}
@@ -369,22 +386,24 @@ MP_SKAGGS_ALPHA = 200.0
 _MP_KDE_RATEMAP_TYPES = ('raw', 'gaussian_smooth', 'Yartsev_adaptive_binned', 'Skaggs_adaptive_binned')
 if MP_KDE_RATEMAP_TYPE not in _MP_KDE_RATEMAP_TYPES:
     raise ValueError(f'MP_KDE_RATEMAP_TYPE must be one of {_MP_KDE_RATEMAP_TYPES}, got {MP_KDE_RATEMAP_TYPE!r}')
-BURST_COLLAPSE_FOR_ZTEST = True  # Kempter z-test on one event per burst (spikes < TMI_BURST_MAX_GAP_SEC apart:
-                              # circular-mean phase, mean pass index) so bursts are not counted as independent
-SLOPE_BNDS = (-1.0, 0.25)     # (low, high) bound on precession slope (cycles/unit); x spans 2
-                              # units per pass, so this is -720..+180 deg/pass. None = +-4 cycles/pass
+BURST_COLLAPSE_FOR_ZTEST = False  # True: Kempter z-test on one event per burst (spikes < TMI_BURST_MAX_GAP_SEC apart:
+                              # circular-mean phase, mean pass index) so bursts are not counted as independent.
+                              # False: on all analysed spikes, as in pass_index.m
+SLOPE_BNDS = None             # (low, high) bound on precession slope (cycles/unit); x spans 2
+                              # units per pass. None = +-4 cycles/pass, as pass_index.m has no bounds by default
 MIN_SPIKES_FOR_FIT = 50       # skip circular-linear fit if fewer spikes than this
-SLOPE_THRESH_DEG_PER_PASS = 15.0   # significant fits need |slope| (deg/pass) above this to be
-                              # precessing (negative) / succeeding (positive); else phase locked
-MAX_FIT_LINES = 3            # a fit whose wrapped phase line has more segments than this is
-                              # marked non-precessing and gets no further analysis
+SLOPE_THRESH_DEG_PER_PASS = 0.0   # significant fits need |slope| (deg/pass) above this to be
+                              # precessing (negative) / processing (positive); else phase locked.
+                              # 0 = the class is just the sign of the slope
+MAX_FIT_LINES = np.inf       # a fit whose wrapped phase line has more segments than this is
+                              # marked non-precessing and gets no further analysis. inf = no limit
 # --- Step 3 gate: fit_R shuffle test (see shuffle_fit_r_significance) ---
-# Before the Kempter z-test is used to classify a cell, its fit_R must beat a null in
+# If on, before the Kempter z-test is used to classify a cell, its fit_R must beat a null in
 # which the phase-position pairing is broken: whole bursts (spikes < TMI_BURST_MAX_GAP_SEC
 # apart, as in the TMI shuffle but with no phase-bin condition) swap phases with each other,
 # keeping the cell's phase distribution (its theta locking) and burst structure intact.
-# Cells failing the gate are classed no_phase_relation.
-USE_FIT_R_GATE = True
+# Cells failing the gate are classed no_phase_relation. Off, as pass_index.m has no such gate.
+USE_FIT_R_GATE = False
 N_FIT_R_SHUFFLES = 1000             # burst-preserving phase permutations; each refits anglereg
 
 # --- Step 1/2: theta phase-locking / modulation parameters ---
@@ -428,7 +447,7 @@ SESSION_TYPE_PLOT_FOLDER = 'SessionTypeComparison'   # in RESULTS_FOLDER, one su
 # [70, 250) deg -- 70-250 and 430-610 deg on the double-cycle 0-720 plot axis; the
 # rest, 250-430 deg (= 250-360 + 0-70) and 610-720 deg, is the procession range.
 PI0_PRECESSION_RANGE_DEG = (70.0, 250.0)
-PI0_PHASE_CLASSES = ('phase_precessing', 'phase_succeeding', 'phase_locked', 'no_phase_relation')  # cells included
+PI0_PHASE_CLASSES = ('phase_precessing', 'phase_processing', 'phase_locked', 'no_phase_relation')  # cells included
 N_PI0_PERMUTATIONS = 10000          # label permutations for the Mardia-Watson-Wheeler test
 PI0_RANGE_COLORS = {'precession': '#8C2981', 'procession': '#FCFDBF'}   # magma light purple (0.4) / light yellow (1.0)
 # Pass-index points at which the fitted line 2*pi*s*x + b is evaluated, each extracted,
@@ -1880,7 +1899,7 @@ def _precession_fit(spk_ts, spk_pass_index, spk_theta_phase, rng, slope_bnds,
         is_significant_precession = False
     # Significant fit (z-test) AND slope beyond +/-SLOPE_THRESH_DEG_PER_PASS:
     # negative -> phase precessing (spike phase advances to earlier phase over
-    # the field pass); positive -> phase succeeding (phase moves later).
+    # the field pass); positive -> phase processing (phase moves later).
     # Significant with |slope| within the threshold: phase locked.
     # Non-significant fit: no phase relation.
     is_precessing = bool(is_significant_precession and slope_deg_per_pass < -SLOPE_THRESH_DEG_PER_PASS)
@@ -1893,7 +1912,7 @@ def _precession_fit(spk_ts, spk_pass_index, spk_theta_phase, rng, slope_bnds,
     elif is_precessing:
         precession_class = 'phase_precessing'
     elif is_recessing:
-        precession_class = 'phase_succeeding'
+        precession_class = 'phase_processing'
     elif is_phase_locked:
         precession_class = 'phase_locked'
     else:
@@ -2487,7 +2506,7 @@ def _draw_tmi_null(ax_s, tmi, is_sig, shuffle_tmis):
     """Draw the TMI shuffle-test null distribution with the observed TMI and
     the null's (1 - ALPHA) percentile."""
     color = 'red' if is_sig else '#4D4D4D'
-    thresh = float(np.percentile(shuffle_tmis, 100 * (1 - 0.01))) #ALPHA)))
+    thresh = float(np.percentile(shuffle_tmis, 100 * (1 - ALPHA)))
     ax_s.hist(shuffle_tmis, bins=40, color='#D9D9D9', edgecolor='black', linewidth=0.5)
     ax_s.axvline(thresh, color='0.3', linestyle='--', linewidth=1.5,
                  label=f'shuffle {100 * (1 - ALPHA):g}th pct = {thresh:.3f}')
@@ -2645,8 +2664,9 @@ def _fit_text_lines(results):
         else '-- Kempter (circular-linear, asymptotic z-test) --',
         f"rho = {results['rho']:.3f}   (r^2 = {results['r_squared']:.3f})",
         f"p (asymptotic) = {results['p']:.4g}",
-        f"fit R = {results['fit_R']:.3f}  (shuffle p = {results['fit_R_shuffle_p']:.3g}, "
-        f"{'PASS' if results['fit_R_Significant'] else 'FAIL'})",
+        f"fit R = {results['fit_R']:.3f}" + (
+            f"  (shuffle p = {results['fit_R_shuffle_p']:.3g}, {'PASS' if results['fit_R_Significant'] else 'FAIL'})"
+            if results['shuffle_fit_r'] is not None else ''),
         f"slope ={results['slope_deg_per_pass']:.2f} deg/pass;  phase range = {results['phase_range_deg']:.1f} deg",
         *(f"phase @ pass index {x:g} ={results[f'phase_at_{key}_deg']:.1f} deg "
           f"({phase_range_label(results[f'phase_at_{key}_deg'])} range)"
@@ -2799,8 +2819,8 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
          else f"single-peak field ({fld['kde_note'] or 'not split'})"),
         f"spikes: {results['n_spikes_input']} theta -> {results['n_spikes_running']} running "
         f"-> {results['n_spikes']} in this field's passes",
-        f"passes kept = {results['n_passes_kept']} / {results['n_passes_total']};  "
-        f"burst events = {results['n_events']}",
+        f"passes kept = {results['n_passes_kept']} / {results['n_passes_total']}"
+        + (f";  burst events = {results['n_events']}" if BURST_COLLAPSE_FOR_ZTEST else ''),
         *([f"peak-bin / onset / offset spikes (position-defined) = {onoff['n_peakbin']} / "
            f"{onoff['n_onset']} / {onoff['n_offset']}"] if onoff is not None else []),
         *_fit_text_lines(results),
@@ -2812,7 +2832,7 @@ def plot_unit_summary(pos_xy, results, title, out_path: Path, theta=None):
         'COMPLETE TRAVERSALS (pass index -1 -> 0 -> +1)',
         f"complete traversals = {results['n_passes_complete']} of {results['n_passes_kept']} kept passes",
         f"spikes: {results['n_spikes_complete']} of {results['n_spikes']} in this field's passes"
-        + (f";  burst events = {comp['n_events']}" if comp is not None else ''),
+        + (f";  burst events = {comp['n_events']}" if comp is not None and BURST_COLLAPSE_FOR_ZTEST else ''),
     ]
     if comp is not None:
         _draw_pass_index_phase(axes[2, 0], comp, label='Complete traversals only (-1 -> 0 -> +1)',
@@ -3060,12 +3080,14 @@ SESSION_COLORS = {
     'NoRot': {'face': PAL_MAGENTA, 'edge': PAL_BLACK},
     'Rot': {'face': '#C000C0', 'edge': PAL_BLACK},
 }
-# Arena and session-type labels don't overlap, so one lookup serves both comparisons.
-GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS}
+# Arena, session-type and animal labels don't overlap, so one lookup serves every comparison.
+GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS,
+                **{a: {'face': c, 'edge': PAL_BLACK} for a, c in ANIMAL_COLORS.items()}}
 _DEFAULT_COLOR = {'face': PAL_GRAY, 'edge': PAL_BLACK}
 # Grouping column -> names of the omnibus tables' group-count / n-per-group columns
 GROUP_COUNT_COLUMNS = {'Arena': ('N_arenas', 'N_per_arena'),
-                       'SessionType': ('N_session_types', 'N_per_session_type')}
+                       'SessionType': ('N_session_types', 'N_per_session_type'),
+                       'Animal': ('N_animals', 'N_per_animal')}
 _TEST_STAT_NAMES = {'Kruskal-Wallis': 'H', 'Mann-Whitney U': 'U',
                     'Mardia-Watson-Wheeler': 'W', 'Watson-Williams': 'F',
                     'Chi-square': 'χ²', 'Fisher exact': 'OR'}
@@ -3562,7 +3584,7 @@ def compare_theta_mod_proportion(df: pd.DataFrame, group_col: str, group_order):
 @_arena_fig_style
 def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
                               out_path: Path, group_col: str = 'Arena', title_prefix: str = '',
-                              pooled_within: str = 'arena'):
+                              pooled: str = 'animals pooled within arena'):
     """v27: left, % of all units that are theta-modulated per group (bars in the group colours,
     'n theta-modulated / n units' above each, stars over pairs with Holm-corrected Fisher
     p < ALPHA); right, absolute numbers as stacked bars (theta-modulated filled, not
@@ -3575,7 +3597,7 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
     pct = counts_df['pct_of_units'].to_numpy()
 
     crit = f'TMI shuffle{" + Rayleigh" if REQUIRE_RAYLEIGH_FOR_THETA_MOD else ""} p < {ALPHA:g}'
-    stats_lines = [f'Theta-modulated = {crit}; one value per unit; animals pooled within {pooled_within}']
+    stats_lines = [f'Theta-modulated = {crit}; one value per unit; {pooled}']
     stats_lines += [f'{_label(r[group_col])}: {r["n_theta_modulated"]}/{r["n_units"]} units '
                     f'({r["pct_of_units"]:.1f} %) | {r["n_theta_modulated"]}/{r["n_units_TMI_tested"]} '
                     f'TMI-tested (>= {MIN_SPIKES_FOR_TMI} spikes; {r["pct_of_TMI_tested"]:.1f} %)'
@@ -3605,11 +3627,14 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
     ax_n.bar(positions, n_tm, width=0.6, color=faces, edgecolor=PAL_BLACK, linewidth=FIG_BOX_LW, zorder=2)
     ax_n.bar(positions, n_not, width=0.6, bottom=n_tm, color='white', edgecolor=PAL_BLACK, hatch='///',
              linewidth=FIG_BOX_LW, zorder=2)
+    y_top = n_all.max() * 1.12 + 1
     for x, a, b in zip(positions, n_tm, n_not):
-        if a:
+        if a >= 0.04 * y_top:
             ax_n.text(x, a / 2, str(a), ha='center', va='center', fontsize=FS_TICK, fontweight='bold', zorder=3)
+        elif a:     # too short to hold its label: written beside the bar
+            ax_n.text(x + 0.33, 0, str(a), ha='left', va='bottom', fontsize=FS_TICK, fontweight='bold', zorder=3)
         ax_n.text(x, a + b, str(a + b), ha='center', va='bottom', fontsize=FS_TICK, zorder=3)
-    ax_n.set_ylim(0, n_all.max() * 1.12 + 1)
+    ax_n.set_ylim(0, y_top)
     ax_n.set_ylabel('Units (n)', fontsize=FS_LABEL - 2, labelpad=8)
     _set_title(ax_n, f'{title_prefix}Theta-modulated units (n)')
 
@@ -3625,6 +3650,24 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
     _draw_stats(ax_info, stats_lines)
     fig.tight_layout()
     _save_fig(fig, out_path)
+
+
+def run_theta_mod_proportion(df: pd.DataFrame, group_col: str, group_order, out_path: Path,
+                             pooled: str, title_prefix: str = '') -> dict[str, pd.DataFrame]:
+    """Proportion and number of theta-modulated units pooled per group: tests
+    (compare_theta_mod_proportion) and plot (plot_theta_mod_proportion, saved to
+    out_path; `pooled` says what the plot's footer reports as pooled). Returns
+    {table key: DataFrame}; empty if no group holds a unit."""
+    counts_df, omnibus_df, pairwise_df = compare_theta_mod_proportion(df, group_col, group_order)
+    if counts_df.empty:
+        return {}
+    plot_theta_mod_proportion(counts_df, omnibus_df, pairwise_df, out_path, group_col=group_col,
+                              title_prefix=title_prefix, pooled=pooled)
+    print('Theta-modulated units: ' + '; '.join(
+        f'{_label(r[group_col])} {r["n_theta_modulated"]}/{r["n_units"]} ({r["pct_of_units"]:.1f} %)'
+        for _, r in counts_df.iterrows()) + f' -- plot saved: {out_path.name}')
+    return {'ThetaModCells_Pooled': counts_df, 'ThetaModCells_PoolOmni': omnibus_df,
+            'ThetaModCells_PoolPair': pairwise_df}
 
 
 def run_group_comparisons(df: pd.DataFrame, group_col: str, group_order, out_dir: Path,
@@ -3723,16 +3766,9 @@ def run_group_comparisons(df: pd.DataFrame, group_col: str, group_order, out_dir
         skip_msg(present, 'recording sessions', 'theta-modulated cell count/proportion')
 
     # ---- v27: proportion and absolute number of theta-modulated units, pooled per group ----
-    counts_df, omnibus_df, pairwise_df = compare_theta_mod_proportion(df, group_col, group_order)
-    if not counts_df.empty:
-        tables['ThetaModCells_Pooled'] = counts_df
-        tables['ThetaModCells_PoolOmni'], tables['ThetaModCells_PoolPair'] = omnibus_df, pairwise_df
-        prop_path = out_dir / f'{file_prefix}_ThetaModProportion.png'
-        plot_theta_mod_proportion(counts_df, omnibus_df, pairwise_df, prop_path, group_col=group_col,
-                                  title_prefix=title_prefix, pooled_within=group_word)
-        print('Theta-modulated units: ' + '; '.join(
-            f'{_label(r[group_col])} {r["n_theta_modulated"]}/{r["n_units"]} ({r["pct_of_units"]:.1f} %)'
-            for _, r in counts_df.iterrows()) + f' -- plot saved: {prop_path.name}')
+    tables.update(run_theta_mod_proportion(df, group_col, group_order,
+                                           out_dir / f'{file_prefix}_ThetaModProportion.png',
+                                           pooled, title_prefix))
 
     # ---- Theta phase at pass index -1 / 0 (field center) / +1 ----
     for x, key, label, file_tag, sheet_tag in PASS_INDEX_PHASE_POINTS:
@@ -3763,7 +3799,10 @@ def _comparison_sheet_name(group_col: str, key: str) -> str:
     The arena comparison keeps v18's sheet names ('ArenaComparison_Omnibus',
     'ArenaComparison_TMI_Pairwise', 'PhaseAtPI0_ByArena', 'ThetaModCells_Pairwise',
     ...); session-type tables get a 'SesType_' prefix ('SesType_Omnibus',
-    'SesType_TMI_Pairwise', 'SesType_PhaseAtPI0_BySesType', ...)."""
+    'SesType_TMI_Pairwise', 'SesType_PhaseAtPI0_BySesType', ...) and per-animal
+    tables an 'Animal_' prefix ('Animal_ThetaModCells_Pooled', ...)."""
+    if group_col == 'Animal':
+        return f'Animal_{key}'
     if key.endswith('_By'):
         key += 'Arena' if group_col == 'Arena' else 'SesType'
     if group_col != 'Arena':
@@ -3868,7 +3907,7 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
     epoch of each LFP file used (Animal, Session, lfp_file, epoch_index, ED_min,
     peakrangenorm, Status) is appended to it, for the pooled ED_min QC plot."""
     output_dir = data_folder / ('ThetaMod_PhasePrecession_v27' +('' if SPLIT_MULTIPEAK_FIELDS else '_NoMultiPeakSplit')
-                                + _THETA_TAG)
+                                + _THETA_TAG + _CLIMER_TAG)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncs_files = sorted(data_folder.glob('*.ncs'), key=_natural_key)
@@ -4051,11 +4090,13 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
                         n_fields = maps['n_detected_fields']
                         dropped = maps['dropped_subfields']
                         n_multi = len({f['parent_field'] for f in maps['fields'] + dropped if f['multi_peak']})
+                        fields_to_run = ([max(maps['fields'], key=lambda f: f['peak_rate_Hz'])]
+                                         if PEAK_FIELD_ONLY else maps['fields'])
                         print(f'  {unit_label}: {n_fields} place field(s) ({maps["detection"]}), '
-                              f'{n_multi} multi-peak -> {len(maps["fields"])} field(s)/sub-field(s) analysed'
+                              f'{n_multi} multi-peak -> {len(fields_to_run)} field(s)/sub-field(s) analysed'
                               + (f', {len(dropped)} sub-field(s) < {MIN_SUBFIELD_SIZE_BINS} bins dropped'
                                  if dropped else ''))
-                        for field in maps['fields']:
+                        for field in fields_to_run:
                             row_f = _process_field(
                                 row, field, n_fields, maps, pos_ts, pos_xy, spk_ts_overlap,
                                 lfp_ts, lfp_sig, lfp_fs, rng, lfp_theta_mask, lfp_phase_unwrapped,
@@ -4208,7 +4249,7 @@ def _fit_columns(res):
         'slope_deg_per_pass': res['slope_deg_per_pass'],
         'r_squared': res['r_squared'], 'fit_R': res['fit_R'],
         'fit_R_shuffle_p': res['fit_R_shuffle_p'],
-        'fit_R_Significant': res['fit_R_Significant'],
+        'fit_R_Significant': res['fit_R_Significant'] if res['shuffle_fit_r'] is not None else np.nan,
         'phase_range_deg': res['phase_range_deg'],
         **{c: v for _, key, *_ in PASS_INDEX_PHASE_POINTS
            for c, v in ((f'phase_at_{key}_deg', res[f'phase_at_{key}_deg']),
@@ -4228,7 +4269,7 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     Each row's Count/Denominator/Percent together cover one pair of
     (number, percentage) items: total cells; SignificantThetaModulation;
     TMI_Significant; ThetaModulated (the Step 3 gate); PrecessionTested; and the
-    PrecessionClass outcomes (phase_precessing / phase_recessing /
+    PrecessionClass outcomes (phase_precessing / phase_processing /
     phase_locked / no_phase_relation, from the asymptotic z-test p in kempter_lincirc) counted two ways -- out of all
     theta-modulated (ThetaModulated) cells, and out of only the subset that
     was actually precession-tested (some theta-modulated cells are skipped,
@@ -4259,7 +4300,8 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     n_subfields = int(multipeak.sum())
     n_small = int((multipeak & (df['field_n_bins'] < MIN_SUBFIELD_SIZE_BINS)).sum())
     rows = [
-        dict(Metric='Cells with > 1 place field (each field analysed separately)',
+        dict(Metric=('Cells with > 1 place field (only the peak-rate field analysed)' if PEAK_FIELD_ONLY
+                     else 'Cells with > 1 place field (each field analysed separately)'),
              Count=n_multi, Denominator=total_cells, DenominatorLabel='total cells',
              Percent=pct(n_multi, total_cells)),
         dict(Metric='Cells with >= 1 multi-peak field (split into sub-fields)',
@@ -4274,7 +4316,7 @@ def build_summary_stats(df: pd.DataFrame) -> pd.DataFrame:
              Count=n_fields_tested, Denominator=np.nan, DenominatorLabel='',
              Percent=np.nan),
     ]
-    for cls, col in (('phase_precessing', 'is_precessing'), ('phase_succeeding', 'is_recessing'),
+    for cls, col in (('phase_precessing', 'is_precessing'), ('phase_processing', 'is_recessing'),
                      ('phase_locked', 'is_phase_locked'), ('no_phase_relation', None)):
         mask = (df['PrecessionClass'] == cls) if col is None else (df[col] == True)  # noqa: E712
         n_f = int(mask.sum())
@@ -4419,8 +4461,9 @@ def main():
     df = pd.DataFrame(all_rows, columns=columns)
     summary_df = build_summary_stats(df)
 
+    df['Animal'] = df['FolderPath'].apply(lambda p: detect_animal_id(Path(p)))
     df['Arena'] = df['FolderPath'].apply(lambda p: detect_arena(Path(p)))
-    df['SessionType'] = [detect_session_type(Path(p), a) for p, a in zip(df['FolderPath'], df['Arena'])]
+    df['SessionType'] =[detect_session_type(Path(p), a) for p, a in zip(df['FolderPath'], df['Arena'])]
     unknown_type = df.loc[df['Arena'].notna() & df['SessionType'].isna(), 'FolderPath'].unique()
     if len(unknown_type):
         print(f'\nWARNING: {len(unknown_type)} session folder(s) with no recognizable session type; '
@@ -4451,11 +4494,38 @@ def main():
         df.loc[df['Arena'].notna()], 'Arena', ARENA_LABELS, out_dir=RESULTS_FOLDER,
         file_prefix='ArenaComparison', group_word='arena')
 
-    readme_df = pd.DataFrame({'Note': [
-        'ThetaPhase sheet: ONE ROW PER PLACE FIELD. A cell with several place fields (MultiField = True, '
-        'n_fields > 1) has one row per field; its unit-level columns (spike counts, MRL, Rayleigh, TMI) are '
-        'repeated on each of its rows. Cells with no field analysed (not theta-modulated, no tracking, '
-        'no field detected) have a single row with Field empty.',
+    # ---- 3) Theta-modulated proportion per animal: all arenas pooled, then within Open (the only arena
+    # recorded in every animal) and Linear (Fa1059 and Fa23BD) ----
+    # sheet name -> tables per scope, stacked into one sheet with an 'Arena' column ('All' = arenas pooled)
+    animal_tables: dict[str, list[pd.DataFrame]] = {}
+    for scope in ('All', 'Open', 'Linear'):
+        df_scope = df if scope == 'All' else df.loc[df['Arena'] == scope]
+        print(f'\n=== Theta-modulated units per animal ({scope}) ===')
+        tables = run_theta_mod_proportion(
+            df_scope, 'Animal', sorted(df_scope['Animal'].unique()),
+            RESULTS_FOLDER / ('AnimalComparison_ThetaModProportion.png' if scope == 'All'
+                              else f'AnimalComparison_{scope}_ThetaModProportion.png'),
+            pooled=('arenas and session types pooled within animal' if scope == 'All'
+                    else f'{scope} arena only; session types pooled within animal'),
+            title_prefix='' if scope == 'All' else f'{scope}: ')
+        for key, table in tables.items():
+            if not table.empty:
+                table.insert(0, 'Arena', scope)
+                animal_tables.setdefault(_comparison_sheet_name('Animal', key), []).append(table)
+
+    readme_df =pd.DataFrame({'Note': [
+        ('Peak-rate field only: each cell has one row, for its field with the highest peak (smoothed) rate; its '
+         'other fields are not analysed and get no row, and n_fields / MultiField still count all detected '
+         'fields. Cells with no field analysed (not theta-modulated, no tracking, no field detected) have a '
+         'single row with Field empty.' if PEAK_FIELD_ONLY else
+         'ThetaPhase sheet: ONE ROW PER PLACE FIELD. A cell with several place fields (MultiField = True, '
+         'n_fields > 1) has one row per field; its unit-level columns (spike counts, MRL, Rayleigh, TMI) are '
+         'repeated on each of its rows. Cells with no field analysed (not theta-modulated, no tracking, '
+         'no field detected) have a single row with Field empty.'),
+        f'Significance (Climer pass_index.m): Kempter z-test p < {ALPHA:g} on all analysed spikes, with no slope '
+        f'bounds passed to the fit. PrecessionClass is the sign of a significant slope: negative = phase_precessing, '
+        f'positive = phase_processing; not significant = no_phase_relation. slope_deg_per_pass is the change over a '
+        f'full pass (pass index -1 to +1), twice the value of Climer\'s rad2deg(2*pi*s).',
         'Field numbering: Field 1 = the field with the highest peak (smoothed) firing rate, then 2, 3, ... in '
         'descending order of peak rate. Per-field figures are named <animal>_<unit>_F<Field>_PassIndex.png '
         '(and _F<Field>_FitRShuffle.png); the figure title gives "Field k of n".',
@@ -4498,7 +4568,8 @@ def main():
         'ThetaModCells_Pooled / _PoolOmni / _PoolPair sheets (v27): number and proportion of theta-modulated '
         'units pooled per arena (or session type), of all units recorded and of units with enough spikes for '
         'the TMI test; chi-square test of independence across groups and pairwise Fisher exact tests (Holm) '
-        'on theta-modulated vs not, out of all units.',
+        'on theta-modulated vs not, out of all units. Animal_ThetaModCells_* sheets: the same per animal, with '
+        'all arenas pooled (Arena = All) and within the Open and Linear arenas.',
     ]})
     excel_path = RESULTS_FOLDER / OUTPUT_EXCEL_NAME
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
@@ -4509,7 +4580,9 @@ def main():
             pd.concat(tables, ignore_index=True).to_excel(writer, sheet_name=sheet_name, index=False)
         for key, table in arena_tables.items():
             table.to_excel(writer, sheet_name=_comparison_sheet_name('Arena', key), index=False)
-    n_units = df[['FolderPath', 'Unit']].drop_duplicates().shape[0]
+        for sheet_name, tables in animal_tables.items():
+            pd.concat(tables, ignore_index=True).to_excel(writer, sheet_name=sheet_name, index=False)
+    n_units =df[['FolderPath', 'Unit']].drop_duplicates().shape[0]
     print(f'\nDone. {n_units} unit(s) processed, {int(df["Field"].notna().sum())} place field row(s). '
           f'Summary saved to {excel_path}')
 

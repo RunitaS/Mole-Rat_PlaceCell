@@ -192,7 +192,10 @@ v27 changes:
     and OO_* Excel columns (visit / spike counts, circular-mean phase and MRL of each).
   * Proportion and absolute number of theta-modulated (ThetaModulated) units pooled per arena
     / session type, with a chi-square test across groups and pairwise Fisher exact tests
-    (Holm): <prefix>_ThetaModProportion.png and 'ThetaModCells_Pool*' sheets.
+    (Holm): <prefix>_ThetaModProportion.png and 'ThetaModCells_Pool*' sheets. The same per animal,
+    in the animal colours, with arenas pooled (AnimalComparison_ThetaModProportion.png) and within
+    the Open and Linear arenas (AnimalComparison_<arena>_ThetaModProportion.png); 'Animal_ThetaModCells_Pool*'
+    sheets.
   Per-unit figures go to <session>/ThetaMod_PhasePrecession_v27.
 
 v28 changes (pass index from field geometry instead of the field-index Hilbert phase):
@@ -2537,7 +2540,7 @@ def _draw_tmi_null(ax_s, tmi, is_sig, shuffle_tmis):
     """Draw the TMI shuffle-test null distribution with the observed TMI and
     the null's (1 - ALPHA) percentile."""
     color = 'red' if is_sig else '#4D4D4D'
-    thresh = float(np.percentile(shuffle_tmis, 100 * (1 - 0.01))) #ALPHA)))
+    thresh = float(np.percentile(shuffle_tmis, 100 * (1 - ALPHA)))
     ax_s.hist(shuffle_tmis, bins=40, color='#D9D9D9', edgecolor='black', linewidth=0.5)
     ax_s.axvline(thresh, color='0.3', linestyle='--', linewidth=1.5,
                  label=f'shuffle {100 * (1 - ALPHA):g}th pct = {thresh:.3f}')
@@ -3119,12 +3122,14 @@ SESSION_COLORS = {
     'NoRot': {'face': PAL_MAGENTA, 'edge': PAL_BLACK},
     'Rot': {'face': '#C000C0', 'edge': PAL_BLACK},
 }
-# Arena and session-type labels don't overlap, so one lookup serves both comparisons.
-GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS}
+# Arena, session-type and animal labels don't overlap, so one lookup serves every comparison.
+GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS,
+                **{a: {'face': c, 'edge': PAL_BLACK} for a, c in ANIMAL_COLORS.items()}}
 _DEFAULT_COLOR = {'face': PAL_GRAY, 'edge': PAL_BLACK}
 # Grouping column -> names of the omnibus tables' group-count / n-per-group columns
 GROUP_COUNT_COLUMNS = {'Arena': ('N_arenas', 'N_per_arena'),
-                       'SessionType': ('N_session_types', 'N_per_session_type')}
+                       'SessionType': ('N_session_types', 'N_per_session_type'),
+                       'Animal': ('N_animals', 'N_per_animal')}
 _TEST_STAT_NAMES = {'Kruskal-Wallis': 'H', 'Mann-Whitney U': 'U',
                     'Mardia-Watson-Wheeler': 'W', 'Watson-Williams': 'F',
                     'Chi-square': 'χ²', 'Fisher exact': 'OR'}
@@ -3621,7 +3626,7 @@ def compare_theta_mod_proportion(df: pd.DataFrame, group_col: str, group_order):
 @_arena_fig_style
 def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
                               out_path: Path, group_col: str = 'Arena', title_prefix: str = '',
-                              pooled_within: str = 'arena'):
+                              pooled: str = 'animals pooled within arena'):
     """v27: left, % of all units that are theta-modulated per group (bars in the group colours,
     'n theta-modulated / n units' above each, stars over pairs with Holm-corrected Fisher
     p < ALPHA); right, absolute numbers as stacked bars (theta-modulated filled, not
@@ -3634,7 +3639,7 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
     pct = counts_df['pct_of_units'].to_numpy()
 
     crit = f'TMI shuffle{" + Rayleigh" if REQUIRE_RAYLEIGH_FOR_THETA_MOD else ""} p < {ALPHA:g}'
-    stats_lines = [f'Theta-modulated = {crit}; one value per unit; animals pooled within {pooled_within}']
+    stats_lines = [f'Theta-modulated = {crit}; one value per unit; {pooled}']
     stats_lines += [f'{_label(r[group_col])}: {r["n_theta_modulated"]}/{r["n_units"]} units '
                     f'({r["pct_of_units"]:.1f} %) | {r["n_theta_modulated"]}/{r["n_units_TMI_tested"]} '
                     f'TMI-tested (>= {MIN_SPIKES_FOR_TMI} spikes; {r["pct_of_TMI_tested"]:.1f} %)'
@@ -3664,11 +3669,14 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
     ax_n.bar(positions, n_tm, width=0.6, color=faces, edgecolor=PAL_BLACK, linewidth=FIG_BOX_LW, zorder=2)
     ax_n.bar(positions, n_not, width=0.6, bottom=n_tm, color='white', edgecolor=PAL_BLACK, hatch='///',
              linewidth=FIG_BOX_LW, zorder=2)
+    y_top = n_all.max() * 1.12 + 1
     for x, a, b in zip(positions, n_tm, n_not):
-        if a:
+        if a >= 0.04 * y_top:
             ax_n.text(x, a / 2, str(a), ha='center', va='center', fontsize=FS_TICK, fontweight='bold', zorder=3)
+        elif a:     # too short to hold its label: written beside the bar
+            ax_n.text(x + 0.33, 0, str(a), ha='left', va='bottom', fontsize=FS_TICK, fontweight='bold', zorder=3)
         ax_n.text(x, a + b, str(a + b), ha='center', va='bottom', fontsize=FS_TICK, zorder=3)
-    ax_n.set_ylim(0, n_all.max() * 1.12 + 1)
+    ax_n.set_ylim(0, y_top)
     ax_n.set_ylabel('Units (n)', fontsize=FS_LABEL - 2, labelpad=8)
     _set_title(ax_n, f'{title_prefix}Theta-modulated units (n)')
 
@@ -3684,6 +3692,24 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
     _draw_stats(ax_info, stats_lines)
     fig.tight_layout()
     _save_fig(fig, out_path)
+
+
+def run_theta_mod_proportion(df: pd.DataFrame, group_col: str, group_order, out_path: Path,
+                             pooled: str, title_prefix: str = '') -> dict[str, pd.DataFrame]:
+    """Proportion and number of theta-modulated units pooled per group: tests
+    (compare_theta_mod_proportion) and plot (plot_theta_mod_proportion, saved to
+    out_path; `pooled` says what the plot's footer reports as pooled). Returns
+    {table key: DataFrame}; empty if no group holds a unit."""
+    counts_df, omnibus_df, pairwise_df = compare_theta_mod_proportion(df, group_col, group_order)
+    if counts_df.empty:
+        return {}
+    plot_theta_mod_proportion(counts_df, omnibus_df, pairwise_df, out_path, group_col=group_col,
+                              title_prefix=title_prefix, pooled=pooled)
+    print('Theta-modulated units: ' + '; '.join(
+        f'{_label(r[group_col])} {r["n_theta_modulated"]}/{r["n_units"]} ({r["pct_of_units"]:.1f} %)'
+        for _, r in counts_df.iterrows()) + f' -- plot saved: {out_path.name}')
+    return {'ThetaModCells_Pooled': counts_df, 'ThetaModCells_PoolOmni': omnibus_df,
+            'ThetaModCells_PoolPair': pairwise_df}
 
 
 def run_group_comparisons(df: pd.DataFrame, group_col: str, group_order, out_dir: Path,
@@ -3782,16 +3808,9 @@ def run_group_comparisons(df: pd.DataFrame, group_col: str, group_order, out_dir
         skip_msg(present, 'recording sessions', 'theta-modulated cell count/proportion')
 
     # ---- v27: proportion and absolute number of theta-modulated units, pooled per group ----
-    counts_df, omnibus_df, pairwise_df = compare_theta_mod_proportion(df, group_col, group_order)
-    if not counts_df.empty:
-        tables['ThetaModCells_Pooled'] = counts_df
-        tables['ThetaModCells_PoolOmni'], tables['ThetaModCells_PoolPair'] = omnibus_df, pairwise_df
-        prop_path = out_dir / f'{file_prefix}_ThetaModProportion.png'
-        plot_theta_mod_proportion(counts_df, omnibus_df, pairwise_df, prop_path, group_col=group_col,
-                                  title_prefix=title_prefix, pooled_within=group_word)
-        print('Theta-modulated units: ' + '; '.join(
-            f'{_label(r[group_col])} {r["n_theta_modulated"]}/{r["n_units"]} ({r["pct_of_units"]:.1f} %)'
-            for _, r in counts_df.iterrows()) + f' -- plot saved: {prop_path.name}')
+    tables.update(run_theta_mod_proportion(df, group_col, group_order,
+                                           out_dir / f'{file_prefix}_ThetaModProportion.png',
+                                           pooled, title_prefix))
 
     # ---- Theta phase at pass index -1 / 0 (field center) / +1 ----
     for x, key, label, file_tag, sheet_tag in PASS_INDEX_PHASE_POINTS:
@@ -3822,7 +3841,10 @@ def _comparison_sheet_name(group_col: str, key: str) -> str:
     The arena comparison keeps v18's sheet names ('ArenaComparison_Omnibus',
     'ArenaComparison_TMI_Pairwise', 'PhaseAtPI0_ByArena', 'ThetaModCells_Pairwise',
     ...); session-type tables get a 'SesType_' prefix ('SesType_Omnibus',
-    'SesType_TMI_Pairwise', 'SesType_PhaseAtPI0_BySesType', ...)."""
+    'SesType_TMI_Pairwise', 'SesType_PhaseAtPI0_BySesType', ...) and per-animal
+    tables an 'Animal_' prefix ('Animal_ThetaModCells_Pooled', ...)."""
+    if group_col == 'Animal':
+        return f'Animal_{key}'
     if key.endswith('_By'):
         key += 'Arena' if group_col == 'Arena' else 'SesType'
     if group_col != 'Arena':
@@ -4479,6 +4501,7 @@ def main():
     df = pd.DataFrame(all_rows, columns=columns)
     summary_df = build_summary_stats(df)
 
+    df['Animal'] = df['FolderPath'].apply(lambda p: detect_animal_id(Path(p)))
     df['Arena'] = df['FolderPath'].apply(lambda p: detect_arena(Path(p)))
     df['SessionType'] = [detect_session_type(Path(p), a) for p, a in zip(df['FolderPath'], df['Arena'])]
     unknown_type = df.loc[df['Arena'].notna() & df['SessionType'].isna(), 'FolderPath'].unique()
@@ -4510,6 +4533,25 @@ def main():
     arena_tables = run_group_comparisons(
         df.loc[df['Arena'].notna()], 'Arena', ARENA_LABELS, out_dir=RESULTS_FOLDER,
         file_prefix='ArenaComparison', group_word='arena')
+
+    # ---- 3) Theta-modulated proportion per animal: all arenas pooled, then within Open (the only arena
+    # recorded in every animal) and Linear (Fa1059 and Fa23BD) ----
+    # sheet name -> tables per scope, stacked into one sheet with an 'Arena' column ('All' = arenas pooled)
+    animal_tables: dict[str, list[pd.DataFrame]] = {}
+    for scope in ('All', 'Open', 'Linear'):
+        df_scope = df if scope == 'All' else df.loc[df['Arena'] == scope]
+        print(f'\n=== Theta-modulated units per animal ({scope}) ===')
+        tables = run_theta_mod_proportion(
+            df_scope, 'Animal', sorted(df_scope['Animal'].unique()),
+            RESULTS_FOLDER / ('AnimalComparison_ThetaModProportion.png' if scope == 'All'
+                              else f'AnimalComparison_{scope}_ThetaModProportion.png'),
+            pooled=('arenas and session types pooled within animal' if scope == 'All'
+                    else f'{scope} arena only; session types pooled within animal'),
+            title_prefix='' if scope == 'All' else f'{scope}: ')
+        for key, table in tables.items():
+            if not table.empty:
+                table.insert(0, 'Arena', scope)
+                animal_tables.setdefault(_comparison_sheet_name('Animal', key), []).append(table)
 
     readme_df = pd.DataFrame({'Note': [
         'ThetaPhase sheet: ONE ROW PER PLACE FIELD. A cell with several place fields (MultiField = True, '
@@ -4564,7 +4606,8 @@ def main():
         'ThetaModCells_Pooled / _PoolOmni / _PoolPair sheets (v27): number and proportion of theta-modulated '
         'units pooled per arena (or session type), of all units recorded and of units with enough spikes for '
         'the TMI test; chi-square test of independence across groups and pairwise Fisher exact tests (Holm) '
-        'on theta-modulated vs not, out of all units.',
+        'on theta-modulated vs not, out of all units. Animal_ThetaModCells_* sheets: the same per animal, with '
+        'all arenas pooled (Arena = All) and within the Open and Linear arenas.',
     ]})
     excel_path = RESULTS_FOLDER / OUTPUT_EXCEL_NAME
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
@@ -4575,6 +4618,8 @@ def main():
             pd.concat(tables, ignore_index=True).to_excel(writer, sheet_name=sheet_name, index=False)
         for key, table in arena_tables.items():
             table.to_excel(writer, sheet_name=_comparison_sheet_name('Arena', key), index=False)
+        for sheet_name, tables in animal_tables.items():
+            pd.concat(tables, ignore_index=True).to_excel(writer, sheet_name=sheet_name, index=False)
     n_units = df[['FolderPath', 'Unit']].drop_duplicates().shape[0]
     print(f'\nDone. {n_units} unit(s) processed, {int(df["Field"].notna().sum())} place field row(s). '
           f'Summary saved to {excel_path}')
