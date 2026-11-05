@@ -28,6 +28,15 @@ sqrt(area_cm2 / n_bins)).
 
 Circular-track fields ('bin_coords' are 1-D angular bins, e.g. '25;26;27')
 have no 2-D shape; their shape columns are left blank (NaN).
+
+field_width_lines gives the two widths as line segments for plotting: the max
+width between the two farthest bin centres, the min width between the two
+closest parallel lines enclosing the field (one through the narrowest
+convex-hull edge, one through the hull vertex farthest from it), drawn through
+that vertex; each is extended by half a bin at both ends so that it is exactly
+as long as the width. The min-width line can end outside the field's bins
+(where the parallel lines touch the field at points that do not face each
+other), so the two parallel lines are returned too.
 """
 
 from copy import copy
@@ -60,6 +69,43 @@ def _axis_deg(v) -> float:
     return float(np.degrees(np.arctan2(v[1], v[0])) % 180.0)
 
 
+def _calipers(pts: np.ndarray) -> dict:
+    """Max- and min-width calipers of >= 2 unique bin centres `pts` (n, 2):
+    max_width / min_width (centre-to-centre, without the extra bin),
+    max_dir / min_dir (axis vectors), and the segments they are measured on,
+    max_seg / min_seg ((2, 2) arrays of bin-centre coordinates): the two
+    farthest bin centres, and the perpendicular from the hull vertex farthest
+    from the narrowest hull edge to that edge's line."""
+    # Max width: the two farthest bin centres.
+    d = pts[:, None, :] - pts[None, :, :]
+    dist = np.hypot(d[..., 0], d[..., 1])
+    i, j = np.unravel_index(np.argmax(dist), dist.shape)
+    max_dir = d[i, j]
+
+    # Min width: narrowest projection, measured across each convex-hull edge.
+    centred = pts - pts.mean(axis=0)
+    if np.linalg.matrix_rank(centred, tol=1e-9) < 2:   # all bins in one line
+        min_w, min_dir = 0.0, np.array([-max_dir[1], max_dir[0]])
+        mid = 0.5 * (pts[i] + pts[j])
+        min_seg = np.array([mid, mid])
+    else:
+        hull = pts[ConvexHull(pts).vertices]
+        edges = np.roll(hull, -1, axis=0) - hull
+        normals = np.column_stack([-edges[:, 1], edges[:, 0]])
+        normals /= np.hypot(normals[:, 0], normals[:, 1])[:, None]
+        proj = hull @ normals.T                  # (n_vertices, n_edges)
+        widths = proj.max(axis=0) - proj.min(axis=0)
+        k = int(np.argmin(widths))
+        min_w, min_dir = widths[k], normals[k]
+        # The edge lies on one extreme of the projection; the caliper runs from
+        # the vertex on the other extreme, perpendicular, to the edge's line.
+        p_k = proj[:, k]
+        far = hull[np.argmax(np.abs(p_k - p_k[k]))]
+        min_seg = np.array([far, far - (far @ min_dir - p_k[k]) * min_dir])
+    return dict(max_width=dist[i, j], max_dir=max_dir, max_seg=np.array([pts[i], pts[j]]),
+                min_width=min_w, min_dir=min_dir, min_seg=min_seg)
+
+
 def field_shape(bin_coords) -> dict:
     """Shape of one field (widths in bins, see module docstring). All values
     NaN if the field has no 2-D bins."""
@@ -73,33 +119,57 @@ def field_shape(bin_coords) -> dict:
         out.update(max_width=1.0, min_width=1.0)
         return out
 
-    # Max width: the two farthest bin centres.
-    d = pts[:, None, :] - pts[None, :, :]
-    dist = np.hypot(d[..., 0], d[..., 1])
-    i, j = np.unravel_index(np.argmax(dist), dist.shape)
-    max_dir = d[i, j]
-    out['max_width'] = dist[i, j] + 1.0
-    out['max_axis_deg'] = _axis_deg(max_dir)
-
-    # Min width: narrowest projection, measured across each convex-hull edge.
-    centred = pts - pts.mean(axis=0)
-    if np.linalg.matrix_rank(centred, tol=1e-9) < 2:   # all bins in one line
-        min_w, min_dir = 0.0, np.array([-max_dir[1], max_dir[0]])
-    else:
-        hull = pts[ConvexHull(pts).vertices]
-        edges = np.roll(hull, -1, axis=0) - hull
-        normals = np.column_stack([-edges[:, 1], edges[:, 0]])
-        normals /= np.hypot(normals[:, 0], normals[:, 1])[:, None]
-        proj = hull @ normals.T                  # (n_vertices, n_edges)
-        widths = proj.max(axis=0) - proj.min(axis=0)
-        k = int(np.argmin(widths))
-        min_w, min_dir = widths[k], normals[k]
-    out['min_width'] = min_w + 1.0
-    out['min_axis_deg'] = _axis_deg(min_dir)
+    c = _calipers(pts)
+    out['max_width'] = c['max_width'] + 1.0
+    out['max_axis_deg'] = _axis_deg(c['max_dir'])
+    out['min_width'] = c['min_width'] + 1.0
+    out['min_axis_deg'] = _axis_deg(c['min_dir'])
 
     between = abs(out['max_axis_deg'] - out['min_axis_deg']) % 180.0
     out['axis_angle_deg'] = min(between, 180.0 - between)
     return out
+
+
+def _extend(seg: np.ndarray, direction: np.ndarray) -> np.ndarray:
+    """`seg` lengthened by half a bin at each end along `direction` (the +1 bin
+    of the widths: from bin edge to bin edge instead of centre to centre)."""
+    u = direction / np.hypot(*direction)
+    s = seg.astype(float)
+    if (s[1] - s[0]) @ u < 0:
+        u = -u
+    return np.array([s[0] - 0.5 * u, s[1] + 0.5 * u])
+
+
+def field_width_lines(bin_coords) -> dict | None:
+    """The max- and min-width lines of one 2-D field, for plotting, as arrays of
+    (x, y) in bin units (bin b spans b .. b + 1, centre b + 0.5):
+      'max'          (2, 2) between the two farthest bin centres
+      'min'          (2, 2) across the narrowest direction, through the hull
+                     vertex farthest from the narrowest hull edge
+      'min_calipers' (2, 2, 2) the two parallel lines, perpendicular to 'min',
+                     that enclose the field (the min width is their distance;
+                     'min' runs from one to the other), as long as the field's
+                     extent along them; None for a single-bin field
+    'max' and 'min' are each as long as the field_shape width of that axis (bin
+    edge to bin edge, i.e. half a bin past the outermost bin centres). None if
+    the field has no 2-D bins."""
+    pts = _parse_bins(bin_coords)
+    if pts is None or not len(pts):
+        return None
+    pts = np.unique(pts, axis=0) + 0.5
+    if len(pts) == 1:
+        p = pts[0]
+        return {'max': np.array([p - [0.5, 0], p + [0.5, 0]]),
+                'min': np.array([p - [0, 0.5], p + [0, 0.5]]), 'min_calipers': None}
+    c = _calipers(pts)
+    n = c['min_dir'] / np.hypot(*c['min_dir'])     # across the min width
+    t = np.array([n[1], -n[0]])                     # along the calipers
+    p_lo, p_hi = (pts @ n).min() - 0.5, (pts @ n).max() + 0.5
+    t_lo, t_hi = (pts @ t).min() - 0.5, (pts @ t).max() + 0.5
+    t0 = c['min_seg'][0] @ t
+    return {'max': _extend(c['max_seg'], c['max_dir']),
+            'min': np.array([t0 * t + p_lo * n, t0 * t + p_hi * n]),
+            'min_calipers': np.array([[t_lo * t + p * n, t_hi * t + p * n] for p in (p_lo, p_hi)])}
 
 
 def add_field_shape(fields: pd.DataFrame) -> pd.DataFrame:

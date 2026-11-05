@@ -33,6 +33,13 @@ it, and an epoch is accepted as a theta epoch only if the frequency of its
 closest-matching (ED_min) reference sinusoid lies in 3-7 Hz (ACG_FREQ_RANGE).
 There is no threshold on the ED_min value itself.
 
+LFP cleaning (clean_lfp): the whole trace is filtered before epoching, with
+the noise reduction of LFP_Speed_Spectrogram_ScalingCorrected.py (after
+SpeedSpectrogram_v2.m): timestamp-anchored .ncs loading -> resample to 1 kHz
+-> mains notch -> wavelet denoising -> linear detrend -> outlier fill, then the
+100 Hz low-pass. The epoch-wise delta/theta and peak-to-peak MAD rejection
+still run on the cleaned epochs.
+
 This script is fully self-contained: it reads Neuralynx .ncs files directly
 (no dependency on FOOOF.py) and recursively processes every .ncs file found
 under a single ROOT_DIR (see Configuration below).
@@ -64,8 +71,10 @@ import textwrap
 from itertools import combinations
 import numpy as np
 import pandas as pd
+import pywt
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy import signal
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import (pearsonr, spearmanr, chi2_contingency, fisher_exact,
                          kruskal, mannwhitneyu)
@@ -136,7 +145,7 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BroadBandFitting_NcsDropCorr')
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BroadBandFitting_NcsDropCorr_NoiseCleaned')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
@@ -184,6 +193,21 @@ NOTCH_Q        = 30.0
 # autocorrelogram shape.
 LOWPASS_CUTOFF_HZ = 100.0  # Hz
 LOWPASS_ORDER = 4          # Butterworth order (zero-phase via filtfilt)
+
+# ---- Noise reduction (from LFP_Speed_Spectrogram_ScalingCorrected.py) ----
+# Applied to the whole trace after the notch, before the low-pass (see clean_lfp).
+# Sample-based windows have the same duration as SpeedSpectrogram_v2.m's at 250 Hz,
+# so the outlier and smoothing windows assume FS_ACG = 1000 Hz.
+WAVELET_NAME     = 'sym4'         # wdenoise default
+WAVELET_LEVEL    = 4              # wdenoise(x, 4)
+OUTLIER_WINDOW   = 400            # 0.4 s: filloutliers(x, 'linear', 'movmedian', 100) at 250 Hz
+OUTLIER_THRESH   = 3.0            # local scaled MADs (filloutliers default)
+# medfilt1(x, 5) + smoothdata(x, 'sgolay', 15). Off, as in the spectrogram code: measured
+# on 3 sessions, they leave ~1% of 30-60 Hz power and ~0% of 60-90 Hz power (theta: ~98%).
+APPLY_SMOOTHING  = False
+MEDFILT_KERNEL   = 21             # 5 samples at 250 Hz
+SGOLAY_WINDOW    = 61             # 15 samples at 250 Hz
+SGOLAY_POLY      = 2              # smoothdata 'sgolay' default
 
 # ---- Artifact rejection (epoch-wise peak-to-peak, robust MAD outlier) ----
 MAD_THRESH = 5.0
@@ -233,6 +257,17 @@ ACG_FREQ_RES = 0.1             # Hz -- step of the reference bank. Not given a s
                                  # frequency estimate at a modest compute cost -- tighten
                                  # (e.g. 0.05) or loosen (e.g. 0.25) as needed.
 ACG_PEAK_PROMINENCE = 0.05      # matches findMinMax(refxc, 0.05, 'fixed') in the original
+# Frequency vs. peak-range plots show every matched epoch over the whole ACG_REF_BANK
+# (theta band marked); centroids and example epochs use accepted theta epochs only.
+FREQ_PLOT_BIN_HZ = 0.5          # Hz -- width of the frequency marginal-histogram bins
+# Non-theta epochs on the speed-coloured scatters get one fixed dark colour per movement
+# group instead of their speed colour. Moving: viridis' darkest shade (#440154) at 60%
+# brightness. Immobile: magma's darkest shade is already black (#000004), so its darkest
+# clearly coloured shade, magma(0.15) (#251255), at 60% brightness.
+NONTHETA_COLORS = {'moving': '#290132', 'immobile': '#160B33'}
+# On the pooled per-animal plot, non-theta epochs get the animal's Pastel1 colour with
+# its RGB scaled by this factor (2x darker), dark but still distinguishable between animals.
+NONTHETA_ANIMAL_DARKEN = 0.5
 
 # Movement classification -- single-threshold binary split: epoch median
 # speed above SPEED_THRESH_CMS -> 'moving', at/below it -> 'immobile'.
@@ -336,6 +371,63 @@ def lowpass_filter(x, fs_hz, cutoff_hz, order=4):
     nyq = fs_hz / 2.0
     b, a = signal.butter(order, cutoff_hz / nyq, btype='low')
     return signal.filtfilt(b, a, np.asarray(x, dtype=np.float64))
+
+
+def denoise_wavelet(x):
+    """Soft-threshold the sym4 detail coefficients, with the noise level estimated
+    from the finest level. BayesShrink (Chang et al. 2000), standing in for wdenoise's
+    default empirical Bayes threshold; a level with no signal above noise is zeroed."""
+    coeffs = pywt.wavedec(x, WAVELET_NAME, level=WAVELET_LEVEL)
+    noise_sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+    denoised = [coeffs[0]]
+    for detail in coeffs[1:]:
+        signal_var = max(np.mean(detail ** 2) - noise_sigma ** 2, 0)
+        thresh = noise_sigma ** 2 / np.sqrt(signal_var) if signal_var > 0 else np.abs(detail).max()
+        denoised.append(pywt.threshold(detail, thresh, 'soft'))
+    return pywt.waverec(denoised, WAVELET_NAME)[:len(x)]
+
+
+def fill_outliers(x, window=OUTLIER_WINDOW, thresh=OUTLIER_THRESH, chunk=20000):
+    """MATLAB's filloutliers(x, 'linear', 'movmedian', window): a sample more than
+    `thresh` scaled MADs from its moving median is replaced by linear interpolation.
+    Windows are k/2 back and k/2 - 1 forward, shrinking at the ends.
+
+    Returns the filled trace and the outlier mask."""
+    n = len(x)
+    n_before = window // 2
+    n_after = window - n_before - 1
+    med, mad = np.empty(n), np.empty(n)
+    windows = sliding_window_view(x, window)
+    for j in range(0, len(windows), chunk):
+        block = windows[j:j + chunk]
+        m = np.median(block, axis=1)
+        med[j + n_before:j + n_before + len(block)] = m
+        mad[j + n_before:j + n_before + len(block)] = np.median(np.abs(block - m[:, None]), axis=1)
+    for k in [*range(n_before), *range(n - n_after, n)]:
+        block = x[max(0, k - n_before):min(n, k + n_after + 1)]
+        med[k] = np.median(block)
+        mad[k] = np.median(np.abs(block - med[k]))
+    is_outlier = np.abs(x - med) > thresh * 1.482602218505602 * mad
+
+    filled = x.copy()
+    filled[is_outlier] = np.interp(np.flatnonzero(is_outlier), np.flatnonzero(~is_outlier), x[~is_outlier])
+    return filled, is_outlier
+
+
+def clean_lfp(lfp, fs_acg):
+    """Native-rate repaired trace (uV) -> fs_acg -> notch -> wavelet denoise ->
+    detrend -> outlier fill (-> median filter -> Savitzky-Golay, if APPLY_SMOOTHING)
+    -> low-pass. Returns the cleaned trace and the fraction of samples outlier-filled."""
+    lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
+    lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
+    lfp = denoise_wavelet(lfp)
+    lfp = detrend_signal(lfp, dtype='linear')
+    lfp, is_outlier = fill_outliers(lfp)
+    if APPLY_SMOOTHING:
+        lfp = signal.medfilt(lfp, MEDFILT_KERNEL)
+        lfp = savgol_filter(lfp, SGOLAY_WINDOW, SGOLAY_POLY)
+    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+    return lfp, is_outlier.mean()
 
 
 def _robust_high_outliers(x, thresh, ref_mask=None):
@@ -912,10 +1004,8 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
     'epoch_start_us'.
     """
     lfp, records = load_ncs(fpath)
-    lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
-    lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
-    lfp = detrend_signal(lfp, dtype='linear')
-    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+    lfp, outlier_frac = clean_lfp(lfp, fs_acg)
+    print(f'    noise cleaning: {100 * outlier_frac:.2f}% samples outlier-filled')
 
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, n_total = build_epochs(lfp, nperseg)
@@ -954,17 +1044,13 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
 
 
 def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
-    """Re-derive the cleaned (resampled / notch-filtered / detrended / low-pass
-    filtered) waveform of one specific epoch from its source .ncs file, for
-    illustrative plotting (plot_example_epoch). `fpath` + `epoch_index` should
-    come from the 'file' / 'epoch_index' columns of a process_ncs_for_acg
-    results row.
+    """Re-derive the cleaned (clean_lfp) waveform of one specific epoch from its
+    source .ncs file, for illustrative plotting (plot_example_epoch). `fpath` +
+    `epoch_index` should come from the 'file' / 'epoch_index' columns of a
+    process_ncs_for_acg results row.
     """
     lfp, _ = load_ncs(fpath)
-    lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
-    lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
-    lfp = detrend_signal(lfp, dtype='linear')
-    lfp = lowpass_filter(lfp, fs_acg, LOWPASS_CUTOFF_HZ, LOWPASS_ORDER)
+    lfp, _ = clean_lfp(lfp, fs_acg)
     nperseg = int(round(fs_acg * epoch_sec))
     epochs, _ = build_epochs(lfp, nperseg)
     return epochs[int(epoch_index)]
@@ -1408,6 +1494,33 @@ def plot_example_epoch(row, epoch_waveform, ax_trace=None, ax_acg=None,
     return ax_trace, ax_acg
 
 
+def _matched_epochs(df):
+    """Epochs shown on the frequency vs. peak-range plots: every epoch matched to
+    a reference sinusoid anywhere in ACG_REF_BANK (theta and non-theta), i.e. all
+    but too-short epochs. Epochs matched below ~1.75 Hz have no peak range (see
+    create_sine_ref_xcorrs) and can't be drawn."""
+    matched = ~df['skipped'] | df['skipped_outofband']
+    return df[matched & np.isfinite(df['peakrangenorm'])]
+
+
+def _freq_plot_bins():
+    """Frequency marginal-histogram bin edges spanning the whole ACG_REF_BANK."""
+    return np.arange(ACG_REF_BANK[0], ACG_REF_BANK[1] + FREQ_PLOT_BIN_HZ / 2, FREQ_PLOT_BIN_HZ)
+
+
+def _darken(color, factor):
+    """`color` with its RGB channels scaled by `factor` (0-1)."""
+    return tuple(factor * np.array(to_rgba(color)[:3]))
+
+
+def _mark_theta_band(ax_main, ax_top):
+    """Dashed lines at the ACG_FREQ_RANGE edges, x-axis over the whole ACG_REF_BANK."""
+    for ax in (ax_main, ax_top):
+        for edge in ACG_FREQ_RANGE:
+            ax.axvline(edge, color='0.3', linestyle='--', linewidth=0.8, zorder=4)
+    ax_main.set_xlim(ACG_REF_BANK)
+
+
 def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  mode='both', speed_vmax=50.0, moving_cmap='viridis',
                                  moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
@@ -1429,9 +1542,11 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     along the colormap; bright pink `immobile_centroid_color` for immobile).
     An annotation in `ax_main`
     reports the percentage of epochs (within `animal`'s scope, if given)
-    rejected as non-theta (ED_min sinusoid outside ACG_FREQ_RANGE) -- these
-    never reach the scatter/centroids since they're filtered out via
-    'skipped'.
+    rejected as non-theta (ED_min sinusoid outside ACG_FREQ_RANGE). The scatter
+    and histograms show every matched epoch over ACG_REF_BANK (_matched_epochs),
+    with the theta band marked and non-theta points in NONTHETA_COLORS instead of
+    their speed colour; the centroids use the accepted theta epochs only
+    (compute_group_centroids).
 
     `mode` selects which group(s) are drawn: 'both' (default), 'moving', or
     'immobile'. Axes/bins are always scaled to the full (both-group)
@@ -1448,7 +1563,7 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     n_rejected = int(scope['skipped_outofband'].sum())
     pct_rejected = 100 * n_rejected / len(scope) if len(scope) else 0.0
 
-    sub = df[~df['skipped']].copy()
+    sub = _matched_epochs(df).copy()
     if animal is not None:
         sub = sub[sub['animal'] == animal]
     sub = sub[sub['movement'].isin(['moving', 'immobile'])]
@@ -1457,27 +1572,41 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     show_moving = mode in ('both', 'moving')
     immobile = sub[sub['movement'] == 'immobile'] if show_immobile else sub.iloc[0:0]
     moving = sub[sub['movement'] == 'moving'] if show_moving else sub.iloc[0:0]
+    # theta epochs are coloured by speed, non-theta epochs in NONTHETA_COLORS
+    imm_theta = immobile[~immobile['skipped_outofband']]
+    imm_non = immobile[immobile['skipped_outofband']]
+    mov_theta = moving[~moving['skipped_outofband']]
+    mov_non = moving[moving['skipped_outofband']]
 
     # immobile first (opaque by default) so the semi-transparent moving layer
     # sits visibly on top rather than being hidden underneath it
     sc_imm = None
     if show_immobile:
-        imm_speed = np.clip(immobile['median_speed_cms'].to_numpy(), 0, immobile_speed_vmax)
-        sc_imm = ax_main.scatter(immobile['freq'], immobile['peakrangenorm'], c=imm_speed,
+        imm_speed = np.clip(imm_theta['median_speed_cms'].to_numpy(), 0, immobile_speed_vmax)
+        sc_imm = ax_main.scatter(imm_theta['freq'], imm_theta['peakrangenorm'], c=imm_speed,
                                  cmap=immobile_cmap, vmin=0, vmax=immobile_speed_vmax, s=16,
                                  edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
                                  alpha=immobile_alpha, label='immobile', zorder=2)
+        ax_main.scatter(imm_non['freq'], imm_non['peakrangenorm'],
+                        color=NONTHETA_COLORS['immobile'], s=16,
+                        edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+                        alpha=immobile_alpha, label='immobile, non-theta', zorder=2)
     sc = None
     if show_moving:
-        speed = np.clip(moving['median_speed_cms'].to_numpy(), 0, speed_vmax)
-        sc = ax_main.scatter(moving['freq'], moving['peakrangenorm'], c=speed,
+        speed = np.clip(mov_theta['median_speed_cms'].to_numpy(), 0, speed_vmax)
+        sc = ax_main.scatter(mov_theta['freq'], mov_theta['peakrangenorm'], c=speed,
                              cmap=moving_cmap, vmin=0, vmax=speed_vmax, s=14,
                              edgecolor='none', alpha=moving_alpha, label='moving', zorder=3)
+        # opaque: at moving_alpha the dark colour reads as grey over white
+        ax_main.scatter(mov_non['freq'], mov_non['peakrangenorm'],
+                        color=NONTHETA_COLORS['moving'], s=14, edgecolor='none',
+                        label='moving, non-theta', zorder=3)
 
     centroids_all = compute_group_centroids(sub)
     shown = {g for g, show in (('moving', show_moving), ('immobile', show_immobile)) if show}
     centroids = centroids_all[centroids_all['movement'].isin(shown)]
-    marker_labels = {'moving': 'moving centroid', 'immobile': 'immobile centroid'}
+    marker_labels = {'moving': f'moving centroid ({_band_label()})',
+                     'immobile': f'immobile centroid ({_band_label()})'}
     # centroid diamonds: bright green from `moving_cmap` (viridis) for moving,
     # bright pink (`immobile_centroid_color`) for immobile
     marker_colors = {'moving': plt.get_cmap(moving_cmap)(moving_centroid_cmap_pos),
@@ -1516,41 +1645,45 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                 colors[b] = cmap_obj(mean_speed / vmax)
         return counts, colors
 
-    def _movement_hist(value_col, bin_edges):
+    def _movement_hist(bar, size_kw, value_col, bin_edges):
+        """Overlaid marginal bars: theta epochs coloured by their mean speed per
+        bin, then non-theta epochs in NONTHETA_COLORS on top. `bar` is ax.bar or
+        ax.barh and `size_kw` its bar-size keyword ('width' / 'height')."""
         centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        widths = np.diff(bin_edges)
+        sizes = {size_kw: np.diff(bin_edges)}
         imm_counts, imm_colors = _speed_colored_counts(
-            immobile, value_col, bin_edges, immobile_cmap_obj, immobile_speed_vmax)
+            imm_theta, value_col, bin_edges, immobile_cmap_obj, immobile_speed_vmax)
         mov_counts, mov_colors = _speed_colored_counts(
-            moving, value_col, bin_edges, moving_cmap_obj, speed_vmax)
-        return centers, widths, imm_counts, imm_colors, mov_counts, mov_colors
+            mov_theta, value_col, bin_edges, moving_cmap_obj, speed_vmax)
+        imm_non_counts, _ = _speed_colored_counts(
+            imm_non, value_col, bin_edges, immobile_cmap_obj, immobile_speed_vmax)
+        mov_non_counts, _ = _speed_colored_counts(
+            mov_non, value_col, bin_edges, moving_cmap_obj, speed_vmax)
+        bar(centers, imm_counts, color=imm_colors, edgecolor=immobile_edgecolor,
+            linewidth=immobile_edgewidth, alpha=immobile_alpha, zorder=2, **sizes)
+        bar(centers, mov_counts, color=mov_colors, edgecolor='none',
+            alpha=moving_alpha, zorder=3, **sizes)
+        bar(centers, mov_non_counts, color=NONTHETA_COLORS['moving'], edgecolor='none',
+            zorder=4, **sizes)
+        bar(centers, imm_non_counts, color=NONTHETA_COLORS['immobile'],
+            edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+            alpha=immobile_alpha, zorder=5, **sizes)
 
-    # bins always span the FULL (both-group) range, so mode='moving' /
-    # 'immobile' single-group panels stay axis-comparable with the merged one
-    freq_bins = np.linspace(sub['freq'].min(), sub['freq'].max(), n_bins)
-    centers_f, widths_f, imm_f, imm_colors_f, mov_f, colors_f = _movement_hist('freq', freq_bins)
-    ax_top.bar(centers_f, imm_f, width=widths_f, color=imm_colors_f,
-              edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-              alpha=immobile_alpha, zorder=2)
-    ax_top.bar(centers_f, mov_f, width=widths_f, color=colors_f,
-              edgecolor='none', alpha=moving_alpha, zorder=3)
+    # bins always span the whole ACG_REF_BANK, so mode='moving' / 'immobile'
+    # single-group panels stay axis-comparable with the merged one
+    _movement_hist(ax_top.bar, 'width', 'freq', _freq_plot_bins())
     ax_top.set_ylabel('Count')
     ax_top.tick_params(labelbottom=False)
     if log_counts:
         ax_top.set_yscale('log')
 
-    pr_bins = np.linspace(0, 1, n_bins)
-    centers_p, widths_p, imm_p, imm_colors_p, mov_p, colors_p = _movement_hist('peakrangenorm', pr_bins)
-    ax_right.barh(centers_p, imm_p, height=widths_p, color=imm_colors_p,
-                 edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-                 alpha=immobile_alpha, zorder=2)
-    ax_right.barh(centers_p, mov_p, height=widths_p, color=colors_p,
-                 edgecolor='none', alpha=moving_alpha, zorder=3)
+    _movement_hist(ax_right.barh, 'height', 'peakrangenorm', np.linspace(0, 1, n_bins))
     ax_right.set_xlabel('Count')
     ax_right.tick_params(labelleft=False)
     if log_counts:
         ax_right.set_xscale('log')
 
+    _mark_theta_band(ax_main, ax_top)
     if animal:
         ax_top.set_title(animal)
 
@@ -1623,13 +1756,15 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
                                 alpha=1.0, n_bins=25, log_counts=True,
                                 show_rejection_annotation=True):
     """Movement-pooled counterpart of _draw_freq_peakrange_scatter: frequency
-    vs. normalised autocorrelogram peak range for every accepted epoch, with
-    moving and immobile epochs combined and no speed colouring. Each animal in
-    `animals` is drawn in its own ANIMAL_COLORS (Pastel1) colour, with a thin
-    dark outline so the light colours stay visible on white, plus marginal
-    count histograms and one centroid diamond per animal.
+    vs. normalised autocorrelogram peak range for every matched epoch over
+    ACG_REF_BANK, with moving and immobile epochs combined and no speed
+    colouring. Each animal in `animals` is drawn in its own ANIMAL_COLORS
+    (Pastel1) colour, with a thin dark outline so the light colours stay visible
+    on white, plus marginal count histograms and one centroid diamond per animal
+    (accepted theta epochs only). Non-theta epochs (points and histograms) use the
+    animal's colour darkened by NONTHETA_ANIMAL_DARKEN.
 
-    Same epoch selection as _draw_freq_peakrange_scatter (non-skipped,
+    Same epoch selection as _draw_freq_peakrange_scatter (_matched_epochs,
     movement in moving/immobile), so the pooled cloud is exactly the union of
     the two movement-segregated clouds. With several animals, the one with the
     most epochs is drawn first so smaller animals' points stay visible on top.
@@ -1640,28 +1775,36 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     n_rejected = int(scope['skipped_outofband'].sum())
     pct_rejected = 100 * n_rejected / len(scope) if len(scope) else 0.0
 
-    sub = scope[~scope['skipped'] & scope['movement'].isin(['moving', 'immobile'])]
+    sub = _matched_epochs(scope)
+    sub = sub[sub['movement'].isin(['moving', 'immobile'])]
     if sub.empty:
-        raise ValueError(f'No accepted moving/immobile epochs for {", ".join(animals)}.')
+        raise ValueError(f'No matched moving/immobile epochs for {", ".join(animals)}.')
 
-    freq_bins = np.linspace(sub['freq'].min(), sub['freq'].max(), n_bins)
+    freq_bins = _freq_plot_bins()
     pr_bins = np.linspace(0, 1, n_bins)
     edge = MARKER_EDGE['markeredgecolor']
 
+    # theta epochs of every animal first, then non-theta epochs (the animal's colour
+    # darkened by NONTHETA_ANIMAL_DARKEN) on top, so no animal's theta layer hides them
     draw_order = sorted(animals, key=lambda a: -int((sub['animal'] == a).sum()))
-    for animal_label in draw_order:
-        a_sub = sub[sub['animal'] == animal_label]
-        if a_sub.empty:
-            continue
-        color = to_rgba(animal_color(animal_label), alpha)
-        ax_main.scatter(a_sub['freq'], a_sub['peakrangenorm'], s=point_size,
-                        facecolor=color, edgecolor=edge, linewidth=0.3, zorder=2,
-                        label=f'{animal_label} (n={len(a_sub)})')
-        ax_top.hist(a_sub['freq'], bins=freq_bins, histtype='stepfilled', log=log_counts,
-                    facecolor=color, edgecolor=edge, linewidth=0.5)
-        ax_right.hist(a_sub['peakrangenorm'], bins=pr_bins, histtype='stepfilled',
-                      orientation='horizontal', log=log_counts,
-                      facecolor=color, edgecolor=edge, linewidth=0.5)
+    for nontheta in (False, True):
+        for animal_label in draw_order:
+            a_sub = sub[(sub['animal'] == animal_label) & (sub['skipped_outofband'] == nontheta)]
+            if a_sub.empty:
+                continue
+            color = animal_color(animal_label)
+            if nontheta:
+                color = _darken(color, NONTHETA_ANIMAL_DARKEN)
+            color = to_rgba(color, alpha)
+            label = f'{animal_label}{", non-theta" if nontheta else ""} (n={len(a_sub)})'
+            ax_main.scatter(a_sub['freq'], a_sub['peakrangenorm'], s=point_size,
+                            facecolor=color, edgecolor=edge, linewidth=0.3,
+                            zorder=3 if nontheta else 2, label=label)
+            ax_top.hist(a_sub['freq'], bins=freq_bins, histtype='stepfilled', log=log_counts,
+                        facecolor=color, edgecolor=edge, linewidth=0.5)
+            ax_right.hist(a_sub['peakrangenorm'], bins=pr_bins, histtype='stepfilled',
+                          orientation='horizontal', log=log_counts,
+                          facecolor=color, edgecolor=edge, linewidth=0.5)
 
     centroids = compute_group_centroids(sub, group_col='animal')
     for _, crow in centroids.iterrows():
@@ -1670,7 +1813,7 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
                         edgecolor='black', linewidth=1, zorder=5)
     # legend proxy for the per-animal centroid diamonds
     ax_main.scatter([], [], marker='D', s=90, facecolor='white', edgecolor='black',
-                    linewidth=1, label='centroid')
+                    linewidth=1, label=f'centroid ({_band_label()})')
 
     ax_main.set_xlabel('Frequency (Hz)')
     ax_main.set_ylabel('Autocorr. peak range')
@@ -1687,6 +1830,7 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     ax_top.tick_params(labelbottom=False)
     ax_right.set_xlabel('Count')
     ax_right.tick_params(labelleft=False)
+    _mark_theta_band(ax_main, ax_top)
     return centroids
 
 
@@ -1898,11 +2042,21 @@ def save_run_metadata(meta_dir=META_DIR):
         'ncs_samples_used':         'valid samples on a timestamp-anchored grid, gaps up to '
                                     '1 s interpolated (ncs_repair.py)',
         'REJECT_PARTIAL_RECORD_EPOCHS': REJECT_PARTIAL_RECORD_EPOCHS,
-        # ---- LFP cleaning (resample -> notch -> detrend -> low-pass) ----
+        # ---- LFP cleaning (resample -> notch -> wavelet denoise -> detrend ->
+        #      outlier fill [-> median -> Savitzky-Golay] -> low-pass) ----
         'FS_ACG':                   FS_ACG,
         'LINE_HARMONICS':           LINE_HARMONICS,
         'NOTCH_Q':                  NOTCH_Q,
+        'WAVELET_NAME':             WAVELET_NAME,
+        'WAVELET_LEVEL':            WAVELET_LEVEL,
+        'wavelet_threshold':        'BayesShrink, soft (noise sigma from finest level)',
         'detrend_type':             'linear',
+        'OUTLIER_WINDOW':           OUTLIER_WINDOW,
+        'OUTLIER_THRESH':           OUTLIER_THRESH,
+        'APPLY_SMOOTHING':          APPLY_SMOOTHING,
+        'MEDFILT_KERNEL':           MEDFILT_KERNEL,
+        'SGOLAY_WINDOW':            SGOLAY_WINDOW,
+        'SGOLAY_POLY':              SGOLAY_POLY,
         'LOWPASS_CUTOFF_HZ':        LOWPASS_CUTOFF_HZ,
         'LOWPASS_ORDER':            LOWPASS_ORDER,
         # ---- epoching / epoch rejection ----
@@ -1934,6 +2088,11 @@ def save_run_metadata(meta_dir=META_DIR):
         'ACG_REF_BANK':             ACG_REF_BANK,
         'ACG_FREQ_RES':             ACG_FREQ_RES,
         'ACG_PEAK_PROMINENCE':      ACG_PEAK_PROMINENCE,
+        'freq_peakrange_plot_epochs': 'every matched epoch over ACG_REF_BANK (theta band '
+                                      'marked); centroids/examples: accepted theta epochs only',
+        'FREQ_PLOT_BIN_HZ':         FREQ_PLOT_BIN_HZ,
+        'NONTHETA_COLORS':          NONTHETA_COLORS,
+        'NONTHETA_ANIMAL_DARKEN':   NONTHETA_ANIMAL_DARKEN,
         'theta_epoch_criterion':    'ED_min reference sinusoid frequency within ACG_FREQ_RANGE '
                                     '(no ED_min value threshold)',
         # ---- summaries / plots ----
