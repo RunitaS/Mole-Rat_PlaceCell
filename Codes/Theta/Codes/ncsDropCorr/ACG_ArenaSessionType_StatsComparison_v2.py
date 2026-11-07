@@ -17,6 +17,14 @@ ArenaSessionType_StatsComparison_v18.py:
      The comparisons are drawn side by side in one figure, each panel with its
      own statistics; they are not tested against each other.
 
+Copied LFP files (DROP_DUPLICATE_LFP): some session folders hold copies of one
+LFP signal under several .ncs names (placed there so that every tetrode had a
+matched LFP file for another analysis; e.g. CSC1 = CSC4, CSC2 = CSC3,
+CSC5 = CSC6 = CSC7 = CSC8). Within a session, files whose epoch results are
+identical (DUP_SIGNATURE_COLS of every epoch) are copies; only the first of
+each set (natural file-name order) is analysed. The dropped copies are listed
+in the 'LFP_Duplicates_Dropped' sheet.
+
 Arena and session type are parsed from each epoch's session folder exactly as
 in ArenaSessionType_StatsComparison_v18.py (extract_arena_type /
 extract_session_type). Only epochs labelled 'immobile' or 'moving' are in the
@@ -67,8 +75,14 @@ Tests (the same as ArenaSessionType_StatsComparison_v18.py):
     groups x (rejected, kept) epoch counts, then pairwise chi-square tests
     (Yates-corrected for 2 x 2 tables), Holm-Bonferroni corrected within each
     measure. Epochs are treated as independent; 'model_note' flags expected
-    counts < 5. Immobility vs mobility within a group: 2 x 2 chi-square
-    (Yates), Holm-corrected across the groups.
+    counts < 5.
+  - % outcomes, immobility vs mobility within a group (metrics 2 and 4):
+    PAIRED. Every PAIRED_UNIT (a recording, or a session with its channels'
+    epoch counts summed) has a % for both movement states (units with
+    < PAIRED_MIN_EPOCHS epochs in either state are left out); the pairs are
+    compared with the Wilcoxon signed-rank test, Holm-corrected across the
+    groups. Units are treated as independent (with PAIRED_UNIT = 'recording',
+    the channels of one session count as separate pairs).
   - continuous values (the per-recording % of metrics 1-2, and the frequency
     and peak range of metric 3): CONTINUOUS_TEST
       'KW'  : Kruskal-Wallis omnibus + pairwise Mann-Whitney U, Holm corrected;
@@ -80,9 +94,15 @@ Tests (the same as ArenaSessionType_StatsComparison_v18.py):
     Here a 'cell' of CellClusteredStats_Utils is one .ncs channel within one
     recording day (animal | day | channel file name), so the same channel
     recorded in several sessions of a day is a repeated measure.
-    Across groups: within each movement state. Immobility vs mobility within
-    a group: the same test with the movement state as the group, Holm across
-    the groups.
+    Across groups: within each movement state.
+  - centroids (metric 3), immobility vs mobility within a group: PAIRED, one
+    pair per PAIRED_UNIT (its immobility and mobility centroids; with
+    CENTROID_UNIT = 'epoch' the pairs are still per-unit means), Wilcoxon
+    signed-rank test, Holm across the groups.
+  The immobility-vs-mobility plots (metrics 2 and 4) show the paired tests and,
+  across the groups, only the epoch-level chi-square tests (as the % outcomes
+  of ArenaSessionType_StatsComparison_v19.py); the recording-level across-group
+  tests are in the workbook only.
 
 Output (OUTPUT_DIR = <ACG_RUN_DIR>\\Stats):
     SessionType\\<arena>\\*.png          session types of <arena>
@@ -109,6 +129,7 @@ INPUT_CSV is only read, not modified.
 import os
 import re
 import sys
+import hashlib
 import shutil
 import platform
 import subprocess
@@ -124,6 +145,7 @@ from scipy import stats
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
@@ -135,14 +157,13 @@ import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-!!!Check stats, something seems to be going wrong!!! Too much significance even where there is no significance!!!
-
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # Output folder of the ACG run: OUTPUT_DIR of Figc_ACG_ScalingCorrected_v9_FOOOF.py.
 # (The 5 Nov v8_NoiseCleaning run of the same format was moved to
 #  ROOT_DIR\Results\ACG\ACG_theta_continuity_BroadBandFitting_NcsDropCorr_NoiseCleaned.)
-ACG_RUN_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BroadBandFitting_NcsDropCorr_NoiseCleaned')
+ACG_RUN_DIR = os.path.join(ROOT_DIR, 'Results', 'ACG',
+                           'ACG_theta_continuity_BP1-20_Demean_SaturationRejection')
 INPUT_CSV   = os.path.join(ACG_RUN_DIR, 'acg_theta_continuity_epochs.csv')
 ACG_META_CSV = os.path.join(ACG_RUN_DIR, 'meta', 'run_metadata.csv')
 
@@ -188,6 +209,22 @@ METRIC_TRANSFORM = 'rank'     # LMM only: 'rank' or 'none'
 CENTROID_UNIT = 'recording'
 # 'recording' only: recording centroids from fewer accepted epochs are left out (1 = keep all).
 MIN_EPOCHS_PER_CENTROID = 1
+
+# Copied LFP files: within a session, .ncs files with identical epoch results
+# (these columns, every epoch) are copies of one signal -- only the first file
+# (natural name order, e.g. CSC1 of CSC1 = CSC4) is analysed. False: keep all.
+DROP_DUPLICATE_LFP = True
+DUP_SIGNATURE_COLS = ['epoch_index', 'epoch_start_us', 'movement', 'ED_min', 'freq',
+                      'peakrangenorm', 'skipped']
+
+# Immobility vs mobility within a group is a PAIRED comparison (Wilcoxon
+# signed-rank) for the % of metrics 2 and 4 and the centroids of metric 3; one
+# pair per unit:
+#   'recording': one .ncs file (its % of immobility and % of mobility epochs)
+#   'session'  : one session folder, the epoch counts of its channels summed
+PAIRED_UNIT = 'recording'
+# Units with fewer epochs than this in either movement state are left out (1 = keep all).
+PAIRED_MIN_EPOCHS = 1
 
 MOVEMENTS = ['immobile', 'moving']
 MOVEMENT_LABELS = {'immobile': 'Immobility', 'moving': 'Mobility'}
@@ -319,9 +356,11 @@ def load_epochs() -> pd.DataFrame:
                             'ACG_ArenaSessionType_StatsComparison_v1.py)'
                             if 'skipped_edmin' in cols else '') + '.')
     ep = pd.read_csv(INPUT_CSV, usecols=['file', 'session_folder', 'movement', 'skipped',
-                                         'skipped_outofband', 'freq', 'peakrangenorm'])
+                                         'skipped_outofband', 'freq', 'peakrangenorm',
+                                         'ED_min', 'epoch_index', 'epoch_start_us'])
     ep['skipped'] = ep['skipped'].map(_to_bool)
     ep['skipped_outofband'] = ep['skipped_outofband'].map(_to_bool)
+    ep, dups = drop_duplicate_recordings(ep)
     n_other = int((~ep['movement'].isin(MOVEMENTS)).sum())
     if n_other:
         print(f'NOTE: {n_other} epoch(s) with movement not in {MOVEMENTS}; dropped.')
@@ -370,7 +409,43 @@ def load_epochs() -> pd.DataFrame:
     ep = ep.merge(files[['file'] + ID_COLS], on='file', how='inner')
     print(f'{len(ep)} epochs from {ep["file"].nunique()} recordings '
           f'({ep["session"].nunique()} sessions, {ep["animal"].nunique()} animals).')
-    return ep
+    return ep, dups
+
+
+def _natural_key(path) -> tuple:
+    """'CSC10ch2.ncs' after 'CSC2ch2.ncs' (numbers compared as numbers)."""
+    return tuple((0, int(t), '') if t.isdigit() else (1, 0, t.lower())
+                 for t in re.split(r'(\d+)', os.path.basename(str(path))) if t)
+
+
+def drop_duplicate_recordings(ep: pd.DataFrame):
+    """Copied LFP files: within a session folder, .ncs files whose epoch results
+    (DUP_SIGNATURE_COLS of every epoch) are identical are copies of one signal
+    (placed there so that every tetrode had a matched LFP file). Only the first
+    file of each set of copies (natural file-name order) is kept. Returns
+    (epochs, table of the dropped copies). DROP_DUPLICATE_LFP = False keeps all."""
+    if not DROP_DUPLICATE_LFP:
+        return ep, pd.DataFrame()
+    cols = [c for c in DUP_SIGNATURE_COLS if c in ep.columns]
+    rows = []
+    for (sess, f), d in ep.groupby(['session_folder', 'file'], sort=False):
+        s = d.sort_values(['epoch_start_us', 'epoch_index'])[cols].copy()
+        num = s.select_dtypes('number').columns
+        s[num] = s[num].round(9)
+        sig = hashlib.sha1(pd.util.hash_pandas_object(s, index=False).to_numpy().tobytes())
+        rows.append((sess, f, sig.hexdigest(), len(d)))
+    files = pd.DataFrame(rows, columns=['session_folder', 'file', 'signature', 'n_epochs'])
+    files = files.iloc[sorted(range(len(files)), key=lambda i: (files['session_folder'].iat[i],
+                                                                _natural_key(files['file'].iat[i])))]
+    files['kept_file'] = files.groupby(['session_folder', 'signature'])['file'].transform('first')
+    dups = files[files['file'] != files['kept_file']].drop(columns='signature')
+    n_sets = files.groupby(['session_folder', 'signature']).ngroups
+    print(f'Duplicate LFP files: {len(files)} files, {n_sets} distinct signals; '
+          f'{len(dups)} copies in {dups["session_folder"].nunique()} sessions dropped '
+          f'(first file of each set kept).')
+    dups = dups.assign(file_name=dups['file'].map(lambda p: os.path.basename(str(p))),
+                       copy_of=dups['kept_file'].map(lambda p: os.path.basename(str(p))))
+    return ep[~ep['file'].isin(set(dups['file']))].copy(), dups.reset_index(drop=True)
 
 
 def recording_table(ep: pd.DataFrame) -> pd.DataFrame:
@@ -575,13 +650,67 @@ def compare_prevalence(rec: pd.DataFrame, key: str, grp: Grouping) -> dict:
     return {'desc': desc, 'epoch': epoch, 'recording': (rec_omni, rec_post)}
 
 
-def compare_prevalence_within(rec: pd.DataFrame, grp: Grouping, family: str = 'nontheta') -> pd.DataFrame:
+def _unit_word(plural: bool = True) -> str:
+    return PAIRED_UNIT + ('s' if plural else '')
+
+
+def _paired_wilcoxon(moving, immobile) -> tuple:
+    """Wilcoxon signed-rank test of paired values (moving vs immobile):
+    (test name, W, p); 'insufficient data' with < 2 pairs or no non-zero difference."""
+    a, b = np.asarray(moving, float), np.asarray(immobile, float)
+    if len(a) >= 2 and np.any(a != b):
+        try:
+            w = stats.wilcoxon(a, b)
+            return 'Wilcoxon signed-rank (paired)', float(w.statistic), float(w.pvalue)
+        except ValueError:
+            pass
+    return 'insufficient data', np.nan, np.nan
+
+
+def paired_units(rec: pd.DataFrame, grp: Grouping, family: str) -> pd.DataFrame:
+    """One row per PAIRED_UNIT of the groups of `grp` with >= PAIRED_MIN_EPOCHS
+    epochs in both movement states: its % of immobility and % of mobility
+    epochs that are `family` epochs ('pct_immobile', 'pct_moving') and
+    'diff_mob_minus_imm' (percentage points)."""
+    suffix, _keys = WITHIN_FAMILIES[family]
+    k_i, k_m = f'n_immobile_{suffix}', f'n_moving_{suffix}'
+    cols = [k_i, 'n_immobile', k_m, 'n_moving']
+    sub = rec[rec[grp.col].isin(grp.order)]
+    if PAIRED_UNIT == 'recording':
+        u = sub[['file', 'session', 'animal', grp.col] + cols].rename(columns={'file': 'unit_id'})
+        u = u.assign(n_channels=1)
+    elif PAIRED_UNIT == 'session':
+        u = (sub.groupby(['session', grp.col])
+                .agg(animal=('animal', 'first'), n_channels=('file', 'nunique'),
+                     **{c: (c, 'sum') for c in cols})
+                .reset_index())
+        u.insert(0, 'unit_id', u['session'])
+    else:
+        raise ValueError(f"PAIRED_UNIT must be 'recording' or 'session', not {PAIRED_UNIT!r}")
+    min_n = max(1, PAIRED_MIN_EPOCHS)
+    u = u[(u['n_immobile'] >= min_n) & (u['n_moving'] >= min_n)].copy()
+    u['pct_immobile'] = 100 * u[k_i] / u['n_immobile']
+    u['pct_moving'] = 100 * u[k_m] / u['n_moving']
+    u['diff_mob_minus_imm'] = u['pct_moving'] - u['pct_immobile']
+    u.insert(0, 'measure', family)
+    return u.rename(columns={grp.col: 'group'}).reset_index(drop=True)
+
+
+def compare_prevalence_within(rec: pd.DataFrame, grp: Grouping, family: str = 'nontheta'):
     """Within each group of `grp`: rate of the WITHIN_FAMILIES `family`
     ('nontheta': non-theta rejection, 'theta': theta epochs) in immobility vs
-    mobility epochs, 2 x 2 chi-square on the epoch counts ('epoch_*') and
-    CONTINUOUS_TEST on the per-recording % ('rec_*'); Holm across the groups."""
-    suffix, keys = WITHIN_FAMILIES[family]
+    mobility, PAIRED per PAIRED_UNIT (paired_units): Wilcoxon signed-rank test
+    of the per-unit % (immobility vs mobility), Holm across the groups. The
+    pooled epoch counts / % are kept as descriptives. Returns (one row per
+    group, the per-unit pairs)."""
+    suffix, _keys = WITHIN_FAMILIES[family]
     label = _within_label(family)
+    units = paired_units(rec, grp, family)
+    n_rec_units = (rec[rec[grp.col].isin(grp.order)]['file'].nunique() if PAIRED_UNIT == 'recording'
+                   else rec[rec[grp.col].isin(grp.order)]['session'].nunique())
+    if len(units) < n_rec_units:
+        print(f'NOTE ({family}): {n_rec_units - len(units)} {_unit_word()} with < '
+              f'{max(1, PAIRED_MIN_EPOCHS)} epoch(s) in a movement state left out of the paired test.')
     rows = []
     for g in grp.order:
         s = rec[rec[grp.col] == g]
@@ -589,33 +718,31 @@ def compare_prevalence_within(rec: pd.DataFrame, grp: Grouping, family: str = 'n
             continue
         ki, ni = int(s[f'n_immobile_{suffix}'].sum()), int(s['n_immobile'].sum())
         km, nm = int(s[f'n_moving_{suffix}'].sum()), int(s['n_moving'].sum())
-        omni = None
-        if ni and nm:
-            omni, _ = _chi_square_tests([[ki, ni - ki], [km, nm - km]], MOVEMENTS,
-                                        f'{ni + nm} epochs from {s["file"].nunique()} recordings')
-        long = pd.concat([s.assign(movement=m, pct=s[f'pct_{keys[m]}']) for m in MOVEMENTS],
-                         ignore_index=True)
-        _d, rec_omni, _p = compare_groups(long, 'pct', label, MOVEMENT_GROUPING)
-        omni = omni or {}
-        rows.append({'measure': family, 'metric': label, 'group': g,
-                     f'n_immobile_{suffix}': ki, 'n_immobile': ni,
-                     'pct_immobile': 100 * ki / ni if ni else np.nan,
-                     f'n_moving_{suffix}': km, 'n_moving': nm,
-                     'pct_moving': 100 * km / nm if nm else np.nan,
-                     'epoch_test': omni.get('test', 'insufficient data'),
-                     'epoch_statistic': omni.get('statistic', np.nan),
-                     'epoch_dof': omni.get('dof', np.nan),
-                     'epoch_p_raw': omni.get('p_value', np.nan),
-                     'epoch_model_note': omni.get('model_note', ''),
-                     'rec_test': rec_omni['test'], 'rec_stat_name': rec_omni.get('stat_name', ''),
-                     'rec_statistic': rec_omni['statistic'], 'rec_p_raw': rec_omni['p_value'],
-                     'rec_model_note': rec_omni.get('model_note', '')})
+        u = units[units['group'] == g]
+        d = u['diff_mob_minus_imm'].to_numpy(float)
+        test, w_stat, p = _paired_wilcoxon(u['pct_moving'], u['pct_immobile'])
+        row = {'measure': family, 'metric': label, 'group': g,
+               f'n_immobile_{suffix}': ki, 'n_immobile': ni,
+               'pct_immobile_pooled': 100 * ki / ni if ni else np.nan,
+               f'n_moving_{suffix}': km, 'n_moving': nm,
+               'pct_moving_pooled': 100 * km / nm if nm else np.nan,
+               'paired_unit': PAIRED_UNIT, 'n_pairs': len(u),
+               'n_animals': u['animal'].nunique(),
+               'mean_pct_immobile': u['pct_immobile'].mean(),
+               'mean_pct_moving': u['pct_moving'].mean(),
+               'median_pct_immobile': u['pct_immobile'].median(),
+               'median_pct_moving': u['pct_moving'].median(),
+               'mean_diff_mob_minus_imm': d.mean() if len(d) else np.nan,
+               'median_diff_mob_minus_imm': np.median(d) if len(d) else np.nan,
+               'n_mob_higher': int((d > 0).sum()), 'n_imm_higher': int((d < 0).sum()),
+               'n_tied': int((d == 0).sum()),
+               'test': test, 'stat_name': 'W', 'statistic': w_stat, 'p_raw': p}
+        rows.append(row)
     out = pd.DataFrame(rows)
     if len(out):
-        for lvl in ('epoch', 'rec'):
-            out[f'{lvl}_p_holm'] = ccs.holm(out[f'{lvl}_p_raw'].to_numpy(float))
-            out[f'{lvl}_significant'] = out[f'{lvl}_p_holm'] < ALPHA
-    return out
+        out['p_holm'] = ccs.holm(out['p_raw'].to_numpy(float))
+        out['significant'] = out['p_holm'] < ALPHA
+    return out, units
 
 
 def compare_centroid(cen: pd.DataFrame, metric: str, grp: Grouping) -> dict:
@@ -635,16 +762,25 @@ def compare_centroid(cen: pd.DataFrame, metric: str, grp: Grouping) -> dict:
             desc_parts.append(d)
         across[m] = (o, p)
 
+    # Immobility vs mobility: paired per PAIRED_UNIT (Wilcoxon signed-rank).
+    pairs = paired_centroids(sub, metric, grp)
     within = []
     for g in grp.order:
-        s = sub[sub[grp.col] == g]
-        if s.empty:
+        if not (sub[grp.col] == g).any():
             continue
-        _d, o, _p = compare_groups(s, metric, f'{name}, immobility vs mobility', MOVEMENT_GROUPING)
-        within.append({'metric': o['metric'], 'group': g, 'test': o['test'],
-                       'stat_name': o.get('stat_name', ''), 'statistic': o['statistic'],
-                       'dof': o.get('dof', np.nan), 'p_raw': o['p_value'],
-                       'model_note': o.get('model_note', '')})
+        u = pairs[pairs['group'] == g]
+        d = u['diff_mob_minus_imm'].to_numpy(float)
+        test, w_stat, p = _paired_wilcoxon(u['moving'], u['immobile'])
+        within.append({'metric': f'{name}, immobility vs mobility (paired)', 'group': g,
+                       'paired_unit': PAIRED_UNIT, 'n_pairs': len(u),
+                       'n_animals': u['animal'].nunique(),
+                       'median_immobile': u['immobile'].median(),
+                       'median_moving': u['moving'].median(),
+                       'median_diff_mob_minus_imm': np.median(d) if len(d) else np.nan,
+                       'n_mob_higher': int((d > 0).sum()), 'n_imm_higher': int((d < 0).sum()),
+                       'test': test, 'stat_name': 'W', 'statistic': w_stat, 'p_raw': p,
+                       'model_note': f'Wilcoxon signed-rank on {_unit_word(False)} pairs '
+                                     f'(pairs treated as independent)'})
     within = pd.DataFrame(within)
     if len(within):
         within['p_holm'] = ccs.holm(within['p_raw'].to_numpy(float))
@@ -655,7 +791,32 @@ def compare_centroid(cen: pd.DataFrame, metric: str, grp: Grouping) -> dict:
                  .rename(columns={grp.col: 'group', 'count': 'n'}))
     animal.insert(0, 'metric', name)
     return {'data': sub, 'desc': pd.concat(desc_parts, ignore_index=True) if desc_parts
-            else pd.DataFrame(), 'across': across, 'within': within, 'animal': animal}
+            else pd.DataFrame(), 'across': across, 'within': within, 'animal': animal,
+            'paired': pairs}
+
+
+def paired_centroids(sub: pd.DataFrame, metric: str, grp: Grouping) -> pd.DataFrame:
+    """One row per PAIRED_UNIT with an accepted-epoch centroid in both movement
+    states: 'immobile' / 'moving' = mean `metric` of its accepted epochs (a
+    'recording' unit is its recording centroid; a 'session' unit pools the
+    epochs of its recordings), 'diff_mob_minus_imm'."""
+    key = {'recording': 'file', 'session': 'session'}.get(PAIRED_UNIT)
+    if key is None:
+        raise ValueError(f"PAIRED_UNIT must be 'recording' or 'session', not {PAIRED_UNIT!r}")
+    s = sub.dropna(subset=[metric])
+    s = s.assign(_wv=s[metric] * s['n_epochs'])
+    agg = s.groupby([key, grp.col, 'movement']).agg(
+        animal=('animal', 'first'), n=('n_epochs', 'sum'), wv=('_wv', 'sum'))
+    agg['value'] = agg['wv'] / agg['n']
+    val = agg['value'].unstack('movement').reindex(columns=MOVEMENTS)
+    n = agg['n'].unstack('movement').reindex(columns=MOVEMENTS).add_prefix('n_epochs_')
+    out = (val.join(n).join(agg['animal'].groupby(level=[0, 1]).first())
+              .dropna(subset=MOVEMENTS).reset_index()
+              .rename(columns={key: 'unit_id', grp.col: 'group'}))
+    out.columns.name = None
+    out['diff_mob_minus_imm'] = out['moving'] - out['immobile']
+    out.insert(0, 'metric', metric)
+    return out
 
 
 def analyse(grp: Grouping, rec: pd.DataFrame, cen: pd.DataFrame) -> dict:
@@ -665,9 +826,11 @@ def analyse(grp: Grouping, rec: pd.DataFrame, cen: pd.DataFrame) -> dict:
     print('Recordings / epochs per group:')
     print(rec.groupby(grp.col)[['file', 'n_epochs']].agg({'file': 'nunique', 'n_epochs': 'sum'})
           .reindex(grp.order).fillna(0).astype(int).to_string())
+    within = {fam: compare_prevalence_within(rec, grp, fam) for fam in WITHIN_FAMILIES}
     return {'grp': grp, 'rec': rec,
             'prev': {key: compare_prevalence(rec, key, grp) for key in PREVALENCE_MEASURES},
-            'within': {fam: compare_prevalence_within(rec, grp, fam) for fam in WITHIN_FAMILIES},
+            'within': {fam: w for fam, (w, _u) in within.items()},
+            'paired': {fam: u for fam, (_w, u) in within.items()},
             'cent': {m: compare_centroid(cen, m, grp) for m in CENTROID_METRICS}}
 
 
@@ -691,10 +854,12 @@ def result_tables(res: dict) -> dict:
         'Prev_Tests':   _concat(tests),
         'Prev_Within':  res['within']['nontheta'],
         'Theta_Within': res['within']['theta'],
+        'Theta_PairedUnits': res['paired']['theta'],
         'Cent_Desc':    _concat([c['desc'] for c in res['cent'].values()]),
         'Cent_Animal':  _concat([c['animal'] for c in res['cent'].values()]),
         'Cent_Tests':   _concat(cent_tests),
         'Cent_Within':  _concat(within_cent),
+        'Cent_PairedUnits': _concat([c['paired'] for c in res['cent'].values()]),
     }
 
 
@@ -749,6 +914,11 @@ GROUP_FACE = {
 # pink immobile, viridis(0.8) moving).
 MOVEMENT_FACE = {'immobile': matplotlib.colormaps['magma'](0.5),
                  'moving':   matplotlib.colormaps['viridis'](0.5)}
+# Fill of the movement-state boxes and bars: MOVEMENT_FACE at 45 % over white
+# (opaque, so bars and boxes have the same shade).
+MOVEMENT_FILL_ALPHA = 0.45
+MOVEMENT_FILL = {m: tuple(MOVEMENT_FILL_ALPHA * np.array(c[:3]) + (1 - MOVEMENT_FILL_ALPHA))
+                 for m, c in MOVEMENT_FACE.items()}
 CENTROID_FACE = {'immobile': '#FF1493', 'moving': matplotlib.colormaps['viridis'](0.8)}
 # Per-animal colours of the ACG script (Pastel1) + one marker per animal.
 ANIMAL_COLORS = {'Fa8477': '#FBB4AE', 'Fa1059': '#B3CDE3', 'Fa23BD': '#CCEBC5', 'Fa5834': '#DECBE4'}
@@ -914,29 +1084,39 @@ def draw_overall(ax, grp, res):
 
 def draw_immobile_vs_mobile(ax, grp, res, family='nontheta'):
     """Metrics 2 ('nontheta': % of epochs rejected as non-theta) and 4 ('theta': % of
-    epochs in theta): immobility and mobility side by side per group."""
-    suffix, keys = WITHIN_FAMILIES[family]
-    within = res['within'][family]
+    epochs in theta): immobility and mobility side by side per group, paired per
+    PAIRED_UNIT (bars: mean of the per-unit %; dots joined by a line: one unit)."""
+    _suffix, keys = WITHIN_FAMILIES[family]
+    within, units = res['within'][family], res['paired'][family]
     if within.empty:
         return [], ['No epochs']
     groups, x = list(within['group']), np.arange(len(within))
     off = {'immobile': -0.2, 'moving': 0.2}
-    top = 0.0
     for m in MOVEMENTS:
-        pct = within[f'pct_{m}'].to_numpy(float)
-        ax.bar(x + off[m], np.nan_to_num(pct), width=0.38, color=MOVEMENT_FACE[m],
-               edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
-        top = max(top, np.nanmax(pct) if np.isfinite(pct).any() else 0,
-                  _rec_dots(ax, res['rec'], grp.col, groups, x + off[m], f'pct_{keys[m]}',
-                            jitter=0.07))
+        ax.bar(x + off[m], np.nan_to_num(within[f'mean_pct_{m}'].to_numpy(float)), width=0.38,
+               color=MOVEMENT_FILL[m], edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+    rng = np.random.default_rng(0)
+    top = 0.0
+    for xi, g in zip(x, groups):
+        u = units[units['group'] == g]
+        if u.empty:
+            continue
+        jit = rng.uniform(-0.06, 0.06, len(u))
+        xy_i = np.c_[xi + off['immobile'] + jit, u['pct_immobile'].to_numpy(float)]
+        xy_m = np.c_[xi + off['moving'] + jit, u['pct_moving'].to_numpy(float)]
+        ax.add_collection(LineCollection(np.stack([xy_i, xy_m], axis=1), colors='0.5',
+                                         linewidths=0.4, alpha=0.5, zorder=2.5))
+        faces = [_animal_color(a) for a in u['animal']]
+        for xy in (xy_i, xy_m):
+            ax.scatter(xy[:, 0], xy[:, 1], s=9, facecolors=faces, edgecolors='0.25',
+                       linewidths=0.4, zorder=3)
+        top = max(top, xy_i[:, 1].max(), xy_m[:, 1].max())
     pairs = [(xi + off['immobile'], xi + off['moving'], p)
-             for xi, p in zip(x, within['epoch_p_holm'])]
+             for xi, p in zip(x, within['p_holm'])]
     _fit_ylim(ax, 0, top if top > 0 else 1, pairs, pct=True)
     ax.set_xticks(x)
-    ax.set_xticklabels([f'{_label(r["group"])}\nImm {r["pct_immobile"]:.1f}%\n'
-                        f'({r[f"n_immobile_{suffix}"]}/{r["n_immobile"]})\n'
-                        f'Mob {r["pct_moving"]:.1f}%\n'
-                        f'({r[f"n_moving_{suffix}"]}/{r["n_moving"]})'
+    ax.set_xticklabels([f'{_label(r["group"])}\n({r["n_pairs"]} {_unit_word(r["n_pairs"] != 1)})\n'
+                        f'Imm {r["mean_pct_immobile"]:.1f}%\nMob {r["mean_pct_moving"]:.1f}%'
                         for _i, r in within.iterrows()],
                        fontsize=FS_TICK - 1)
     ax.set_ylabel('% of epochs of that movement state', fontsize=FS_LABEL)
@@ -955,22 +1135,29 @@ def draw_immobile_vs_mobile(ax, grp, res, family='nontheta'):
         lines.append(f'Non-theta epoch: ED_min sinusoid frequency outside {_band()} (reference '
                      f'bank {ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz). Denominator: every epoch '
                      f'of that movement state.')
-    lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")} '
-                 f'(Holm across {grp.noun}):')
+    unit_def = ('one recording (.ncs file) = one pair' if PAIRED_UNIT == 'recording' else
+                'one session = one pair, epoch counts of its channels summed')
+    lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")}, paired '
+                 f'({unit_def}): Wilcoxon signed-rank test, Holm across {grp.noun}:')
     for r in within.itertuples():
-        lines.append(f'{_label(r.group)}: epochs {r.epoch_test} χ² = {r.epoch_statistic:.2f}, '
-                     f'p(Holm) = {_fmt_p(r.epoch_p_holm)} {_stars(r.epoch_p_holm)} | recordings '
-                     f'{r.rec_test} p(Holm) = {_fmt_p(r.rec_p_holm)} {_stars(r.rec_p_holm)}')
+        if r.test == 'insufficient data':
+            lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs): insufficient data')
+            continue
+        lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs, {r.n_animals} animals): '
+                     f'median Δ(mob − imm) = {r.median_diff_mob_minus_imm:+.1f} pp '
+                     f'(mob higher in {r.n_mob_higher}, imm higher in {r.n_imm_higher}), '
+                     f'W = {r.statistic:.1f}, p = {_fmt_p(r.p_raw)}, '
+                     f'p(Holm) = {_fmt_p(r.p_holm)} {_stars(r.p_holm)}')
+    if PAIRED_UNIT == 'recording':
+        lines.append('Pairs treated as independent; the channels of one session are separate pairs.')
     for m in MOVEMENTS:
-        pr = res['prev'][keys[m]]
-        lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs -- epoch level:')
-        lines += _test_lines(*pr['epoch'])
-        lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs -- recording level:')
-        lines += _test_lines(*pr['recording'])
-    lines += _note_line(res['prev'][keys['immobile']]['recording'][0])
-    lines.append('Bars: epochs pooled; dots: one recording each (animal colour); '
-                 f'brackets: immobility vs mobility (epoch level), Holm p < {ALPHA:g}')
-    handles = [Patch(facecolor=MOVEMENT_FACE[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
+        lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs:')
+        lines += _test_lines(*res['prev'][keys[m]]['epoch'])
+    lines += _note_line(res['prev'][keys['immobile']]['epoch'][0])
+    lines.append(f'Bars: mean of the per-{_unit_word(False)} %; dots: one {_unit_word(False)} each '
+                 f'(animal colour), joined across movement states; brackets: paired immobility '
+                 f'vs mobility test, Holm p < {ALPHA:g}')
+    handles = [Patch(facecolor=MOVEMENT_FILL[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
     return handles + _animal_handles(res['rec']['animal'].dropna().unique()), lines
 
 
@@ -982,9 +1169,9 @@ def draw_split(ax, grp, res):
         return [], ['No non-theta rejected epochs']
     groups, x = list(desc['group']), np.arange(len(desc))
     imm = desc['pct_epochs'].to_numpy(float)
-    ax.bar(x, imm, width=BAR_WIDTH, color=MOVEMENT_FACE['immobile'], edgecolor=BAR_EDGE,
+    ax.bar(x, imm, width=BAR_WIDTH, color=MOVEMENT_FILL['immobile'], edgecolor=BAR_EDGE,
            linewidth=BAR_EDGE_LW, zorder=2)
-    ax.bar(x, 100 - imm, bottom=imm, width=BAR_WIDTH, color=MOVEMENT_FACE['moving'],
+    ax.bar(x, 100 - imm, bottom=imm, width=BAR_WIDTH, color=MOVEMENT_FILL['moving'],
            edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
     _fit_ylim(ax, 0, 100, _posthoc_pairs(pr['epoch'][1], dict(zip(groups, x))), pct=True)
     ax.set_xticks(x)
@@ -998,7 +1185,7 @@ def draw_split(ax, grp, res):
     lines += _test_lines(*pr['epoch']) + _note_line(pr['epoch'][0])
     lines += ['Recording level (one % per recording with >= 1 rejected epoch):']
     lines += _test_lines(*pr['recording']) + _note_line(pr['recording'][0])
-    handles = [Patch(facecolor=MOVEMENT_FACE[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
+    handles = [Patch(facecolor=MOVEMENT_FILL[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
     return handles, lines
 
 
@@ -1012,7 +1199,18 @@ def draw_centroid(ax, grp, res, metric):
     if not groups:
         return [], ['No accepted epochs']
     off = {'immobile': -0.2, 'moving': 0.2}
-    rng = np.random.default_rng(0)
+    # One jitter per recording, so its immobility and mobility dots line up for the pair lines.
+    files = sorted(sub['file'].unique(), key=str)
+    jit = dict(zip(files, np.random.default_rng(0).uniform(-0.1, 0.1, len(files))))
+    join = CENTROID_UNIT == 'recording' and PAIRED_UNIT == 'recording'
+    if join:
+        pos_g = {g: i for i, g in enumerate(groups)}
+        pr = c['paired'][c['paired']['group'].isin(pos_g)]
+        x0 = pr['group'].map(pos_g).to_numpy(float) + pr['unit_id'].map(jit).to_numpy(float)
+        segs = np.stack([np.c_[x0 + off['immobile'], pr['immobile'].to_numpy(float)],
+                         np.c_[x0 + off['moving'], pr['moving'].to_numpy(float)]], axis=1)
+        ax.add_collection(LineCollection(segs, colors='0.5', linewidths=0.4, alpha=0.5,
+                                         zorder=2.5))
     top, bottom = -np.inf, np.inf
     for m in MOVEMENTS:
         data, pos, gs = [], [], []
@@ -1030,11 +1228,11 @@ def draw_centroid(ax, grp, res, metric):
                         capprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
                         medianprops=dict(linewidth=MEDIAN_LW, color=PAL_BLACK), zorder=2)
         for patch in bp['boxes']:
-            patch.set_facecolor(matplotlib.colors.to_rgba(MOVEMENT_FACE[m], 0.45))
+            patch.set_facecolor(MOVEMENT_FILL[m])
         for p_, g, v in zip(pos, gs, data):
             s = sub[(sub[grp.col] == g) & (sub['movement'] == m)].dropna(subset=[metric])
             if CENTROID_UNIT == 'recording':
-                ax.scatter(p_ + rng.uniform(-0.1, 0.1, len(s)), s[metric], s=8,
+                ax.scatter(p_ + s['file'].map(jit).to_numpy(float), s[metric], s=8,
                            facecolors=[_animal_color(a) for a in s['animal']],
                            edgecolors='0.3', linewidths=0.3, alpha=0.8, zorder=3)
             for a, va in s.groupby('animal')[metric]:
@@ -1076,15 +1274,26 @@ def draw_centroid(ax, grp, res, metric):
         lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()}:')
         lines += _test_lines(*c['across'][m])
     if len(c['within']):
-        lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")} '
-                     f'({c["within"]["test"].iloc[0]}, Holm across {grp.noun}): ' +
-                     ', '.join(f'{_label(r.group)} p(Holm) = {_fmt_p(r.p_holm)} {_stars(r.p_holm)}'
-                               for r in c['within'].itertuples()))
+        unit_def = ('one recording = one pair (its immobility and mobility centroids)'
+                    if PAIRED_UNIT == 'recording' else
+                    'one session = one pair, accepted epochs of its recordings pooled')
+        lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")}, paired '
+                     f'({unit_def}): Wilcoxon signed-rank test, Holm across {grp.noun}:')
+        for r in c['within'].itertuples():
+            if r.test == 'insufficient data':
+                lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs): insufficient data')
+                continue
+            lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs, {r.n_animals} animals): '
+                         f'median Δ(mob − imm) = {r.median_diff_mob_minus_imm:+.3g} '
+                         f'(mob higher in {r.n_mob_higher}, imm higher in {r.n_imm_higher}), '
+                         f'W = {r.statistic:.1f}, p = {_fmt_p(r.p_raw)}, '
+                         f'p(Holm) = {_fmt_p(r.p_holm)} {_stars(r.p_holm)}')
     lines += _note_line(c['across']['immobile'][0])
     lines.append(f'Brackets: Holm p < {ALPHA:g} (across {grp.noun} within a movement state; '
-                 f'immobility vs mobility within a {grp.noun.rstrip("s")})')
-    handles = [Patch(facecolor=matplotlib.colors.to_rgba(MOVEMENT_FACE[m], 0.45),
-                     edgecolor=PAL_BLACK, label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
+                 f'paired immobility vs mobility within a {grp.noun.rstrip("s")})'
+                 + ('; grey lines join the two centroids of one recording' if join else ''))
+    handles = [Patch(facecolor=MOVEMENT_FILL[m], edgecolor=PAL_BLACK, label=MOVEMENT_LABELS[m])
+               for m in MOVEMENTS]
     handles += [Line2D([0], [0], marker='D', linestyle='None', markersize=8,
                        markerfacecolor=CENTROID_FACE[m], markeredgecolor=PAL_BLACK,
                        label=f'{MOVEMENT_LABELS[m]} centroid') for m in MOVEMENTS]
@@ -1153,8 +1362,8 @@ def print_significant(tables: dict, name: str):
             if pd.notna(pv) and pv < ALPHA:
                 rows.append(f"  {r['measure']:22s} {r['level']:10s} {str(r.get('movement', '')):9s} "
                             f"{str(r['comparison']):18s} {r['test']:34s} p={pv:.4g}")
-    for tname, cols in (('Prev_Within', ['epoch_p_holm', 'rec_p_holm']),
-                        ('Theta_Within', ['epoch_p_holm', 'rec_p_holm']),
+    for tname, cols in (('Prev_Within', ['p_holm']),
+                        ('Theta_Within', ['p_holm']),
                         ('Cent_Within', ['p_holm'])):
         t = tables.get(tname)
         if t is None or not len(t):
@@ -1211,7 +1420,7 @@ def main():
     _set_prevalence_labels()
     save_run_snapshot()
 
-    ep = load_epochs()
+    ep, dups = load_epochs()
     rec = recording_table(ep)
     cen = centroid_table(ep)
     del ep
@@ -1283,6 +1492,8 @@ def main():
         for sheet, tbl in all_tables.items():
             tbl.to_excel(writer, sheet_name=sheet[:31], index=False)
         rec.to_excel(writer, sheet_name='Recordings', index=False)
+        if len(dups):
+            dups.to_excel(writer, sheet_name='LFP_Duplicates_Dropped', index=False)
         if CENTROID_UNIT == 'recording':
             cen.to_excel(writer, sheet_name='Centroids', index=False)
     print(f'\nAll statistics saved to {STATS_XLSX}')
