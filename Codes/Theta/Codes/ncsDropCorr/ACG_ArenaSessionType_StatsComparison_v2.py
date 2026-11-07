@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Statistical comparison of the ACG theta-continuity results
-(Figc_ACG_ScalingCorrected_v4_SessionSegregation.py, its epoch table
-'acg_theta_continuity_epochs.csv') at the three levels of
+(Figc_ACG_ScalingCorrected_v9_FOOOF.py -- or v8_NoiseCleaning, same epoch-table
+format -- its epoch table 'acg_theta_continuity_epochs.csv') at the three levels of
 ArenaSessionType_StatsComparison_v18.py:
 
   1. Session types WITHIN each arena type:
@@ -22,13 +22,19 @@ in ArenaSessionType_StatsComparison_v18.py (extract_arena_type /
 extract_session_type). Only epochs labelled 'immobile' or 'moving' are in the
 epoch table (the ACG script drops the rest).
 
+v2 vs v1: v1 read the ED_min-threshold runs (v4: 'skipped_edmin', ACG_ED_MIN_THRESH).
+v8/v9 have no ED_min threshold: every epoch is matched against the broadband
+1-20 Hz reference bank (ACG_REF_BANK) and rejected as NON-THETA when the frequency
+of its ED_min sinusoid lies outside ACG_FREQ_RANGE (3-7 Hz) -- the
+'skipped_outofband' column. Metrics 1-2 are now the non-theta rejection.
+
 Metrics:
 
-  1. ED_min rejection: % of epochs whose ED_min (normalised distance to the
-     closest reference sinusoid) is above ACG_ED_MIN_THRESH ('skipped_edmin').
-     Denominator: every epoch in the epoch table, i.e. epochs that passed the
+  1. Non-theta rejection: % of epochs whose ED_min (closest-matching) reference
+     sinusoid is outside ACG_FREQ_RANGE ('skipped_outofband'). Denominator:
+     every epoch in the epoch table, i.e. epochs that passed the record-integrity,
      delta/theta and MAD artifact rejection.
-  2. ED_min rejection in immobility vs mobility:
+  2. Non-theta rejection in immobility vs mobility:
        - % of immobility epochs rejected and % of mobility epochs rejected
          (each normalised within its own movement state), compared across the
          groups and, within each group, immobility vs mobility;
@@ -44,6 +50,17 @@ Metrics:
      every recording centroid (dots, 'recording' only), the centroid of each
      of the 4 animals (large markers) and the group centroid (diamond, mean of
      the plotted values).
+  4. Theta-range epochs in immobility vs mobility: % of immobility epochs and
+     % of mobility epochs that are theta epochs (each normalised within its
+     own movement state). A theta epoch is an accepted (~skipped) epoch of the
+     ACG run: matched-sinusoid frequency ('freq') in ACG_FREQ_RANGE. Denominator:
+     every epoch of that movement state in the epoch table (non-theta epochs
+     included). Compared across the groups within each movement state, and
+     immobility vs mobility within each group, with the same tests as metric 2.
+     With no ED_min threshold, a theta epoch is just a non-rejected one, so
+     metric 4 = 100 % - metric 2 per movement state and its tests give the
+     same statistics and p-values as metric 2's (kept as the theta-prevalence
+     view of the same counts).
 
 Tests (the same as ArenaSessionType_StatsComparison_v18.py):
   - % outcomes, epoch level: chi-square test of independence on the
@@ -67,18 +84,22 @@ Tests (the same as ArenaSessionType_StatsComparison_v18.py):
     a group: the same test with the movement state as the group, Holm across
     the groups.
 
-Output (OUTPUT_DIR = <ROOT_DIR>\\Results\\ACG\\Stats):
+Output (OUTPUT_DIR = <ACG_RUN_DIR>\\Stats):
     SessionType\\<arena>\\*.png          session types of <arena>
     ArenaType\\*.png                     arena types
     AnimalControlledArenaType\\*.png     the animal-controlled comparisons side by side
-      EDmin_Rejected_Overall.png         metric 1
-      EDmin_Rejected_ImmobileVsMobile.png  metric 2, per-movement-state rates
-      EDmin_Rejected_Split.png           metric 2, split of the rejected epochs
+      NonTheta_Rejected_Overall.png      metric 1
+      NonTheta_Rejected_ImmobileVsMobile.png  metric 2, per-movement-state rates
+      NonTheta_Rejected_Split.png        metric 2, split of the rejected epochs
       Centroid_Frequency.png             metric 3, frequency
       Centroid_PeakRange.png             metric 3, peak range
+      Theta_ImmobileVsMobile.png         metric 4
     ACG_SessionArena_Stats.xlsx          sheets '<prefix>_<table>', prefix
                                          'Ses<arena>', 'Arena' or 'AC<A><B>'
-                                         (+ 'Recordings', 'Centroids')
+                                         (+ 'Recordings', 'Centroids').
+                                         Metric 4: measures 'theta_immobile' /
+                                         'theta_moving' in Prev_Desc / Prev_Tests,
+                                         immobility vs mobility in Theta_Within
     ACG_SessionArena_AllStats.csv        every table in long format
     RunSnapshots\\<YYYYmmdd_HHMMSS>\\     this script + RunMetadata.csv
 
@@ -114,21 +135,28 @@ import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
+!!!Check stats, something seems to be going wrong!!! Too much significance even where there is no significance!!!
+
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
-# Output folder of the ACG run (Figc_ACG_ScalingCorrected_v4_SessionSegregation.py)
-ACG_RUN_DIR = os.path.join(ROOT_DIR, 'Results', 'ACG', 'ACG_theta_continuity_NoiseRemoval_EdgePad_NcsDropCorr')
+# Output folder of the ACG run: OUTPUT_DIR of Figc_ACG_ScalingCorrected_v9_FOOOF.py.
+# (The 5 Nov v8_NoiseCleaning run of the same format was moved to
+#  ROOT_DIR\Results\ACG\ACG_theta_continuity_BroadBandFitting_NcsDropCorr_NoiseCleaned.)
+ACG_RUN_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BroadBandFitting_NcsDropCorr_NoiseCleaned')
 INPUT_CSV   = os.path.join(ACG_RUN_DIR, 'acg_theta_continuity_epochs.csv')
 ACG_META_CSV = os.path.join(ACG_RUN_DIR, 'meta', 'run_metadata.csv')
 
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'Results', 'ACG', 'Stats')
+# Inside the ACG run folder, so the stats stay with the run they were computed from.
+OUTPUT_DIR = os.path.join(ACG_RUN_DIR, 'Stats')
 STATS_XLSX = os.path.join(OUTPUT_DIR, 'ACG_SessionArena_Stats.xlsx')
 STATS_CSV  = os.path.join(OUTPUT_DIR, 'ACG_SessionArena_AllStats.csv')
 RUN_SNAPSHOT_SUBDIR = 'RunSnapshots'
 
-# ED_min threshold of the ACG run, used for labels only (the rejection itself is
-# the 'skipped_edmin' column). Read from ACG_META_CSV when it is there.
-ACG_ED_MIN_THRESH = 1.0
+# Theta band of the ACG run (its ACG_FREQ_RANGE, Hz, inclusive): an epoch whose
+# ED_min sinusoid lies outside it is rejected as non-theta ('skipped_outofband').
+# Used for labels and a consistency check; read from ACG_META_CSV when it is there.
+THETA_RANGE = (3.0, 7.0)
+ACG_REF_BANK = (1.0, 20.0)   # reference bank of the ACG run (labels only)
 
 ARENA_TYPES = ['Circle', 'Linear', 'Open']
 ARENA_SESSION_TYPES = {
@@ -248,17 +276,32 @@ def _to_bool(x) -> bool:
 ID_COLS = ['session', 'unit', 'animal', 'rec_day', 'cell_id', 'arena_type', 'session_type']
 
 
+def _parse_range(text) -> tuple:
+    """'(3.0, 7.0)' -> (3.0, 7.0)."""
+    lo, hi = (float(v) for v in re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', str(text))[:2])
+    return lo, hi
+
+
 def read_acg_settings():
-    """ACG_ED_MIN_THRESH from the ACG run's metadata, if available."""
-    global ACG_ED_MIN_THRESH
+    """THETA_RANGE (= ACG_FREQ_RANGE) and ACG_REF_BANK from the ACG run's metadata,
+    if available. Refuses ED_min-threshold runs (v4-era), which need v1."""
+    global THETA_RANGE, ACG_REF_BANK
     if not os.path.isfile(ACG_META_CSV):
-        print(f'No ACG run metadata at {ACG_META_CSV}; using ACG_ED_MIN_THRESH = {ACG_ED_MIN_THRESH:g}')
+        print(f'No ACG run metadata at {ACG_META_CSV}; using THETA_RANGE = {THETA_RANGE}, '
+              f'ACG_REF_BANK = {ACG_REF_BANK}')
         return
     meta = pd.read_csv(ACG_META_CSV).set_index('parameter')['value']
-    if 'ACG_ED_MIN_THRESH' in meta and meta['ACG_ED_MIN_THRESH'] != 'None':
-        ACG_ED_MIN_THRESH = float(meta['ACG_ED_MIN_THRESH'])
+    if 'ACG_ED_MIN_THRESH' in meta and str(meta['ACG_ED_MIN_THRESH']) != 'None':
+        raise ValueError(f'{ACG_META_CSV} is from an ED_min-threshold ACG run '
+                         f'(ACG_ED_MIN_THRESH = {meta["ACG_ED_MIN_THRESH"]}); '
+                         f'use ACG_ArenaSessionType_StatsComparison_v1.py for it.')
+    if 'ACG_FREQ_RANGE' in meta:
+        THETA_RANGE = _parse_range(meta['ACG_FREQ_RANGE'])
+    if 'ACG_REF_BANK' in meta:
+        ACG_REF_BANK = _parse_range(meta['ACG_REF_BANK'])
     print(f'ACG run: {meta.get("script_name", "?")} ({meta.get("run_datetime", "?")}), '
-          f'ED_min threshold {ACG_ED_MIN_THRESH:g}')
+          f'theta band {_band()}, reference bank {ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz, '
+          f'REJECT_PARTIAL_RECORD_EPOCHS = {meta.get("REJECT_PARTIAL_RECORD_EPOCHS", "?")}')
 
 
 def load_epochs() -> pd.DataFrame:
@@ -267,16 +310,40 @@ def load_epochs() -> pd.DataFrame:
     recording. Epochs with no recognizable arena are dropped."""
     if not os.path.isfile(INPUT_CSV):
         raise FileNotFoundError(f'{INPUT_CSV} not found -- run '
-                                f'Figc_ACG_ScalingCorrected_v4_SessionSegregation.py first.')
+                                f'Figc_ACG_ScalingCorrected_v9_FOOOF.py first.')
     print(f'Loading {INPUT_CSV} ...')
+    cols = pd.read_csv(INPUT_CSV, nrows=0).columns
+    if 'skipped_outofband' not in cols:
+        raise ValueError(f'{INPUT_CSV} has no skipped_outofband column'
+                         + (' (it has skipped_edmin: an ED_min-threshold run -- use '
+                            'ACG_ArenaSessionType_StatsComparison_v1.py)'
+                            if 'skipped_edmin' in cols else '') + '.')
     ep = pd.read_csv(INPUT_CSV, usecols=['file', 'session_folder', 'movement', 'skipped',
-                                         'skipped_edmin', 'freq', 'peakrangenorm'])
+                                         'skipped_outofband', 'freq', 'peakrangenorm'])
     ep['skipped'] = ep['skipped'].map(_to_bool)
-    ep['skipped_edmin'] = ep['skipped_edmin'].map(_to_bool)
+    ep['skipped_outofband'] = ep['skipped_outofband'].map(_to_bool)
     n_other = int((~ep['movement'].isin(MOVEMENTS)).sum())
     if n_other:
         print(f'NOTE: {n_other} epoch(s) with movement not in {MOVEMENTS}; dropped.')
     ep = ep[ep['movement'].isin(MOVEMENTS)].copy()
+
+    # Epochs skipped for being too short (skipped, not out of band) have no
+    # frequency estimate: neither theta nor non-theta, so they are dropped.
+    too_short = ep['skipped'] & ~ep['skipped_outofband']
+    if too_short.any():
+        print(f'NOTE: {int(too_short.sum())} too-short skipped epoch(s) (no frequency estimate); dropped.')
+        ep = ep[~too_short].copy()
+
+    # Metric 4: theta epochs = the ACG run's accepted epochs.
+    ep['theta'] = ~ep['skipped']
+    # Consistency check: accepted <=> freq in THETA_RANGE (inclusive).
+    lo, hi = THETA_RANGE
+    in_band = pd.to_numeric(ep['freq'], errors='coerce').between(lo - 1e-9, hi + 1e-9)
+    n_diff = int((in_band != ep['theta']).sum())
+    print(f'Theta epochs (ED_min sinusoid in {_band()}): {int(ep["theta"].sum())} of {len(ep)}; '
+          f'non-theta: {int(ep["skipped_outofband"].sum())}'
+          + (f'; WARNING: {n_diff} epoch(s) whose freq disagrees with THETA_RANGE {THETA_RANGE} '
+             f'(different ACG_FREQ_RANGE in the run?)' if n_diff else ''))
 
     # One row per recording (.ncs file): arena / session type / ids.
     files = ep.drop_duplicates('file')[['file', 'session_folder']].copy()
@@ -307,15 +374,17 @@ def load_epochs() -> pd.DataFrame:
 
 
 def recording_table(ep: pd.DataFrame) -> pd.DataFrame:
-    """One row per recording (.ncs file): epoch and ED_min-rejected counts (all /
-    immobility / mobility) and the PREVALENCE_MEASURES percentages ('pct_<key>',
-    NaN where the denominator is 0)."""
-    rej = ep['skipped_edmin']
+    """One row per recording (.ncs file): epoch, non-theta-rejected and theta-epoch
+    counts (all / immobility / mobility) and the PREVALENCE_MEASURES percentages
+    ('pct_<key>', NaN where the denominator is 0)."""
+    rej = ep['skipped_outofband']
+    theta = ep['theta']
     imm = ep['movement'].eq('immobile')
     mov = ep['movement'].eq('moving')
-    flags = pd.DataFrame({'n_epochs': 1, 'n_edmin_rejected': rej,
+    flags = pd.DataFrame({'n_epochs': 1, 'n_rejected': rej,
                           'n_immobile': imm, 'n_immobile_rejected': rej & imm,
-                          'n_moving': mov, 'n_moving_rejected': rej & mov},
+                          'n_moving': mov, 'n_moving_rejected': rej & mov,
+                          'n_immobile_theta': theta & imm, 'n_moving_theta': theta & mov},
                          index=ep.index).astype(int)
     counts = flags.groupby(ep['file']).sum()
     rec = ep.groupby('file')[ID_COLS].first().join(counts).reset_index()
@@ -436,24 +505,48 @@ def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str, grp: Gr
 
 
 # (label, rejected-count column, denominator column)
-PREVALENCE_MEASURES = {
-    'overall':  (f'% of all epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-                 'n_edmin_rejected', 'n_epochs'),
-    'immobile': (f'% of immobility epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-                 'n_immobile_rejected', 'n_immobile'),
-    'moving':   (f'% of mobility epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-                 'n_moving_rejected', 'n_moving'),
-    'rejected_in_immobility': ('% of ED_min-rejected epochs that are immobility epochs',
-                               'n_immobile_rejected', 'n_edmin_rejected'),
+PREVALENCE_MEASURES = {   # labels set in _set_prevalence_labels (theta band of the run)
+    'overall':  ('% of all epochs rejected as non-theta', 'n_rejected', 'n_epochs'),
+    'immobile': ('% of immobility epochs rejected as non-theta', 'n_immobile_rejected', 'n_immobile'),
+    'moving':   ('% of mobility epochs rejected as non-theta', 'n_moving_rejected', 'n_moving'),
+    'rejected_in_immobility': ('% of non-theta rejected epochs that are immobility epochs',
+                               'n_immobile_rejected', 'n_rejected'),
+    # metric 4
+    'theta_immobile': ('% of immobility epochs in theta', 'n_immobile_theta', 'n_immobile'),
+    'theta_moving':   ('% of mobility epochs in theta', 'n_moving_theta', 'n_moving'),
+}
+
+# Immobility-vs-mobility comparisons: {family: (suffix of the count columns
+# 'n_<movement>_<suffix>', {movement: PREVALENCE_MEASURES key})}
+WITHIN_FAMILIES = {
+    'nontheta': ('rejected', {'immobile': 'immobile', 'moving': 'moving'}),
+    'theta':    ('theta', {'immobile': 'theta_immobile', 'moving': 'theta_moving'}),
 }
 
 
+def _band() -> str:
+    return f'{THETA_RANGE[0]:g}-{THETA_RANGE[1]:g} Hz'
+
+
+def _nontheta() -> str:
+    """Short definition of a non-theta epoch, for labels."""
+    return f'non-theta (ED_min sinusoid outside {_band()})'
+
+
 def _set_prevalence_labels():
-    """PREVALENCE_MEASURES labels with the ED_min threshold read from the ACG run."""
+    """PREVALENCE_MEASURES labels with the theta band read from the ACG run."""
     for key, word in (('overall', 'all'), ('immobile', 'immobility'), ('moving', 'mobility')):
         _l, k_col, n_col = PREVALENCE_MEASURES[key]
-        PREVALENCE_MEASURES[key] = (f'% of {word} epochs with ED_min > {ACG_ED_MIN_THRESH:g}',
-                                    k_col, n_col)
+        PREVALENCE_MEASURES[key] = (f'% of {word} epochs rejected as {_nontheta()}', k_col, n_col)
+    for key, word in (('theta_immobile', 'immobility'), ('theta_moving', 'mobility')):
+        _l, k_col, n_col = PREVALENCE_MEASURES[key]
+        PREVALENCE_MEASURES[key] = (f'% of {word} epochs in {_band()} theta', k_col, n_col)
+
+
+def _within_label(family: str) -> str:
+    if family == 'nontheta':
+        return 'Non-theta rejection rate, immobility vs mobility'
+    return f'{_band()} theta-epoch rate, immobility vs mobility'
 
 
 def compare_prevalence(rec: pd.DataFrame, key: str, grp: Grouping) -> dict:
@@ -482,30 +575,32 @@ def compare_prevalence(rec: pd.DataFrame, key: str, grp: Grouping) -> dict:
     return {'desc': desc, 'epoch': epoch, 'recording': (rec_omni, rec_post)}
 
 
-def compare_prevalence_within(rec: pd.DataFrame, grp: Grouping) -> pd.DataFrame:
-    """Within each group of `grp`: ED_min rejection rate of immobility vs
+def compare_prevalence_within(rec: pd.DataFrame, grp: Grouping, family: str = 'nontheta') -> pd.DataFrame:
+    """Within each group of `grp`: rate of the WITHIN_FAMILIES `family`
+    ('nontheta': non-theta rejection, 'theta': theta epochs) in immobility vs
     mobility epochs, 2 x 2 chi-square on the epoch counts ('epoch_*') and
     CONTINUOUS_TEST on the per-recording % ('rec_*'); Holm across the groups."""
-    label = f'ED_min > {ACG_ED_MIN_THRESH:g} rate, immobility vs mobility'
+    suffix, keys = WITHIN_FAMILIES[family]
+    label = _within_label(family)
     rows = []
     for g in grp.order:
         s = rec[rec[grp.col] == g]
         if s.empty:
             continue
-        ki, ni = int(s['n_immobile_rejected'].sum()), int(s['n_immobile'].sum())
-        km, nm = int(s['n_moving_rejected'].sum()), int(s['n_moving'].sum())
+        ki, ni = int(s[f'n_immobile_{suffix}'].sum()), int(s['n_immobile'].sum())
+        km, nm = int(s[f'n_moving_{suffix}'].sum()), int(s['n_moving'].sum())
         omni = None
         if ni and nm:
             omni, _ = _chi_square_tests([[ki, ni - ki], [km, nm - km]], MOVEMENTS,
                                         f'{ni + nm} epochs from {s["file"].nunique()} recordings')
-        long = pd.concat([s.assign(movement=m, pct=s[f'pct_{m}']) for m in MOVEMENTS],
+        long = pd.concat([s.assign(movement=m, pct=s[f'pct_{keys[m]}']) for m in MOVEMENTS],
                          ignore_index=True)
         _d, rec_omni, _p = compare_groups(long, 'pct', label, MOVEMENT_GROUPING)
         omni = omni or {}
-        rows.append({'metric': label, 'group': g,
-                     'n_immobile_rejected': ki, 'n_immobile': ni,
+        rows.append({'measure': family, 'metric': label, 'group': g,
+                     f'n_immobile_{suffix}': ki, 'n_immobile': ni,
                      'pct_immobile': 100 * ki / ni if ni else np.nan,
-                     'n_moving_rejected': km, 'n_moving': nm,
+                     f'n_moving_{suffix}': km, 'n_moving': nm,
                      'pct_moving': 100 * km / nm if nm else np.nan,
                      'epoch_test': omni.get('test', 'insufficient data'),
                      'epoch_statistic': omni.get('statistic', np.nan),
@@ -572,7 +667,7 @@ def analyse(grp: Grouping, rec: pd.DataFrame, cen: pd.DataFrame) -> dict:
           .reindex(grp.order).fillna(0).astype(int).to_string())
     return {'grp': grp, 'rec': rec,
             'prev': {key: compare_prevalence(rec, key, grp) for key in PREVALENCE_MEASURES},
-            'prev_within': compare_prevalence_within(rec, grp),
+            'within': {fam: compare_prevalence_within(rec, grp, fam) for fam in WITHIN_FAMILIES},
             'cent': {m: compare_centroid(cen, m, grp) for m in CENTROID_METRICS}}
 
 
@@ -594,7 +689,8 @@ def result_tables(res: dict) -> dict:
     return {
         'Prev_Desc':    _concat([pr['desc'].assign(measure=k) for k, pr in res['prev'].items()]),
         'Prev_Tests':   _concat(tests),
-        'Prev_Within':  res['prev_within'],
+        'Prev_Within':  res['within']['nontheta'],
+        'Theta_Within': res['within']['theta'],
         'Cent_Desc':    _concat([c['desc'] for c in res['cent'].values()]),
         'Cent_Animal':  _concat([c['animal'] for c in res['cent'].values()]),
         'Cent_Tests':   _concat(cent_tests),
@@ -816,9 +912,11 @@ def draw_overall(ax, grp, res):
     return _animal_handles(res['rec']['animal'].dropna().unique()), lines
 
 
-def draw_immobile_vs_mobile(ax, grp, res):
-    """Metric 2: % of immobility / mobility epochs rejected, side by side per group."""
-    within = res['prev_within']
+def draw_immobile_vs_mobile(ax, grp, res, family='nontheta'):
+    """Metrics 2 ('nontheta': % of epochs rejected as non-theta) and 4 ('theta': % of
+    epochs in theta): immobility and mobility side by side per group."""
+    suffix, keys = WITHIN_FAMILIES[family]
+    within = res['within'][family]
     if within.empty:
         return [], ['No epochs']
     groups, x = list(within['group']), np.arange(len(within))
@@ -829,32 +927,47 @@ def draw_immobile_vs_mobile(ax, grp, res):
         ax.bar(x + off[m], np.nan_to_num(pct), width=0.38, color=MOVEMENT_FACE[m],
                edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
         top = max(top, np.nanmax(pct) if np.isfinite(pct).any() else 0,
-                  _rec_dots(ax, res['rec'], grp.col, groups, x + off[m], f'pct_{m}', jitter=0.07))
+                  _rec_dots(ax, res['rec'], grp.col, groups, x + off[m], f'pct_{keys[m]}',
+                            jitter=0.07))
     pairs = [(xi + off['immobile'], xi + off['moving'], p)
              for xi, p in zip(x, within['epoch_p_holm'])]
     _fit_ylim(ax, 0, top if top > 0 else 1, pairs, pct=True)
     ax.set_xticks(x)
-    ax.set_xticklabels([f'{_label(r.group)}\nImm {r.pct_immobile:.1f}%\n'
-                        f'({r.n_immobile_rejected}/{r.n_immobile})\nMob {r.pct_moving:.1f}%\n'
-                        f'({r.n_moving_rejected}/{r.n_moving})' for r in within.itertuples()],
+    ax.set_xticklabels([f'{_label(r["group"])}\nImm {r["pct_immobile"]:.1f}%\n'
+                        f'({r[f"n_immobile_{suffix}"]}/{r["n_immobile"]})\n'
+                        f'Mob {r["pct_moving"]:.1f}%\n'
+                        f'({r[f"n_moving_{suffix}"]}/{r["n_moving"]})'
+                        for _i, r in within.iterrows()],
                        fontsize=FS_TICK - 1)
     ax.set_ylabel('% of epochs of that movement state', fontsize=FS_LABEL)
-    ax.set_title(textwrap.fill(_titled(f'ED_min > {ACG_ED_MIN_THRESH:g} rejection, '
-                                       f'immobility vs mobility', grp), 40), fontsize=FS_TITLE - 2)
+    title = (f'Non-theta (outside {_band()}) rejection, immobility vs mobility'
+             if family == 'nontheta' else
+             f'Epochs in {_band()} theta, immobility vs mobility')
+    ax.set_title(textwrap.fill(_titled(title, grp), 40), fontsize=FS_TITLE - 2)
 
-    lines = [f'Immobility vs mobility within each {grp.noun.rstrip("s")} '
-             f'(Holm across {grp.noun}):']
+    lines = []
+    if family == 'theta':
+        lines.append(f'Theta epoch: ED_min sinusoid frequency in {_band()} (reference bank '
+                     f'{ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz). Denominator: every epoch of that '
+                     f'movement state (non-theta epochs included), so these % = 100 - the non-theta '
+                     f'rejection %, with the same test results.')
+    else:
+        lines.append(f'Non-theta epoch: ED_min sinusoid frequency outside {_band()} (reference '
+                     f'bank {ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz). Denominator: every epoch '
+                     f'of that movement state.')
+    lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")} '
+                 f'(Holm across {grp.noun}):')
     for r in within.itertuples():
         lines.append(f'{_label(r.group)}: epochs {r.epoch_test} χ² = {r.epoch_statistic:.2f}, '
                      f'p(Holm) = {_fmt_p(r.epoch_p_holm)} {_stars(r.epoch_p_holm)} | recordings '
                      f'{r.rec_test} p(Holm) = {_fmt_p(r.rec_p_holm)} {_stars(r.rec_p_holm)}')
     for m in MOVEMENTS:
-        pr = res['prev'][m]
+        pr = res['prev'][keys[m]]
         lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs -- epoch level:')
         lines += _test_lines(*pr['epoch'])
         lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs -- recording level:')
         lines += _test_lines(*pr['recording'])
-    lines += _note_line(res['prev']['overall']['recording'][0])
+    lines += _note_line(res['prev'][keys['immobile']]['recording'][0])
     lines.append('Bars: epochs pooled; dots: one recording each (animal colour); '
                  f'brackets: immobility vs mobility (epoch level), Holm p < {ALPHA:g}')
     handles = [Patch(facecolor=MOVEMENT_FACE[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
@@ -862,11 +975,11 @@ def draw_immobile_vs_mobile(ax, grp, res):
 
 
 def draw_split(ax, grp, res):
-    """Metric 2: split of the ED_min-rejected epochs between immobility and mobility."""
+    """Metric 2: split of the non-theta rejected epochs between immobility and mobility."""
     pr = res['prev']['rejected_in_immobility']
     desc = pr['desc']
     if desc.empty:
-        return [], ['No ED_min-rejected epochs']
+        return [], ['No non-theta rejected epochs']
     groups, x = list(desc['group']), np.arange(len(desc))
     imm = desc['pct_epochs'].to_numpy(float)
     ax.bar(x, imm, width=BAR_WIDTH, color=MOVEMENT_FACE['immobile'], edgecolor=BAR_EDGE,
@@ -877,8 +990,8 @@ def draw_split(ax, grp, res):
     ax.set_xticks(x)
     ax.set_xticklabels([f'{_label(g)}\nImm {p:.1f}%\nMob {100 - p:.1f}%\n(n={n} rejected)'
                         for g, p, n in zip(groups, imm, desc['n_epochs'])])
-    ax.set_ylabel('% of ED_min-rejected epochs', fontsize=FS_LABEL)
-    ax.set_title(textwrap.fill(_titled(f'ED_min > {ACG_ED_MIN_THRESH:g} rejected epochs: '
+    ax.set_ylabel('% of non-theta rejected epochs', fontsize=FS_LABEL)
+    ax.set_title(textwrap.fill(_titled(f'Non-theta (outside {_band()}) rejected epochs: '
                                        f'immobility vs mobility share', grp), 40),
                  fontsize=FS_TITLE - 2)
     lines = ['Epoch level (rejected epochs pooled; groups x (immobility, mobility)):']
@@ -979,11 +1092,14 @@ def draw_centroid(ax, grp, res, metric):
 
 
 PLOTS = [
-    ('EDmin_Rejected_Overall',          draw_overall,            GROUP_W),
-    ('EDmin_Rejected_ImmobileVsMobile', draw_immobile_vs_mobile, PAIR_GROUP_W),
-    ('EDmin_Rejected_Split',            draw_split,              GROUP_W),
+    ('NonTheta_Rejected_Overall',          draw_overall,            GROUP_W),
+    ('NonTheta_Rejected_ImmobileVsMobile', draw_immobile_vs_mobile, PAIR_GROUP_W),
+    ('NonTheta_Rejected_Split',            draw_split,              GROUP_W),
 ] + [(stem, (lambda m: lambda ax, grp, res: draw_centroid(ax, grp, res, m))(metric), PAIR_GROUP_W)
-     for metric, (_n, _y, stem) in CENTROID_METRICS.items()]
+     for metric, (_n, _y, stem) in CENTROID_METRICS.items()] + [
+    ('Theta_ImmobileVsMobile',
+     lambda ax, grp, res: draw_immobile_vs_mobile(ax, grp, res, 'theta'), PAIR_GROUP_W),
+]
 
 
 def save_panels(results: list, draw, group_w: float, out_path: str):
@@ -1037,14 +1153,16 @@ def print_significant(tables: dict, name: str):
             if pd.notna(pv) and pv < ALPHA:
                 rows.append(f"  {r['measure']:22s} {r['level']:10s} {str(r.get('movement', '')):9s} "
                             f"{str(r['comparison']):18s} {r['test']:34s} p={pv:.4g}")
-    for tname, cols in (('Prev_Within', ['epoch_p_holm', 'rec_p_holm']), ('Cent_Within', ['p_holm'])):
+    for tname, cols in (('Prev_Within', ['epoch_p_holm', 'rec_p_holm']),
+                        ('Theta_Within', ['epoch_p_holm', 'rec_p_holm']),
+                        ('Cent_Within', ['p_holm'])):
         t = tables.get(tname)
         if t is None or not len(t):
             continue
         for _i, r in t.iterrows():
             for col in cols:
                 if pd.notna(r[col]) and r[col] < ALPHA:
-                    rows.append(f"  {r.get('measure', 'edmin'):22s} {col:12s} immobile vs moving "
+                    rows.append(f"  {r.get('measure', 'nontheta'):22s} {col:12s} immobile vs moving "
                                 f"in {r['group']}: p(Holm)={r[col]:.4g}")
     print(f'\nSignificant differences, {name} (p < {ALPHA}):' if rows
           else f'\nNo significant differences ({name}).')

@@ -26,8 +26,7 @@ events use the span of the *_cm.csv tracking timestamps.
 
 Outputs (next to OUTPUT_EXCEL):
   <name>_MTclean.xlsx            – corrected metrics table + before/after table for MT units
-  quality_plots_MTclean/         – one histogram per metric, an all-metrics grid,
-                                   a before/after comparison and per-unit MT waveforms
+  quality_plots_MTclean/         – one histogram per metric and an all-metrics grid
 """
 
 import os
@@ -46,8 +45,8 @@ ROOT_FOLDER  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data'
 OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data\QUALITY_METRICS.xlsx'
 SHEET_NAME   = 'Quality Metrics'
 
-CLEAN_EXCEL = os.path.splitext(OUTPUT_EXCEL)[0] + '_MTclean.xlsx'
-PLOT_DIR    = os.path.join(os.path.dirname(OUTPUT_EXCEL), 'quality_plots_MTclean')
+CLEAN_EXCEL = os.path.splitext(OUTPUT_EXCEL)[0] + '_MTclean_v2.xlsx'
+PLOT_DIR    = os.path.join(os.path.dirname(OUTPUT_EXCEL), 'quality_plots_MTclean_v2')
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 N_SAMPLES            = 32        # samples per waveform (NTT tetrode standard)
@@ -77,7 +76,6 @@ SURFACE        = '#fcfcfb'
 
 ACCEPTED_COLOR     = MAGMA_2
 REJECTED_COLOR     = REJECT_COLOR
-MT_COLOR           = MAGMA_3     # multi-trigger units (rug marks, "clean" values)
 COLOR_THR_GOOD     = MAGMA_1
 COLOR_THR_BAD      = MAGMA_3
 COLOR_THR_MARGINAL = MAGMA_4
@@ -323,7 +321,6 @@ def recompute_without_multi_triggers(ntt_path: str):
     Metrics in RECOMPUTED_KEYS on the spikes without secondary triggers.
     Best channel / peak index for the detection come from the mean of ALL
     spikes, exactly as in Fig1def_spike_quality_v2.py.
-    Returns (metrics dict, pt_all, pt_clean).
     """
     waveforms = load_ntt_waveforms(ntt_path)
     pt_all    = compute_pt(waveforms)
@@ -334,7 +331,7 @@ def recompute_without_multi_triggers(ntt_path: str):
            'n_mt_spikes_excluded': int((counts > 0).sum())}
     if clean.shape[0] == 0:
         out.update({k: float('nan') for k in RECOMPUTED_KEYS})
-        return out, pt_all, None
+        return out
 
     pt_clean = compute_pt(clean)
     out.update({
@@ -345,37 +342,7 @@ def recompute_without_multi_triggers(ntt_path: str):
         'peak_amp_uV':          pt_clean['peak_amp_uV'],
         'pt_best_channel_clean': pt_clean['best_channel'],
     })
-    return out, pt_all, pt_clean
-
-
-def plot_mt_waveforms(pt_all: dict, pt_clean: dict, out_base: str, title: str, n_excl: int, n_clean: int):
-    """Mean waveform of all spikes vs. clean spikes (each on its own best channel)."""
-    time_axis = np.arange(N_SAMPLES) * SAMPLE_INTERVAL_MS
-    fig, ax = plt.subplots(figsize=(6, 4), facecolor=SURFACE)
-    _style_axes(ax)
-    ax.plot(time_axis, pt_all['mean_waveform'], color=INK_MUTED, lw=1.6, ls='--',
-            label=f'All spikes (ch {pt_all["best_channel"]})')
-    ax.plot(time_axis, pt_clean['mean_waveform'], color=MT_COLOR, lw=1.8,
-            label=f'MT spikes excluded (ch {pt_clean["best_channel"]})')
-    wf = pt_clean['mean_waveform']
-    s, e = pt_clean['spike_start_idx'], pt_clean['spike_end_idx']
-    ax.axvspan(s * SAMPLE_INTERVAL_MS, e * SAMPLE_INTERVAL_MS, color=MAGMA_4, alpha=0.18, lw=0, zorder=1)
-    ax.scatter([pt_clean['peak_idx'] * SAMPLE_INTERVAL_MS], [wf[pt_clean['peak_idx']]],
-               facecolor=MAGMA_3, edgecolor=SURFACE, s=45, zorder=5)
-    ax.scatter([pt_clean['trough_idx'] * SAMPLE_INTERVAL_MS], [wf[pt_clean['trough_idx']]],
-               facecolor=MAGMA_1, edgecolor=SURFACE, s=45, zorder=5)
-    ax.set_xlabel('Time (ms)', color=INK_PRIMARY)
-    ax.set_ylabel('Amplitude (µV)', color=INK_PRIMARY)
-    ax.set_title(title, color=INK_PRIMARY, fontsize=10, loc='left')
-    _legend_outside(ax)
-    note = (f'Excluded {n_excl} MT spikes, kept {n_clean}\n'
-            f'P-T time = {pt_clean["pt_time_ms"]:.3f} ms\n'
-            f'P/T ratio = {pt_clean["pt_ratio"]:.3f}\n'
-            f'Peak amp = {pt_clean["peak_amp_uV"]:.1f} µV\n'
-            f'Spike duration = {pt_clean["spike_duration_ms"]:.3f} ms')
-    ax.text(1.02, 0.0, note, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY,
-            ha='left', va='bottom')
-    _save(fig, out_base, exts=('png',))
+    return out
 
 
 # ── Load workbook and re-compute multi-trigger units ──────────────────────────
@@ -392,9 +359,6 @@ mt_rows   = df.index[df['multi_trigger']].tolist()
 mt_before = df.loc[mt_rows, [session_col, 'unit'] + RECOMPUTED_KEYS].copy()
 print(f'{len(mt_rows)} multi-trigger unit(s) found in {os.path.basename(OUTPUT_EXCEL)}')
 
-mt_wf_dir = os.path.join(PLOT_DIR, 'MT_waveforms')
-os.makedirs(mt_wf_dir, exist_ok=True)
-
 recomputed_ok = []
 for idx in mt_rows:
     session = str(df.at[idx, session_col])
@@ -405,7 +369,7 @@ for idx in mt_rows:
         print(f'  ERROR: file not found: {ntt_path}')
         continue
     try:
-        metrics, pt_all, pt_clean = recompute_without_multi_triggers(ntt_path)
+        metrics = recompute_without_multi_triggers(ntt_path)
     except Exception as exc:
         print(f'  ERROR: {exc}')
         continue
@@ -413,11 +377,6 @@ for idx in mt_rows:
         df.at[idx, k] = v
     recomputed_ok.append(idx)
     print(f'  excluded {metrics["n_mt_spikes_excluded"]} MT spikes, kept {metrics["n_spikes_clean"]}')
-    if pt_clean is not None:
-        label = f'{session}_{os.path.splitext(unit)[0]}'.replace(os.sep, '_').replace('/', '_')
-        plot_mt_waveforms(pt_all, pt_clean, os.path.join(mt_wf_dir, f'{label}_MTclean'),
-                          f'{session} | {unit}',
-                          metrics['n_mt_spikes_excluded'], metrics['n_spikes_clean'])
 
 # ── Mean firing rate (all spikes of the unit / recording duration) ────────────
 
@@ -447,12 +406,10 @@ print(f'\nCorrected metrics saved: {CLEAN_EXCEL}')
 
 # ── Histograms of all quality metrics ─────────────────────────────────────────
 
-def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_colors=(), thr_labels=(),
+def draw_histogram(ax, values, accepted, xlabel, thresholds=(), thr_colors=(), thr_labels=(),
                    n_bins=30, legend=True, amp=None, amp_norm=None, log_x=False):
     """
-    Stacked histogram (rejected in gray at the bottom, accepted in colour on top),
-    with multi-trigger units (values re-computed on clean spikes) marked as a rug
-    below the bars.
+    Stacked histogram (rejected in gray at the bottom, accepted in colour on top).
     If `amp` is given, every accepted unit is drawn as its own unit-height block,
     coloured by its peak amplitude (AMP_CMAP / amp_norm) and stacked low → high
     amplitude within each bin.
@@ -465,7 +422,6 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
         valid &= values > 0
     vals     = values[valid]
     acc      = np.asarray(accepted, dtype=bool)[valid]
-    mt       = np.asarray(is_mt, dtype=bool)[valid]
     if amp is not None:
         amp = np.asarray(amp, dtype=float)[valid]
         if amp_norm is None:
@@ -504,14 +460,6 @@ def draw_histogram(ax, values, accepted, is_mt, xlabel, thresholds=(), thr_color
         # Outline restores the gap between bins drawn by the SURFACE edges elsewhere
         ax.bar(bin_centers, n_acc, width=bin_widths, bottom=n_rej, fill=False,
                edgecolor=SURFACE, linewidth=1.0, zorder=3.5)
-    if mt.any():
-        # Rug in its own strip below the bars so it never hides low bins
-        top = max(float((n_rej + n_acc).max()), 1.0)
-        ax.set_ylim(-0.10 * top, 1.05 * top)
-        ax.axhline(0, color=INK_MUTED, linewidth=0.8, zorder=4)
-        ax.plot(vals[mt], np.full(mt.sum(), -0.05 * top), linestyle='none', marker='|',
-                markersize=7, markeredgewidth=0.8, alpha=0.6, color=MT_COLOR, zorder=6,
-                label=f'Multi-trigger, MT spikes excluded (n={int(mt.sum())})')
 
     for xv, col, lbl in zip(thresholds, thr_colors, thr_labels):
         ax.axvline(xv, color=col, linewidth=1.5, linestyle='--', zorder=4, label=lbl)
@@ -576,7 +524,6 @@ histogram_specs = [
 LOG_X_COLS = {'mean_fr_hz'}      # strongly right-skewed: log-spaced bins on a log axis
 
 accepted_flags = df['accepted'].values
-mt_flags       = df.index.isin(recomputed_ok)
 excel_base     = os.path.splitext(os.path.basename(OUTPUT_EXCEL))[0]
 
 # Peak-amplitude colour scale shared by all histograms (accepted units only):
@@ -606,7 +553,7 @@ for suffix, col, title, xlabel, thr, thr_c, thr_l in histogram_specs:
     color_by_amp = col != 'peak_amp_uV'
     fig, ax = plt.subplots(figsize=(8, 4.5), facecolor=SURFACE)
     _style_axes(ax)
-    draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags, mt_flags,
+    draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags,
                    xlabel, thr, thr_c, thr_l,
                    amp=peak_amps if color_by_amp else None, amp_norm=amp_norm,
                    log_x=col in LOG_X_COLS)
@@ -626,7 +573,7 @@ fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.2 * n_cols, 3.6 * n_rows), f
 axes = np.atleast_1d(axes).ravel()
 for ax, (suffix, col, title, xlabel, thr, thr_c, thr_l) in zip(axes, specs_present):
     _style_axes(ax)
-    draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags, mt_flags,
+    draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags,
                    xlabel, thr, thr_c, thr_l, legend=False,
                    amp=peak_amps if col != 'peak_amp_uV' else None, amp_norm=amp_norm,
                    log_x=col in LOG_X_COLS)
@@ -635,13 +582,11 @@ for ax in axes[len(specs_present):]:
     ax.set_visible(False)
 grid_handles = [plt.Rectangle((0, 0), 1, 1, color=AMP_CMAP(0.5)),
                 plt.Rectangle((0, 0), 1, 1, color=REJECTED_COLOR),
-                plt.Line2D([], [], linestyle='none', marker='|', markersize=7,
-                           markeredgewidth=0.8, color=MT_COLOR),
                 plt.Line2D([], [], color=INK_PRIMARY, lw=1.5),
                 plt.Line2D([], [], color=INK_PRIMARY, lw=1.5, ls=':')]
 fig.legend(grid_handles, ['Accepted (colour = peak amplitude; solid in the peak-amplitude panel)',
-                          'Rejected', 'Multi-trigger (MT spikes excluded)', 'Mean', 'Median'],
-           loc='lower center', ncol=5, frameon=False, fontsize=9, labelcolor=INK_PRIMARY)
+                          'Rejected', 'Mean', 'Median'],
+           loc='lower center', ncol=4, frameon=False, fontsize=9, labelcolor=INK_PRIMARY)
 fig.tight_layout(rect=(0, 0.11, 1, 1))
 grid_cax = fig.add_axes((0.35, 0.065, 0.30, 0.012))
 _amp_colorbar(fig.colorbar(ScalarMappable(norm=amp_norm, cmap=AMP_CMAP), cax=grid_cax,
@@ -649,34 +594,6 @@ _amp_colorbar(fig.colorbar(ScalarMappable(norm=amp_norm, cmap=AMP_CMAP), cax=gri
 grid_cax.xaxis.set_label_position('top')
 _save(fig, os.path.join(PLOT_DIR, f'{excel_base}_MTclean_all_metrics'))
 print('All-metrics grid saved')
-
-# ── Before/after comparison for multi-trigger units ───────────────────────────
-
-if recomputed_ok:
-    compare_specs = [('spike_duration_ms', 'Spike duration (ms)'),
-                     ('template_correlation', 'Template correlation (r)'),
-                     ('pt_time_ms', 'PT time (ms)'),
-                     ('pt_ratio', '|peak| / |trough|'),
-                     ('peak_amp_uV', 'Peak amplitude (µV)')]
-    fig, axes = plt.subplots(1, len(compare_specs), figsize=(3.0 * len(compare_specs), 4.0),
-                             facecolor=SURFACE)
-    for ax, (key, ylabel) in zip(axes, compare_specs):
-        _style_axes(ax)
-        before = pd.to_numeric(mt_before.loc[recomputed_ok, key], errors='coerce').values
-        after  = pd.to_numeric(df.loc[recomputed_ok, key], errors='coerce').values
-        for b, a in zip(before, after):
-            ax.plot([0, 1], [b, a], color=INK_MUTED, lw=0.8, alpha=0.6, zorder=2)
-        ax.scatter(np.zeros(len(before)), before, s=22, color=INK_SECONDARY, zorder=3)
-        ax.scatter(np.ones(len(after)),   after,  s=22, color=MT_COLOR,      zorder=3)
-        ax.set_xticks([0, 1])
-        ax.set_xticklabels(['All spikes', 'MT excluded'], color=INK_PRIMARY)
-        ax.set_xlim(-0.4, 1.4)
-        ax.set_ylabel(ylabel, color=INK_PRIMARY)
-    fig.suptitle(f'Multi-trigger units (n = {len(recomputed_ok)}): metrics before vs. after '
-                 f'excluding multi-trigger spikes', color=INK_PRIMARY, fontsize=11, x=0.01, ha='left')
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    _save(fig, os.path.join(PLOT_DIR, f'{excel_base}_MTclean_before_after'))
-    print('Before/after comparison saved')
 
 print(f'\nDone. Plots in {PLOT_DIR}')
 print(f'Multi-trigger units re-computed: {len(recomputed_ok)} of {len(mt_rows)}')

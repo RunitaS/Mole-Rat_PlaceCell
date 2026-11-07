@@ -1521,13 +1521,50 @@ def _mark_theta_band(ax_main, ax_top):
     ax_main.set_xlim(ACG_REF_BANK)
 
 
+def _rejection_note(scope):
+    """One-line non-theta rejection summary over every epoch in `scope`."""
+    n_rejected = int(scope['skipped_outofband'].sum())
+    pct_rejected = 100 * n_rejected / len(scope) if len(scope) else 0.0
+    return (f'Non-theta (outside {_band_label()}): {pct_rejected:.1f}% '
+            f'rejected ({n_rejected}/{len(scope)})')
+
+
+def _legend_and_notes_below(fig, center_axes, below_axes, handles, labels, notes=None,
+                            ncol=2, fontsize=7, notes_fontsize=7, gap=0.01):
+    """Legend (`handles`/`labels`) and optional `notes` text placed under the
+    plots instead of over the data: the legend's top sits `gap` (figure
+    fraction) below the lowest tick label / axis label of `below_axes`,
+    horizontally centred on the span of `center_axes`, and `notes` goes below
+    the legend. Positions are measured from the drawn figure, so call this
+    after all axes/colorbars exist. Figure-level artists, so they are kept by
+    savefig(bbox_inches='tight') even when they fall below y=0.
+    Returns the legend."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    to_fig = fig.transFigure.inverted()
+    y_bottom = min(ax.get_tightbbox(renderer).y0 for ax in below_axes)
+    y_top = to_fig.transform((0, y_bottom))[1] - gap
+    x0 = min(ax.get_position().x0 for ax in center_axes)
+    x1 = max(ax.get_position().x1 for ax in center_axes)
+    xc = (x0 + x1) / 2
+
+    leg = fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(xc, y_top),
+                     bbox_transform=fig.transFigure, ncol=ncol, frameon=False,
+                     fontsize=fontsize)
+    if notes:
+        leg_bottom = to_fig.transform((0, leg.get_window_extent(renderer).y0))[1]
+        fig.text(xc, leg_bottom - gap, notes, ha='center', va='top',
+                 fontsize=notes_fontsize, color='0.2')
+    return leg
+
+
 def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  mode='both', speed_vmax=50.0, moving_cmap='viridis',
                                  moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
                                  immobile_cmap='magma', immobile_alpha=1.0,
                                  immobile_edgecolor='#FFB3BA', immobile_edgewidth=0.8,
                                  moving_centroid_cmap_pos=0.8, immobile_centroid_color='#FF1493',
-                                 n_bins=25, log_counts=True, show_rejection_annotation=True):
+                                 n_bins=25, log_counts=True):
     """Shared drawing routine for the Fig. 4e/h-style scatter: frequency vs.
     normalised autocorrelogram peak range. Immobile epochs are drawn in
     `immobile_cmap` (coloured by per-epoch running speed over
@@ -1540,9 +1577,9 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     moving/immobile centroids are marked as diamonds in a bright colour
     (green from viridis for moving, at position `moving_centroid_cmap_pos`
     along the colormap; bright pink `immobile_centroid_color` for immobile).
-    An annotation in `ax_main`
-    reports the percentage of epochs (within `animal`'s scope, if given)
-    rejected as non-theta (ED_min sinusoid outside ACG_FREQ_RANGE). The scatter
+    No legend or rejection annotation is drawn on `ax_main` -- callers put
+    them below the figure with _legend_and_notes_below (handles from
+    ax_main.get_legend_handles_labels(), text from _rejection_note). The scatter
     and histograms show every matched epoch over ACG_REF_BANK (_matched_epochs),
     with the theta band marked and non-theta points in NONTHETA_COLORS instead of
     their speed colour; the centroids use the accepted theta epochs only
@@ -1559,10 +1596,6 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     None when that group isn't drawn (see `mode`); pass them to
     _add_speed_colorbars.
     """
-    scope = df if animal is None else df[df['animal'] == animal]
-    n_rejected = int(scope['skipped_outofband'].sum())
-    pct_rejected = 100 * n_rejected / len(scope) if len(scope) else 0.0
-
     sub = _matched_epochs(df).copy()
     if animal is not None:
         sub = sub[sub['animal'] == animal]
@@ -1619,13 +1652,6 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     ax_main.set_xlabel('Frequency (Hz)')
     ax_main.set_ylabel('Autocorr. peak range')
     ax_main.set_ylim(0, 1)
-    ax_main.legend(loc='upper left', frameon=False, fontsize=7)
-    if show_rejection_annotation:
-        ax_main.text(0.98, 0.02,
-                     f'Non-theta (outside {_band_label()}): {pct_rejected:.1f}% '
-                     f'rejected ({n_rejected}/{len(scope)})',
-                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
-                     color='0.3')
 
     moving_cmap_obj = plt.get_cmap(moving_cmap)
     immobile_cmap_obj = plt.get_cmap(immobile_cmap)
@@ -1749,12 +1775,15 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
 
     _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
 
+    scope = df if animal is None else df[df['animal'] == animal]
+    _legend_and_notes_below(fig, [ax_main], [ax_main, ax_right],
+                            *ax_main.get_legend_handles_labels(), notes=_rejection_note(scope))
+
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
 
 def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_size=14,
-                                alpha=1.0, n_bins=25, log_counts=True,
-                                show_rejection_annotation=True):
+                                alpha=1.0, n_bins=25, log_counts=True):
     """Movement-pooled counterpart of _draw_freq_peakrange_scatter: frequency
     vs. normalised autocorrelogram peak range for every matched epoch over
     ACG_REF_BANK, with moving and immobile epochs combined and no speed
@@ -1768,13 +1797,12 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     movement in moving/immobile), so the pooled cloud is exactly the union of
     the two movement-segregated clouds. With several animals, the one with the
     most epochs is drawn first so smaller animals' points stay visible on top.
+    Like _draw_freq_peakrange_scatter, no legend / rejection annotation is drawn
+    on `ax_main` (see _legend_and_notes_below).
 
     Returns centroids DataFrame (animal, freq_centroid, peakrangenorm_centroid, n).
     """
     scope = df[df['animal'].isin(animals)]
-    n_rejected = int(scope['skipped_outofband'].sum())
-    pct_rejected = 100 * n_rejected / len(scope) if len(scope) else 0.0
-
     sub = _matched_epochs(scope)
     sub = sub[sub['movement'].isin(['moving', 'immobile'])]
     if sub.empty:
@@ -1818,13 +1846,6 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     ax_main.set_xlabel('Frequency (Hz)')
     ax_main.set_ylabel('Autocorr. peak range')
     ax_main.set_ylim(0, 1)
-    ax_main.legend(loc='upper left', frameon=False, fontsize=7)
-    if show_rejection_annotation:
-        ax_main.text(0.98, 0.02,
-                     f'Non-theta (outside {_band_label()}): {pct_rejected:.1f}% '
-                     f'rejected ({n_rejected}/{len(scope)})',
-                     transform=ax_main.transAxes, ha='right', va='bottom', fontsize=7,
-                     color='0.3')
 
     ax_top.set_ylabel('Count')
     ax_top.tick_params(labelbottom=False)
@@ -1862,6 +1883,10 @@ def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5)):
     ax_top.set_title(f'{animals[0]}: all epochs' if len(animals) == 1
                      else 'All animals: all epochs')
 
+    _legend_and_notes_below(fig, [ax_main], [ax_main, ax_right],
+                            *ax_main.get_legend_handles_labels(),
+                            notes=_rejection_note(df[df['animal'].isin(animals)]))
+
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
 
@@ -1876,7 +1901,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     speed in `moving_cmap`, immobile epochs by speed in `immobile_cmap` (with
     a pastel-red outline) in every panel.
 
-    A footer below the panels reports the non-theta rejection rate (within
+    One shared legend sits below the panels (not over the data), and below it
+    a footer reports the non-theta rejection rate (within
     `animal`'s scope, if given): the overall percentage of epochs whose
     ED_min sinusoid fell outside ACG_FREQ_RANGE, how that rejected set splits
     between immobility and mobility epochs, and -- correcting for imbalanced
@@ -1889,6 +1915,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     outer = fig.add_gridspec(1, 3, wspace=0.6, bottom=0.22, top=0.88)
 
     centroids = None
+    main_axes, right_axes = [], []
+    legend_handles, legend_labels = [], []
     for col, (mode, title) in enumerate((('moving', 'Mobility'),
                                          ('immobile', 'Immobility'),
                                          ('both', 'Merged'))):
@@ -1902,13 +1930,16 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
             df, ax_main, ax_top, ax_right, animal=animal, mode=mode,
             speed_vmax=speed_vmax, moving_cmap=moving_cmap, moving_alpha=moving_alpha,
             immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-            immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
-            show_rejection_annotation=False)
+            immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
         ax_top.set_title(title)
         _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.25, pad=0.45,
                              label_fontsize=7)
+        main_axes.append(ax_main)
+        right_axes.append(ax_right)
         if mode == 'both':
             centroids = c
+            # merged panel holds every legend entry; one shared legend below all panels
+            legend_handles, legend_labels = ax_main.get_legend_handles_labels()
 
     if animal:
         fig.suptitle(animal)
@@ -1933,16 +1964,17 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     pct_moving_rej_of_moving = 100 * n_rej_moving / n_moving_total if n_moving_total else 0.0
 
     band = _band_label()
-    fig.text(0.5, 0.02,
-             f'Non-theta (ED_min sinusoid outside {band}) rejected {n_rejected}/{len(scope)} '
+    notes = (f'Non-theta (ED_min sinusoid outside {band}) rejected {n_rejected}/{len(scope)} '
              f'epochs overall ({pct_rejected:.1f}%)\n'
              f'Non-theta rejected epochs in immobility ({pct_rej_immobile:.1f}%) | '
              f'Non-theta rejected epochs in mobility ({pct_rej_moving:.1f}%)\n'
              f'% of total immobility epochs rejected as non-theta: '
              f'{pct_immobile_rej_of_immobile:.1f}% ({n_rej_immobile}/{n_immobile_total}) | '
              f'% of total mobility epochs rejected as non-theta: '
-             f'{pct_moving_rej_of_moving:.1f}% ({n_rej_moving}/{n_moving_total})',
-             ha='center', va='bottom', fontsize=8, color='0.2')
+             f'{pct_moving_rej_of_moving:.1f}% ({n_rej_moving}/{n_moving_total})')
+    _legend_and_notes_below(fig, main_axes + right_axes, main_axes + right_axes,
+                            legend_handles, legend_labels, notes=notes,
+                            ncol=len(legend_handles) or 1, notes_fontsize=8)
 
     return fig, centroids
 
@@ -1999,6 +2031,10 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
         immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
 
     _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
+
+    scope = df if animal is None else df[df['animal'] == animal]
+    _legend_and_notes_below(fig, [ax_main], [ax_main, ax_right, ax_acg_m, ax_acg_i],
+                            *ax_main.get_legend_handles_labels(), notes=_rejection_note(scope))
 
     if animal:
         fig.suptitle(animal)

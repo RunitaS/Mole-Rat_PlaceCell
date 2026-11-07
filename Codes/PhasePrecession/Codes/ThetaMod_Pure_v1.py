@@ -150,7 +150,7 @@ ANIMAL_COLORS = {
 
 # --- Theta phase and theta modulation (Steps 1-2) ---
 LFP_FILTER_BAND = (3.0, 7.0)        # Hz, theta band of the Hilbert phase
-PHASE_BIN_SIZE_DEG = 36             # degrees per polar-histogram bin (360 must be divisible by this);
+PHASE_BIN_SIZE_DEG = 12             # degrees per polar-histogram bin (360 must be divisible by this);
                                      # matches calc_tmi's bin_width_deg for consistency
 ALPHA = 0.05                        # Rayleigh-test / TMI-shuffle / comparison significance threshold
 MIN_SPIKES_FOR_TMI = 50             # min spikes required to run the Rayleigh / TMI tests
