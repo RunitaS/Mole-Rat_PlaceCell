@@ -1,0 +1,5978 @@
+# -*- coding: utf-8 -*-
+"""
+Statistical comparison of place-cell characterization metrics, using the
+workbook produced by PlaceCellChar_FieldDetect_Main_v3.py (the 'output_excel'
+file), at three levels:
+
+  1. Session types WITHIN each arena type -- the cells of one arena are
+     grouped together and its session types are compared with each other:
+         Open   : Cntrl, Rotate, Zero          (e.g. '1_Cntrl', '2Rotate')
+         Linear : 0, 90, 180, 270              (digits at the end, e.g. '3_180')
+         Circle : Stnd, NoRot, Rot             (e.g. '2NoRot', '4Stnd')
+  2. Arena types as a whole (Circle / Linear / Open, all session types of an
+     arena pooled), compared with each other.
+  3. Animal-controlled arena types: not every animal was recorded in every
+     arena, so level 2 mixes arena and animal differences. Here each
+     comparison uses only the animals recorded in all of its arenas
+     (ANIMAL_CONTROLLED_COMPARISONS):
+         Circle vs Open : Fa8477, Fa5834
+         Linear vs Open : Fa1059, Fa23BD
+     Each plot shows these comparisons side by side (left to right in the
+     order of ANIMAL_CONTROLLED_COMPARISONS), each panel with its own
+     within-comparison statistics; the comparisons are not tested against
+     each other.
+  4. Animal IDs (V20): every cell of every arena and session type, grouped by
+     animal (column 'animal_id': the animal parsed from the session path,
+     matched to an ANIMAL_COLORS ID so that e.g. 'FA1059' and 'Fa1059' are one
+     animal; animals not in ANIMAL_COLORS keep their own label and come last).
+     Every metric of levels 1-3 (incl. temporal stability, multi-peak and
+     wall distance), same tests. The animals were not all recorded in the
+     same arenas (see level 3), so animal and arena differences are mixed here.
+  5. All cells (V20): every cell pooled into one group ('AllCells'), every
+     metric of levels 1-3 except wall distance, as one box / bar per plot and
+     one histogram -- no tests (nothing to compare); the descriptives
+     (n, mean, median, ...) are written under each plot unless
+     ALL_CELLS_SHOW_DESCRIPTIVES = False. Colour: ALL_CELLS_COLOR (viridis).
+
+Levels 1-4 use the same tests (below). All statistics tables are saved to a
+NEW workbook (+ one long-format CSV) in OUTPUT_DIR, together with the plots:
+
+    OUTPUT_DIR\\SessionType\\<arena>\\              box/bar plots, session types of <arena>
+    OUTPUT_DIR\\SessionType\\<arena>\\Histograms\\
+    OUTPUT_DIR\\ArenaType\\                         box/bar plots, arena types
+    OUTPUT_DIR\\ArenaType\\Histograms\\
+    OUTPUT_DIR\\AnimalControlledArenaType\\         box/bar plots, the comparisons side by side
+    OUTPUT_DIR\\AnimalControlledArenaType\\Histograms\\
+    OUTPUT_DIR\\AnimalControlledArenaType\\ExampleMaps\\  temporal stability and
+                                                    multi-peak ('MultiPeak_*') example maps
+    OUTPUT_DIR\\AnimalControlledArenaType\\AnimalControlled_Stats.xlsx  level-3 tables only
+    OUTPUT_DIR\\AnimalID\\                          box/bar plots, animals (level 4, V20)
+    OUTPUT_DIR\\AnimalID\\Histograms\\
+    OUTPUT_DIR\\AllCells\\                          one box / bar, all cells pooled (level 5, V20)
+    OUTPUT_DIR\\AllCells\\Histograms\\
+    OUTPUT_DIR\\SessionArena_Stats.xlsx             sheets 'Ses<arena>_*', 'Arena_*',
+                                                    'AC<A><B>_*' (level 3), 'Animal_*'
+                                                    (level 4) and 'All_*' (level 5,
+                                                    descriptives only)
+    OUTPUT_DIR\\SessionArena_AllStats.csv
+    Every one of those comparison folders (SessionType\\<arena>, ArenaType,
+    AnimalControlledArenaType, AnimalID; AllCells without WallDistance) also has (V19):
+        TemporalStability\\                         'TemporalStability_*.png' box plots
+        TemporalStability\\Histograms\\             'Hist_TemporalStability_*.png'
+        MultiPeak\\                                 'MultiPeak_*.png' box / bar plots
+        MultiPeak\\Histograms\\                     'Hist_MultiPeak_*.png'
+        WallDistance\\                             'WallDist_*.png' (see 'Wall distance' below)
+    OUTPUT_DIR\\WallDistance\\                      WallDistanceSchematic_<arena>.png and
+                                                    WallDist_PeakDistance_vs_Dwell.png
+    OUTPUT_DIR\\RunSnapshots\\<YYYYmmdd_HHMMSS>\\       saved BEFORE the analysis runs:
+        code\\                                      this script + PlaceCell_Main_v21,
+                                                    CellClusteredStats_Utils, PlaceFieldShape_Utils
+        RunMetadata.xlsx                            'Run' (time, git commit, versions)
+                                                    and 'Parameters' (every setting)
+
+INPUT_EXCEL is only read, not modified. The place-field shape columns
+(PlaceFieldShape_Utils.SHAPE_COLUMNS) are written to a COPY of it,
+FIELD_SHAPE_EXCEL ('<INPUT_EXCEL name>_FldShp.xlsx', same folder), in the
+first empty columns of its 'PlaceFields' sheet.
+
+Arena type and session type are both extracted from the folder path stored in
+the 'session' column (column A) of the 'Full' and 'PlaceFields' sheets, e.g.
+'Fa1059\\Linear\\Day10\\1_0' is arena 'Linear', session type '0' (the session
+type comes from the label of the last folder). Rows whose arena is recognized
+but whose session type isn't are kept in the arena comparison and left out of
+the session-type comparison. Only rows with place_cell == True are analyzed
+(except place-cell yield, which uses all recorded units).
+
+Metrics compared (all restricted to place_cell == True):
+
+  Sheet 'Full':
+    - peak_fr          Peak firing rate
+    - sir              Spatial information score
+    - sparsity         Sparsity
+    - coherence        Coherence score
+    - stability_score  Stability score; also compared separately within each
+                        stability type (STABILITY_TYPES): split-half p <= 0.05
+                        with a positive score, p <= 0.05 with a negative
+                        score, and p > 0.05
+    - final_speed_score Speed score (mean of the binned and instantaneous
+                        scores). Speed cells are those with speed_cell == True:
+                        p-type if final_speed_score > 0, n-type if < 0. Cells
+                        with speed_cell False / 'not tested' are non-speed.
+    - mean_fr          Mean firing rate ('Extra' sheets)
+
+  Sheet 'PlaceFields' (aggregated per cell):
+    - n_fields         Number of place fields per cell
+    - total_area_cm2   Area occupied by fields per cell (sum of field areas)
+    - pct_area         Percentage area occupied by fields per cell (sum of
+                        each field's pct_of_occupied_area)
+    - in_out_spike_ratio  (V19) in / out, where in = spikes inside any place
+                        field of the cell (sum of field_n_spikes) and out =
+                        n_spikes ('Full') - in. Both are moving-only spikes
+                        (immobility filter of PlaceCell_Main_v21); spikes in
+                        bins outside every field, valid or not, count as out.
+                        NaN when out = 0.
+    - within_field_firing_index  (V19) (in - out) / (in + out), -1 to 1.
+                        A monotonic transform of in_out_spike_ratio
+                        ((r - 1) / (r + 1)), so its rank tests ('KW', or 'LMM'
+                        on ranks) give the same p-values; the plots and means
+                        differ.
+
+  Sheet 'PlaceFields' (one value per field, from 'bin_coords'; see
+  PlaceFieldShape_Utils.py):
+    - fld_max_width_cm   Maximum field width (axis with the most bins)
+    - fld_min_width_cm   Minimum field width (axis with the fewest bins)
+    - fld_axis_angle_deg Angle between the max- and min-width axes
+    - fld_width_ratio    Max width / min width
+    - fld_mean_width_cm  Mean of the max and min widths
+    Circular-track fields are 1-D (angular bins) and have no 2-D shape, so
+    these are compared for Linear and Open only.
+
+  Proportions: place-cell yield, theta modulation, coherence shuffle
+  significance, split-half stability significance, speed cells, and the
+  p-Speed / n-Speed / non-speed classification.
+
+  Temporal stability (V15, merged from TemporalStabilityMap_v6_MapPassStability.py;
+  one value per cell, TEMPORAL_STABILITY_METRICS, box plots / histograms
+  'TemporalStability_<metric>.png' in the TemporalStability\\ subfolder of each
+  comparison folder; sheets '*_TS_Desc', '*_TS_Omnibus',
+  '*_TS_PostHoc'). Switched off with INCLUDE_TEMPORAL_STABILITY = False.
+  The cells are every .ntt under TS_PLACE_CELL_FOLDER (the Output_PlaceTrue
+  folder of a PlaceCell_Main_v21 run; all already place cells). Everything is
+  computed in this script from each cell's .ntt + tracking file (no precomputed
+  temporal stability table is read), as follows:
+    1. Rebuild the session trajectory, spike positions and bin grid with
+       PlaceCell_Main_v21.compute_metrics (same cleaning, smoothing, immobility
+       filter and spike assignment as the run that detected the fields).
+    2. Detect its place fields with PlaceCell_Main_v21's threshold method
+       (detect_place_fields_threshold_2d / _circular) on those maps. A cell
+       with no field under the current criteria is kept: its field metrics are
+       NaN, its whole-map and peak-bin metrics and its map are still produced.
+    3. For every field bin, split the trajectory into visits: a visit is one
+       contiguous run of tracking frames inside that bin (entry -> exit), the
+       same definition PlaceCell_Main_v21 uses for its visit count. Visits
+       shorter than MIN_VISIT_S are ignored.
+    4. Per field bin: % of visits during which the cell fired >= 1 spike
+       (a spike belongs to a visit if it was assigned to one of its frames).
+       mean_pct_across_bins / median_pct_across_bins summarise these per cell.
+    5. Occupancy-weighted summaries, so that a bin the animal spent little time
+       in (e.g. 1 visit, 1 spike -> 100%) counts less than a well-sampled bin:
+         occ_wmean_pct_across_bins / occ_wmedian_pct_across_bins
+                                 mean / median of the per-bin % weighted by
+                                 each bin's dwell time (occupancy_s, moving-only
+                                 frames); the weighted median is the smallest
+                                 bin % at which the cumulative dwell reaches
+                                 half the total
+         occ_wmean_pct_mapnorm   sum over field bins of % x dwell, divided by
+                                 the dwell of ALL valid bins (= the weighted
+                                 mean x the fraction of map dwell spent in the
+                                 field); PerCell + PerField
+         occ_wmean_pct_all_bins  occupancy-weighted mean % over EVERY visited
+                                 valid bin, in or out of a field; PerCell only
+    6. Peak bin: the valid bin with the highest rate in the RAW (unsmoothed)
+       ratemap (Circle track: raw angular map), whether or not it lies in a
+       field; its % of visits with >= 1 spike is pct_at_peak_bin (white star
+       on the raw and stability maps).
+    7. Lap stability: temporal stability per PASS through a field. A pass is
+       one contiguous run of moving-only frames inside the field: it starts
+       when the animal enters any bin of the field and ends when it leaves the
+       field through any bin (moving between bins of the same field does not
+       end it). Passes shorter than MIN_PASS_S, and passes cut by the start /
+       end of the session (no observed entry or exit), are dropped. A pass
+       'fired' if >= MIN_SPIKES_PER_PASS spikes were assigned to its frames.
+         lap_stability_score   n passes with >= MIN_SPIKES_PER_PASS spikes /
+                               n passes (0-1), per field (PerField); on PerCell
+                               it pools the passes through every field
+         mean_lap_stability_across_fields   PerCell: mean of the cell's
+                               per-field lap_stability_score
+  Figure (one per cell, saved next to its .ntt in TEMPORAL_STABILITY_SUBDIR):
+    trajectory + spikes | raw ratemap | Gaussian-smoothed ratemap | temporal
+    stability map (field bins coloured by %, each field labelled with its lap
+    stability; visited non-field bins gray; never-visited bins blank; Circle
+    track drawn as a ring of angular bins).
+  Per-cell / per-field / per-bin results: OUTPUT_DIR\\TS_RESULTS_XLSX (sheets
+  PerCell, PerField, PerBin; output only, never read). Example maps (animal-controlled comparisons only): per
+  arena, the N_EXAMPLE_MAPS cells with the highest (Best) and lowest (Worst)
+  EXAMPLE_METRIC and the N_EXAMPLE_MAPS closest to the arena mean (Mean),
+  copied with a banner naming the animal, session and unit to
+  OUTPUT_DIR\\AnimalControlledArenaType\\ExampleMaps\\
+  ('<comparison>_<arena>_<Best|Mean|Worst><rank>_<session>_<unit>.png').
+  Analysis settings (bin size, smoothing, filters, field thresholds,
+  COORD_UNITS, ...) come from PlaceCell_Main_v21.
+
+  Multi-peak fields (V15, merged from PlaceCell_MultiPeak_KDE_v2.py and
+  MultiPeak_StatsComparison.py; switched off with INCLUDE_MULTIPEAK = False).
+  Whether one isolated place field has two or more peaks inside it (not
+  whether a cell has several fields). Runs on the place_cell == True cells of
+  INPUT_EXCEL ('Full'), whose .ntt + tracking files are in MP_PLACE_CELL_FOLDER;
+  the fields PlaceCell_Main isolated ('PlaceFields', bin_coords) are reused
+  as-is. With RUN_MULTIPEAK_KDE = True each cell's full-session ratemap is
+  rebuilt exactly as in PlaceCell_Main (the MP_ ratemap settings must match
+  that run; ratemap_check flags any field whose recomputed smoothed peak does
+  not reproduce the Excel peak_fr_hz), else the 'Fields' sheet of an existing
+  MULTIPEAK_EXCEL is used. Per field:
+    1. Fit a weighted Gaussian KDE (scipy.stats.gaussian_kde, bandwidth
+       KDE_BW_METHOD) on the field's bin centres, each bin weighted by its rate
+       in the KDE_RATEMAP_TYPE map (raw, occupancy-weighted smoothed,
+       Gaussian-smoothed, Yartsev or Skaggs adaptive-binned). Scaled by the
+       summed rate, the KDE is in Hz. Circle track: 1-D along the track angle
+       (adaptive discs become intervals, wrapping around theta = 0/2*pi).
+    2. Find the KDE's local maxima inside the field (8-neighbourhood on the
+       2-D grid; left/right neighbour on the Circle track), also evaluating a
+       1-bin ring around the field, so a field-edge bin only counts if the KDE
+       really falls off outside it. A maximum is counted as a peak if its
+       height is >= PEAK_REL_HEIGHT_FRAC of the field's highest peak AND the
+       KDE dips below (1 - MIN_TROUGH_DIP_FRAC) x its height on the way to
+       every higher peak. Fields with < MIN_KDE_POINTS non-zero-rate bins get
+       no KDE (kde_note) and are single-peak.
+    3. >= 2 counted peaks -> multi_peak = True; the field is cut at the
+       troughs between its peaks by marker-based watershed on the KDE.
+  Fields with no KDE (EXCLUDE_NO_KDE_FIELDS) or a failed ratemap_check
+  (EXCLUDE_RATEMAP_MISMATCH) are left out of the comparison; the per-cell
+  values are computed from the fields kept. Metrics compared (MULTIPEAK_METRICS
+  and MULTIPEAK_CATEGORICAL; plots 'MultiPeak_<Cell|Field|MultiField>_<metric>.png'
+  and 'MultiPeak_Categorical_<metric>.png', histograms 'Hist_MultiPeak_*', in the
+  MultiPeak\\ subfolder of each comparison folder;
+  sheets '*_MP_Desc', '*_MP_Omnibus', '*_MP_PostHoc', '*_MP_CatDesc', ...):
+    per cell        n_multi_peak_fields, pct_multi_peak_fields, max_n_peaks,
+                    % of place cells with >= 1 multi-peak field
+    per field       n_peaks, % of place fields that are multi-peak
+    multi-peak      shallowest_trough_rel (saddle / lower peak of the weakest
+    fields only     split), lowest_counted_peak_rel (lowest / highest peak;
+                    >= PEAK_REL_HEIGHT_FRAC by construction),
+                    peak_separation_cm (mean distance between neighbouring peaks)
+  Several fields of a cell are repeated measures ('KW' treats them as
+  independent; the LMM's cell random effect accounts for them).
+  Per-field / per-sub-field / per-cell results: MULTIPEAK_EXCEL (sheets
+  Fields, SubFields, Cells, Settings). Figure per cell, in MP_RATEMAP_DIR\\
+  MultiPeak or SinglePeak: the unbinned trajectory (gray, whole session) with the
+  cell's spikes (red, moving frames only: the spikes behind the ratemaps),
+  Gaussian-smoothed ratemap (field bins only, field outlines black, trough cuts
+  white, counted peaks as stars), the KDE input map, and the field KDE (Circle
+  track: trajectory + spikes, angular ring, field profiles along the track angle).
+  Example maps (animal-controlled comparisons only):
+  per arena, best / mean / worst N_EXAMPLE_MAPS cells by MP_EXAMPLE_METRIC,
+  saved as 'MultiPeak_<comparison>_<arena>_<Best|Mean|Worst><rank>_...png' in
+  OUTPUT_DIR\\AnimalControlledArenaType\\ExampleMaps\\.
+
+  Wall distance (V17, merged from
+  EdgeCentreZone_StatsComparison_v6_WallDistance_StatsContinuum_v1.py; switched
+  off with INCLUDE_WALL_DISTANCE = False). Every place cell is placed at the
+  wall distance of the PEAK BIN OF ITS RAW RATE MAP, measured in the same units
+  (2 x 2 cm bins) in every arena, and every metric above is related to that
+  distance, within the cells of each comparison (levels 1-3, same cells, same
+  groups, same CONTINUOUS_TEST / METRIC_TRANSFORM / ALPHA). Place-cell yield is
+  left out: only place cells are in WD_PLACE_CELL_DIR, so non-place cells have
+  no distance.
+    wall_dist (integer, in bins; the nearest wall has distance 0):
+      Open   circular open field, dia 60 cm -> 15 radial rings of 2 cm:
+             floor((30 cm - radial distance of the bin centre) / 2 cm)
+             0 = outermost ring ... 14 = bins around the centre
+      Linear 80 x 8 cm track, 4 bins across the width: the 2 outer rows are 0,
+             the 2 middle rows 1; the first / last column (track ends) are 0 too
+             if LINEAR_ENDS_ARE_WALLS
+      Circle annular track, 4 cm wide = 2 radial rows, each against a wall ->
+             0 for every bin: a single level, no within-arena distance test
+    Peak bin: the valid bin with the highest rate in the raw map (spikes /
+    occupancy, no smoothing), from the .ntt + tracking files in
+    WD_PLACE_CELL_DIR: tracking cleaned and Gaussian smoothed, open-field tracking
+    centred on the arena, spikes matched to the nearest frame (WD_MAX_GAP_US),
+    speed filter on spikes and occupancy, valid bins = visited >= WD_MIN_VISITS
+    times. Fields inherit the distance of their cell's peak bin. Cells are
+    matched by the session path from the animal folder onwards + .ntt file name.
+    Tests, for every metric of a comparison:
+      Across distance levels, within each group: the levels are the groups of
+        the same tests as above (compare_groups: Kruskal-Wallis + Mann-Whitney U,
+        or LMM; compare_categorical / compare_speed_direction: chi-square), Holm
+        within each metric and group. Continuous metrics: levels with a single
+        value are described but not tested. Sheets '*_WD_Desc', '*_WD_Omnibus',
+        '*_WD_PostHoc'.
+      Trend with distance, within each group with >= 2 levels (sheet '*_WD_Trend'):
+        continuous  'KW' : Spearman rank correlation (rows independent)
+                    'LMM': rank(metric) ~ wall_dist + (1|animal) + (1|animal:day)
+                           + (1|cell), likelihood-ratio test of the slope; slope
+                           in SD of the ranks per bin
+        yes/no      logistic regression on wall_dist ('LMM': GEE clustered by
+                    cell), Wald test, odds ratio per bin; speed direction as two
+                    outcomes (p-type, n-type). Also Holm-corrected across the
+                    metrics of a group (p_holm_metrics).
+      Pooled over the groups (>= 2 groups with >= 2 levels; sheet '*_WD_Pooled'):
+        one distance effect with the group as a covariate, and the wall_dist x
+        group interaction (do the slopes differ?).
+      Matched distance: at every wall_dist held by >= 2 groups, the groups are
+        compared with the same tests as above, e.g. Circle vs Linear vs Open cells
+        at distance 0. Sheets '*_WD_MatchOmnibus', '*_WD_MatchPostHoc' (Holm
+        within each metric and distance).
+    '*_WD_Counts': place-cell rows / cells per group and distance. As with all
+    sheets, '*' = 'Ses<arena>', 'Arena' or 'AC<A><B>'; the comparisons of level 3
+    are not tested against each other. Workbook-wide sheets: 'WD_Sessions' (dwell
+    at every distance, every session), 'WD_Cells' (peak bin + wall_dist of every
+    unit) and 'WD_PeakOccupancy' (observed vs dwell-expected peaks per distance);
+    the first two are not statistics and stay out of the CSV.
+    Plots 'WallDist_<metric plot name>.png' (WallDistance\\ subfolder): x = wall_dist; every group's cells
+    as points (shaded and marked as in the box plots) with their median + IQR per
+    distance, or % yes with Wilson 95 % CI per distance; the groups side by side
+    at each distance, the tests underneath. No plots for comparisons with a
+    single distance level (SessionType\\Circle).
+
+Place-field dimension figures (V19; switched off with
+INCLUDE_FIELD_DIMENSION_MAPS = False). One figure per place cell of
+FD_FIELDS_EXCEL with 2-D fields (Circle-track fields are 1-D and have no
+widths), saved as <session>\\FIELD_DIM_SUBDIR\\<unit>_field_dimensions.png
+under FD_PLACE_CELL_FOLDER, next to the session's ratemap folder. The cell's
+Gaussian-smoothed full-session ratemap is rebuilt with
+PlaceCell_Main_v21.compute_metrics; the field bins keep their values and the
+colour scale of the whole map (min-max over all valid bins, as in the
+ratemap figure), the other visited bins are gray, never-visited bins blank.
+Each field is outlined and gets its max-width line (white) and min-width
+line (black), as long as fld_max_width / fld_min_width and on the same axes
+(PlaceFieldShape_Utils.field_width_lines), plus the two dashed parallel lines
+that enclose the field at the min width; the widths, ratio and axis angle are
+listed in the title. FD_FIELDS_EXCEL is used for these figures only.
+
+Box-plot points: each point (one unit in one session; for field shape, one
+field) is filled with its group's hue, darker for a higher spatial
+information score (SHADE_METRIC, ranked within the comparison; the lightest
+shade is a tint, SHADE_LIGHT_MIX, so it stays visible). The shades
+are computed separately for every comparison -- each SessionType\\<arena>
+folder, ArenaType, and each AnimalControlledArenaType pair -- and a cell
+keeps its shade in all box plots of that comparison. Significance is shown by
+the marker: o passed / X failed (coherence shuffle, split-half stability),
+^ / v p- / n-type speed cell, X not a speed cell.
+
+Red rings (V20; RING_FLAGS, settings LOW_DWELL_PCTILE / RING_*), box plots of every
+comparison folder only (not histograms or WallDist_* plots). Each ringed plot is
+saved twice: <name>.png without the rings (and without the ringed-only stats section),
+<name>_control.png with them (CONTROL_SUFFIX):
+  Full_peak_fr.png              cells whose peak_fr bin has a low dwell: the bin is the
+                                max of PlaceCell_Main_v21's raw map (pc.compute_metrics,
+                                rebuilt in the temporal stability step; 2-D grid in every
+                                arena), its dwell = moving-only occupancy (s) of that bin
+                                (PerCell column peak_fr_bin_dwell_s). Ringed if dwell <=
+                                the LOW_DWELL_PCTILE-th percentile of the cells in the
+                                same box (LOW_DWELL_SCOPE = 'group': one threshold per box
+                                of each comparison) or over ALL place-cell rows ('pooled').
+                                The ringed points are compared with the same test as all
+                                points (CONTINUOUS_TEST). Needs INCLUDE_TEMPORAL_STABILITY.
+  FieldShape_fld_width_ratio.png fields whose cell's raw-map peak bin is at wall distance 0
+                                (wall-distance analysis; every field of the cell inherits
+                                it). Needs INCLUDE_WALL_DISTANCE. Saved three times
+                                (NEG_CONTROL_METRICS): no rings; _PosControl = red rings
+                                on the wall fields + test on them; _NegControl = green
+                                rings (NEG_RING_COLOR) on every other field + the same
+                                test on those only (NEG_CONTROL_EXCLUDE_UNKNOWN: whether
+                                fields without a wall distance are left out).
+
+Repeated measures: every row is one unit in one session, and a unit recorded
+in several sessions of a day (same animal + day + unit label) appears once per
+session -- within an arena (e.g. Linear: 332 place-cell rows from 195 cells)
+and, for units recorded in two arenas on the same day, across arenas. Those
+rows are not independent. Tests used (see CellClusteredStats_Utils.py):
+
+  - continuous metrics (CONTINUOUS_TEST below):
+      'KW'  : Kruskal-Wallis omnibus test, pairwise Mann-Whitney U post hoc
+              tests. These treat every row as independent (no correction for
+              repeated cells); the 'model_note' column reports how many cells
+              repeat.
+      'LMM' : linear mixed model (on ranks, METRIC_TRANSFORM)
+                metric ~ group + (1|animal) + (1|animal:day) + (1|cell)
+              omnibus likelihood-ratio test, pairwise Wald contrasts
+              (CellClusteredStats_Utils.compare_continuous_nested).
+  - % outcomes and speed direction (p/n/non): chi-square test of
+    independence, pairwise chi-square post hoc tests (Yates-corrected for
+    2 x 2 tables). Also treat rows as independent; 'model_note' flags
+    tables with expected counts < 5.
+
+Pairwise p-values are Holm-Bonferroni corrected within each metric (and, for
+session types, within each arena).
+
+Parameters to edit (below):
+    INPUT_EXCEL  = path to the output_excel file from
+                   PlaceCellChar_FieldDetect_Main_v3.py (read only)
+    OUTPUT_DIR   = new folder for all statistics tables and plots
+    INCLUDE_TEMPORAL_STABILITY, TS_PLACE_CELL_FOLDER = temporal stability
+    (see above)
+    INCLUDE_MULTIPEAK, RUN_MULTIPEAK_KDE, MP_PLACE_CELL_FOLDER, the KDE
+    peak / trough / bandwidth settings and the MP_ ratemap settings =
+    multi-peak fields (see above)
+    INCLUDE_WALL_DISTANCE, WD_PLACE_CELL_DIR, LINEAR_ENDS_ARE_WALLS and the WD_
+    geometry / raw-map settings = wall distance (see above)
+    INCLUDE_FIELD_DIMENSION_MAPS, FD_FIELDS_EXCEL, FD_PLACE_CELL_FOLDER,
+    FIELD_DIM_SUBDIR = place-field dimension figures (see above)
+"""
+
+import os
+import re
+import sys
+import heapq
+import shutil
+import platform
+import functools
+import subprocess
+import tempfile
+import importlib.metadata
+import textwrap
+import colorsys
+import threading
+import warnings
+import concurrent.futures
+from dataclasses import dataclass, replace
+from datetime import datetime
+from itertools import combinations
+from typing import NamedTuple
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.ndimage import convolve, gaussian_filter1d
+from scipy.stats import gaussian_kde
+from PIL import Image
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
+import matplotlib.transforms as mtransforms
+from matplotlib.cm import ScalarMappable
+from matplotlib.lines import Line2D
+from matplotlib.patches import Circle, Patch, Rectangle, Wedge
+from matplotlib.ticker import MaxNLocator
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, Normalize, to_hex, to_rgb
+from matplotlib.collections import LineCollection, PatchCollection
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.image import imread
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+# CellClusteredStats_Utils.py lives one folder up from FinalCodes\ (appended, so
+# that this folder's PlaceCell_Main_v21.py comes first).
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import CellClusteredStats_Utils as ccs
+import PlaceFieldShape_Utils as pfs
+import PlaceCell_Main_v21 as pc   # temporal stability maps
+
+# ── Parameters ──────────────────────────────────────────────────────────────
+
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Main\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Char\v3'
+
+# Copy of INPUT_EXCEL with the place-field shape columns added to its
+# 'PlaceFields' sheet.
+FIELD_SHAPE_EXCEL = os.path.splitext(INPUT_EXCEL)[0] + '_FldShp.xlsx'
+
+STATS_XLSX = os.path.join(OUTPUT_DIR, 'SessionArena_Stats.xlsx')
+STATS_CSV  = os.path.join(OUTPUT_DIR, 'SessionArena_AllStats.csv')
+
+# Before the analysis starts, a snapshot of the code (this script + the local
+# modules it imports) and RunMetadata.xlsx (run info + every parameter) are
+# saved to OUTPUT_DIR\RUN_SNAPSHOT_SUBDIR\<YYYYmmdd_HHMMSS>.
+RUN_SNAPSHOT_SUBDIR = 'RunSnapshots'
+
+# Subfolders of every comparison folder (SessionType\<arena>, ArenaType,
+# AnimalControlledArenaType) for the temporal stability and multi-peak plots
+# (+ their Histograms\) and the wall-distance plots; WD_PLOTS_SUBDIR also holds
+# the workbook-wide wall-distance figures in OUTPUT_DIR.
+TS_PLOTS_SUBDIR = 'TemporalStability'
+MP_PLOTS_SUBDIR = 'MultiPeak'
+WD_PLOTS_SUBDIR = 'WallDistance'
+
+# ── Temporal stability (merged from TemporalStabilityMap_v6_MapPassStability.py) ──
+
+# False: no temporal stability comparison at all.
+INCLUDE_TEMPORAL_STABILITY = True
+
+# Place-cell folder (Output_PlaceTrue of a PlaceCell_Main_v21 run): every .ntt under
+# it is analysed; each session folder also holds its tracking file.
+TS_PLACE_CELL_FOLDER = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
+
+# Per-cell / per-field / per-bin temporal stability table, written to OUTPUT_DIR
+# on every run (output only: the analysis never reads it back).
+TS_RESULTS_XLSX = 'TemporalStability.xlsx'
+
+# Temporal stability figures go in this subfolder of each session folder (next to the .ntt).
+TEMPORAL_STABILITY_SUBDIR = 'temporal_stability'
+
+MIN_VISIT_S     = 0.1      # visits shorter than this (s) are ignored; 0 = keep every visit
+MIN_PASS_S      = 0.1      # field passes shorter than this (s) are ignored; 0 = keep every pass
+MIN_SPIKES_PER_PASS = 5    # a pass counts as stable with >= this many spikes
+STABILITY_CMAP  = 'jet'
+NON_FIELD_COLOR = '0.75'   # gray for visited bins outside every place field
+
+TS_MAX_WORKERS = pc.MAX_WORKERS
+
+# Example maps for each animal-controlled comparison: per arena, the
+# N_EXAMPLE_MAPS cells with the highest (best) and lowest (worst)
+# EXAMPLE_METRIC and the N_EXAMPLE_MAPS closest to the arena's mean (mean),
+# saved in AnimalControlledArenaType\EXAMPLE_MAPS_SUBDIR.
+EXAMPLE_METRIC      = 'mean_pct_across_bins'
+N_EXAMPLE_MAPS      = 3
+EXAMPLE_MAPS_SUBDIR = 'ExampleMaps'
+
+# ── Place-field dimension maps (V19) ────────────────────────────────────────
+
+# False: no field dimension figures.
+INCLUDE_FIELD_DIMENSION_MAPS = True
+
+# Workbook whose place cells ('Full') and fields ('PlaceFields', bin_coords) are
+# drawn -- figures only, the statistics always use INPUT_EXCEL. It should come
+# from the PlaceCell_Main_v21 run that drew the current ratemap figures (same
+# tracking files), so that its fields sit on the rebuilt Gaussian-smoothed map;
+# a field whose rebuilt peak differs from its peak_fr_hz is flagged on the figure.
+FD_FIELDS_EXCEL = os.path.join(TS_PLACE_CELL_FOLDER, 'All_TT_PlaceChar_SiSkaggsAdptBin_Final_OnlyPC.xlsx')
+
+# Folder with the .ntt + tracking files of those place cells; one figure per
+# cell goes in FIELD_DIM_SUBDIR of its session folder (next to
+# PlaceCell_Main_v21's ratemap folder, pc.RATEMAPS_SUBDIR).
+FD_PLACE_CELL_FOLDER = TS_PLACE_CELL_FOLDER
+FIELD_DIM_SUBDIR     = 'field_dimensions'
+FD_MAX_WORKERS       = pc.MAX_WORKERS
+
+# ── Multi-peak fields (merged from PlaceCell_MultiPeak_KDE_v2.py) ───────────
+
+# False: no multi-peak comparison at all.
+INCLUDE_MULTIPEAK = True
+
+# True: run the KDE multi-peak analysis (per-cell figures + MULTIPEAK_EXCEL),
+# then compare it. False: skip it and compare the 'Fields' sheet of an
+# existing MULTIPEAK_EXCEL.
+RUN_MULTIPEAK_KDE = True
+
+# Output_PlaceTrue folder of the PlaceCell_Main run that wrote INPUT_EXCEL
+# (.ntt + tracking file of every place cell). The place cells and their
+# fields are taken from INPUT_EXCEL ('Full' and 'PlaceFields' sheets).
+MP_PLACE_CELL_FOLDER = TS_PLACE_CELL_FOLDER
+
+# Peak detection on each field's KDE
+PEAK_REL_HEIGHT_FRAC = 0.75     # a KDE peak is counted if its height is >= this
+                                # fraction of the field's highest KDE peak
+MIN_TROUGH_DIP_FRAC  = 0.2      # ...and if the KDE dips below (1 - this) x its height on the
+                                # way to any higher peak (0.0: any real dip; flat ridges and
+                                # plateaus never count as a second peak)
+KDE_BW_METHOD        = 0.35     # gaussian_kde bw_method: 'scott', 'silverman' or a scalar
+                                # factor (kernel sigma = factor x the field's weighted std)
+MIN_KDE_POINTS       = 5        # fields with fewer bins of non-zero rate (in the KDE input map)
+                                # get no KDE and are reported as single-peak (kde_note says why)
+
+# Ratemap the KDE is fitted on (weights of the field bins); same options as
+# PlaceCell_Main's SI_RATEMAP_TYPE:
+#   'raw'                     : spikes / occupancy, unsmoothed
+#   'occ_weighted_smooth'     : smooth(spikes) / smooth(occupancy), Gaussian sigma MP_GAUSSIAN_SIGMA_CM
+#   'gaussian_smooth'         : Gaussian-smoothed ratemap (the map the fields were isolated on)
+#   'Yartsev_adaptive_binned' : adaptive disc grows until it holds MP_YARTSEV_DISC_OCC_S of occupancy
+#   'Skaggs_adaptive_binned'  : adaptive disc grows until r_cm * occ_s * sqrt(spikes) >= MP_SKAGGS_ALPHA
+KDE_RATEMAP_TYPE = 'Skaggs_adaptive_binned'
+_KDE_RATEMAP_TYPES = ('raw', 'occ_weighted_smooth', 'gaussian_smooth',
+                      'Yartsev_adaptive_binned', 'Skaggs_adaptive_binned')
+if KDE_RATEMAP_TYPE not in _KDE_RATEMAP_TYPES:
+    raise ValueError(f"KDE_RATEMAP_TYPE must be one of {_KDE_RATEMAP_TYPES}, "
+                     f"got {KDE_RATEMAP_TYPE!r}")
+# Adaptive-map settings -- keep them equal to the PlaceCell_Main run that
+# wrote INPUT_EXCEL so the KDE sees the same map as its SIR (Alpha200 run).
+MP_ADAPTIVE_MAX_RSQ   = 200     # disc stops growing at r^2 = MP_ADAPTIVE_MAX_RSQ - 1 (bins^2)
+MP_ADAPTIVE_MIN_OCC_S = 0.5     # bins whose final disc holds < this occupancy (s) get rate 0
+MP_YARTSEV_DISC_OCC_S = 1.0     # Yartsev: occupancy (s) a disc must enclose
+MP_SKAGGS_ALPHA       = 200.0   # Skaggs: cm * s * sqrt(spike)
+
+# Fields left out of the multi-peak comparison:
+EXCLUDE_NO_KDE_FIELDS    = True   # no KDE fitted (too few non-zero bins, see kde_note)
+EXCLUDE_RATEMAP_MISMATCH = True   # rebuilt ratemap did not reproduce the Excel peak
+
+# Ratemap rebuild (must match the PlaceCell_Main run that wrote INPUT_EXCEL)
+MP_FPS                  = 30       # tracking frame rate (Hz)
+
+MP_BIN_CM               = 2.0      # bin size in cm
+MP_ARENA_WIDTH_CM       = 80.0     # physical arena width in cm (pixel coordinates only)
+MP_USE_MIN_OCC_S        = False    # valid bins: >= MP_MIN_OCC_S seconds occupancy
+MP_MIN_OCC_S            = 0.5
+MP_USE_MIN_VISITS       = True     # valid bins: visited >= MP_MIN_VISITS times
+MP_MIN_VISITS           = 2
+MP_MAX_GAP_US           = 50_000   # max spike–position gap in µs (50 ms)
+MP_POS_JUMP_THRESH_CMS  = 90.0     # tracking-artifact speed threshold (cm/s)
+MP_POS_SMOOTH_SIGMA_SMP = 5.0      # Gaussian smoothing sigma (samples) of x/y position
+MP_IMMOBILITY_SPEED_CMS = 0.5      # frames slower than this (cm/s) are dropped
+MP_COORD_UNITS          = 'cm'     # 'cm': *_cm.csv (time col A, x col D, y col E); 'pixel': x/y/time columns
+MP_GAUSSIAN_SIGMA_CM    = 3        # ratemap Gaussian smoothing sigma (cm)
+MP_RADIAL_RANGE_CLIP_PCTILE = 0.5  # Circle track: percentile trimmed off each end of radial distance
+
+MP_MAX_WORKERS = 4
+
+# Example maps for each animal-controlled comparison (as EXAMPLE_METRIC, with
+# N_EXAMPLE_MAPS), ranked by this per-cell multi-peak metric.
+MP_EXAMPLE_METRIC = 'pct_multi_peak_fields'
+
+# Output folder (inside MP_PLACE_CELL_FOLDER), named after the KDE settings
+# so runs with different settings don't overwrite each other.
+_MP_BW_TAG = KDE_BW_METHOD if isinstance(KDE_BW_METHOD, str) else f'{KDE_BW_METHOD:g}'
+MULTIPEAK_SUBDIR = (f'MultiPeak_KDE_Pk{PEAK_REL_HEIGHT_FRAC * 100:g}_Tr{MIN_TROUGH_DIP_FRAC:g}'
+                    f'_Sm{_MP_BW_TAG}_{KDE_RATEMAP_TYPE}').replace('.', '')
+MULTIPEAK_DIR   = os.path.join(MP_PLACE_CELL_FOLDER, MULTIPEAK_SUBDIR)
+MULTIPEAK_EXCEL = os.path.join(MULTIPEAK_DIR, 'MultiPeak_KDE_Fields.xlsx')
+MP_RATEMAP_DIR  = os.path.join(MULTIPEAK_DIR, 'ratemaps_GaussianSmoothed')
+
+# Saved to the 'Settings' sheet of MULTIPEAK_EXCEL.
+MP_RUN_CONFIG_VARS = [
+    'MP_PLACE_CELL_FOLDER', 'INPUT_EXCEL', 'MULTIPEAK_EXCEL', 'MP_RATEMAP_DIR',
+    'PEAK_REL_HEIGHT_FRAC', 'MIN_TROUGH_DIP_FRAC', 'KDE_BW_METHOD', 'MIN_KDE_POINTS',
+    'KDE_RATEMAP_TYPE', 'MP_ADAPTIVE_MAX_RSQ', 'MP_ADAPTIVE_MIN_OCC_S', 'MP_YARTSEV_DISC_OCC_S',
+    'MP_SKAGGS_ALPHA', 'MP_MAX_WORKERS',
+    'MP_FPS', 'MP_BIN_CM', 'MP_ARENA_WIDTH_CM',
+    'MP_USE_MIN_OCC_S', 'MP_MIN_OCC_S', 'MP_USE_MIN_VISITS', 'MP_MIN_VISITS',
+    'MP_MAX_GAP_US', 'MP_POS_JUMP_THRESH_CMS', 'MP_POS_SMOOTH_SIGMA_SMP', 'MP_IMMOBILITY_SPEED_CMS',
+    'MP_COORD_UNITS', 'MP_GAUSSIAN_SIGMA_CM', 'MP_RADIAL_RANGE_CLIP_PCTILE',
+]
+
+MP_NTT_DTYPE = np.dtype([
+    ('timestamp',   '<u8'),
+    ('sc_number',   '<u4'),
+    ('cell_number', '<u4'),
+    ('params',      '<u4', (8,)),
+    ('waveforms',   '<i2', (32, 4)),
+])
+
+# ── Wall distance (merged from EdgeCentreZone_StatsComparison_v6_WallDistance_StatsContinuum_v1.py) ──
+
+# False: no wall-distance analysis at all.
+INCLUDE_WALL_DISTANCE = True
+
+# Folder with the .ntt + tracking files of the place cells (Output_PlaceTrue of
+# the PlaceCell_Main run that wrote INPUT_EXCEL).
+WD_PLACE_CELL_DIR = TS_PLACE_CELL_FOLDER
+
+# Linear track: the track ends count as walls (first / last column of bins at distance 0).
+LINEAR_ENDS_ARE_WALLS = True
+
+# Plots: x-axis width per distance bin (inches) and the largest x offset between
+# the groups at one distance (distance bins).
+WD_DIST_W       = 0.6
+WD_GROUP_OFFSET = 0.22
+
+# Arena geometry
+WD_BIN_CM                   = 2.0
+WD_OPEN_DIAMETER_CM         = 60.0
+WD_LINEAR_LENGTH_CM         = 80.0
+WD_LINEAR_WIDTH_CM          = 8.0
+WD_CIRCLE_OUTER_DIAMETER_CM = 80.0
+WD_CIRCLE_INNER_DIAMETER_CM = 72.0
+
+# Tracking and raw rate map of the peak bin (position smoothing: MP_POS_JUMP_THRESH_CMS,
+# MP_POS_SMOOTH_SIGMA_SMP)
+WD_COORD_UNITS             = 'cm'     # 'cm': tracking file *_cm.csv (time, ., ., x, y); else pixels
+WD_FPS                     = 30
+WD_MAX_GAP_US              = 50_000   # max spike-to-frame gap (µs)
+WD_CENTRE_OPEN_FIELD_TRACKING = True
+WD_SPEED_FILTER_ENABLED    = True
+WD_MIN_SPEED_CMS           = 0.5
+WD_MAX_SPEED_CMS           = 90.0
+WD_SPEED_FILTER_OCCUPANCY  = True
+WD_USE_MIN_OCC_S           = False    # valid bins: >= WD_MIN_OCC_S seconds occupancy
+WD_MIN_OCC_S               = 1.0
+WD_USE_MIN_VISITS          = True     # valid bins: >= WD_MIN_VISITS separate visits
+WD_MIN_VISITS              = 2
+
+WD_DIST_LABEL = f'Distance from the nearest wall (bins of {WD_BIN_CM:g} cm)'
+
+# Workbook-only tables (not statistics): left out of STATS_CSV.
+WD_TABLES_NOT_IN_CSV = ('WD_Sessions', 'WD_Cells')
+
+# ── Red rings on box-plot points (V20) ──────────────────────────────────────
+# Full_peak_fr.png: cells whose peak_fr bin (PlaceCell_Main raw map, rebuilt in the
+# temporal stability step) has a dwell time <= the LOW_DWELL_PCTILE-th percentile of
+# that dwell. LOW_DWELL_SCOPE = 'group': one threshold per box, from the cells of that
+# box only (e.g. animal-controlled Fa1059 + Fa23BD, Open box: the cells of those two
+# animals in the Open arena); 'pooled': one threshold over ALL place cells (every
+# arena / session). Needs INCLUDE_TEMPORAL_STABILITY.
+# FieldShape_fld_width_ratio.png: fields of cells whose raw-map peak bin is at wall
+# distance 0 (the wall-distance analysis; fields inherit their cell's distance).
+# Needs INCLUDE_WALL_DISTANCE.
+LOW_DWELL_PCTILE = 10
+LOW_DWELL_SCOPE  = 'group'  # 'group': percentile within each box; 'pooled': over all place cells
+RING_COLOR      = '#FF0000'
+# Graded rings (RING_SHADE_BY): ring colour runs from RING_COLOR_DARK (lowest value among
+# the ringed points of a box) to RING_COLOR_LIGHT (highest ringed value of that box).
+RING_COLOR_DARK  = '#7A0000'
+RING_COLOR_LIGHT = '#FF9E9E'
+RING_LW          = 1.3      # ring line width (pt)
+RING_GAP_PT      = 0.0      # gap between the dot's edge and the ring's inner edge (pt)
+POINT_EDGE_LW    = 0.5      # black edge of the box-plot points (plot_metric)
+
+ARENA_TYPES = ['Circle', 'Linear', 'Open']
+
+# Session types within each arena, in plotting order.
+ARENA_SESSION_TYPES = {
+    'Open':   ['Cntrl', 'Rotate', 'Zero'],
+    'Linear': ['0', '90', '180', '270'],
+    'Circle': ['Stnd', 'NoRot', 'Rot'],
+}
+ALPHA       = 0.05
+
+# Animal-controlled arena comparisons (level 3): {name: (animals, arenas)}.
+# Each compares the given arenas using only the cells of the given animals,
+# which were recorded in all of those arenas. Animal IDs are matched
+# case-insensitively against the animal parsed from the session path
+# (CellClusteredStats_Utils.ANIMAL_PATTERN). The plots of all comparisons are
+# saved side by side (left to right in this order) in ANIMAL_CONTROLLED_DIR.
+ANIMAL_CONTROLLED_DIR = 'AnimalControlledArenaType'
+ANIMAL_CONTROLLED_COMPARISONS = {
+    'Circle_vs_Open': (['Fa8477', 'Fa5834'], ['Circle', 'Open']),
+    'Linear_vs_Open': (['Fa1059', 'Fa23BD'], ['Linear', 'Open']),
+}
+PANEL_GAP_IN = 0.3   # white gap between the side-by-side panels (inches)
+
+# Level 4 (V20): every cell grouped by animal ID (colours: ANIMAL_COLORS),
+# plots in OUTPUT_DIR\ANIMAL_ID_DIR.
+ANIMAL_ID_DIR = 'AnimalID'
+
+# Level 5 (V20): every cell pooled into one group, no tests, plots in
+# OUTPUT_DIR\ALL_CELLS_DIR (colour: ALL_CELLS_COLOR). True: the descriptives
+# (n, mean ± SD, median [Q1, Q3] / % yes) are written under each plot.
+ALL_CELLS_DIR   = 'AllCells'
+ALL_CELLS_LABEL = 'All cells'
+ALL_CELLS_SHOW_DESCRIPTIVES = True
+
+# True: a unit with the same label recorded in two arenas on the same day
+# (same animal + day + unit) is treated as the SAME cell. Only correct if that
+# day's sessions in both arenas were spike-sorted together; set False if each
+# arena was sorted separately (labels then coincide only by chance).
+LINK_CELLS_ACROSS_ARENAS = True
+
+# Test for the continuous metrics:
+#   'LMM' : nested linear mixed model (accounts for repeated cells, days and
+#           animals; see CellClusteredStats_Utils.compare_continuous_nested)
+#   'KW'  : Kruskal-Wallis omnibus + pairwise Mann-Whitney U post-hoc, Holm-
+#           Bonferroni corrected -- ASSUMES every row is independent (ignores
+#           cells recorded in several sessions / arenas of one day)
+CONTINUOUS_TEST = 'KW'
+
+# With CONTINUOUS_TEST = 'LMM', the model is fitted to 'rank' (the ranks of
+# the metric; robust, the mixed-model analogue of Kruskal-Wallis) or 'none'
+# (the raw values).
+METRIC_TRANSFORM = 'rank'
+
+FULL_METRICS = {
+    'peak_fr':         'Peak firing rate',
+    'sir':             'Spatial information score',
+    'sparsity':        'Sparsity',
+    'coherence':       'Coherence score',
+    'stability_score':   'Stability score',
+    'final_speed_score': 'Speed score',
+}
+
+FIELD_METRICS = {
+    'n_fields':       'Number of place fields per cell',
+    'total_area_cm2': 'Area occupied by fields per cell',
+    'pct_area':       'Percentage area occupied by fields per cell',
+    'in_out_spike_ratio':        'In-field / out-of-field spike ratio',
+    'within_field_firing_index': 'Within-field firing index, (in - out) / (in + out)',
+}
+
+# Place-field shape, one value per field (PlaceFieldShape_Utils.py).
+FIELD_SHAPE_METRICS = {
+    'fld_max_width_cm':   'Maximum place-field width (cm)',
+    'fld_min_width_cm':   'Minimum place-field width (cm)',
+    'fld_axis_angle_deg': 'Angle between max- and min-width axes (deg)',
+    'fld_width_ratio':    'Place-field width ratio (max / min)',
+    'fld_mean_width_cm':  'Mean place-field width (cm)',
+}
+
+# Stability score is also compared within each stability type (split-half
+# significance, stability_p_value <= ALPHA, and the sign of the score); one
+# extra box plot per type, 'Full_stability_score_<type>.png'.
+STABILITY_TYPES = {
+    'SigPos': 'significant, positive',
+    'SigNeg': 'significant, negative',
+    'NonSig': 'not significant',
+}
+
+# Extra continuous metric generated by the characterization pipeline but not
+# covered by FULL_METRICS above.
+EXTRA_FULL_METRICS = {'mean_fr': 'Mean firing rate'}
+
+# Place-cell yield uses every recorded unit (place_cell True/False/None), not
+# just confirmed place cells.
+CATEGORICAL_METRICS_ALL_UNITS = {
+    'place_cell': 'Place-cell yield (% of recorded units classified as place cells)',
+}
+CATEGORICAL_METRICS_PLACE_CELLS = {
+    'theta_modulated':          'Theta modulation (% of place cells)',
+    'coherence_bootstrap_sig':  'Coherence shuffle significance (% of place cells)',
+    'stability_significant':    'Split-half stability significance, p <= 0.05 (% of place cells)',
+    'speed_cell_final':         'Speed cells (% of place cells)',
+}
+
+# Temporal stability, one value per cell (PerCell columns from run_ts_maps).
+TEMPORAL_STABILITY_METRICS = {
+    'mean_pct_across_bins':   'Mean temporal stability across field bins (% visits with >= 1 spike)',
+    'median_pct_across_bins': 'Median temporal stability across field bins (% visits with >= 1 spike)',
+    'occ_wmean_pct_across_bins':   'Occupancy-weighted mean temporal stability across field bins (% visits with >= 1 spike)',
+    'occ_wmedian_pct_across_bins': 'Occupancy-weighted median temporal stability across field bins (% visits with >= 1 spike)',
+    'occ_wmean_pct_mapnorm':  'Field temporal stability weighted by dwell, normalised to whole-map dwell (%)',
+    'occ_wmean_pct_all_bins': 'Occupancy-weighted mean temporal stability across all visited map bins (% visits with >= 1 spike)',
+    'pct_at_peak_bin':       'Temporal stability at the raw-ratemap peak bin (% visits with >= 1 spike)',
+    'lap_stability_score':   f'Lap stability, passes pooled over all fields '
+                             f'(fraction of passes with >= {MIN_SPIKES_PER_PASS} spikes)',
+    'mean_lap_stability_across_fields':
+                             f'Mean lap stability across fields '
+                             f'(fraction of passes with >= {MIN_SPIKES_PER_PASS} spikes)',
+}
+
+# Multi-peak fields, by table (build_multipeak_dfs): 'Cell' one value per
+# place cell, 'Field' one per place field, 'MultiField' one per multi-peak field.
+MULTIPEAK_METRICS = {
+    'Cell': {
+        'n_multi_peak_fields':   'Multi-peak fields per cell',
+        'pct_multi_peak_fields': 'Percentage of fields per cell that are multi-peak',
+        'max_n_peaks':           'Most peaks in a field of the cell',
+    },
+    'Field': {
+        'n_peaks': 'Number of peaks per field',
+    },
+    'MultiField': {
+        'shallowest_trough_rel':   'Trough / lower peak (multi-peak fields)',
+        'lowest_counted_peak_rel': 'Lowest peak / highest peak (multi-peak fields)',
+        'peak_separation_cm':      'Distance between neighbouring peaks, cm (multi-peak fields)',
+    },
+}
+MULTIPEAK_CATEGORICAL = {
+    'Cell':  {'has_multi_peak_field': 'Cells with a multi-peak field (% of place cells)'},
+    'Field': {'multi_peak':           'Multi-peak fields (% of place fields)'},
+}
+
+
+@dataclass
+class Grouping:
+    """What the groups being compared are: the column holding the group label,
+    the groups in plotting order, a plural noun for the stats text, and an
+    optional prefix for plot titles (e.g. 'Linear arena'). `shade` is the
+    per-cell shading of this comparison, {(session, unit): t} (cell_shades),
+    set by run_comparison. tests=False (a single group, level 5): no test
+    results in the plots' stats text and no significance printout."""
+    col: str
+    order: list
+    noun: str
+    title: str = ''
+    shade: dict = None
+    tests: bool = True
+
+
+ARENA_GROUPING = Grouping('arena_type', ARENA_TYPES, 'arena types')
+
+# Level 5: one group holding every cell ('all_cells' column, _tag_groups).
+ALL_CELLS_GROUPING = Grouping('all_cells', [ALL_CELLS_LABEL], 'cells', tests=False)
+
+
+def session_grouping(arena: str) -> Grouping:
+    return Grouping('session_type', ARENA_SESSION_TYPES[arena], 'session types',
+                    f'{arena} arena')
+
+
+def animal_controlled_grouping(animals: list, arenas: list) -> Grouping:
+    return Grouping('arena_type', [a for a in ARENA_TYPES if a in arenas], 'arena types',
+                    f'{" + ".join(animals)} only')
+
+
+def animal_id_grouping(df: pd.DataFrame) -> Grouping:
+    """Level 4: the animals ('animal_id') of `df`, in ANIMAL_COLORS order, then any
+    animal not in ANIMAL_COLORS (alphabetically). Rows with no animal are left out."""
+    present = set(df['animal_id'].dropna().astype(str))
+    order = ([a for a in ANIMAL_COLORS if a in present]
+             + sorted(present - set(ANIMAL_COLORS)))
+    return Grouping('animal_id', order, 'animals')
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _to_bool(x) -> bool:
+    """Normalize place_cell values that may come back from Excel as bool,
+    numpy bool, or string ('True'/'False')."""
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        return x.strip().lower() == 'true'
+    if pd.isna(x):
+        return False
+    return bool(x)
+
+
+def _to_tri_bool(x):
+    """Normalize a boolean-ish Excel cell (bootstrap_sig / speed_cell / ...)
+    to True, False, or None (unknown/blank/NaN/'not tested'), since
+    these columns may come back from Excel as bool, string, or a blank cell
+    that pandas reads as NaN."""
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s == 'true':
+            return True
+        if s == 'false':
+            return False
+        return None
+    if pd.isna(x):
+        return None
+    return bool(x)
+
+
+def _speed_class(score, cell):
+    """'p' (p-type speed cell), 'n' (n-type), 'non' (non-speed), or None if
+    final_speed_score is missing. A cell is a speed cell only when speed_cell
+    is True; its type follows the sign of final_speed_score. speed_cell False
+    or 'not tested' (the shuffle was skipped because the initial fit wasn't
+    significant) both count as non-speed."""
+    s = pd.to_numeric(score, errors='coerce')
+    if pd.isna(s):
+        return None
+    if _to_tri_bool(cell) is True and s != 0:
+        return 'p' if s > 0 else 'n'
+    return 'non'
+
+
+def add_speed_class(df: pd.DataFrame) -> pd.DataFrame:
+    """Add 'speed_class' ('p'/'n'/'non'/None) and 'speed_cell_final'
+    (True/False/None, for the % speed cells comparison) columns."""
+    df = df.copy()
+    df['speed_class'] = [_speed_class(s, c)
+                         for s, c in zip(df['final_speed_score'], df['speed_cell'])]
+    df['speed_cell_final'] = df['speed_class'].map(
+        lambda k: None if k is None else k in ('p', 'n'))
+    return df
+
+
+def _stability_sig(v):
+    v = pd.to_numeric(v, errors='coerce')
+    return bool(v <= ALPHA) if pd.notna(v) else None
+
+
+def _stability_type(score, p):
+    """'SigPos' / 'SigNeg' (split-half p <= ALPHA with a score > 0 / < 0),
+    'NonSig' (p > ALPHA), or None if the score or p-value is missing (or the
+    score is exactly 0 and significant)."""
+    s = pd.to_numeric(score, errors='coerce')
+    sig = _stability_sig(p)
+    if pd.isna(s) or sig is None:
+        return None
+    if not sig:
+        return 'NonSig'
+    return 'SigPos' if s > 0 else 'SigNeg' if s < 0 else None
+
+
+def extract_arena_type(session_path: str):
+    """Return 'Open', 'Linear', or 'Circle' if one of those appears as a
+    path component of `session_path`, else None."""
+    parts = re.split(r'[\\/]+', str(session_path))
+    for part in parts:
+        for arena in ARENA_TYPES:
+            if part.strip().lower() == arena.lower():
+                return arena
+    return None
+
+
+def extract_session_type(session_path: str, arena: str):
+    """Return the session type named in the last folder of `session_path`
+    (e.g. '1_Cntrl' -> 'Cntrl' for Open, '3_180' -> '180' for Linear,
+    '2NoRot' -> 'NoRot' for Circle), or None if it can't be recognized."""
+    if arena is None:
+        return None
+    label = re.split(r'[\\/]+', str(session_path).strip())[-1].strip().lower()
+
+    if arena == 'Open':
+        for t in ARENA_SESSION_TYPES['Open']:
+            if t.lower() in label:
+                return t
+    elif arena == 'Linear':
+        m = re.search(r'_(270|180|90|0)$', label)
+        if m:
+            return m.group(1)
+    elif arena == 'Circle':
+        # 'norot' must be tested before 'rot', which it contains.
+        if 'norot' in label:
+            return 'NoRot'
+        if 'stnd' in label:
+            return 'Stnd'
+        if 'rot' in label:
+            return 'Rot'
+    return None
+
+
+def _label(group: str) -> str:
+    """Display label for plots: Linear session types are angles."""
+    return f'{group}°' if str(group).isdigit() else str(group)
+
+
+def _tag_groups(df: pd.DataFrame, what: str) -> pd.DataFrame:
+    """Add 'arena_type', 'session_type' and 'cell_id' (+ 'animal', 'rec_day',
+    'animal_id' and 'all_cells') columns to a dataframe with 'session' and 'unit'
+    columns. Rows with no recognizable arena are dropped; rows with an arena but
+    no recognizable session type are kept (session_type None) for the arena
+    comparison."""
+    df = df.copy()
+    df['arena_type'] = df['session'].apply(extract_arena_type)
+    unknown = df[df['arena_type'].isna()]
+    if len(unknown):
+        print(f'WARNING: {len(unknown)} {what} had a session path with no '
+              f'recognizable arena type ({ARENA_TYPES}); excluded from analysis:')
+        for s in sorted(unknown['session'].astype(str).unique()):
+            print(f'    {s}')
+    df = df.dropna(subset=['arena_type']).copy()
+
+    df['session_type'] = [extract_session_type(s, a)
+                          for s, a in zip(df['session'], df['arena_type'])]
+    no_type = df[df['session_type'].isna()]
+    if len(no_type):
+        print(f'WARNING: {len(no_type)} {what} had no recognizable session type; '
+              f'kept in the arena comparison, excluded from the session-type comparison:')
+        for s in sorted(no_type['session'].astype(str).unique()):
+            print(f'    {s}')
+    df = ccs.add_cell_ids(df, include_arena=not LINK_CELLS_ACROSS_ARENAS)
+    df['animal_id'] = df['animal'].map(canonical_animal_id)   # level 4 groups
+    df['all_cells'] = ALL_CELLS_LABEL                          # level 5 group
+    return df
+
+
+def load_sheets():
+    """Read 'Full' and 'PlaceFields', add the field-shape columns to the
+    latter and save them to FIELD_SHAPE_EXCEL (a copy of INPUT_EXCEL)."""
+    full   = pd.read_excel(INPUT_EXCEL, sheet_name='Full')
+    fields = pfs.add_field_shape(pd.read_excel(INPUT_EXCEL, sheet_name='PlaceFields'))
+    pfs.save_shape_columns(INPUT_EXCEL, FIELD_SHAPE_EXCEL, fields)
+    print(f'Place-field shape columns saved to {FIELD_SHAPE_EXCEL}')
+    return full, fields
+
+
+def build_full_metrics_df(full: pd.DataFrame) -> pd.DataFrame:
+    df = full[full['place_cell'].apply(_to_bool)]
+    df = add_speed_class(_tag_groups(df, 'place cell(s)'))
+    df['stability_significant'] = df['stability_p_value'].apply(_stability_sig)
+    df['stability_type'] = [_stability_type(s, p) for s, p in
+                            zip(df['stability_score'], df['stability_p_value'])]
+    return df
+
+
+def build_field_metrics_df(full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataFrame:
+    place_cells = full[full['place_cell'].apply(_to_bool)][
+        ['session', 'unit', 'n_fields_detected', 'n_spikes']].drop_duplicates()
+
+    agg = (fields.groupby(['session', 'unit'])
+                 .agg(n_fields=('field_number', 'count'),
+                      total_area_cm2=('area_cm2', 'sum'),
+                      pct_area=('pct_of_occupied_area', 'sum'),
+                      spikes_in_fields=('field_n_spikes', 'sum'))
+                 .reset_index())
+
+    merged = place_cells.merge(agg, on=['session', 'unit'], how='left')
+    # Place cells with no rows in 'PlaceFields' (n_fields_detected == 0) get 0s.
+    for col in ('n_fields', 'total_area_cm2', 'pct_area', 'spikes_in_fields'):
+        merged[col] = merged[col].fillna(0.0)
+
+    # In- vs out-of-field spikes: moving-only spikes ('n_spikes'), field spikes summed over
+    # every field of the cell; spikes in bins outside all fields (valid or not) are 'out'.
+    n_spk = pd.to_numeric(merged['n_spikes'], errors='coerce')
+    s_in  = merged['spikes_in_fields']
+    s_out = n_spk - s_in
+    merged['spikes_out_fields'] = s_out
+    merged['in_out_spike_ratio'] = (s_in / s_out).where(s_out > 0)          # NaN if no 'out' spike
+    merged['within_field_firing_index'] = ((s_in - s_out) / n_spk).where(n_spk > 0)
+    bad = merged[s_out < 0]
+    if len(bad):
+        print(f'WARNING: {len(bad)} place cell(s) have more field spikes than n_spikes; '
+              f'spike ratio / firing index set to NaN:')
+        for s, u in zip(bad['session'], bad['unit']):
+            print(f'    {s} | {u}')
+        merged.loc[bad.index, ['in_out_spike_ratio', 'within_field_firing_index']] = np.nan
+
+    return _tag_groups(merged, 'place cell(s) (field analysis)')
+
+
+def build_field_shape_df(full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataFrame:
+    """One row per place field of a place cell, with its shape columns.
+    Fields with no 2-D shape (circular track) are dropped."""
+    place_cells = full[full['place_cell'].apply(_to_bool)][['session', 'unit']].drop_duplicates()
+    df = fields[['session', 'unit', 'field_number'] + pfs.SHAPE_COLUMNS].merge(
+        place_cells, on=['session', 'unit'], how='inner')
+    df = df.dropna(subset=['fld_max_width_cm'])
+    return _tag_groups(df, 'place field(s) (field-shape analysis)')
+
+
+def build_all_units_df(full: pd.DataFrame) -> pd.DataFrame:
+    """Like build_full_metrics_df, but keeps every recorded unit (not just
+    confirmed place cells) -- needed to compute place-cell yield per group."""
+    return _tag_groups(full, 'unit(s)')
+
+
+def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str, grp: Grouping):
+    """Descriptive stats, omnibus test, and post-hoc pairwise tests for one
+    metric across the groups of `grp`. CONTINUOUS_TEST = 'KW': Kruskal-Wallis,
+    then pairwise Mann-Whitney U (Holm-Bonferroni corrected), rows treated as
+    independent; 'LMM': nested linear mixed model accounting for repeated
+    cells, days and animals (CellClusteredStats_Utils.compare_continuous_nested).
+    Returns (desc_df, omnibus_row, posthoc_df)."""
+    groups, n_cells = {}, {}
+    for g in grp.order:
+        sub = df.loc[df[grp.col] == g, [metric_col, 'cell_id']].copy()
+        sub[metric_col] = pd.to_numeric(sub[metric_col], errors='coerce')
+        sub = sub.dropna(subset=[metric_col])
+        if len(sub):
+            groups[g] = sub[metric_col].to_numpy(dtype=float)
+            n_cells[g] = sub['cell_id'].nunique()
+
+    desc_rows = []
+    for g, vals in groups.items():
+        desc_rows.append({
+            'metric': metric_label, grp.col: g, 'n': len(vals),
+            'n_cells': n_cells[g],
+            'mean': np.mean(vals), 'median': np.median(vals),
+            'q1': np.percentile(vals, 25), 'q3': np.percentile(vals, 75),
+            'std': np.std(vals, ddof=1) if len(vals) > 1 else np.nan,
+            'sem': stats.sem(vals) if len(vals) > 1 else np.nan,
+            'min': np.min(vals), 'max': np.max(vals),
+        })
+    desc_df = pd.DataFrame(desc_rows)
+
+    omnibus = {'metric': metric_label, 'n_groups': len(groups),
+               'groups': ', '.join(f'{g} (n={len(v)})' for g, v in groups.items())}
+
+    if CONTINUOUS_TEST == 'KW':
+        if len(groups) < 2 or any(len(v) < 2 for v in groups.values()):
+            omni, posthoc_rows = None, []
+        else:
+            sub = df[df[grp.col].isin(list(groups))].copy()
+            sub[metric_col] = pd.to_numeric(sub[metric_col], errors='coerce')
+            summary = ccs.repetition_summary(sub.dropna(subset=[metric_col]), grp.col)
+            try:
+                omni, posthoc_rows = ccs._classic_continuous(
+                    groups, f'Kruskal-Wallis + Mann-Whitney U (rows treated as independent): {summary}')
+            except ValueError:  # e.g. all values identical
+                omni, posthoc_rows = None, []
+    elif CONTINUOUS_TEST == 'LMM':
+        omni, posthoc_rows = ccs.compare_continuous_nested(df, grp.col, grp.order,
+                                                           metric_col, transform=METRIC_TRANSFORM)
+    else:
+        raise ValueError(f"CONTINUOUS_TEST must be 'LMM' or 'KW', not {CONTINUOUS_TEST!r}")
+    if omni is None:
+        omnibus.update({'test': 'insufficient data', 'statistic': np.nan,
+                         'p_value': np.nan, 'significant': False})
+        return desc_df, omnibus, pd.DataFrame()
+
+    omnibus.update(omni)
+    omnibus['significant'] = bool(omni['p_value'] < ALPHA)
+    posthoc_df = pd.DataFrame([{'metric': metric_label, **r} for r in posthoc_rows])
+    return desc_df, omnibus, posthoc_df
+
+
+
+# ── Figure style (matches the Figure 3 place-cell histograms) ────────────────
+# Arial, bold axis labels, small plain tick labels, thin black left/bottom
+# axes with short outward ticks, solid-filled bars separated by thin white
+# gaps, and a dashed median line labelled 'med=...'.
+PAL_MAGENTA = '#FA7FFA'
+PAL_CYAN    = '#7FFAFA'
+PAL_BLUE    = '#7FB3E5'
+PAL_DKBLUE  = '#0066CC'
+PAL_GRAY    = '#7F7F7F'
+PAL_GREEN   = '#00C000'
+PAL_ORANGE  = '#FF8000'
+PAL_RED     = '#FF0000'
+PAL_BLACK   = '#000000'
+FIG_FONT    = ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans']
+
+FS_LABEL, FS_TITLE, FS_TICK, FS_LEGEND, FS_STATS, FS_MED = 14, 15, 11, 11, 9, 10
+STATS_LINE_IN = 0.2    # panel height per line of stats text (inches)
+LEGEND_ROW_IN = 0.3    # panel height per row of legend entries (inches)
+FIG_DPI = 500
+
+AXIS_LW     = 0.8      # spines, ticks and the dashed median line
+BOX_LW      = 1.0      # box-plot outlines, whiskers, caps; significance lines
+MEDIAN_LW   = 1.5      # box-plot median
+BAR_EDGE    = 'white'  # bar/histogram outlines: a thin white gap between bars
+BAR_EDGE_LW = 0.6
+BAR_WIDTH   = 0.6      # categorical bars, as a fraction of the bar spacing
+GROUP_W     = 1.1      # box/bar plots: x-axis width per condition (inches)
+AXIS_PAD_W  = 1.4      # box/bar plots: extra width for the y-axis label/ticks
+STATS_CHARS_PER_IN = 15  # approx. characters of stats text per inch of width
+
+plt.rcParams.update({
+    'font.family':        'sans-serif',
+    'font.sans-serif':    FIG_FONT,
+    'pdf.fonttype':       42,       # keep text editable in Illustrator
+    'ps.fonttype':        42,
+    'svg.fonttype':       'none',
+    'text.color':         PAL_BLACK,
+    'axes.labelcolor':    PAL_BLACK,
+    'axes.labelweight':   'bold',
+    'axes.titleweight':   'bold',
+    'axes.edgecolor':     PAL_BLACK,
+    'axes.linewidth':     AXIS_LW,
+    'axes.spines.top':    False,
+    'axes.spines.right':  False,
+    'xtick.color':        PAL_BLACK,
+    'ytick.color':        PAL_BLACK,
+    'xtick.direction':    'out',
+    'ytick.direction':    'out',
+    'xtick.major.width':  AXIS_LW,
+    'ytick.major.width':  AXIS_LW,
+    'xtick.major.size':   3.5,
+    'ytick.major.size':   3.5,
+    'axes.facecolor':     'white',
+    'figure.facecolor':   'white',
+    'savefig.facecolor':  'white',
+    'axes.grid':          False,
+    'legend.frameon':     False,
+})
+
+# Per-group colors. face = fill for boxes/bars/histograms/points; dark / light
+# = deeper and paler tones of that shade, used for p-type / n-type speed cells
+# (see plot_speed_direction); edge = point outline.
+def _shade(face, dark, light):
+    return {'face': face, 'edge': PAL_BLACK, 'dark': dark, 'light': light}
+
+# Arena types: magenta = circular track, cyan = linear track, blue = open arena.
+ARENA_COLORS = {
+    'Open':   _shade(PAL_BLUE,    PAL_DKBLUE, '#CCE1F5'),
+    'Linear': _shade(PAL_CYAN,    '#00B3B3',  '#CCFDFD'),
+    'Circle': _shade(PAL_MAGENTA, '#C000C0',  '#FDCCFD'),
+}
+
+# Session types: shades of their arena's hue.
+SESSION_COLORS = {
+    # Open: Cntrl light blue, Rotate dark blue, Zero gray
+    'Cntrl':  _shade(PAL_BLUE,   PAL_DKBLUE, '#CCE1F5'),
+    'Rotate': _shade(PAL_DKBLUE, '#003D7A',  '#99C2EB'),
+    'Zero':   _shade('#BFBFBF',  '#404040',  '#E6E6E6'),
+    # Linear: 0 darkest cyan -> 270 lightest
+    '0':      _shade('#008080',  '#004D4D',  '#99CCCC'),
+    '90':     _shade('#00B3B3',  '#006B6B',  '#99E1E1'),
+    '180':    _shade('#33D6D6',  '#1F8080',  '#ADEFEF'),
+    '270':    _shade(PAL_CYAN,   '#00B3B3',  '#CCFDFD'),
+    # Circle: Stnd lightest magenta, NoRot lighter, Rot dark
+    'Stnd':   _shade('#FDC4FD',  '#D94FD9',  '#FEE7FE'),
+    'NoRot':  _shade(PAL_MAGENTA, '#C000C0', '#FDCCFD'),
+    'Rot':    _shade('#C000C0',  '#730073',  '#E699E6'),
+}
+
+# Animal IDs (level 4, V20).
+ANIMAL_COLORS = {
+    'Fa8477': '#FBB4AE',  # Pastel1[0] red
+    'Fa1059': '#B3CDE3',  # Pastel1[1] blue
+    'Fa23BD': '#CCEBC5',  # Pastel1[2] green
+    'Fa5834': '#DECBE4',  # Pastel1[3] purple
+}
+
+
+def animal_color(label, default='#888888'):
+    """ANIMAL_COLORS entry for an animal label, matched on the ID so that e.g.
+    'Fa1059', '1059Test' and 'FA1059' all resolve; `default` if no ID matches."""
+    label = str(label).upper()
+    for animal_id, color in ANIMAL_COLORS.items():
+        if animal_id[2:].upper() in label:
+            return color
+    return default
+
+
+def canonical_animal_id(label):
+    """The ANIMAL_COLORS key whose ID matches `label` (same rule as animal_color),
+    else the label itself; None for a missing label."""
+    if label is None or (not isinstance(label, str) and pd.isna(label)):
+        return None
+    up = str(label).upper()
+    for animal_id in ANIMAL_COLORS:
+        if animal_id[2:].upper() in up:
+            return animal_id
+    return str(label)
+
+
+# All cells pooled (level 5, V20): lime green of viridis.
+ALL_CELLS_COLOR = to_hex(matplotlib.colormaps['viridis'](0.85))   # '#a5db36'
+
+
+def _derived_shade(face: str) -> dict:
+    """_shade for a single face colour: 'dark' = its hue at 40 % lightness (p-type
+    speed cells, wall-distance lines), 'light' = the face halfway to white (n-type)."""
+    h, _l, s = colorsys.rgb_to_hls(*to_rgb(face))
+    rgb = np.array(to_rgb(face))
+    return _shade(face, to_hex(colorsys.hls_to_rgb(h, 0.40, s)), to_hex(rgb + (1.0 - rgb) * 0.5))
+
+
+# Arena, session-type and all-cells labels don't overlap, so one lookup serves
+# them all; animal labels are resolved by _color (animal_color).
+GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS,
+                ALL_CELLS_LABEL: _derived_shade(ALL_CELLS_COLOR)}
+ANIMAL_GROUP_COLORS = {a: _derived_shade(c) for a, c in ANIMAL_COLORS.items()}
+_DEFAULT_COLOR = {'face': PAL_GRAY, 'edge': PAL_BLACK, 'dark': PAL_GRAY, 'light': '#D4D4D4'}
+
+# Points that failed their significance/shuffle test are always drawn in this
+# neutral gray (the reference figures' "discarded" gray), regardless of group.
+SIG_GRAY = {'face': PAL_GRAY, 'edge': PAL_BLACK}
+
+# Per-cell shading: every point in the box plots is filled with its group's
+# hue, darker for a higher SHADE_METRIC (spatial information score). The
+# shades are computed once per comparison -- each SessionType\<arena> folder,
+# ArenaType, and each animal-controlled pair -- from that comparison's place
+# cells, and a cell (one unit in one session) keeps its shade in every box
+# plot of that comparison (all fields of a cell share the cell's shade).
+SHADE_METRIC    = 'sir'
+SHADE_SCALE     = 'rank'          # 'rank': percentile of the score; 'linear': min-max of the score
+# Lowest score: the group's pure hue mixed with SHADE_LIGHT_MIX white (kept
+# well below 1 so it stays visible); highest score: the pure hue scaled to
+# SHADE_DARK_KEEP of its brightness. Shades in between are blended linearly.
+SHADE_LIGHT_MIX = 0.45
+SHADE_DARK_KEEP = 0.35
+
+# Point markers for the significance metrics (the fill stays the cell's shade).
+MARKER_PASS, MARKER_FAIL, MARKER_P, MARKER_N = 'o', 'X', '^', 'v'
+MARKER_SIZE = {MARKER_PASS: 22}   # others: 30 (they look smaller at equal area)
+
+
+def cell_shades(df: pd.DataFrame) -> dict:
+    """{(session, unit): t}, t from 0 (lowest SHADE_METRIC in `df`) to 1
+    (highest); rows with no score are left out."""
+    v = pd.to_numeric(df[SHADE_METRIC], errors='coerce')
+    ok = v.notna()
+    v = v[ok]
+    if SHADE_SCALE == 'rank':
+        t = (v.rank(method='average') - 1) / max(len(v) - 1, 1)
+    elif SHADE_SCALE == 'linear':
+        span = v.max() - v.min()
+        t = (v - v.min()) / span if span > 0 else v * 0 + 0.5
+    else:
+        raise ValueError(f"SHADE_SCALE must be 'rank' or 'linear', not {SHADE_SCALE!r}")
+    return dict(zip(zip(df.loc[ok, 'session'], df.loc[ok, 'unit']), t))
+
+
+def _cell_color(group: str, t: float) -> str:
+    """The group's hue at shade position t (0 = lightest tint, 1 = darkest)."""
+    h, _l, s = colorsys.rgb_to_hls(*to_rgb(_color(group)['face']))
+    pure  = np.array(colorsys.hls_to_rgb(h, 0.5, s))
+    light = pure + (1.0 - pure) * SHADE_LIGHT_MIX
+    dark  = pure * SHADE_DARK_KEEP
+    return to_hex(light + (dark - light) * t)
+
+
+def _color(group: str) -> dict:
+    if group in GROUP_COLORS:
+        return GROUP_COLORS[group]
+    animal = canonical_animal_id(group)
+    return ANIMAL_GROUP_COLORS.get(animal, _DEFAULT_COLOR)
+
+
+def _new_fig(figsize, legend_rows=0, stats_lines=None):
+    """Figure + main axes. If there is a legend and/or stats text, a second
+    borderless axes sits below the plot to hold them (legend on top, stats
+    underneath), so neither overlaps the data. The panel is sized to fit."""
+    w, h = figsize
+    panel_h = legend_rows * LEGEND_ROW_IN + len(stats_lines or []) * STATS_LINE_IN
+    if panel_h > 0:
+        panel_h += 0.2
+        fig, (ax, ax_info) = plt.subplots(2, 1, figsize=(w, h + panel_h),
+                                          gridspec_kw={'height_ratios': [h, panel_h]})
+        ax_info.axis('off')
+        return fig, ax, ax_info
+    fig, ax = plt.subplots(figsize=figsize)
+    return fig, ax, None
+
+
+def _bar_fig_width(n_groups: int) -> float:
+    """Figure width for a box/bar plot with `n_groups` conditions: a fixed
+    width per condition, so boxes/bars and the gaps between them keep their
+    proportions whatever the number of conditions."""
+    return n_groups * GROUP_W + AXIS_PAD_W
+
+
+def _wrap_stats(stats_lines, fig_w: float) -> list:
+    """Re-wrap the stats text lines to fit a figure `fig_w` inches wide."""
+    width = max(40, int(fig_w * STATS_CHARS_PER_IN))
+    return [w for line in (stats_lines or []) for w in (textwrap.wrap(line, width) or [''])]
+
+
+def _draw_stats(ax_info, stats_lines):
+    """Write the stats text at the bottom of the panel (below any legend)."""
+    if ax_info is None or not stats_lines:
+        return
+    ax_info.text(0.5, 0.0, '\n'.join(stats_lines), transform=ax_info.transAxes,
+                 fontsize=FS_STATS, va='bottom', ha='center', linespacing=1.3)
+
+
+# ── Stats text shown under each plot ─────────────────────────────────────────
+
+def _fmt_p(p) -> str:
+    if p is None or pd.isna(p):
+        return 'n/a'
+    return '< 0.001' if p < 0.001 else f'{p:.3f}'
+
+
+def _stars(p) -> str:
+    if p is None or pd.isna(p):
+        return ''
+    return '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < ALPHA else 'n.s.'
+
+
+def _pair_label(cmp: str) -> str:
+    return ' vs '.join(_label(g) for g in str(cmp).split(' vs '))
+
+
+def _desc_str(vals) -> str:
+    """'mean ± SD | median [Q1, Q3]' for an array of values."""
+    vals = np.asarray(vals, dtype=float)
+    if not len(vals):
+        return 'n/a'
+    sd = f'{np.std(vals, ddof=1):.3g}' if len(vals) > 1 else 'n/a'
+    return (f'mean {np.mean(vals):.3g} ± {sd} SD | median {np.median(vals):.3g} '
+            f'[Q1 {np.percentile(vals, 25):.3g}, Q3 {np.percentile(vals, 75):.3g}]')
+
+
+def _test_lines(omnibus: dict, posthoc_df: pd.DataFrame) -> list:
+    """Omnibus test (statistic, dof, p) and post-hoc pairwise tests (statistic,
+    raw p, Holm-corrected p) as text lines."""
+    test = omnibus.get('test', '')
+    if test == 'insufficient data':
+        return ['Insufficient data for a statistical test']
+    dof = omnibus.get('dof')
+    dof_str = f', dof = {int(dof)}' if dof is not None and pd.notna(dof) else ''
+    p = omnibus.get('p_value')
+    lines = [f'{test}: {omnibus.get("stat_name", "stat")} = {omnibus["statistic"]:.3f}{dof_str}, '
+             f'p = {_fmt_p(p)} {_stars(p)}']
+    if posthoc_df is not None and len(posthoc_df):
+        lines.append(f'Post-hoc ({posthoc_df["test"].iloc[0]}, Holm-Bonferroni corrected):')
+        for _, r in posthoc_df.iterrows():
+            fmt = '.3g' if r['stat_name'] == 'OR' else '.1f' if r['stat_name'] == 'U' else '.3f'
+            stat_str = f'{r["stat_name"]} = {r["statistic"]:{fmt}}'
+            lines.append(f'{_pair_label(r["comparison"])}: {stat_str}, p = {_fmt_p(r["p_raw"])}, '
+                         f'p(Holm) = {_fmt_p(r["p_holm"])} {_stars(r["p_holm"])}')
+    return lines
+
+
+def _model_note_lines(omnibus: dict) -> list:
+    """Which model was used, and on how many cells (one line; wrapped to the
+    figure width by _wrap_stats)."""
+    note = omnibus.get('model_note')
+    return [note] if isinstance(note, str) and note else []
+
+
+def _with_tests(desc_lines: list, omnibus, posthoc_df, grp: Grouping) -> list:
+    """Descriptive lines + test lines; without tests (grp.tests False, level 5) only
+    the descriptives, or nothing if ALL_CELLS_SHOW_DESCRIPTIVES is False."""
+    if not grp.tests:
+        return desc_lines if ALL_CELLS_SHOW_DESCRIPTIVES else []
+    return desc_lines + _test_lines(omnibus, posthoc_df) + _model_note_lines(omnibus)
+
+
+def _continuous_stats_lines(desc_df, omnibus, posthoc_df, grp: Grouping) -> list:
+    lines = []
+    for _, r in desc_df.iterrows():
+        sd = f'{r["std"]:.3g}' if pd.notna(r['std']) else 'n/a'
+        lines.append(f'{_label(r[grp.col])} (n={int(r["n"])}): mean {r["mean"]:.3g} ± {sd} SD | '
+                     f'median {r["median"]:.3g} [Q1 {r["q1"]:.3g}, Q3 {r["q3"]:.3g}]')
+    return _with_tests(lines, omnibus, posthoc_df, grp)
+
+
+def _categorical_stats_lines(desc_df, omnibus, posthoc_df, grp: Grouping) -> list:
+    lines = [f'{_label(r[grp.col])} (n={int(r["n"])}): {int(r["n_true"])} yes / '
+             f'{int(r["n_false"])} no = {r["pct_true"]:.1f} %'
+             for _, r in desc_df.iterrows()]
+    return _with_tests(lines, omnibus, posthoc_df, grp)
+
+
+def _speed_dir_stats_lines(desc_df, omnibus, posthoc_df, grp: Grouping) -> list:
+    lines = [f'{_label(r[grp.col])} (n={int(r["n"])}): '
+             f'p-Speed {int(r["n_p_speed"])} ({r["pct_p_speed"]:.1f} %), '
+             f'n-Speed {int(r["n_n_speed"])} ({r["pct_n_speed"]:.1f} %), '
+             f'non-speed {int(r["n_non_speed"])} ({r["pct_non_speed"]:.1f} %)'
+             for _, r in desc_df.iterrows()]
+    return _with_tests(lines, omnibus, posthoc_df, grp)
+
+
+def _style_axes(ax):
+    ax.tick_params(axis='both', labelsize=FS_TICK)
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def _titled(text: str, grp: Grouping) -> str:
+    return f'{grp.title}: {text}' if grp.title else text
+
+
+def _set_title(ax, text):
+    # ~7 bold title characters per inch of figure width
+    ax.set_title(textwrap.fill(text, max(20, int(ax.figure.get_figwidth() * 7))),
+                 fontsize=FS_TITLE - 2, pad=12)
+
+
+def _save(fig, out_path):
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches='tight')
+    plt.close(fig)
+
+
+def _draw_sig_brackets(ax, pos_by_group: dict, posthoc_df, y_base: float,
+                       y_step: float, y_text: float):
+    """For every pairwise comparison with Holm-corrected p < ALPHA, draw a
+    single horizontal line above the two groups with the number of stars
+    (* p<0.05, ** p<0.01, *** p<0.001) centered on it. Narrower spans are
+    stacked lowest so lines don't cross. Returns the y of the highest line
+    drawn, or None if no comparison was significant."""
+    if posthoc_df is None or not len(posthoc_df):
+        return None
+    sig = []
+    for _, r in posthoc_df.iterrows():
+        p = r.get('p_holm')
+        if p is None or pd.isna(p) or p >= ALPHA:
+            continue
+        g1, g2 = [g.strip() for g in str(r['comparison']).split(' vs ')]
+        if g1 not in pos_by_group or g2 not in pos_by_group:
+            continue
+        x1, x2 = sorted((pos_by_group[g1], pos_by_group[g2]))
+        sig.append((x2 - x1, x1, x2, _stars(p)))
+    y = y_base
+    for _span, x1, x2, stars in sorted(sig):
+        ax.plot([x1, x2], [y, y], color=PAL_BLACK, linewidth=BOX_LW,
+                solid_capstyle='butt', clip_on=False, zorder=5)
+        ax.text((x1 + x2) / 2, y + y_text, stars, ha='center', va='center',
+                fontsize=FS_LABEL + 3, fontweight='bold', clip_on=False, zorder=5)
+        y += y_step
+    return y - y_step if sig else None
+
+
+# Metrics whose individual points get a marker by p-value/shuffle-test status
+# -- see _point_styles. Also drives which plots get a significance legend.
+SIGNIFICANCE_METRICS = {'coherence', 'stability_score', 'final_speed_score'}
+
+
+def _point_styles(metric_col: str, sub: pd.DataFrame, group: str, shades: dict) -> list:
+    """Per-point (face, marker) for one group's jittered scatter points,
+    aligned row-for-row with `sub` (which must still hold the original
+    columns, e.g. 'coherence_bootstrap_sig').
+
+    face: the cell's shade (`shades`, see cell_shades); the plain group color
+    for cells with no shade. marker:
+    - coherence: MARKER_FAIL only if the cell's coherence failed its shuffle
+      test (coherence_bootstrap_sig is False); untested/blank cells keep
+      MARKER_PASS.
+    - stability_score: MARKER_FAIL unless its split-half p-value is <= ALPHA.
+    - final_speed_score: MARKER_P / MARKER_N for p-type (score > 0) / n-type
+      (score < 0) speed cells, MARKER_FAIL for the rest (speed_cell False /
+      'not tested').
+    - everything else: MARKER_PASS.
+    """
+    shades = shades or {}
+    base = _color(group)['face']
+    faces = [_cell_color(group, shades[k]) if k in shades else base
+             for k in zip(sub['session'], sub['unit'])]
+
+    if metric_col == 'coherence':
+        markers = [MARKER_FAIL if _to_tri_bool(s) is False else MARKER_PASS
+                   for s in sub['coherence_bootstrap_sig']]
+    elif metric_col == 'stability_score':
+        p = pd.to_numeric(sub['stability_p_value'], errors='coerce')
+        markers = [MARKER_PASS if (pd.notna(v) and v <= ALPHA) else MARKER_FAIL for v in p]
+    elif metric_col == 'final_speed_score':
+        markers = [{'p': MARKER_P, 'n': MARKER_N}.get(k, MARKER_FAIL) for k in sub['speed_class']]
+    else:
+        markers = [MARKER_PASS] * len(sub)
+    return list(zip(faces, markers))
+
+
+_SIGNIFICANCE_LEGENDS = {
+    'coherence': [
+        (MARKER_PASS, 'passed shuffle test (p < 0.05) / not tested'),
+        (MARKER_FAIL, 'failed shuffle test'),
+    ],
+    'stability_score': [
+        (MARKER_PASS, f'p ≤ {ALPHA:g}'),
+        (MARKER_FAIL, f'p > {ALPHA:g}'),
+    ],
+    'final_speed_score': [
+        (MARKER_P,    'p-type speed cell (positive)'),
+        (MARKER_N,    'n-type speed cell (negative)'),
+        (MARKER_FAIL, 'not a speed cell / not tested'),
+    ],
+}
+
+
+def _add_significance_legend(ax_info, metric_col: str, face: str, extra_handles=()):
+    """Draw the significance (marker) legend into the borderless panel below
+    the plot, with `face` as the example fill, followed by `extra_handles`
+    (e.g. the red-ring entry)."""
+    entries = _SIGNIFICANCE_LEGENDS.get(metric_col) or []
+    handles = [Line2D([0], [0], marker=marker, linestyle='None', markersize=8,
+                       markerfacecolor=face, markeredgecolor=PAL_BLACK,
+                       markeredgewidth=0.5, label=label)
+               for marker, label in entries] + list(extra_handles)
+    if handles:
+        ax_info.legend(handles=handles, loc='upper center', fontsize=FS_LEGEND, ncol=1)
+
+
+# Red rings (V20): {metric_col: flag column}. A point is ringed when its row has
+# flag == True; plots of a table without the column get no rings. The legend /
+# stats text of each comparison is in _RING_TEXT (filled by add_peak_dwell_flag
+# and add_wall_field_flag): {metric_col: (legend label, stats-text line)}.
+RING_FLAGS = {
+    'peak_fr':         'low_peak_dwell',
+    'fld_width_ratio': 'peak_at_wall',
+}
+_RING_TEXT = {}
+# Every plot with red rings is also saved without them; the ringed version gets this
+# suffix (Full_peak_fr.png = no rings, Full_peak_fr_control.png = with rings).
+CONTROL_SUFFIX = '_control'
+
+# Negative control: metrics in NEG_CONTROL_METRICS get a third plot in which the red rings
+# are replaced by green rings (NEG_RING_COLOR) around every point that is NOT red-ringed,
+# with the same test (compare_groups) on the green-ringed points only. Their red-ringed
+# plot gets POS_CONTROL_SUFFIX instead of CONTROL_SUFFIX:
+#   FieldShape_fld_width_ratio.png             no rings
+#   FieldShape_fld_width_ratio_PosControl.png  red rings  (cell peak at the wall)
+#   FieldShape_fld_width_ratio_NegControl.png  green rings (all other fields)
+NEG_CONTROL_METRICS = {'fld_width_ratio'}
+POS_CONTROL_SUFFIX  = '_PosControl'
+NEG_CONTROL_SUFFIX  = '_NegControl'
+NEG_RING_COLOR      = '#00A000'
+# Points with no value in this column are neither red- nor green-ringed when
+# NEG_CONTROL_EXCLUDE_UNKNOWN is True; with False, every point that is not red-ringed is
+# green-ringed (fields without a wall distance included).
+NEG_CONTROL_KNOWN_COL       = {'fld_width_ratio': 'cell_peak_wall_dist'}
+NEG_CONTROL_EXCLUDE_UNKNOWN = False
+_NEG_RING_TEXT = {}   # {metric_col: (legend label, stats-text line)}; set by add_wall_field_flag
+
+# Graded rings: {metric_col: (value column, name in the legend)}. Within each box, the
+# ringed points are shaded by this column, low = RING_COLOR_DARK, high = RING_COLOR_LIGHT
+# (linear between the box's lowest and highest ringed value). Metrics not listed get
+# plain RING_COLOR rings.
+RING_SHADE_BY = {
+    'peak_fr': ('peak_fr_bin_dwell_s', 'peak-bin dwell'),
+}
+_RING_CMAP = LinearSegmentedColormap.from_list('ring_shade', [RING_COLOR_DARK, RING_COLOR_LIGHT])
+
+
+def _ring_colors(sub: pd.DataFrame, metric_col: str, ringed: np.ndarray):
+    """Ring edge colours of the ringed rows of one box (`sub`, boolean mask `ringed`):
+    graded by RING_SHADE_BY[metric_col] if `sub` carries that column, else RING_COLOR."""
+    col = RING_SHADE_BY.get(metric_col, (None, None))[0]
+    n = int(ringed.sum())
+    if col is None or col not in sub.columns:
+        return [RING_COLOR] * n
+    v = pd.to_numeric(sub[col], errors='coerce').to_numpy(dtype=float)[ringed]
+    lo, hi = np.nanmin(v), np.nanmax(v)
+    frac = (v - lo) / (hi - lo) if hi > lo else np.zeros(n)   # all tied: darkest
+    return [RING_COLOR if not np.isfinite(f) else to_hex(_RING_CMAP(f)) for f in frac]
+
+
+def _ring_col(df: pd.DataFrame, metric_col: str):
+    """The red-ring flag column of `metric_col` if `df` carries it (and its text is set), else None."""
+    col = RING_FLAGS.get(metric_col)
+    return col if col in df.columns and metric_col in _RING_TEXT else None
+
+
+def _has_neg_control(df: pd.DataFrame, metric_col: str) -> bool:
+    """True if `metric_col` gets a green-ring (negative control) plot for table `df`."""
+    return (metric_col in NEG_CONTROL_METRICS and metric_col in _NEG_RING_TEXT
+            and _ring_col(df, metric_col) is not None)
+
+
+def _ring_mask(df: pd.DataFrame, metric_col: str, neg: bool = False) -> pd.Series:
+    """Rows of `df` ringed red (neg=False: flag True) or green (neg=True: flag not True,
+    minus rows without NEG_CONTROL_KNOWN_COL if NEG_CONTROL_EXCLUDE_UNKNOWN)."""
+    flag = df[RING_FLAGS[metric_col]].fillna(False).astype(bool)
+    if not neg:
+        return flag
+    mask = ~flag
+    known = NEG_CONTROL_KNOWN_COL.get(metric_col)
+    if NEG_CONTROL_EXCLUDE_UNKNOWN and known in df.columns:
+        mask &= pd.to_numeric(df[known], errors='coerce').notna()
+    return mask
+
+
+def _draw_stats_split(ax_info, upper: list, lower: list):
+    """Stats text in two sections: `upper` (all points) above a black horizontal line,
+    `lower` (red-ringed points) below it, both at the bottom of the panel. Without
+    `lower`, the same as _draw_stats."""
+    if ax_info is None:
+        return
+    if not lower:
+        _draw_stats(ax_info, upper)
+        return
+    fig = ax_info.figure
+    kw = dict(fontsize=FS_STATS, va='bottom', ha='center', linespacing=1.3)
+    t_low = ax_info.text(0.5, 0.0, '\n'.join(lower), transform=ax_info.transAxes, **kw)
+    h_pt = t_low.get_window_extent(fig.canvas.get_renderer()).height * 72.0 / fig.dpi
+    gap_pt = 0.4 * STATS_LINE_IN * 72.0          # text <-> line, each side
+    y_line = h_pt + gap_pt
+    ax_info.add_line(Line2D([0.0, 1.0], [0.0, 0.0], color=PAL_BLACK, linewidth=BOX_LW,
+                            clip_on=False,
+                            transform=mtransforms.offset_copy(ax_info.transAxes, fig=fig,
+                                                              y=y_line, units='points')))
+    if upper:
+        ax_info.text(0.5, 0.0, '\n'.join(upper),
+                     transform=mtransforms.offset_copy(ax_info.transAxes, fig=fig,
+                                                       y=y_line + gap_pt, units='points'), **kw)
+
+
+def plot_metric(df: pd.DataFrame, metric_col: str, metric_label: str, out_path: str,
+                grp: Grouping, stats_lines=None, posthoc_df=None, ring_stats_lines=None,
+                ring_text: dict = None, neg_ring_stats_lines=None, ring_mode: str = None):
+    """Box plot + jittered points of one metric. With a red-ring flag (_ring_col), the
+    flagged points are ringed and the stats panel gets a second section under a black
+    line: the ring description + `ring_stats_lines` (tests on the ringed points only).
+    `ring_text` ({metric_col: (legend, stats line)}) overrides _RING_TEXT for this plot.
+    A plot with red rings is saved twice: without the rings to `out_path`, and with
+    them to `out_path` + CONTROL_SUFFIX (e.g. Full_peak_fr_control.png). Metrics with a
+    negative control (_has_neg_control) are saved three times: no rings, red rings
+    (+ POS_CONTROL_SUFFIX) and green rings around the other points (+ NEG_CONTROL_SUFFIX,
+    stats section from `neg_ring_stats_lines`).
+    ring_mode: None = save every version; 'none' / 'pos' / 'neg' = only that one, to out_path."""
+    if ring_mode is None:
+        if not _ring_col(df, metric_col):
+            ring_mode = 'none'
+        else:
+            kw = dict(stats_lines=stats_lines, posthoc_df=posthoc_df, ring_text=ring_text)
+            root, ext = os.path.splitext(out_path)
+            plot_metric(df, metric_col, metric_label, out_path, grp, ring_mode='none', **kw)
+            if _has_neg_control(df, metric_col):
+                plot_metric(df, metric_col, metric_label, f'{root}{NEG_CONTROL_SUFFIX}{ext}', grp,
+                            ring_mode='neg', ring_stats_lines=neg_ring_stats_lines, **kw)
+                pos_suffix = POS_CONTROL_SUFFIX
+            else:
+                pos_suffix = CONTROL_SUFFIX
+            plot_metric(df, metric_col, metric_label, f'{root}{pos_suffix}{ext}', grp,
+                        ring_mode='pos', ring_stats_lines=ring_stats_lines, **kw)
+            return
+    neg = ring_mode == 'neg'
+    rtext = {**_RING_TEXT, **(ring_text or {})}
+    if neg:
+        rtext = {**rtext, **_NEG_RING_TEXT}
+    present = []
+    subsets = {}
+    for g in grp.order:
+        sub = df.loc[df[grp.col] == g].copy()
+        sub[metric_col] = pd.to_numeric(sub[metric_col], errors='coerce')
+        sub = sub.dropna(subset=[metric_col])
+        if len(sub):
+            present.append(g)
+            subsets[g] = sub
+    if not present:
+        return
+
+    data = [subsets[g][metric_col].to_numpy(dtype=float) for g in present]
+    positions = np.arange(1, len(present) + 1)
+
+    # Red rings (RING_FLAGS): only if this table carries the flag column.
+    # Green rings (neg): the points that are not red-ringed (_ring_mask).
+    ring_col = _ring_col(df, metric_col) if ring_mode in ('pos', 'neg') else None
+    rings = ({g: _ring_mask(subsets[g], metric_col, neg=neg).to_numpy() for g in present}
+             if ring_col else {})
+    ring_word = 'Green' if neg else 'Red'
+    # Graded ring colours (RING_SHADE_BY, red rings only) if this table carries the value column.
+    shade_col, shade_name = RING_SHADE_BY.get(metric_col, (None, None))
+    ring_graded = bool(ring_col) and not neg and shade_col in df.columns
+
+    has_legend = metric_col in SIGNIFICANCE_METRICS
+    fig_w = _bar_fig_width(len(present))
+    if grp.shade:
+        stats_lines = list(stats_lines or []) + [
+            f'Point shade: the cell\'s {FULL_METRICS[SHADE_METRIC].lower()} '
+            f'({"rank" if SHADE_SCALE == "rank" else "value"} within this comparison), '
+            f'darker = higher']
+    stats_lines = _wrap_stats(stats_lines, fig_w)
+    ring_lines = []
+    if ring_col:
+        ring_body = ([f'{ring_word}-ringed points only:']
+                     + list(ring_stats_lines or ['no test (no ringed points)']))
+        if not grp.tests and not ring_stats_lines:
+            ring_body = []
+        shade_txt = (f' Ring shade: darker = lower {shade_name}, from the lowest (dark) to '
+                     f'the highest (light) ringed {shade_name} of each box.'
+                     if ring_graded else '')
+        ring_lines = _wrap_stats(
+            [rtext[metric_col][1] + shade_txt + ' Ringed: '
+             + ', '.join(f'{_label(g)} {int(rings[g].sum())}/{len(rings[g])}' for g in present)]
+            + ring_body, fig_w)
+    fig, ax, ax_info = _new_fig(
+        (fig_w, 5.5),
+        # + 1 line of room for the separator between the two sections
+        stats_lines=stats_lines + ([''] + ring_lines if ring_lines else []),
+        legend_rows=(len(_SIGNIFICANCE_LEGENDS[metric_col]) if has_legend else 0)
+                    + ((2 if ring_graded else 1) if ring_col else 0))
+
+    bp = ax.boxplot(data, positions=positions, showfliers=False,
+                     patch_artist=True, widths=0.55,
+                     boxprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
+                     whiskerprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
+                     capprops=dict(linewidth=BOX_LW, color=PAL_BLACK),
+                     medianprops=dict(linewidth=MEDIAN_LW, color=PAL_BLACK),
+                     zorder=2)
+    for patch, g in zip(bp['boxes'], present):
+        patch.set_facecolor(_color(g)['face'])
+        patch.set_edgecolor(PAL_BLACK)
+
+    rng = np.random.default_rng(0)
+    for pos, g, vals in zip(positions, present, data):
+        styles  = _point_styles(metric_col, subsets[g], g, grp.shade)
+        faces   = np.array([fc for fc, _m in styles])
+        markers = np.array([m for _fc, m in styles])
+        x = pos + rng.uniform(-0.12, 0.12, size=len(vals))
+        for m in dict.fromkeys(markers):
+            sel = markers == m
+            ax.scatter(x[sel], vals[sel], s=MARKER_SIZE.get(m, 30), marker=m,
+                       facecolors=faces[sel], edgecolors=PAL_BLACK, linewidths=POINT_EDGE_LW,
+                       zorder=3)
+        if ring_col and rings[g].any():
+            # Ring hugging the dot: a scatter marker's diameter is sqrt(s) points, the dot's
+            # black edge adds POINT_EDGE_LW, and the ring's line is centred on its path, so
+            # this diameter puts the ring's inner edge on the dot's outer edge.
+            d_dot = np.sqrt([MARKER_SIZE.get(m, 30) for m in markers[rings[g]]])
+            ax.scatter(x[rings[g]], vals[rings[g]],
+                       s=(d_dot + POINT_EDGE_LW + RING_LW + 2 * RING_GAP_PT) ** 2, marker='o',
+                       facecolors='none', linewidths=RING_LW, zorder=4,
+                       edgecolors=([NEG_RING_COLOR] * int(rings[g].sum()) if neg
+                                   else _ring_colors(subsets[g], metric_col, rings[g])))
+
+    # Significance lines above significantly different pairs of groups.
+    y_lo, y_hi = ax.get_ylim()
+    span = y_hi - y_lo
+    y_data_max = max(np.max(v) for v in data)
+    top = _draw_sig_brackets(ax, dict(zip(present, positions)), posthoc_df,
+                             y_base=y_data_max + 0.06 * span,
+                             y_step=0.10 * span, y_text=0.03 * span)
+    if top is not None:
+        ax.set_ylim(y_lo, max(y_hi, top + 0.08 * span))
+
+    def _ring_handle(color, label):
+        return Line2D([0], [0], marker='o', linestyle='None', markersize=10,
+                      markerfacecolor='none', markeredgecolor=color,
+                      markeredgewidth=RING_LW, label=label)
+    if not ring_col:
+        ring_handles = []
+    elif ring_graded:
+        ring_handles = [_ring_handle(RING_COLOR_DARK, f'{rtext[metric_col][0]}: lowest {shade_name}'),
+                        _ring_handle(RING_COLOR_LIGHT, f'highest ringed {shade_name} of the box')]
+    else:
+        ring_handles = [_ring_handle(NEG_RING_COLOR if neg else RING_COLOR, rtext[metric_col][0])]
+    if has_legend or ring_handles:
+        _add_significance_legend(ax_info, metric_col, _cell_color(present[0], 0.5),
+                                 extra_handles=ring_handles)
+    _draw_stats_split(ax_info, stats_lines, ring_lines)
+
+    tick_labels = [f'{_label(g)}\n(n={len(subsets[g])})' for g in present]
+    ax.set_xticks(positions)
+    ax.set_xticklabels(tick_labels)
+    ax.set_ylabel(textwrap.fill(metric_label, 30), fontsize=FS_LABEL, labelpad=8)
+    _set_title(ax, _titled(metric_label, grp))
+    _style_axes(ax)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+def run_all_comparisons(df: pd.DataFrame, metrics: dict, plot_prefix: str,
+                        grp: Grouping, plots_dir: str, ring_text: dict = None):
+    """`ring_text` ({metric_col: (legend, stats line)}) overrides _RING_TEXT for this
+    comparison (e.g. the per-box thresholds of flag_low_dwell_per_group)."""
+    rtext = {**_RING_TEXT, **(ring_text or {})}
+    all_desc, all_omnibus, all_posthoc = [], [], []
+    os.makedirs(plots_dir, exist_ok=True)
+    for col, label in metrics.items():
+        desc_df, omnibus, posthoc_df = compare_groups(df, col, label, grp)
+        all_desc.append(desc_df)
+        all_omnibus.append(omnibus)
+        if len(posthoc_df):
+            all_posthoc.append(posthoc_df)
+
+        # Red-ringed points only (V20): the same test (compare_groups) on the flagged
+        # rows; saved with the metric label '<label> (red-ringed only: ...)'.
+        ring_stats_lines = None
+        ring_col = _ring_col(df, col)
+        if ring_col:
+            ringed = df[df[ring_col].fillna(False).astype(bool)]
+            if len(ringed):
+                r_desc, r_omni, r_post = compare_groups(
+                    ringed, col, f'{label} (red-ringed only: {rtext[col][0]})', grp)
+                all_desc.append(r_desc)
+                all_omnibus.append(r_omni)
+                if len(r_post):
+                    all_posthoc.append(r_post)
+                ring_stats_lines = _continuous_stats_lines(r_desc, r_omni, r_post, grp)
+
+        # Negative control (NEG_CONTROL_METRICS): the same test on the points that are
+        # not red-ringed (green rings); metric label '<label> (green-ringed only: ...)'.
+        neg_ring_stats_lines = None
+        if _has_neg_control(df, col):
+            others = df[_ring_mask(df, col, neg=True)]
+            if len(others):
+                n_desc, n_omni, n_post = compare_groups(
+                    others, col, f'{label} (green-ringed only: {_NEG_RING_TEXT[col][0]})', grp)
+                all_desc.append(n_desc)
+                all_omnibus.append(n_omni)
+                if len(n_post):
+                    all_posthoc.append(n_post)
+                neg_ring_stats_lines = _continuous_stats_lines(n_desc, n_omni, n_post, grp)
+
+        plot_metric(df, col, label,
+                    os.path.join(plots_dir, f'{plot_prefix}_{col}.png'), grp,
+                    stats_lines=_continuous_stats_lines(desc_df, omnibus, posthoc_df, grp),
+                    posthoc_df=posthoc_df, ring_stats_lines=ring_stats_lines,
+                    ring_text=ring_text, neg_ring_stats_lines=neg_ring_stats_lines)
+
+    desc_df    = pd.concat(all_desc, ignore_index=True) if all_desc else pd.DataFrame()
+    omnibus_df = pd.DataFrame(all_omnibus)
+    posthoc_df = pd.concat(all_posthoc, ignore_index=True) if all_posthoc else pd.DataFrame()
+    return desc_df, omnibus_df, posthoc_df
+
+
+# ── Categorical (proportion) comparisons ────────────────────────────────────
+# Boolean/tri-state outcomes generated by the characterization pipeline
+# (theta modulation, shuffle/stability significance, speed modulation) that
+# weren't covered above because they're proportions, not continuous metrics.
+# Compared with a chi-square test of independence, then pairwise chi-square
+# tests between groups, Holm-Bonferroni corrected (_chi_square_tests).
+
+def _chi_square_tests(table: list, present: list, summary: str):
+    """Chi-square test of independence on the groups x categories count
+    `table`, then pairwise chi-square tests between every pair of groups
+    (Yates-corrected for 2 x 2 tables), Holm-Bonferroni corrected.
+    Categories with no counts are dropped. Returns (omnibus_dict,
+    posthoc_rows), or (None, []) if the table has < 2 groups or categories."""
+    arr = np.array(table, dtype=float)
+    arr = arr[:, arr.sum(axis=0) > 0] if arr.size else arr
+    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 2:
+        return None, []
+
+    chi2, p, dof, expected = stats.chi2_contingency(arr)
+    note = f'Chi-square (rows treated as independent): {summary}'
+    n_low = int((expected < 5).sum())
+    if n_low:
+        note += (f'; {n_low} of {expected.size} expected counts < 5, '
+                 f'chi-square approximation may be unreliable')
+    omni = {'test': 'Chi-square test of independence', 'stat_name': 'χ²',
+            'statistic': chi2, 'dof': dof, 'p_value': p, 'model_note': note}
+
+    rows = []
+    for i, j in combinations(range(len(present)), 2):
+        sub_t = arr[[i, j]]
+        sub_t = sub_t[:, sub_t.sum(axis=0) > 0]
+        if sub_t.shape[1] < 2:
+            c2, pp, d = np.nan, np.nan, np.nan
+        else:
+            c2, pp, d, _e = stats.chi2_contingency(sub_t)
+        rows.append({'comparison': f'{present[i]} vs {present[j]}',
+                     'test': 'Pairwise chi-square' + (' (Yates)' if sub_t.shape == (2, 2) else ''),
+                     'stat_name': 'χ²', 'statistic': c2, 'dof': d, 'p_raw': pp})
+    return omni, ccs._finish_posthoc(rows)
+
+
+def compare_categorical(df: pd.DataFrame, col: str, label: str, grp: Grouping):
+    """Descriptive counts, chi-square omnibus test and Holm-corrected pairwise
+    chi-square tests for one True/False outcome across the groups of `grp`."""
+    sub = df[df[grp.col].isin(grp.order)].copy()
+    sub['_y'] = sub[col].apply(_to_tri_bool)
+    sub = sub.dropna(subset=['_y'])
+    present = [g for g in grp.order if (sub[grp.col] == g).any()]
+    table = []
+    for g in present:
+        yg = sub.loc[sub[grp.col] == g, '_y'].astype(bool)
+        table.append([int(yg.sum()), int((~yg).sum())])
+    omni, posthoc_rows = (_chi_square_tests(table, present,
+                                            ccs.repetition_summary(sub, grp.col))
+                          if len(present) >= 2 else (None, []))
+    rows = [{'metric': label, grp.col: g, 'n': t + f, 'n_true': t, 'n_false': f,
+             'pct_true': 100.0 * t / (t + f)}
+            for g, (t, f) in zip(present, table)]
+    desc_df = pd.DataFrame(rows)
+
+    omnibus = {'metric': label, 'n_groups': len(present),
+               'groups': ', '.join(f'{g} (n={r["n"]})' for g, r in zip(present, rows))}
+
+    if omni is None:
+        omnibus.update({'test': 'insufficient data', 'statistic': np.nan,
+                         'p_value': np.nan, 'dof': np.nan, 'significant': False})
+        return desc_df, omnibus, pd.DataFrame()
+
+    omnibus.update(omni)
+    omnibus['significant'] = bool(pd.notna(omni['p_value']) and omni['p_value'] < ALPHA)
+    posthoc_df = pd.DataFrame([{'metric': label, **r} for r in posthoc_rows])
+    return desc_df, omnibus, posthoc_df
+
+
+def _set_percent_ylim(ax, pos_by_group: dict, posthoc_df, bar_top: float):
+    """Draw significance lines above 100 %-scale bars and extend the y-axis to
+    fit them, keeping the ticks at 0-100."""
+    top = _draw_sig_brackets(ax, pos_by_group, posthoc_df, y_base=bar_top + 4,
+                             y_step=8, y_text=3)
+    ax.set_ylim(0, 100 if top is None else max(100, top + 8))
+    ax.set_yticks(np.arange(0, 101, 20))
+
+
+def plot_categorical(df: pd.DataFrame, col: str, label: str, out_path: str,
+                     grp: Grouping, stats_lines=None, posthoc_df=None,
+                     ylabel: str = '% of cells'):
+    present, pct_true, ns = [], [], []
+    for g in grp.order:
+        sub = df.loc[df[grp.col] == g, col].apply(_to_tri_bool).dropna()
+        if len(sub) == 0:
+            continue
+        present.append(g)
+        ns.append(len(sub))
+        pct_true.append(100.0 * (sub == True).sum() / len(sub))  # noqa: E712
+    if not present:
+        return
+
+    fig_w = _bar_fig_width(len(present))
+    stats_lines = _wrap_stats(stats_lines, fig_w)
+    fig, ax, ax_info = _new_fig((fig_w, 5.5), stats_lines=stats_lines)
+    _draw_stats(ax_info, stats_lines)
+
+    positions = np.arange(len(present))
+    faces = [_color(g)['face'] for g in present]
+    ax.bar(positions, pct_true, color=faces, edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW,
+           width=BAR_WIDTH, zorder=2)
+
+    tick_labels = [f'{_label(g)}\n(n={n})' for g, n in zip(present, ns)]
+    ax.set_xticks(positions)
+    ax.set_xticklabels(tick_labels)
+    ax.set_ylabel(ylabel, fontsize=FS_LABEL, labelpad=8)
+    _set_percent_ylim(ax, dict(zip(present, positions)), posthoc_df, max(pct_true))
+    _set_title(ax, _titled(label, grp))
+    _style_axes(ax)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+def compare_speed_direction(df: pd.DataFrame, grp: Grouping):
+    """3-way (p-Speed / n-Speed / non-speed) classification from the final
+    speed score / speed_cell across the groups of `grp` -- a groups x 3
+    chi-square test with Holm-corrected pairwise chi-square tests, since
+    'speed direction' isn't a simple True/False outcome."""
+    label = 'Speed-direction classification (p-Speed / n-Speed / non-speed, % of place cells)'
+    categories = ['p', 'n', 'non']
+    sub = df[df[grp.col].isin(grp.order) & df['speed_class'].isin(categories)]
+    present = [g for g in grp.order if (sub[grp.col] == g).any()]
+    table = [[int(((sub[grp.col] == g) & (sub['speed_class'] == c)).sum())
+              for c in categories] for g in present]
+    omni, posthoc_rows = (_chi_square_tests(table, present,
+                                            ccs.repetition_summary(sub, grp.col))
+                          if len(present) >= 2 else (None, []))
+    rows = []
+    for g, (n_p, n_n, n_non) in zip(present, table):
+        n_total = n_p + n_n + n_non
+        rows.append({'metric': label, grp.col: g, 'n': n_total,
+                      'n_p_speed': n_p, 'n_n_speed': n_n, 'n_non_speed': n_non,
+                      'pct_p_speed': 100.0 * n_p / n_total,
+                      'pct_n_speed': 100.0 * n_n / n_total,
+                      'pct_non_speed': 100.0 * n_non / n_total})
+    desc_df = pd.DataFrame(rows)
+
+    omnibus = {'metric': label, 'n_groups': len(present),
+               'groups': ', '.join(f'{g} (n={r["n"]})' for g, r in zip(present, rows))}
+
+    if omni is None:
+        omnibus.update({'test': 'insufficient data', 'statistic': np.nan,
+                         'p_value': np.nan, 'dof': np.nan, 'significant': False})
+        return desc_df, omnibus, pd.DataFrame()
+
+    omnibus.update(omni)
+    omnibus['significant'] = bool(pd.notna(omni['p_value']) and omni['p_value'] < ALPHA)
+    posthoc_df = pd.DataFrame([{'metric': label, **r} for r in posthoc_rows])
+    return desc_df, omnibus, posthoc_df
+
+
+def plot_speed_direction(df: pd.DataFrame, out_path: str, grp: Grouping,
+                         stats_lines=None, posthoc_df=None):
+    present, pct_p, pct_n, pct_non, ns = [], [], [], [], []
+    for g in grp.order:
+        cls = df.loc[df[grp.col] == g, 'speed_class'].dropna()
+        n_total = len(cls)
+        if n_total == 0:
+            continue
+        n_p = int((cls == 'p').sum())
+        n_n = int((cls == 'n').sum())
+        present.append(g)
+        ns.append(n_total)
+        pct_p.append(100.0 * n_p / n_total)
+        pct_n.append(100.0 * n_n / n_total)
+        pct_non.append(100.0 * (n_total - n_p - n_n) / n_total)
+    if not present:
+        return
+
+    fig_w = _bar_fig_width(len(present))
+    stats_lines = _wrap_stats(stats_lines, fig_w)
+    fig, ax, ax_info = _new_fig((fig_w, 5.5), legend_rows=1, stats_lines=stats_lines)
+
+    positions = np.arange(len(present))
+    dark   = [_color(g)['dark']  for g in present]
+    light  = [_color(g)['light'] for g in present]
+    bottoms2 = [p + n for p, n in zip(pct_p, pct_n)]
+    bar_kw = dict(edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, width=BAR_WIDTH, zorder=2)
+    ax.bar(positions, pct_p, color=dark, label='p-Speed', **bar_kw)
+    ax.bar(positions, pct_n, bottom=pct_p, color=light, label='n-Speed', **bar_kw)
+    ax.bar(positions, pct_non, bottom=bottoms2, color=SIG_GRAY['face'],
+           label='non-speed', **bar_kw)
+
+    tick_labels = [f'{_label(g)}\n(n={n})' for g, n in zip(present, ns)]
+    ax.set_xticks(positions)
+    ax.set_xticklabels(tick_labels)
+    ax.set_ylabel('% of place cells', fontsize=FS_LABEL, labelpad=8)
+    _set_percent_ylim(ax, dict(zip(present, positions)), posthoc_df, 100)
+    _set_title(ax, _titled('Speed-direction classification (speed score)', grp))
+    _style_axes(ax)
+    handles, labels = ax.get_legend_handles_labels()
+    ax_info.legend(handles, labels, loc='upper center', fontsize=FS_LEGEND, ncol=3)
+    _draw_stats(ax_info, stats_lines)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+# ── Histograms by group ─────────────────────────────────────────────────────
+# Histogram plots of the place-cell characterization metrics, split by group
+# (arena type or session type), on the SAME place-cell populations analyzed
+# above.
+
+N_BINS   = 15
+
+SPEED_METRICS = {
+    'final_speed_score': 'Speed score',
+}
+HIST_FULL_METRICS = {k: v for k, v in FULL_METRICS.items() if k not in SPEED_METRICS}
+
+# Explicit p-type/n-type speed-cell colors (green/red) -- independent of the
+# per-group GROUP_COLORS palette used elsewhere.
+P_COLOR = {'face': PAL_GREEN, 'edge': PAL_BLACK}  # p-type (positive) speed cells
+N_COLOR = {'face': PAL_RED,   'edge': PAL_BLACK}  # n-type (negative) speed cells
+
+HIST_PANEL_W, HIST_PANEL_H = 3.6, 3.4   # size of one histogram panel (inches)
+
+
+def _new_panel_fig(n_pan: int, stats_lines=None):
+    """Figure with a row of `n_pan` histogram panels (one per group, as in the
+    Figure 3 histograms) on a shared x-axis, and a borderless panel underneath
+    for the stats text. Returns (fig, axes, ax_info)."""
+    info_h = len(stats_lines or []) * STATS_LINE_IN + 0.4
+    fig = plt.figure(figsize=(max(HIST_PANEL_W * n_pan, 7), HIST_PANEL_H + info_h))
+    gs = fig.add_gridspec(2, n_pan, height_ratios=[HIST_PANEL_H, info_h])
+    axes = []
+    for i in range(n_pan):
+        axes.append(fig.add_subplot(gs[0, i], sharex=axes[0] if axes else None))
+    ax_info = fig.add_subplot(gs[1, :])
+    ax_info.axis('off')
+    return fig, axes, ax_info
+
+
+def _hist_panel(ax, vals, bins, face: str):
+    """Solid histogram with thin white gaps between the bars, plus a dashed
+    line at the median labelled 'med=...' in the top-right corner."""
+    counts, _, _ = ax.hist(vals, bins=bins, color=face, edgecolor=BAR_EDGE,
+                           linewidth=BAR_EDGE_LW, zorder=2)
+    ax.set_ylim(0, max(counts.max(), 1) * 1.15)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    med = np.median(vals)
+    ax.axvline(med, color=PAL_BLACK, linestyle=(0, (3, 2)), linewidth=AXIS_LW, zorder=4)
+    ax.text(0.98, 0.99, f'med={med:.3g}', transform=ax.transAxes,
+            ha='right', va='top', fontsize=FS_MED)
+
+
+def plot_histogram_by_group(df: pd.DataFrame, metric_col: str, metric_label: str,
+                            out_path: str, grp: Grouping):
+    """One figure per metric: one histogram panel per group present, on
+    shared bins so the distributions are directly comparable."""
+    values = {}
+    for g in grp.order:
+        vals = pd.to_numeric(df.loc[df[grp.col] == g, metric_col],
+                              errors='coerce').dropna().to_numpy(dtype=float)
+        if len(vals):
+            values[g] = vals
+    if not values:
+        return
+
+    all_vals = np.concatenate(list(values.values()))
+    bins = np.histogram_bin_edges(all_vals, bins=N_BINS)
+
+    desc_df, omnibus, posthoc_df = compare_groups(df, metric_col, metric_label, grp)
+    stats_lines = _wrap_stats(_continuous_stats_lines(desc_df, omnibus, posthoc_df, grp),
+                              max(HIST_PANEL_W * len(values), 7))
+    fig, axes, ax_info = _new_panel_fig(len(values), stats_lines)
+
+    for ax, (g, vals) in zip(axes, values.items()):
+        _hist_panel(ax, vals, bins, _color(g)['face'])
+        ax.set_title(f'{_label(g)} (n={len(vals)})', fontsize=FS_LABEL, pad=10)
+        ax.set_xlabel(textwrap.fill(metric_label, 22), fontsize=FS_LABEL, labelpad=6)
+        _style_axes(ax)
+    axes[0].set_ylabel('Count', fontsize=FS_LABEL, labelpad=6)
+    _draw_stats(ax_info, stats_lines)
+    if grp.title:
+        fig.suptitle(grp.title, fontsize=FS_TITLE, fontweight='bold')
+
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+def _speed_type_masks(sub: pd.DataFrame):
+    """Boolean (p_mask, n_mask) numpy arrays for a sub-dataframe, from its
+    speed_class column."""
+    return (sub['speed_class'] == 'p').to_numpy(), (sub['speed_class'] == 'n').to_numpy()
+
+
+def plot_speed_histograms_by_group(df: pd.DataFrame, metric_col: str,
+                                   metric_label: str, out_path: str, grp: Grouping):
+    """Speed-score histogram restricted to speed cells (speed_cell ==
+    True), with one panel per group and p-type (green) / n-type (red)
+    speed cells stacked within each panel."""
+    passed = df['speed_class'].isin(['p', 'n'])
+
+    sub_all = df.loc[passed].copy()
+    sub_all[metric_col] = pd.to_numeric(sub_all[metric_col], errors='coerce')
+    sub_all = sub_all.dropna(subset=[metric_col])
+
+    present = [g for g in grp.order if (sub_all[grp.col] == g).any()]
+    if not present:
+        print(f'  No speed cells for {metric_label}; skipping plot.')
+        return
+
+    bins = np.histogram_bin_edges(sub_all[metric_col].to_numpy(dtype=float), bins=N_BINS)
+
+    # Stats text: descriptives per group and p/n type, then a
+    # Kruskal-Wallis / Mann-Whitney U (compare_groups)
+    # comparison of the pooled speed-modulated cells across groups.
+    split = {}
+    stats_lines = []
+    for g in present:
+        sub = sub_all.loc[sub_all[grp.col] == g]
+        p_mask, n_mask = _speed_type_masks(sub)
+        split[g] = (sub.loc[p_mask, metric_col].to_numpy(dtype=float),
+                    sub.loc[n_mask, metric_col].to_numpy(dtype=float))
+        for name, v in zip(('p-type', 'n-type'), split[g]):
+            stats_lines.append(f'{_label(g)} {name} (n={len(v)}): {_desc_str(v)}')
+    if grp.tests:
+        _, omnibus, posthoc_df = compare_groups(sub_all, metric_col, metric_label, grp)
+        stats_lines.append(f'Across {grp.noun} (all speed-modulated cells pooled):')
+        stats_lines += _test_lines(omnibus, posthoc_df)
+    elif not ALL_CELLS_SHOW_DESCRIPTIVES:
+        stats_lines = []
+
+    fig, axes, ax_info = _new_panel_fig(len(present), stats_lines)
+    _draw_stats(ax_info, stats_lines)
+
+    for ax, g in zip(axes, present):
+        sub = sub_all.loc[sub_all[grp.col] == g]
+        p_vals, n_vals = split[g]
+
+        ax.hist([p_vals, n_vals], bins=bins, stacked=True,
+                color=[P_COLOR['face'], N_COLOR['face']],
+                edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.set_title(f'{_label(g)}\n(n={len(sub)}: {len(p_vals)} p-type, {len(n_vals)} n-type)',
+                     fontsize=FS_LABEL, pad=10)
+        ax.set_xlabel(textwrap.fill(metric_label, 22), fontsize=FS_LABEL, labelpad=6)
+        _style_axes(ax)
+
+    axes[0].set_ylabel('Count', fontsize=FS_LABEL, labelpad=6)
+    handles = [Patch(facecolor=P_COLOR['face'], edgecolor='none', label='p-type speed cell'),
+               Patch(facecolor=N_COLOR['face'], edgecolor='none', label='n-type speed cell')]
+    fig.legend(handles=handles, loc='lower center', ncol=2, fontsize=FS_LEGEND,
+               bbox_to_anchor=(0.5, 1.0))
+    fig.suptitle(f'{_titled(metric_label, grp)}\n(speed cells only)',
+                 fontsize=FS_TITLE, y=1.2)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+# ── Temporal stability maps (from TemporalStabilityMap_v6_MapPassStability.py) ──
+
+_print_lock = threading.Lock()
+
+
+def _find_tracking_csv(dirpath: str) -> str | None:
+    """Same tracking-file selection as PlaceCell_Main_v21's batch scan."""
+    tracking = [f for f in os.listdir(dirpath) if f.lower().endswith(('.csv', '.xlsx'))]
+    if pc.COORD_UNITS == 'cm':
+        tracking = [f for f in tracking if f.lower().endswith('_cm.csv')]
+    else:
+        tracking = [f for f in tracking if not f.lower().endswith('_cm.csv')]
+    return os.path.join(dirpath, tracking[0]) if len(tracking) == 1 else None
+
+
+def _visit_stats(flat_bin: np.ndarray, dt_frames: np.ndarray, spike_frame: np.ndarray,
+                 n_bins: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-bin visit counts on the moving-only frame sequence.
+
+    A visit starts whenever the bin index differs from the previous frame and
+    lasts until the animal leaves that bin. A visit 'fired' if >= 1 spike was
+    assigned (nearest frame) to one of its frames. Visits shorter than
+    MIN_VISIT_S are dropped.
+
+    Returns (n_visits, n_visits_fired), each of length n_bins.
+    """
+    if flat_bin.size == 0:
+        return np.zeros(n_bins, dtype=np.int64), np.zeros(n_bins, dtype=np.int64)
+
+    starts = np.flatnonzero(np.r_[True, flat_bin[1:] != flat_bin[:-1]])
+    ends   = np.r_[starts[1:] - 1, flat_bin.size - 1]
+    visit_bin = flat_bin[starts]
+    visit_dur = np.add.reduceat(dt_frames, starts)
+
+    spk = np.sort(spike_frame)
+    n_spk = (np.searchsorted(spk, ends, side='right')
+             - np.searchsorted(spk, starts, side='left'))
+
+    keep = visit_dur >= MIN_VISIT_S
+    n_visits = np.bincount(visit_bin[keep], minlength=n_bins)
+    n_fired  = np.bincount(visit_bin[keep & (n_spk > 0)], minlength=n_bins)
+    return n_visits, n_fired
+
+
+def _pass_stats(in_field: np.ndarray, dt_frames: np.ndarray,
+                spike_frame: np.ndarray) -> tuple[int, int]:
+    """Passes through one field on the moving-only frame sequence.
+
+    `in_field` is True on frames inside any bin of the field. A pass is one
+    contiguous run of True frames (entry -> exit through any bin). Passes
+    shorter than MIN_PASS_S, or touching the first / last frame (entry or exit
+    not observed), are dropped. A pass is stable if >= MIN_SPIKES_PER_PASS
+    spikes were assigned (nearest frame) to its frames.
+
+    Returns (n_passes, n_passes_with_min_spikes).
+    """
+    if not in_field.any():
+        return 0, 0
+    edges  = np.diff(np.r_[0, in_field.astype(np.int8), 0])
+    starts = np.flatnonzero(edges == 1)
+    ends   = np.flatnonzero(edges == -1) - 1
+    cum_dt = np.r_[0.0, np.cumsum(dt_frames)]
+    dur    = cum_dt[ends + 1] - cum_dt[starts]
+
+    spk = np.sort(spike_frame)
+    n_spk = (np.searchsorted(spk, ends, side='right')
+             - np.searchsorted(spk, starts, side='left'))
+
+    keep = (dur >= MIN_PASS_S) & (starts > 0) & (ends < in_field.size - 1)
+    return int(keep.sum()), int((keep & (n_spk >= MIN_SPIKES_PER_PASS)).sum())
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Smallest value at which the cumulative weight (values sorted ascending)
+    reaches half the total weight. NaN if the weights sum to 0."""
+    total = weights.sum()
+    if total <= 0:
+        return np.nan
+    order = np.argsort(values, kind='stable')
+    cum_w = np.cumsum(weights[order])
+    return float(values[order][np.searchsorted(cum_w, 0.5 * total)])
+
+
+def _field_bins(bin_coords: str, is_circle: bool) -> list[tuple[int, ...]]:
+    """bin_coords string -> list of bin tuples: (bx, by) for 2-D, (bt,) for Circle."""
+    if is_circle:
+        return [(int(b),) for b in bin_coords.split(';')]
+    return [tuple(int(v) for v in pair.split('-')) for pair in bin_coords.split(';')]
+
+
+def _contour_field(ax, field_mask: np.ndarray, bin_cm: float, upsample: int = 8) -> None:
+    """Outline a 2-D field mask along bin edges on a cm-extent imshow. The mask
+    is padded (so fields touching the grid edge still close) and upsampled (so
+    the contour follows bin edges instead of cutting corners between centres)."""
+    up = np.kron(np.pad(field_mask.astype(float), 1), np.ones((upsample, upsample)))
+    xc = ((np.arange(up.shape[0]) + 0.5) / upsample - 1) * bin_cm
+    yc = ((np.arange(up.shape[1]) + 0.5) / upsample - 1) * bin_cm
+    ax.contour(xc, yc, up.T, levels=[0.5], colors='black', linewidths=1.2)
+
+
+def _colorbar(fig, ax, mappable, label: str) -> None:
+    """Colorbar matched to the axes height (thin linear-track maps included)."""
+    cax = make_axes_locatable(ax).append_axes('right', size='3%', pad=0.1)
+    fig.colorbar(mappable, cax=cax, label=label)
+
+
+def _mark_peak(ax, x: float, y: float) -> None:
+    """White star on the raw-ratemap peak bin (x, y in the axes' data units)."""
+    ax.plot(x, y, marker='*', color='white', markeredgecolor='black', markersize=14,
+            linestyle='none')
+
+
+def _plot_rate(ax, fig, rate: np.ndarray, valid: np.ndarray, extent: list, title: str):
+    im = ax.imshow(np.ma.masked_where(~valid, rate).T, origin='lower', extent=extent,
+                   cmap='jet', interpolation='nearest')
+    _colorbar(fig, ax, im, 'firing rate (Hz)')
+    ax.set_title(title)
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+
+
+def _plot_stability_2d(ax, fig, pct: np.ndarray, field_mask: np.ndarray,
+                       valid: np.ndarray, extent: list):
+    gray = np.ma.masked_where(~(valid & ~field_mask), np.ones_like(pct))
+    ax.imshow(gray.T, origin='lower', extent=extent,
+              cmap=ListedColormap([NON_FIELD_COLOR]), interpolation='nearest')
+    im = ax.imshow(np.ma.masked_where(~field_mask, pct).T, origin='lower', extent=extent,
+                   cmap=STABILITY_CMAP, vmin=0, vmax=100, interpolation='nearest')
+    _colorbar(fig, ax, im, '% visits with >= 1 spike')
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+
+
+def _plot_stability_ring(ax, fig, pct: np.ndarray, field_mask: np.ndarray,
+                         valid: np.ndarray, ctx_circ: dict):
+    """Angular analogue of _plot_stability_2d, drawn as a ring like
+    PlaceCell_Main_v21._plot_ratemap_ring."""
+    n_theta, bw = ctx_circ['n_bins_theta'], ctx_circ['bin_width_rad']
+    r_min, r_max = ctx_circ['r_min'], ctx_circ['r_max']
+    theta_mesh, r_mesh = np.meshgrid(np.arange(n_theta + 1) * bw, [r_min, r_max])
+
+    gray = np.ma.masked_where(~(valid & ~field_mask), np.ones(n_theta)).reshape(1, n_theta)
+    ax.pcolormesh(theta_mesh, r_mesh, gray, cmap=ListedColormap([NON_FIELD_COLOR]),
+                  shading='flat')
+    field = np.ma.masked_where(~field_mask, pct).reshape(1, n_theta)
+    mesh = ax.pcolormesh(theta_mesh, r_mesh, field, cmap=STABILITY_CMAP,
+                         vmin=0, vmax=100, shading='flat')
+    fig.colorbar(mesh, ax=ax, label='% visits with >= 1 spike', fraction=0.046, pad=0.1)
+    ax.set_theta_zero_location('E')
+    ax.set_theta_direction(1)
+    ax.set_ylim(0, r_max * 1.1)
+    ax.set_rticks([])
+
+
+def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
+    """Temporal stability map for one place cell.
+
+    Returns (cell_row, field_rows, bin_rows); cell_row is None if skipped.
+    """
+    idx, total, dirpath, unit = args
+    session  = os.path.relpath(dirpath, TS_PLACE_CELL_FOLDER)
+    ntt_path = os.path.join(dirpath, unit)
+    with _print_lock:
+        print(f'[{idx}/{total}]  {session}  |  {unit}')
+
+    csv_path = _find_tracking_csv(dirpath)
+    if csv_path is None:
+        with _print_lock:
+            print(f'  [SKIP] no single tracking file found in {dirpath}')
+        return None, [], []
+
+    metrics, ctx = pc.compute_metrics(csv_path, ntt_path, pc.arena_width_cm, pc.target_bin_cm)
+    if not ctx or not ctx['valid_mask'].any():
+        with _print_lock:
+            print(f'  [SKIP] no valid occupancy for {unit}')
+        return None, [], []
+
+    bin_cm      = pc.target_bin_cm
+    n_bx, n_by  = ctx['n_bins_x'], ctx['n_bins_y']
+    is_circle   = pc._is_circle_arena(dirpath)
+    arena_type  = 'Circle' if is_circle else '2D'
+    spike_frame = ctx['spike_frame']
+
+    # ── Place fields + the bin sequence / grid they are defined on ───────────
+    # Same detection as PlaceCell_Main_v21._run_job (Circle track: angular bins).
+    if is_circle:
+        ctx_circ  = pc._build_ratemap_circular(ctx, bin_cm)
+        fields, _ = pc.detect_place_fields_threshold_circular(ctx_circ, bin_cm)
+        flat_bin  = ctx_circ['beh_bt']
+        grid      = (ctx_circ['n_bins_theta'],)
+        valid     = ctx_circ['valid_mask']
+        occ       = ctx_circ['occ_map']
+    else:
+        ctx_circ  = None
+        fields, _ = pc.detect_place_fields_threshold_2d(metrics, ctx, bin_cm)
+        flat_bin  = ctx['beh_bx'] * n_by + ctx['beh_by']
+        grid      = (n_bx, n_by)
+        valid     = ctx['valid_mask']
+        occ       = ctx['occ_map']
+
+    if not fields:
+        with _print_lock:
+            print(f'  [NO FIELD] no place field detected for {unit}; field metrics are NaN')
+
+    field_mask = np.zeros(grid, dtype=bool)
+    field_id   = np.zeros(grid, dtype=np.int64)       # field_number per bin, 0 = no field
+    for f in fields:
+        for bn in _field_bins(f['bin_coords'], is_circle):
+            field_mask[bn] = True
+            field_id[bn]   = f['field_number']
+
+    # ── Visits per bin + fraction with >= 1 spike ────────────────────────────
+    n_visits, n_fired = _visit_stats(flat_bin, ctx['dt_frames'], spike_frame, int(np.prod(grid)))
+    n_visits = n_visits.reshape(grid)
+    n_fired  = n_fired.reshape(grid)
+    spk_bins = np.bincount(flat_bin[spike_frame], minlength=int(np.prod(grid))).reshape(grid)
+
+    pct = np.full(grid, np.nan)
+    has_visits = field_mask & (n_visits > 0)
+    pct[has_visits] = 100.0 * n_fired[has_visits] / n_visits[has_visits]
+
+    # ── Temporal stability at the raw-ratemap peak bin ───────────────────────
+    # Peak over all valid bins of the RAW (unsmoothed) ratemap, first bin on ties.
+    # Circle track: the raw angular map (spikes / occupancy per angular bin, as in
+    # PlaceCell_Main_v21._ratemap_circular). The peak need not lie in a field.
+    if is_circle:
+        raw_rate = np.zeros(grid)
+        np.divide(spk_bins, occ, out=raw_rate, where=valid)
+    else:
+        raw_rate = ctx['fr_raw']
+    peak_bn = tuple(int(b) for b in
+                    np.unravel_index(np.argmax(np.where(valid, raw_rate, -np.inf)), grid))
+    peak_pct = (100.0 * n_fired[peak_bn] / n_visits[peak_bn]) if n_visits[peak_bn] else np.nan
+
+    # ── Tables ────────────────────────────────────────────────────────────────
+    bin_rows = []
+    for bn in zip(*np.nonzero(field_mask)):
+        row = {'session': session, 'unit': unit, 'arena_type': arena_type,
+               'field_number': int(field_id[bn])}
+        if is_circle:
+            row['bin_theta'] = int(bn[0])
+        else:
+            row['bin_x'], row['bin_y'] = int(bn[0]), int(bn[1])
+        row.update({'n_visits': int(n_visits[bn]), 'n_visits_with_spike': int(n_fired[bn]),
+                    'pct_visits_with_spike': round(float(pct[bn]), 2) if has_visits[bn] else np.nan,
+                    'n_spikes': int(spk_bins[bn]), 'occupancy_s': round(float(occ[bn]), 3)})
+        bin_rows.append(row)
+
+    occ_map_total = float(occ[valid].sum())                # dwell (s) over the whole ratemap
+
+    def _summary(mask: np.ndarray) -> dict:
+        p = pct[mask & has_visits]
+        w = occ[mask & has_visits]                         # dwell time (s) per bin
+        v, fired = int(n_visits[mask].sum()), int(n_fired[mask].sum())
+        n_pass, n_pass_ok = _pass_stats(mask.ravel()[flat_bin], ctx['dt_frames'], spike_frame)
+        return {'n_field_bins': int(mask.sum()),
+                'mean_pct_across_bins':   round(float(np.mean(p)), 2)   if p.size else np.nan,
+                'median_pct_across_bins': round(float(np.median(p)), 2) if p.size else np.nan,
+                'occ_wmean_pct_across_bins':
+                    round(float(np.sum(p * w) / w.sum()), 2) if w.sum() > 0 else np.nan,
+                'occ_wmedian_pct_across_bins': round(_weighted_median(p, w), 2),
+                'occ_wmean_pct_mapnorm':
+                    round(float(np.sum(p * w) / occ_map_total), 2)
+                    if occ_map_total > 0 and w.sum() > 0 else np.nan,
+                'occupancy_s_field_bins': round(float(occ[mask].sum()), 3),
+                'n_visits_total': v, 'n_visits_with_spike_total': fired,
+                'pooled_pct_visits_with_spike': round(100.0 * fired / v, 2) if v else np.nan,
+                'n_passes': n_pass, 'n_passes_with_min_spikes': n_pass_ok,
+                'lap_stability_score': round(n_pass_ok / n_pass, 3) if n_pass else np.nan}
+
+    field_rows = [{'session': session, 'unit': unit, 'arena_type': arena_type,
+                   'field_number': int(fn), **_summary(field_id == fn)}
+                  for fn in sorted(np.unique(field_id[field_mask]))]
+    cell_row = {'session': session, 'unit': unit, 'arena_type': arena_type,
+                'n_fields': len(field_rows), 'n_spikes': metrics.get('n_spikes'),
+                'peak_fr': metrics.get('peak_fr'), 'mean_fr': metrics.get('mean_fr'),
+                'sir': metrics.get('sir'), **_summary(field_mask)}
+    field_laps = [fr['lap_stability_score'] for fr in field_rows
+                  if not np.isnan(fr['lap_stability_score'])]
+    cell_row['mean_lap_stability_across_fields'] = (round(float(np.mean(field_laps)), 3)
+                                                    if field_laps else np.nan)
+
+    # Whole-map occupancy-weighted stability: every visited valid bin, in or out of a field.
+    map_bins = valid & (n_visits > 0)
+    p_map = 100.0 * n_fired[map_bins] / n_visits[map_bins]
+    w_map = occ[map_bins]
+    cell_row.update({'n_map_bins_visited': int(map_bins.sum()),
+                     'occupancy_s_map': round(occ_map_total, 3),
+                     'occ_wmean_pct_all_bins':
+                         round(float(np.sum(p_map * w_map) / w_map.sum()), 2)
+                         if w_map.sum() > 0 else np.nan})
+    if is_circle:
+        cell_row['peak_bin_theta'] = peak_bn[0]
+    else:
+        cell_row['peak_bin_x'], cell_row['peak_bin_y'] = peak_bn
+    cell_row.update({'peak_raw_fr': round(float(raw_rate[peak_bn]), 3),
+                     'peak_bin_in_field': bool(field_mask[peak_bn]),
+                     'peak_bin_n_visits': int(n_visits[peak_bn]),
+                     'peak_bin_n_visits_with_spike': int(n_fired[peak_bn]),
+                     'pct_at_peak_bin': round(float(peak_pct), 2)})
+
+    # ── Dwell at the bin behind peak_fr (V20) ────────────────────────────────
+    # PlaceCell_Main_v21's peak_fr is the max of its FIRING_RATE_RATEMAP_TYPE map
+    # ('raw') over the 2-D grid -- for every arena, the Circle track included -- so
+    # the bin is taken from that map (first bin on ties) and its dwell (s) from the
+    # raw, moving-only occupancy map.
+    fr_pk, valid_pk = ctx['fr_firing'], ctx['firing_valid']
+    if valid_pk.any():
+        pk = np.unravel_index(np.argmax(np.where(valid_pk, fr_pk, -np.inf)), fr_pk.shape)
+        cell_row.update({'peak_fr_bin_x': int(pk[0]), 'peak_fr_bin_y': int(pk[1]),
+                         'peak_fr_bin_rate_hz': round(float(fr_pk[pk]), 4),
+                         'peak_fr_bin_dwell_s': round(float(ctx['occ_map'][pk]), 4),
+                         'peak_fr_bin_n_tied': int((valid_pk & (fr_pk == fr_pk[pk])).sum())})
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    # Wide arenas (linear track) stack the four panels vertically; others sit in one row.
+    aspect = n_by / n_bx
+    if aspect < 0.5:
+        n_rows, n_cols = 4, 1
+        fig = Figure(figsize=(14, 4 * (14 * aspect + 1.5) + 1))
+    else:
+        n_rows, n_cols = 1, 4
+        fig = Figure(figsize=(26, 6.5))
+    FigureCanvasAgg(fig)
+    extent = [0, n_bx * bin_cm, 0, n_by * bin_cm]
+
+    ax_traj = fig.add_subplot(n_rows, n_cols, 1)
+    ax_traj.plot(ctx['x_cm_all'], ctx['y_cm_all'], color='0.6', linewidth=0.5, label='trajectory')
+    ax_traj.plot(ctx['x_cm'][spike_frame], ctx['y_cm'][spike_frame], '.', color='red',
+                 markersize=3, label='spikes')
+    ax_traj.set_xlim(extent[0], extent[1])
+    ax_traj.set_ylim(extent[2], extent[3])
+    ax_traj.set_aspect('equal', adjustable='box')
+    ax_traj.set_xlabel('x (cm)')
+    ax_traj.set_ylabel('y (cm)')
+    ax_traj.set_title('Trajectory + spikes')
+    ax_traj.legend(loc='upper right', ncol=2, fontsize=8)
+    make_axes_locatable(ax_traj).append_axes('right', size='3%', pad=0.1).axis('off')  # align with maps
+
+    ax_raw = fig.add_subplot(n_rows, n_cols, 2)
+    _plot_rate(ax_raw, fig, ctx['fr_raw'], ctx['valid_mask'], extent, 'Raw ratemap')
+    ax_smooth = fig.add_subplot(n_rows, n_cols, 3)
+    _plot_rate(ax_smooth, fig, ctx['fr_smooth'], ctx['valid_mask'], extent,
+               f'Gaussian-smoothed (sigma = {pc.GAUSSIAN_SIGMA_CM:g} cm)')
+
+    stab_title = 'Temporal stability (field bins)' if fields else 'No place field detected'
+    if is_circle:
+        assert ctx_circ is not None
+        ax_stab = fig.add_subplot(n_rows, n_cols, 4, projection='polar')
+        _plot_stability_ring(ax_stab, fig, pct, field_mask, valid, ctx_circ)
+        _mark_peak(ax_stab, (peak_bn[0] + 0.5) * ctx_circ['bin_width_rad'],
+                   0.5 * (ctx_circ['r_min'] + ctx_circ['r_max']))
+        stab_title += ', angular'
+    else:
+        ax_stab = fig.add_subplot(n_rows, n_cols, 4)
+        _plot_stability_2d(ax_stab, fig, pct, field_mask, valid, extent)
+        for fn in np.unique(field_id[field_mask]):
+            for ax in (ax_raw, ax_smooth, ax_stab):
+                _contour_field(ax, field_id == fn, bin_cm)
+        for ax in (ax_raw, ax_stab):
+            _mark_peak(ax, (peak_bn[0] + 0.5) * bin_cm, (peak_bn[1] + 0.5) * bin_cm)
+    ax_stab.set_title(f'{stab_title}\n* = raw-ratemap peak bin: {cell_row["pct_at_peak_bin"]}% '
+                      f'of {cell_row["peak_bin_n_visits"]} visits')
+
+    # Lap stability label on each field (2-D: bin centroid; Circle: circular-mean angle).
+    for fr in field_rows:
+        bins = np.argwhere(field_id == fr['field_number'])
+        if is_circle:
+            assert ctx_circ is not None
+            ang = (bins[:, 0] + 0.5) * ctx_circ['bin_width_rad']
+            xy = (np.angle(np.mean(np.exp(1j * ang))) % (2 * np.pi),
+                  0.5 * (ctx_circ['r_min'] + ctx_circ['r_max']))
+        else:
+            xy = tuple((bins.mean(axis=0) + 0.5) * bin_cm)
+        ax_stab.annotate(f"F{fr['field_number']}: {fr['n_passes_with_min_spikes']}/{fr['n_passes']}"
+                         f" = {fr['lap_stability_score']}", xy=xy, ha='center', va='center',
+                         fontsize=8, fontweight='bold',
+                         bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='black', alpha=0.8))
+
+    ntt_name = os.path.splitext(unit)[0]
+    lap_line = '  |  '.join(f"F{fr['field_number']}: {fr['n_passes_with_min_spikes']}/"
+                            f"{fr['n_passes']} passes = {fr['lap_stability_score']}"
+                            for fr in field_rows) or 'no fields'
+    fig.suptitle(f"{session}  |  {ntt_name}\n"
+                 f"{cell_row['n_fields']} field(s), {cell_row['n_field_bins']} bins  |  "
+                 f"mean across bins = {cell_row['mean_pct_across_bins']}%, "
+                 f"median = {cell_row['median_pct_across_bins']}%, "
+                 f"occ-weighted mean = {cell_row['occ_wmean_pct_across_bins']}%, "
+                 f"occ-weighted median = {cell_row['occ_wmedian_pct_across_bins']}%, "
+                 f"pooled = {cell_row['pooled_pct_visits_with_spike']}% of "
+                 f"{cell_row['n_visits_total']} visits with >= 1 spike\n"
+                 f"Lap stability (passes with >= {MIN_SPIKES_PER_PASS} spikes): {lap_line}  ||  "
+                 f"all fields pooled = {cell_row['lap_stability_score']}, "
+                 f"mean across fields = {cell_row['mean_lap_stability_across_fields']}",
+                 fontsize=10)
+    fig.tight_layout()
+
+    save_dir = os.path.join(dirpath, TEMPORAL_STABILITY_SUBDIR)
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'{ntt_name}_temporal_stability.png')
+    fig.savefig(save_path, dpi=150)
+    with _print_lock:
+        print(f'  [SAVED] {save_path}')
+
+    return cell_row, field_rows, bin_rows
+
+
+def run_ts_maps() -> pd.DataFrame:
+    """Temporal stability map for every .ntt under TS_PLACE_CELL_FOLDER; writes
+    OUTPUT_DIR\\TS_RESULTS_XLSX and returns its PerCell table."""
+    jobs = []
+    for dirpath, _, filenames in os.walk(TS_PLACE_CELL_FOLDER):
+        jobs += [(dirpath, unit) for unit in sorted(filenames) if unit.lower().endswith('.ntt')]
+    job_args = [(i, len(jobs), *job) for i, job in enumerate(jobs, start=1)]
+    print(f'Found {len(jobs)} place cell(s) in {TS_PLACE_CELL_FOLDER}\n')
+
+    results = []
+    # The maps keep the full axes box (the stats-plot style above hides the top
+    # and right spines).
+    with matplotlib.rc_context({'axes.spines.top': True, 'axes.spines.right': True}), \
+            concurrent.futures.ThreadPoolExecutor(max_workers=TS_MAX_WORKERS) as executor:
+        futures = {executor.submit(_ts_run_cell, a): a for a in job_args}
+        for future in concurrent.futures.as_completed(futures):
+            a = futures[future]
+            try:
+                results.append((a[0], future.result()))
+            except Exception as e:
+                print(f'  ERROR in {a[2]} | {a[3]}: {e}')
+    results.sort(key=lambda r: r[0])
+
+    cell_rows  = [r[0] for _, r in results if r[0] is not None]
+    field_rows = [f for _, r in results for f in r[1]]
+    bin_rows   = [b for _, r in results for b in r[2]]
+
+    cell_df = pd.DataFrame(cell_rows)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    results_xlsx = os.path.join(OUTPUT_DIR, TS_RESULTS_XLSX)
+    with pd.ExcelWriter(results_xlsx, engine='openpyxl') as writer:
+        cell_df.to_excel(writer,                  sheet_name='PerCell',  index=False)
+        pd.DataFrame(field_rows).to_excel(writer, sheet_name='PerField', index=False)
+        pd.DataFrame(bin_rows).to_excel(writer,   sheet_name='PerBin',   index=False)
+
+    print(f'\nDone. {len(cell_rows)}/{len(jobs)} temporal stability map(s) plotted.')
+    print(f'Temporal stability results saved to {results_xlsx}')
+    return cell_df
+
+
+def build_temporal_stability_df() -> pd.DataFrame:
+    """PerCell temporal stability table computed here by run_ts_maps, tagged
+    with arena type, session type, animal and cell_id like the other dataframes."""
+    cell_df = run_ts_maps()
+    if cell_df.empty:
+        raise RuntimeError(f'No temporal stability results from the .ntt files under '
+                           f'{TS_PLACE_CELL_FOLDER}.')
+    return _tag_groups(cell_df, 'place cell(s) (temporal stability)')
+
+
+def _map_path(session: str, unit: str) -> str:
+    """Temporal stability figure written by _ts_run_cell for this cell."""
+    return os.path.join(TS_PLACE_CELL_FOLDER, session, TEMPORAL_STABILITY_SUBDIR,
+                        f'{os.path.splitext(unit)[0]}_temporal_stability.png')
+
+
+def _pick_examples(d: pd.DataFrame, n: int, metric: str) -> list[tuple[str, int, pd.Series]]:
+    """(category, rank, row) for the n best, n closest-to-mean and n worst rows
+    of d by `metric`. A cell is picked once: Best first, then Worst, then
+    Mean from the rest (small groups give fewer maps)."""
+    d = d.dropna(subset=[metric]).sort_values(
+        [metric, 'session', 'unit'], ascending=[False, True, True], kind='stable')
+    best  = d.head(n)
+    worst = d.drop(best.index).tail(n).iloc[::-1]
+    rest  = d.drop(best.index.union(worst.index))
+    mean  = rest.loc[(rest[metric] - d[metric].mean()).abs()
+                     .sort_values(kind='stable').index[:n]]
+    return [(cat, rank, row) for cat, part in (('Best', best), ('Mean', mean), ('Worst', worst))
+            for rank, (_, row) in enumerate(part.iterrows(), start=1)]
+
+
+def _save_example_maps(grp: Grouping, df: pd.DataFrame, out_dir: str, prefix: str,
+                       metric: str, map_path) -> None:
+    """Copy the best / mean / worst N_EXAMPLE_MAPS per-cell figures
+    (map_path(session, unit): temporal stability map or multi-peak ratemap) of
+    each group of `grp`, ranked by `metric`, into `out_dir` as
+    '<prefix>_<group>_<cat><rank>_...png', each with a banner naming the
+    animal, session, unit and its `metric` value."""
+    os.makedirs(out_dir, exist_ok=True)
+    unit_str = '%' if 'pct' in metric else ''
+    for g in grp.order:
+        d = df[df[grp.col] == g]
+        group_mean = d[metric].mean()
+        for cat, rank, row in _pick_examples(d, N_EXAMPLE_MAPS, metric):
+            src = map_path(row['session'], row['unit'])
+            if not os.path.isfile(src):
+                print(f'  [SKIP example] map not found: {src}')
+                continue
+            img = imread(src)
+            h_in, w_in = img.shape[0] / 150, img.shape[1] / 150   # maps are saved at dpi=150
+            banner_in = 1.0
+            fig = Figure(figsize=(w_in, h_in + banner_in))
+            FigureCanvasAgg(fig)
+            ax = fig.add_axes((0, 0, 1, h_in / (h_in + banner_in)))
+            ax.imshow(img)
+            ax.axis('off')
+            ntt_name = os.path.splitext(row['unit'])[0]
+            fig.text(0.5, 1 - 0.5 * banner_in / (h_in + banner_in),
+                     f'{grp.title}  |  {_label(g)}  |  {cat} {rank} of {N_EXAMPLE_MAPS}  |  '
+                     f'Animal: {row["animal"]}  |  Session: {row["session"]}  |  Unit: {ntt_name}\n'
+                     f'{metric} = {row[metric]:.2f}{unit_str}  '
+                     f'({_label(g)} mean = {group_mean:.2f}{unit_str})',
+                     ha='center', va='center', fontsize=14, fontweight='bold')
+            session_tag = '_'.join(p for p in str(row['session']).replace('/', '\\').split('\\') if p)
+            fig.savefig(os.path.join(out_dir, f'{prefix}_{g}_{cat}{rank}_{session_tag}_{ntt_name}.png'),
+                        dpi=150)
+    print(f'Example maps ({prefix}) saved to {out_dir}')
+
+
+# ── Place-field dimension maps ──────────────────────────────────────────────
+
+_FD_LINE_STYLES = {   # (label, line colour, outline colour)
+    'max': ('max width', 'white', 'black'),
+    'min': ('min width', 'black', 'white'),
+}
+
+
+def _fd_run_cell(args) -> bool:
+    """Field dimension figure for one place cell: its Gaussian-smoothed
+    full-session ratemap (PlaceCell_Main_v21.compute_metrics, same bins, values
+    and colour scale as the 'Gaussian-smoothed' panel of its ratemap figure),
+    field bins in colour, the cell's other visited bins gray, each field
+    outlined with its max- and min-width lines (PlaceFieldShape_Utils).
+    `cell_fields` are the cell's 'PlaceFields' rows. Returns True if saved."""
+    idx, total, session, unit, cell_fields = args
+    dirpath  = os.path.join(FD_PLACE_CELL_FOLDER, session)
+    ntt_path = os.path.join(dirpath, unit)
+    with _print_lock:
+        print(f'[{idx}/{total}]  {session}  |  {unit}')
+    if not os.path.isfile(ntt_path):
+        with _print_lock:
+            print(f'  [SKIP] .ntt not found: {ntt_path}')
+        return False
+    csv_path = _find_tracking_csv(dirpath)
+    if csv_path is None:
+        with _print_lock:
+            print(f'  [SKIP] no single tracking file found in {dirpath}')
+        return False
+
+    _, ctx = pc.compute_metrics(csv_path, ntt_path, pc.arena_width_cm, pc.target_bin_cm)
+    if not ctx or not ctx['valid_mask'].any():
+        with _print_lock:
+            print(f'  [SKIP] no valid occupancy for {unit}')
+        return False
+
+    bin_cm     = pc.target_bin_cm
+    n_bx, n_by = ctx['n_bins_x'], ctx['n_bins_y']
+    rate, valid = ctx['fr_smooth'], ctx['valid_mask']
+
+    field_id = np.zeros((n_bx, n_by), dtype=np.int64)    # field_number per bin, 0 = no field
+    mismatch = []
+    for _, f in cell_fields.iterrows():
+        bins = np.array(_field_bins(f['bin_coords'], False))
+        if (bins[:, 0] >= n_bx).any() or (bins[:, 1] >= n_by).any():
+            with _print_lock:
+                print(f'  [SKIP] field {f["field_number"]} lies outside the rebuilt '
+                      f'{n_bx} x {n_by} bin grid of {unit}')
+            return False
+        field_id[bins[:, 0], bins[:, 1]] = int(f['field_number'])
+        # The Excel field peak is the max of the Gaussian-smoothed map over its bins.
+        if abs(rate[bins[:, 0], bins[:, 1]].max() - float(f['peak_fr_hz'])) > 0.002:
+            mismatch.append(int(f['field_number']))
+    field_mask = field_id > 0
+    if mismatch:
+        with _print_lock:
+            print(f'  [WARN] {session} | {unit}: rebuilt ratemap peak != Excel peak_fr_hz '
+                  f'in field(s) {mismatch} (check the PlaceCell_Main_v21 settings)')
+
+    aspect = n_by / n_bx
+    fig_w  = 14.0 if aspect < 0.5 else 9.0
+    n_text = 2 + len(cell_fields) + bool(mismatch)
+    fig = Figure(figsize=(fig_w, fig_w * 0.85 * aspect + 1.2 + 0.25 * n_text))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(1, 1, 1)
+    extent = [0, n_bx * bin_cm, 0, n_by * bin_cm]
+
+    # Colour scale of the full-session map (min / max over all valid bins), so a
+    # field bin has exactly the colour it has in the cell's ratemap figure.
+    vmin, vmax = float(rate[valid].min()), float(rate[valid].max())
+    gray = np.ma.masked_where(~(valid & ~field_mask), np.ones_like(rate))
+    ax.imshow(gray.T, origin='lower', extent=extent,
+              cmap=ListedColormap([NON_FIELD_COLOR]), interpolation='nearest')
+    im = ax.imshow(np.ma.masked_where(~(valid & field_mask), rate).T, origin='lower',
+                   extent=extent, cmap='jet', vmin=vmin, vmax=vmax, interpolation='nearest')
+    _colorbar(fig, ax, im, 'firing rate (Hz), Gaussian-smoothed')
+
+    lines = []
+    centre = np.array([extent[1], extent[3]]) / 2.0
+    for _, f in cell_fields.iterrows():
+        fn = int(f['field_number'])
+        _contour_field(ax, field_id == fn, bin_cm)
+        seg = pfs.field_width_lines(f['bin_coords'])
+        if seg['min_calipers'] is not None:
+            for cal in seg['min_calipers'] * bin_cm:
+                ax.plot(cal[:, 0], cal[:, 1], color='black', linewidth=0.9, linestyle=(0, (4, 2)),
+                        zorder=3, clip_on=False)
+        for key, (_, color, edge) in _FD_LINE_STYLES.items():
+            xy = seg[key] * bin_cm
+            ax.plot(xy[:, 0], xy[:, 1], color=color, linewidth=2.2, solid_capstyle='butt',
+                    marker='o', markersize=3.5, zorder=4, clip_on=False,
+                    path_effects=[path_effects.withStroke(linewidth=4.2, foreground=edge)])
+        # Label at the max-line end nearer the map centre, offset towards the centre.
+        ends = seg['max'] * bin_cm
+        end = ends[np.argmin(np.hypot(*(ends - centre).T))]
+        off = np.sign(centre - end) * 6
+        ax.annotate(f'F{fn}', xy=end, xytext=tuple(off), textcoords='offset points', fontsize=9,
+                    fontweight='bold', zorder=5, ha='left' if off[0] >= 0 else 'right',
+                    va='bottom' if off[1] >= 0 else 'top',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='black', alpha=0.8))
+        lines.append(f'F{fn}: max {f["fld_max_width_cm"]:.1f} cm, min {f["fld_min_width_cm"]:.1f} cm, '
+                     f'ratio {f["fld_width_ratio"]:.2f}, axes {f["fld_axis_angle_deg"]:.0f} deg apart, '
+                     f'{int(f["n_bins"])} bins, peak {f["peak_fr_hz"]:.2f} Hz')
+
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_xlabel('x (cm)')
+    ax.set_ylabel('y (cm)')
+    handles = [Line2D([], [], color=color, linewidth=2.2, marker='o', markersize=3.5,
+                      path_effects=[path_effects.withStroke(linewidth=4.2, foreground=edge)],
+                      label=label)
+               for label, color, edge in _FD_LINE_STYLES.values()]
+    handles.append(Line2D([], [], color='black', linewidth=0.9, linestyle=(0, (4, 2)),
+                          label='parallel lines enclosing the field (min width apart)'))
+    handles.append(Patch(facecolor=NON_FIELD_COLOR, edgecolor='black', label='outside the fields'))
+    ax.legend(handles=handles, loc='lower left', bbox_to_anchor=(0, 1.01), ncol=4,
+              fontsize=8, frameon=False)
+
+    ntt_name = os.path.splitext(unit)[0]
+    title = [f'{session}  |  {ntt_name}  |  {len(cell_fields)} field(s)', *lines]
+    if mismatch:
+        title.append(f'WARNING: rebuilt ratemap peak != Excel peak in field(s) {mismatch}')
+    fig.suptitle('\n'.join(title), fontsize=9)
+    fig.tight_layout()
+
+    save_dir = os.path.join(dirpath, FIELD_DIM_SUBDIR)
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'{ntt_name}_field_dimensions.png')
+    fig.savefig(save_path, dpi=150)
+    with _print_lock:
+        print(f'  [SAVED] {save_path}')
+    return True
+
+
+def run_field_dimension_maps() -> None:
+    """Field dimension figure (_fd_run_cell) for every place cell of
+    FD_FIELDS_EXCEL with a 2-D field, its fields' shape from
+    PlaceFieldShape_Utils. Circle-track fields are 1-D and have no widths, so
+    Circle cells are skipped."""
+    print(f'\nField dimension maps: fields from {FD_FIELDS_EXCEL}')
+    full   = pd.read_excel(FD_FIELDS_EXCEL, sheet_name='Full')
+    fields = pfs.add_field_shape(pd.read_excel(FD_FIELDS_EXCEL, sheet_name='PlaceFields'))
+    place = full[full['place_cell'].apply(_to_bool)][['session', 'unit']].drop_duplicates()
+    f = fields.merge(place, on=['session', 'unit'], how='inner')
+    n_1d = f.loc[f['fld_max_width_bins'].isna(), ['session', 'unit']].drop_duplicates()
+    f = f.dropna(subset=['fld_max_width_bins'])
+    cells = list(f.groupby(['session', 'unit'], sort=True))
+    print(f'{len(cells)} place cell(s) with 2-D fields '
+          f'({len(n_1d)} with 1-D Circle-track fields skipped)')
+
+    job_args = [(i, len(cells), s, u, d.sort_values('field_number'))
+                for i, ((s, u), d) in enumerate(cells, start=1)]
+    n_saved = 0
+    with matplotlib.rc_context({'axes.spines.top': True, 'axes.spines.right': True}), \
+            concurrent.futures.ThreadPoolExecutor(max_workers=FD_MAX_WORKERS) as executor:
+        futures = {executor.submit(_fd_run_cell, a): a for a in job_args}
+        for future in concurrent.futures.as_completed(futures):
+            a = futures[future]
+            try:
+                n_saved += bool(future.result())
+            except Exception as e:
+                print(f'  ERROR in {a[2]} | {a[3]}: {e}')
+    print(f'Done. {n_saved}/{len(cells)} field dimension map(s) saved in '
+          f'<session>\\{FIELD_DIM_SUBDIR}\\ under {FD_PLACE_CELL_FOLDER}')
+
+
+# ── Multi-peak: ratemap reconstruction (copied from PlaceCell_Main, CPU only) ─
+
+def _mp_bin_visit_counts(flat_idx: np.ndarray, n_bins: int) -> np.ndarray:
+    """Number of visits per bin: a visit starts whenever the animal enters a bin
+    (first frame, or bin index differs from the previous frame)."""
+    flat_idx = np.asarray(flat_idx)
+    if flat_idx.size == 0:
+        return np.zeros(n_bins, dtype=np.int64)
+    starts = np.ones(flat_idx.size, dtype=bool)
+    starts[1:] = flat_idx[1:] != flat_idx[:-1]
+    return np.bincount(flat_idx[starts], minlength=n_bins)
+
+
+def _mp_valid_bin_mask(occ: np.ndarray, visits: np.ndarray) -> np.ndarray:
+    """Valid bins under the enabled criteria (MP_USE_MIN_OCC_S / MP_USE_MIN_VISITS)."""
+    mask = occ > 0
+    if MP_USE_MIN_OCC_S:
+        mask &= occ >= MP_MIN_OCC_S
+    if MP_USE_MIN_VISITS:
+        mask &= visits >= MP_MIN_VISITS
+    return mask
+
+
+def _mp_gaussian_kernel(sigma_bins: float) -> np.ndarray:
+    """2D Gaussian kernel, sigma given in bins, truncated at 3 sigma."""
+    radius = max(1, int(np.ceil(3 * sigma_bins)))
+    ax = np.arange(-radius, radius + 1)
+    xx, yy = np.meshgrid(ax, ax, indexing='ij')
+    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma_bins ** 2))
+    kernel /= kernel.sum()
+    return kernel
+
+
+def _mp_gaussian_kernel_1d(sigma_bins: float) -> np.ndarray:
+    """1D Gaussian kernel, sigma given in bins, truncated at 3 sigma."""
+    radius = max(1, int(np.ceil(3 * sigma_bins)))
+    ax = np.arange(-radius, radius + 1)
+    kernel = np.exp(-(ax ** 2) / (2 * sigma_bins ** 2))
+    kernel /= kernel.sum()
+    return kernel
+
+
+def _mp_gaussian_smooth(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
+    """Gaussian smoothing restricted to valid bins, edge-corrected by dividing
+    the convolved rates by the convolved mask."""
+    kernel = _mp_gaussian_kernel(MP_GAUSSIAN_SIGMA_CM / bin_cm)
+    fr_in   = np.where(valid_mask, fr_map, 0.0)
+    mask_in = valid_mask.astype(np.float64)
+    smoothed_fr      = convolve(fr_in,   kernel, mode='constant', cval=0.0)
+    smoothed_weights = convolve(mask_in, kernel, mode='constant', cval=0.0)
+
+    smoothed = np.zeros_like(smoothed_fr)
+    valid_weights = smoothed_weights > 0
+    smoothed[valid_weights] = smoothed_fr[valid_weights] / smoothed_weights[valid_weights]
+    smoothed[~valid_mask] = 0.0
+    return smoothed
+
+
+def _mp_gaussian_smooth_circular(fr_map: np.ndarray, valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
+    """Gaussian smoothing on a 1D angular rate map, padded by wrapping (the
+    track is a closed loop)."""
+    kernel = _mp_gaussian_kernel_1d(MP_GAUSSIAN_SIGMA_CM / bin_cm)
+    kr = kernel.shape[0] // 2
+    n_theta = fr_map.shape[0]
+
+    fr_pad   = np.pad(np.where(valid_mask, fr_map, 0.0), (kr, kr), mode='wrap')
+    mask_pad = np.pad(valid_mask.astype(np.float64),     (kr, kr), mode='wrap')
+    smoothed_fr      = convolve(fr_pad,   kernel, mode='constant', cval=0.0)[kr:kr + n_theta]
+    smoothed_weights = convolve(mask_pad, kernel, mode='constant', cval=0.0)[kr:kr + n_theta]
+
+    smoothed = np.zeros_like(smoothed_fr)
+    valid_weights = smoothed_weights > 0
+    smoothed[valid_weights] = smoothed_fr[valid_weights] / smoothed_weights[valid_weights]
+    smoothed[~valid_mask] = 0.0
+    return smoothed
+
+
+def _mp_load_tracking(csv_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load, clean, and pixel→cm-convert one tracking file (same as
+    PlaceCell_Main._load_tracking, full session). Returns (x_cm, y_cm, t_us)."""
+    data = (pd.read_excel(csv_path) if csv_path.lower().endswith('.xlsx')
+            else pd.read_csv(csv_path))
+
+    if MP_COORD_UNITS == 'cm':
+        t = np.asarray(data.iloc[:, 0], dtype=float)
+        x = np.asarray(data.iloc[:, 3], dtype=float)
+        y = np.asarray(data.iloc[:, 4], dtype=float)
+    else:
+        x = np.asarray(data['x'],    dtype=float)
+        y = np.asarray(data['y'],    dtype=float)
+        t = np.asarray(data['time'], dtype=float)
+
+    mask = ~np.isin(x, [1, -1])
+    x, y, t = x[mask], y[mask], t[mask]
+
+    if len(t) >= 2:
+        if MP_COORD_UNITS == 'cm':
+            units_per_cm = 1.0
+        else:
+            x_span = np.percentile(x, 99.5) - np.percentile(x, 0.5)
+            y_span = np.percentile(y, 99.5) - np.percentile(y, 0.5)
+            units_per_cm = max(x_span, y_span) / MP_ARENA_WIDTH_CM
+        jump_thresh_per_us = MP_POS_JUMP_THRESH_CMS * units_per_cm * 1e-6
+
+        dt_step   = np.diff(t)
+        dxy_step  = np.hypot(np.diff(x), np.diff(y))
+        valid_step = dt_step > 0
+        speed_step = np.zeros_like(dxy_step)
+        speed_step[valid_step] = dxy_step[valid_step] / dt_step[valid_step]
+
+        speed    = np.append(speed_step, speed_step[-1])
+        valid_dt = np.append(valid_step, valid_step[-1])
+
+        keep = np.where(valid_dt & (speed < jump_thresh_per_us))[0]
+        x, y, t = x[keep], y[keep], t[keep]
+
+    order = np.argsort(t)
+    x, y, t = x[order], y[order], t[order]
+
+    if len(t) == 0:
+        return x.astype(np.float64), y.astype(np.float64), t.astype(np.float64)
+
+    if MP_COORD_UNITS == 'cm':
+        x_cm = x - x.min()
+        y_cm = y - y.min()
+    else:
+        px_per_cm = max(x.max() - x.min(), y.max() - y.min()) / MP_ARENA_WIDTH_CM
+        x_cm = (x - x.min()) / px_per_cm
+        y_cm = (y - y.min()) / px_per_cm
+
+    return x_cm, y_cm, t
+
+
+def _mp_smooth_tracking_position(x_cm: np.ndarray, y_cm: np.ndarray,
+                              t_us: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Iterative jump removal, linear interpolation over artifact frames, then
+    Gaussian smoothing (same as PlaceCell_Main._smooth_tracking_position)."""
+    n = len(x_cm)
+    if n < 2:
+        return x_cm.copy(), y_cm.copy()
+
+    bad = np.zeros(n, dtype=bool)
+    for _ in range(n):
+        good_idx = np.where(~bad)[0]
+        if len(good_idx) < 2:
+            break
+        dt_good = np.diff(t_us[good_idx]) * 1e-6
+        with np.errstate(invalid='ignore', divide='ignore'):
+            step_speed = np.hypot(np.diff(x_cm[good_idx]), np.diff(y_cm[good_idx])) / dt_good
+        step_speed[dt_good <= 0] = 0.0
+
+        newly_bad = step_speed > MP_POS_JUMP_THRESH_CMS
+        if not newly_bad.any():
+            break
+        bad[good_idx[1:][newly_bad]] = True
+
+    good_idx = np.where(~bad)[0]
+    if len(good_idx) == 0 or len(good_idx) == n:
+        x_clean, y_clean = x_cm.copy(), y_cm.copy()
+    else:
+        x_clean = np.interp(t_us, t_us[good_idx], x_cm[good_idx])
+        y_clean = np.interp(t_us, t_us[good_idx], y_cm[good_idx])
+
+    x_smooth = gaussian_filter1d(x_clean, sigma=MP_POS_SMOOTH_SIGMA_SMP, mode='nearest')
+    y_smooth = gaussian_filter1d(y_clean, sigma=MP_POS_SMOOTH_SIGMA_SMP, mode='nearest')
+    return x_smooth, y_smooth
+
+
+def _mp_instantaneous_speed(x_cm: np.ndarray, y_cm: np.ndarray, t_us: np.ndarray) -> np.ndarray:
+    """Per-frame running speed (cm/s); the last frame gets the second-last frame's speed."""
+    dt_s = np.diff(t_us) * 1e-6
+    with np.errstate(invalid='ignore', divide='ignore'):
+        speed = np.hypot(np.diff(x_cm), np.diff(y_cm)) / dt_s
+    speed[dt_s <= 0] = np.nan
+    return np.append(speed, speed[-1])
+
+
+def _mp_load_session_track(csv_path: str) -> dict | None:
+    """Tracking part of PlaceCell_Main.compute_metrics (steps 1-3), shared by
+    every unit of a session: cleaned + smoothed position, per-frame occupancy
+    time, immobility mask and position bins."""
+    x_cm, y_cm, t = _mp_load_tracking(csv_path)
+    if len(t) == 0:
+        return None
+    x_cm, y_cm = _mp_smooth_tracking_position(x_cm, y_cm, t)
+
+    dt_frames     = np.empty(len(t), dtype=np.float64)
+    dt_frames[0]  = 1.0 / MP_FPS
+    dt_frames[1:] = np.minimum(np.diff(t) * 1e-6, 2.0 / MP_FPS)
+
+    if len(t) >= 2:
+        moving = ~(_mp_instantaneous_speed(x_cm, y_cm, t) < MP_IMMOBILITY_SPEED_CMS)   # NaN speed kept
+    else:
+        moving = np.ones(len(t), dtype=bool)
+    if not moving.any():
+        return None
+
+    n_bins_x = max(1, int(np.ceil(x_cm.max() / MP_BIN_CM)))
+    n_bins_y = max(1, int(np.ceil(y_cm.max() / MP_BIN_CM)))
+    beh_bx = np.clip((x_cm / MP_BIN_CM).astype(int), 0, n_bins_x - 1)
+    beh_by = np.clip((y_cm / MP_BIN_CM).astype(int), 0, n_bins_y - 1)
+
+    return dict(x_cm=x_cm, y_cm=y_cm, t=t, dt_frames=dt_frames, moving=moving,
+                beh_bx=beh_bx, beh_by=beh_by, n_bins_x=n_bins_x, n_bins_y=n_bins_y)
+
+
+def _mp_build_unit_ratemap(track: dict, ntt_path: str) -> dict:
+    """Spike part of PlaceCell_Main.compute_metrics (steps 4-7): 50 ms
+    nearest-frame assignment, immobility filter, occupancy / spike maps, valid
+    bins, raw and Gaussian-smoothed ratemaps (moving frames only)."""
+    t, moving = track['t'], track['moving']
+    n_bins_x, n_bins_y = track['n_bins_x'], track['n_bins_y']
+
+    spike_data = np.memmap(ntt_path, dtype=MP_NTT_DTYPE, mode='r', offset=16 * 1024)
+    spike_data = spike_data[spike_data['cell_number'] != 0]  # drop unsorted/discarded cluster 0
+    spike_ts   = np.sort(spike_data['timestamp'].astype(np.float64))
+
+    idx   = np.searchsorted(t, spike_ts, side='left')
+    idx_l = np.clip(idx - 1, 0, len(t) - 1)
+    idx_r = np.clip(idx,     0, len(t) - 1)
+    dist_l  = np.abs(spike_ts - t[idx_l])
+    dist_r  = np.abs(spike_ts - t[idx_r])
+    nearest = np.where(dist_l <= dist_r, idx_l, idx_r)
+    valid_spike  = np.minimum(dist_l, dist_r) <= MP_MAX_GAP_US
+    moving_spike = valid_spike & moving[nearest]
+
+    new_frame_idx = np.cumsum(moving) - 1
+    spike_frame   = new_frame_idx[nearest[moving_spike]]
+    beh_bx    = track['beh_bx'][moving]
+    beh_by    = track['beh_by'][moving]
+    dt_frames = track['dt_frames'][moving]
+
+    occ_map   = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    spike_map = np.zeros((n_bins_x, n_bins_y), dtype=np.float64)
+    np.add.at(occ_map,   (beh_bx, beh_by), dt_frames)
+    np.add.at(spike_map, (beh_bx[spike_frame], beh_by[spike_frame]), 1.0)
+
+    visit_map  = _mp_bin_visit_counts(beh_bx * n_bins_y + beh_by,
+                                   n_bins_x * n_bins_y).reshape(n_bins_x, n_bins_y)
+    valid_mask = _mp_valid_bin_mask(occ_map, visit_map)
+
+    fr_raw = np.zeros_like(occ_map)
+    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
+    fr_smooth = _mp_gaussian_smooth(fr_raw, valid_mask, MP_BIN_CM)
+
+    return dict(x_cm=track['x_cm'][moving], y_cm=track['y_cm'][moving],
+                x_cm_all=track['x_cm'], y_cm_all=track['y_cm'],
+                spike_frame=spike_frame, dt_frames=dt_frames,
+                occ_map=occ_map, spike_map=spike_map, valid_mask=valid_mask,
+                fr_raw=fr_raw, fr_smooth=fr_smooth,
+                n_bins_x=n_bins_x, n_bins_y=n_bins_y)
+
+
+def _mp_fit_ring_centre(x_cm: np.ndarray, y_cm: np.ndarray) -> tuple:
+    """Algebraic (Kasa) circle fit to the tracked positions -> (cx, cy)."""
+    A = np.column_stack([x_cm, y_cm, np.ones_like(x_cm)])
+    b = x_cm ** 2 + y_cm ** 2
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return sol[0] / 2.0, sol[1] / 2.0
+
+
+def _mp_build_ratemap_circular(ctx: dict) -> dict:
+    """1-D angular ratemap of the Circle track (same as
+    PlaceCell_Main._build_ratemap_circular)."""
+    x_cm, y_cm  = ctx['x_cm'], ctx['y_cm']
+    spike_frame = ctx['spike_frame']
+    dt_frames   = ctx['dt_frames']
+
+    cx, cy = _mp_fit_ring_centre(x_cm, y_cm)
+    r_cm        = np.hypot(x_cm - cx, y_cm - cy)
+    theta_0_2pi = np.mod(np.arctan2(y_cm - cy, x_cm - cx), 2.0 * np.pi)
+
+    r_min = float(np.percentile(r_cm, MP_RADIAL_RANGE_CLIP_PCTILE))
+    r_max = float(np.percentile(r_cm, 100.0 - MP_RADIAL_RANGE_CLIP_PCTILE))
+
+    bin_width_rad = MP_BIN_CM / max(float(np.median(r_cm)), 1e-6)
+    n_bins_theta  = max(1, int(round(2.0 * np.pi / bin_width_rad)))
+    bin_width_rad = 2.0 * np.pi / n_bins_theta
+
+    beh_bt = np.clip((theta_0_2pi / bin_width_rad).astype(int), 0, n_bins_theta - 1)
+
+    occ_map   = np.zeros(n_bins_theta, dtype=np.float64)
+    spike_map = np.zeros(n_bins_theta, dtype=np.float64)
+    np.add.at(occ_map,   beh_bt, dt_frames)
+    np.add.at(spike_map, beh_bt[spike_frame], 1.0)
+
+    valid_mask = _mp_valid_bin_mask(occ_map, _mp_bin_visit_counts(beh_bt, n_bins_theta))
+    fr_raw = np.zeros_like(occ_map)
+    fr_raw[valid_mask] = spike_map[valid_mask] / occ_map[valid_mask]
+    fr_smooth = _mp_gaussian_smooth_circular(fr_raw, valid_mask, MP_BIN_CM)
+
+    return dict(occ_map=occ_map, spike_map=spike_map,
+                valid_mask=valid_mask, fr_raw=fr_raw, fr_smooth=fr_smooth,
+                n_bins_theta=n_bins_theta, bin_width_rad=bin_width_rad,
+                r_min=r_min, r_max=r_max, track_width_cm=max(r_max - r_min, 0.0))
+
+
+# ── Multi-peak: KDE input ratemap (KDE_RATEMAP_TYPE) ────────────────────────
+# 2-D grid: copied from PlaceCell_Main (_mp_occ_weighted_smooth and the
+# Yartsev / Skaggs adaptive-disc ratemaps, CPU only).
+
+def _mp_occ_weighted_smooth(spike_map: np.ndarray, occ_map: np.ndarray,
+                         valid_mask: np.ndarray, bin_cm: float) -> np.ndarray:
+    """smooth(spikes) / smooth(occupancy), both restricted to valid bins."""
+    kernel = _mp_gaussian_kernel(MP_GAUSSIAN_SIGMA_CM / bin_cm)
+    spk_smooth = convolve(np.where(valid_mask, spike_map, 0.0), kernel, mode='constant', cval=0.0)
+    occ_smooth = convolve(np.where(valid_mask, occ_map,   0.0), kernel, mode='constant', cval=0.0)
+    rate = np.zeros_like(spk_smooth)
+    ok = valid_mask & (occ_smooth > 0)
+    rate[ok] = spk_smooth[ok] / occ_smooth[ok]
+    return rate
+
+
+@functools.lru_cache(maxsize=16)
+def _mp_adaptive_disc_geometry(n_bins_x: int, n_bins_y: int,
+                            max_rsq: int) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    """Grid geometry for the adaptive-disc ratemaps, cached per grid shape:
+    (pad, gather_idx, n_enclosed, disc_r_bins) -- see PlaceCell_Main."""
+    pad = int(np.floor(np.sqrt(max_rsq - 1)))
+    ax  = np.arange(-pad, pad + 1)
+    dx, dy = np.meshgrid(ax, ax, indexing='ij')
+    dx, dy = dx.ravel(), dy.ravel()
+    d2     = dx ** 2 + dy ** 2
+    keep   = d2 <= max_rsq - 1
+    order  = np.argsort(d2[keep], kind='stable')
+    dx, dy, d2 = dx[keep][order], dy[keep][order], d2[keep][order]
+
+    bx, by = np.meshgrid(np.arange(n_bins_x), np.arange(n_bins_y), indexing='ij')
+    px = bx.ravel()[None, :] + pad + dx[:, None]
+    py = by.ravel()[None, :] + pad + dy[:, None]
+    gather_idx = px * (n_bins_y + 2 * pad) + py
+
+    n_enclosed  = np.searchsorted(d2, np.arange(max_rsq), side='right')
+    disc_r_bins = np.sqrt(d2[n_enclosed - 1])
+    return pad, gather_idx, n_enclosed, disc_r_bins
+
+
+def _mp_adaptive_disc_sums(spike_map: np.ndarray, occ_map: np.ndarray,
+                        valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Spikes and occupancy inside every candidate disc of every bin:
+    (spk_disc, occ_disc, disc_r_bins), discs indexed by r^2 = 0..ADAPTIVE_MAX_RSQ-1."""
+    n_bins_x, n_bins_y = occ_map.shape
+    pad, gather_idx, n_enclosed, disc_r_bins = _mp_adaptive_disc_geometry(
+        n_bins_x, n_bins_y, MP_ADAPTIVE_MAX_RSQ)
+    spk_pad = np.pad(np.where(valid_mask, spike_map, 0.0), pad).ravel()
+    occ_pad = np.pad(np.where(valid_mask, occ_map,   0.0), pad).ravel()
+    spk_disc = np.cumsum(spk_pad[gather_idx], axis=0)[n_enclosed - 1]
+    occ_disc = np.cumsum(occ_pad[gather_idx], axis=0)[n_enclosed - 1]
+    return spk_disc, occ_disc, disc_r_bins
+
+
+def _mp_adaptive_rate_at(k: np.ndarray, spk_disc: np.ndarray, occ_disc: np.ndarray,
+                      valid_mask: np.ndarray) -> np.ndarray:
+    """Rate from the chosen disc index `k` of every (flattened) bin; bins whose
+    final disc holds < MP_ADAPTIVE_MIN_OCC_S of occupancy get rate 0. Works for
+    the 2-D grid and the 1-D angular map alike."""
+    cols    = np.arange(valid_mask.size)
+    spk_fin = spk_disc[k, cols].reshape(valid_mask.shape)
+    occ_fin = occ_disc[k, cols].reshape(valid_mask.shape)
+    rate = np.zeros(valid_mask.shape, dtype=np.float64)
+    ok = valid_mask & (occ_fin >= MP_ADAPTIVE_MIN_OCC_S)
+    rate[ok] = spk_fin[ok] / occ_fin[ok]
+    return rate
+
+
+def _mp_first_satisfied(satisfied: np.ndarray) -> np.ndarray:
+    """Index of the first disc meeting the criterion, else the largest disc."""
+    return np.where(satisfied.any(axis=0), satisfied.argmax(axis=0), satisfied.shape[0] - 1)
+
+
+def _mp_adaptive_ratemap(spike_map: np.ndarray, occ_map: np.ndarray, valid_mask: np.ndarray,
+                      spk_disc: np.ndarray, occ_disc: np.ndarray,
+                      disc_r_bins: np.ndarray, bin_cm: float) -> np.ndarray:
+    """Yartsev or Skaggs adaptive ratemap (KDE_RATEMAP_TYPE) from disc sums."""
+    if not valid_mask.any() or spike_map[valid_mask].sum() <= 0:
+        return np.zeros(valid_mask.shape, dtype=np.float64)
+    if KDE_RATEMAP_TYPE == 'Yartsev_adaptive_binned':
+        satisfied = occ_disc >= MP_YARTSEV_DISC_OCC_S
+    else:   # Skaggs & McNaughton 1998, r = disc radius + half a bin, in cm
+        r_cm = (disc_r_bins + 0.5) * bin_cm
+        satisfied = r_cm[:, None] * occ_disc * np.sqrt(spk_disc) >= MP_SKAGGS_ALPHA
+    return _mp_adaptive_rate_at(_mp_first_satisfied(satisfied), spk_disc, occ_disc, valid_mask)
+
+
+def _mp_kde_input_map_2d(ctx: dict) -> np.ndarray:
+    """KDE_RATEMAP_TYPE ratemap on the 2-D grid."""
+    if KDE_RATEMAP_TYPE == 'raw':
+        return ctx['fr_raw']
+    if KDE_RATEMAP_TYPE == 'gaussian_smooth':
+        return ctx['fr_smooth']
+    spike_map, occ_map, valid_mask = ctx['spike_map'], ctx['occ_map'], ctx['valid_mask']
+    if KDE_RATEMAP_TYPE == 'occ_weighted_smooth':
+        return _mp_occ_weighted_smooth(spike_map, occ_map, valid_mask, MP_BIN_CM)
+    spk_disc, occ_disc, disc_r_bins = _mp_adaptive_disc_sums(spike_map, occ_map, valid_mask)
+    return _mp_adaptive_ratemap(spike_map, occ_map, valid_mask,
+                             spk_disc, occ_disc, disc_r_bins, MP_BIN_CM)
+
+
+# 1-D angular map (Circle track): the same maps, with the disc replaced by an
+# interval of +-r bins along the track and smoothing / intervals wrapping
+# around the theta=0/2*pi seam. The interval grows in whole bins up to the
+# 2-D maximum radius, floor(sqrt(MP_ADAPTIVE_MAX_RSQ - 1)) bins.
+
+def _mp_kde_input_map_circular(cc: dict) -> np.ndarray:
+    """KDE_RATEMAP_TYPE ratemap on the 1-D angular map of the Circle track."""
+    if KDE_RATEMAP_TYPE == 'raw':
+        return cc['fr_raw']
+    if KDE_RATEMAP_TYPE == 'gaussian_smooth':
+        return cc['fr_smooth']
+    spike_map, occ_map, valid_mask = cc['spike_map'], cc['occ_map'], cc['valid_mask']
+    spk_in = np.where(valid_mask, spike_map, 0.0)
+    occ_in = np.where(valid_mask, occ_map,   0.0)
+    n = len(occ_map)
+
+    if KDE_RATEMAP_TYPE == 'occ_weighted_smooth':
+        kernel = _mp_gaussian_kernel_1d(MP_GAUSSIAN_SIGMA_CM / MP_BIN_CM)
+        kr = kernel.shape[0] // 2
+        spk_s = convolve(np.pad(spk_in, (kr, kr), mode='wrap'), kernel, mode='constant')[kr:kr + n]
+        occ_s = convolve(np.pad(occ_in, (kr, kr), mode='wrap'), kernel, mode='constant')[kr:kr + n]
+        rate = np.zeros(n)
+        ok = valid_mask & (occ_s > 0)
+        rate[ok] = spk_s[ok] / occ_s[ok]
+        return rate
+
+    r_max = min(int(np.floor(np.sqrt(MP_ADAPTIVE_MAX_RSQ - 1))), (n - 1) // 2)
+    spk_disc = np.empty((r_max + 1, n))
+    occ_disc = np.empty((r_max + 1, n))
+    spk_disc[0], occ_disc[0] = spk_in, occ_in
+    for r in range(1, r_max + 1):
+        spk_disc[r] = spk_disc[r - 1] + np.roll(spk_in, r) + np.roll(spk_in, -r)
+        occ_disc[r] = occ_disc[r - 1] + np.roll(occ_in, r) + np.roll(occ_in, -r)
+    return _mp_adaptive_ratemap(spike_map, occ_map, valid_mask, spk_disc, occ_disc,
+                             np.arange(r_max + 1, dtype=float), MP_BIN_CM)
+
+
+# ── Multi-peak: detection (KDE + watershed) ─────────────────────────────────
+
+def _watershed(values: np.ndarray, adj: list, seeds: list) -> np.ndarray:
+    """Marker-based watershed (priority flood, highest value first) over the
+    field nodes 0..len(values)-1. `adj[i]` lists node i's neighbours (indices
+    >= len(values) are outside the field and ignored); seeds[k] gets label k+1.
+    Each node takes the label of the basin that reaches it first while
+    descending the surface, so basins meet at the troughs."""
+    n_field = len(values)
+    labels = np.zeros(n_field, dtype=int)
+    heap = []
+    for k, s in enumerate(seeds, start=1):
+        labels[s] = k
+        heapq.heappush(heap, (-values[s], s))
+    while heap:
+        _, i = heapq.heappop(heap)
+        for j in adj[i]:
+            if j < n_field and labels[j] == 0:
+                labels[j] = labels[i]
+                heapq.heappush(heap, (-values[j], j))
+    return labels
+
+
+def _merge_levels(rate: np.ndarray, adj: list) -> np.ndarray:
+    """Union-find over the field bins in descending KDE order (0-D topological
+    persistence). For every bin, the KDE level at which the region it tops
+    merges into a region with a higher top, i.e. the trough that has to be
+    crossed to reach a higher peak. Non-peak bins merge at their own height;
+    the field's highest bin never merges (inf)."""
+    n_field = len(rate)
+    parent  = np.full(n_field, -1)
+    top     = np.arange(n_field)                 # highest bin of each root's region
+    merge   = np.full(n_field, np.inf)
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in np.argsort(-rate, kind='stable'):
+        parent[i] = i
+        for j in adj[i]:
+            if j >= n_field or parent[j] < 0:
+                continue
+            ri, rj = find(i), find(j)
+            if ri == rj:
+                continue
+            # Higher top survives; exact ties go to the lower bin index, the
+            # same order the local maxima are ranked in (_kde_multipeak).
+            ti, tj = top[ri], top[rj]
+            hi, lo = (ri, rj) if (rate[ti], -ti) >= (rate[tj], -tj) else (rj, ri)
+            merge[top[lo]] = rate[i]
+            parent[lo] = hi
+    return merge
+
+
+def _no_kde_result(n_field: int, w: np.ndarray, note: str) -> dict:
+    """Single-peak result for a field the KDE can't be fitted on (too few
+    non-zero-rate bins): the whole field is one sub-field, peak at the
+    highest raw-rate bin."""
+    peak = int(np.argmax(w))
+    return dict(rate=np.full(n_field, np.nan), labels=np.ones(n_field, dtype=int),
+                local_max=[peak], counted=[peak], trough_rel={peak: np.nan},
+                ref_hz=np.nan, peak_fallback=False, saddles={},
+                kde_axes='', kde_factor=np.nan, kde_neff=np.nan,
+                kde_bw_bins=np.array([np.nan]), kde_n_points=int((w > 0).sum()),
+                kde_note=note)
+
+
+def _kde_multipeak(pts_ext: np.ndarray, n_field: int, adj: list, w: np.ndarray) -> dict:
+    """KDE peak search + trough cut for one field.
+
+    pts_ext : (d, n_ext) bin-centre coordinates (in bins) -- the field's n_field
+              bins first, then a 1-bin ring around the field.
+    adj     : for each field bin, the indices (into pts_ext) of its neighbours.
+    w       : firing rate of each field bin in the KDE_RATEMAP_TYPE map (KDE weights).
+    """
+    d   = pts_ext.shape[0]
+    pos = w > 0
+    if pos.sum() < MIN_KDE_POINTS:
+        return _no_kde_result(n_field, w, f'{int(pos.sum())} non-zero-rate bin(s) < '
+                                          f'MIN_KDE_POINTS: no KDE, single peak')
+
+    # Collinear non-zero-rate bins (a 1-bin-wide strip, or too few points)
+    # make the 2-D covariance singular: fit a 1-D KDE along the field's long
+    # (first principal) axis instead.
+    X   = pts_ext[:, :n_field][:, pos]
+    cov = np.atleast_2d(np.cov(X, aweights=w[pos]))
+    evals, evecs = np.linalg.eigh(cov)
+    if evals.max() <= 0:
+        return _no_kde_result(n_field, w, 'all non-zero-rate bins at one location: no KDE, single peak')
+    if d > 1 and evals.min() <= 1e-6 * evals.max():
+        axis      = evecs[:, -1]
+        proj      = axis[None, :]
+        kde_axes  = f'long axis ({axis[0]:+.2f}, {axis[1]:+.2f})'
+    else:
+        proj      = np.eye(d)
+        kde_axes  = 'theta' if d == 1 else 'x,y'
+    kde = gaussian_kde(proj @ X, bw_method=KDE_BW_METHOD, weights=w[pos])
+
+    # Σ r_i K(x - x_i) with K integrating to 1 over one bin -> rate in Hz.
+    rate_ext = kde(proj @ pts_ext) * float(w.sum())
+    rate     = rate_ext[:n_field]
+
+    # Local maxima inside the field (>= every neighbour, ring bins included,
+    # so a field-edge bin only counts if the KDE really falls off outside it).
+    # Adjacent maxima can only be exact ties -- keep one of them.
+    cand = [i for i in range(n_field) if all(rate_ext[i] >= rate_ext[j] for j in adj[i])]
+    cand.sort(key=lambda i: -rate[i])
+    local_max = []
+    for i in cand:
+        if not any(i in adj[p] for p in local_max):
+            local_max.append(i)
+
+    # The KDE's maximum can sit just outside a non-convex field; then fall back
+    # to the field's highest KDE bin as its single peak.
+    peak_fallback = not local_max
+    if peak_fallback:
+        local_max = [int(np.argmax(rate))]
+
+    # A peak counts if it is tall enough AND a real trough separates it from
+    # every higher peak (trough_rel = deepest-needed crossing / own height).
+    merge      = _merge_levels(rate, adj)
+    ref_hz     = float(rate[local_max[0]])
+    trough_rel = {i: (np.nan if i == local_max[0] else float(merge[i] / rate[i]))
+                  for i in local_max}
+    counted = [local_max[0]] + [
+        i for i in local_max[1:]
+        if rate[i] >= PEAK_REL_HEIGHT_FRAC * ref_hz
+        and merge[i] < (1.0 - MIN_TROUGH_DIP_FRAC) * rate[i]]
+    labels  = _watershed(rate, adj, counted)
+
+    # Saddle between two touching sub-fields = highest crossing point between
+    # them (max over touching bin pairs of the lower of the two KDE values).
+    saddles: dict[tuple[int, int], float] = {}
+    for i in range(n_field):
+        for j in adj[i]:
+            if j < n_field and labels[i] and labels[j] and labels[i] < labels[j]:
+                key = (int(labels[i]), int(labels[j]))
+                saddles[key] = max(saddles.get(key, -np.inf), float(min(rate[i], rate[j])))
+
+    return dict(rate=rate, labels=labels, local_max=local_max, counted=counted,
+                trough_rel=trough_rel, ref_hz=ref_hz, peak_fallback=peak_fallback,
+                saddles=saddles, kde_axes=kde_axes, kde_factor=float(kde.factor),
+                kde_neff=float(kde.neff),
+                kde_bw_bins=np.sqrt(np.diag(np.atleast_2d(kde.covariance))),
+                kde_n_points=int(pos.sum()), kde_note='')
+
+
+def _analyse_field_2d(nodes: list, kde_map: np.ndarray) -> dict:
+    """KDE multi-peak analysis of one 2-D grid field (nodes = (bx, by) bins),
+    bins weighted by the KDE input ratemap `kde_map`."""
+    index = {n: k for k, n in enumerate(nodes)}
+    ext_nodes = list(nodes)
+    adj = []
+    for bx, by in nodes:
+        nbrs = []
+        for ddx in (-1, 0, 1):
+            for ddy in (-1, 0, 1):
+                if ddx == 0 and ddy == 0:
+                    continue
+                nb = (bx + ddx, by + ddy)
+                k = index.get(nb)
+                if k is None:                     # ring bin just outside the field
+                    k = len(ext_nodes)
+                    index[nb] = k
+                    ext_nodes.append(nb)
+                nbrs.append(k)
+        adj.append(nbrs)
+
+    pts_ext = np.asarray(ext_nodes, dtype=float).T + 0.5
+    idx = np.asarray(nodes)
+    return _kde_multipeak(pts_ext, len(nodes), adj, kde_map[idx[:, 0], idx[:, 1]])
+
+
+def _order_ring_run(bts: list) -> np.ndarray:
+    """Angular bins of one Circle field in track order: a field straddling the
+    theta=0/2*pi seam is rotated to start after its gap, so positions along
+    the returned array are contiguous."""
+    bts = np.sort(np.asarray(bts, dtype=int))
+    gaps = np.where(np.diff(bts) > 1)[0]
+    if len(gaps) == 0:
+        return bts
+    g = gaps[0]
+    return np.concatenate([bts[g + 1:], bts[:g + 1]])
+
+
+def _analyse_field_circular(ordered: np.ndarray, kde_map: np.ndarray) -> dict:
+    """KDE multi-peak analysis of one Circle field along the track (1-D,
+    positions 0..L-1 in track order, plus one ring bin at each end), bins
+    weighted by the KDE input angular ratemap `kde_map`."""
+    L = len(ordered)
+    pos_ext = np.concatenate([np.arange(L), [-1, L]]).astype(float) + 0.5
+    adj = [[i - 1 if i > 0 else L, i + 1 if i < L - 1 else L + 1] for i in range(L)]
+    return _kde_multipeak(pos_ext[None, :], L, adj, kde_map[ordered])
+
+
+def _join(vals, fmt='{:.4f}') -> str:
+    return ';'.join(fmt.format(v) for v in vals)
+
+
+def _analyse_cell(ctx: dict, cc: dict | None, fdf: pd.DataFrame,
+                  arena_type: str, session: str, unit: str) -> tuple[list, list, list]:
+    """Runs the multi-peak analysis on every field of one cell.
+    Returns (field_rows, sub_rows, plot_fields)."""
+    field_rows, sub_rows, plot_fields = [], [], []
+    circle = arena_type == 'Circle'
+
+    for _, f in fdf.sort_values('field_number').iterrows():
+        fn = int(f['field_number'])
+        coords = str(f['bin_coords'])
+
+        if circle:
+            n_theta = cc['n_bins_theta']
+            bw_rad  = cc['bin_width_rad']
+            bts = [int(b) for b in coords.split(';')]
+            if min(bts) < 0 or max(bts) >= n_theta:
+                raise ValueError(f'field {fn}: bin_coords outside the {n_theta}-bin angular map')
+            nodes = _order_ring_run(bts)
+            res   = _analyse_field_circular(nodes, cc['kde_in'])
+            pos   = np.arange(len(nodes), dtype=float)[:, None]   # position along the track (bins)
+            sm, raw = cc['fr_smooth'][nodes], cc['fr_raw'][nodes]
+            bin_str = [str(int(b)) for b in nodes]
+            theta_c = (nodes + 0.5) * bw_rad
+        else:
+            nodes = sorted(tuple(int(v) for v in p.split('-')) for p in coords.split(';'))
+            idx = np.asarray(nodes)
+            if (idx.min() < 0 or idx[:, 0].max() >= ctx['n_bins_x']
+                    or idx[:, 1].max() >= ctx['n_bins_y']):
+                raise ValueError(f'field {fn}: bin_coords outside the '
+                                 f'{ctx["n_bins_x"]}x{ctx["n_bins_y"]} ratemap grid')
+            res = _analyse_field_2d(nodes, ctx['kde_in'])
+            pos = idx.astype(float)
+            sm, raw = ctx['fr_smooth'][idx[:, 0], idx[:, 1]], ctx['fr_raw'][idx[:, 0], idx[:, 1]]
+            bin_str = [f'{bx}-{by}' for bx, by in nodes]
+
+        rate, labels, counted = res['rate'], res['labels'], res['counted']
+        ref_hz   = res['ref_hz']
+        n_peaks  = len(counted)
+        multi    = n_peaks >= 2
+        n_field  = len(nodes)
+
+        # Sanity check: the rebuilt smoothed map must reproduce PlaceCell_Main's
+        # field peak (peak_fr_hz, rounded to 4 dp in the Excel).
+        recomputed_peak = float(sm.max())
+        excel_peak      = float(f['peak_fr_hz'])
+        ratemap_check   = bool(np.isclose(recomputed_peak, excel_peak, rtol=1e-3, atol=1e-3))
+
+        peak_hz = [float(rate[c]) for c in counted]
+        troughs, separations = {}, {}
+        for (a, b), s in sorted(res['saddles'].items()):
+            troughs[(a, b)] = s / min(peak_hz[a - 1], peak_hz[b - 1])
+            # Distance between the two peaks either side of this trough (arc
+            # length along the track on the Circle; ~MP_BIN_CM per bin).
+            d_bins = float(np.hypot(*(pos[counted[a - 1]] - pos[counted[b - 1]]))) \
+                if pos.shape[1] == 2 else float(abs(pos[counted[a - 1], 0] - pos[counted[b - 1], 0]))
+            separations[(a, b)] = d_bins * MP_BIN_CM
+
+        field_rows.append({
+            'session': session, 'unit': unit, 'arena_type': arena_type,
+            'field_number': fn,
+            'multi_peak': multi,
+            'n_peaks': n_peaks,
+            'n_kde_local_maxima': len(res['local_max']),
+            'peak_fallback': res['peak_fallback'],
+            'kde_peak_hz': round(ref_hz, 4),
+            'peak_threshold_hz': round(PEAK_REL_HEIGHT_FRAC * ref_hz, 4),
+            'peak_kde_hz': _join(peak_hz),
+            'peak_bins': ';'.join(bin_str[c] for c in counted),
+            'local_max_rel_heights': _join([rate[i] / ref_hz for i in res['local_max']], '{:.3f}'),
+            'local_max_trough_rel': _join([res['trough_rel'][i] for i in res['local_max']], '{:.3f}'),
+            'shallowest_trough_rel': round(max(troughs.values()), 4) if troughs else np.nan,
+            'troughs_rel': ';'.join(f'{a}-{b}:{v:.3f}' for (a, b), v in troughs.items()),
+            'lowest_counted_peak_rel': round(min(peak_hz) / ref_hz, 4) if multi else np.nan,
+            'peak_separation_cm': (round(float(np.mean(list(separations.values()))), 2)
+                                   if separations else np.nan),
+            'peak_separations_cm': ';'.join(f'{a}-{b}:{v:.1f}' for (a, b), v in separations.items()),
+            'kde_n_points': res['kde_n_points'],
+            'kde_n_eff': round(res['kde_neff'], 2),
+            'kde_factor': round(res['kde_factor'], 4),
+            'kde_axes': res['kde_axes'],
+            'kde_bw_cm': _join(res['kde_bw_bins'] * MP_BIN_CM, '{:.2f}'),
+            'kde_note': res['kde_note'],
+            'n_bins': n_field,
+            'area_cm2': f.get('area_cm2'),
+            'pct_of_occupied_area': f.get('pct_of_occupied_area'),
+            'peak_fr_hz': excel_peak,
+            'recomputed_peak_fr_hz': round(recomputed_peak, 4),
+            'ratemap_check': ratemap_check,
+            'bin_coords': ';'.join(sorted(bin_str, key=lambda s: tuple(int(v) for v in s.split('-')))),
+        })
+
+        plot_fields.append(dict(field_number=fn, nodes=nodes, rate=rate, labels=labels,
+                                counted=counted, local_max=res['local_max'],
+                                ref_hz=ref_hz, multi=multi))
+
+        if not multi:
+            continue
+
+        # ── Sub-field rows (multi-peak fields only) ───────────────────────────
+        for k in range(1, n_peaks + 1):
+            members = np.where(labels == k)[0]
+            seed    = counted[k - 1]
+            loc     = members[int(np.argmax(sm[members]))]
+            sm_m    = sm[members]
+            touching = [s for (a, b), s in res['saddles'].items() if k in (a, b)]
+            max_saddle = max(touching) if touching else np.nan
+
+            row = {
+                'session': session, 'unit': unit, 'arena_type': arena_type,
+                'field_number': fn, 'sub_field_number': k, 'sub_field_id': f'{fn}.{k}',
+                'kde_peak_hz': round(peak_hz[k - 1], 4),
+                'kde_peak_rel': round(peak_hz[k - 1] / ref_hz, 4),
+                'peak_fr_hz': round(float(sm[loc]), 4),
+                'peak_fr_hz_raw': round(float(raw[loc]), 4),
+                'field_raw_max_fr_hz': round(float(raw[members].max()), 4),
+                'n_bins': len(members),
+                'pct_of_field_area': round(100.0 * len(members) / n_field, 2),
+                'max_saddle_hz': round(max_saddle, 4),
+                'max_saddle_rel': round(max_saddle / peak_hz[k - 1], 4),
+            }
+            if circle:
+                com = np.arctan2(np.sum(sm_m * np.sin(theta_c[members])),
+                                 np.sum(sm_m * np.cos(theta_c[members]))) % (2.0 * np.pi)
+                row.update({
+                    'kde_peak_bin_theta': int(nodes[seed]),
+                    'kde_peak_theta_deg': round(float(np.degrees(theta_c[seed])), 2),
+                    'peak_bin_theta': int(nodes[loc]),
+                    'peak_theta_deg': round(float(np.degrees(theta_c[loc])), 2),
+                    'com_theta_deg': round(float(np.degrees(com)), 2),
+                    'arc_length_cm': round(len(members) * MP_BIN_CM, 2),
+                    'area_cm2': round(len(members) * MP_BIN_CM * cc['track_width_cm'], 2),
+                    'bin_coords': ';'.join(bin_str[m] for m in members),
+                })
+            else:
+                bxs, bys = idx[members, 0], idx[members, 1]
+                com_x = float(np.sum(sm_m * bxs) / np.sum(sm_m))
+                com_y = float(np.sum(sm_m * bys) / np.sum(sm_m))
+                row.update({
+                    'kde_peak_bin_x': nodes[seed][0], 'kde_peak_bin_y': nodes[seed][1],
+                    'peak_bin_x': nodes[loc][0], 'peak_bin_y': nodes[loc][1],
+                    'com_bin_x': round(com_x, 3), 'com_bin_y': round(com_y, 3),
+                    'com_cm_x': round(com_x * MP_BIN_CM, 2),
+                    'com_cm_y': round(com_y * MP_BIN_CM, 2),
+                    'area_cm2': round(len(members) * MP_BIN_CM ** 2, 2),
+                    'bin_coords': ';'.join(bin_str[m] for m in members),
+                })
+            sub_rows.append(row)
+
+    return field_rows, sub_rows, plot_fields
+
+
+# ── Multi-peak: per-cell figures ────────────────────────────────────────────
+
+_MP_GRAY_CMAP = ListedColormap(['#bdbdbd'])     # background (visited, non-field) bins
+_MP_TXT_FX    = [path_effects.withStroke(linewidth=2, foreground='black')]
+
+
+def _mask_outline_segments(mask: np.ndarray) -> list:
+    """Bin-edge segments outlining the True region of a 2-D mask (bin (i, j)
+    spans [i, i+1] x [j, j+1])."""
+    p = np.pad(mask, 1)
+    segs = []
+    for i, j in zip(*np.nonzero(p[1:, 1:-1] != p[:-1, 1:-1])):     # vertical edges at x = i
+        segs.append([(i, j), (i, j + 1)])
+    for i, j in zip(*np.nonzero(p[1:-1, 1:] != p[1:-1, :-1])):     # horizontal edges at y = j
+        segs.append([(i, j), (i + 1, j)])
+    return segs
+
+
+def _label_cut_segments(sub_id: np.ndarray) -> list:
+    """Bin-edge segments between neighbouring bins with different non-zero labels."""
+    segs = []
+    a, b = sub_id[:-1, :], sub_id[1:, :]
+    for i, j in zip(*np.nonzero((a > 0) & (b > 0) & (a != b))):
+        segs.append([(i + 1, j), (i + 1, j + 1)])
+    a, b = sub_id[:, :-1], sub_id[:, 1:]
+    for i, j in zip(*np.nonzero((a > 0) & (b > 0) & (a != b))):
+        segs.append([(i, j + 1), (i + 1, j + 1)])
+    return segs
+
+
+def _field_summary_title(plot_fields: list) -> str:
+    return '  '.join(f"F{pf['field_number']}: {len(pf['counted'])} peak"
+                     f"{'s' if len(pf['counted']) != 1 else ''}" for pf in plot_fields)
+
+
+def _mp_plot_trajectory(ax, ctx: dict, scale: float, unit: str) -> None:
+    """Unbinned trajectory of the whole session (gray) and the cell's spikes (red;
+    moving frames only, the spikes behind the ratemaps). Positions (cm) are divided
+    by `scale`; the axes are labelled in `unit`."""
+    sf = ctx['spike_frame']
+    ax.plot(ctx['x_cm_all'] / scale, ctx['y_cm_all'] / scale, color='0.6', linewidth=0.5)
+    ax.plot(ctx['x_cm'][sf] / scale, ctx['y_cm'][sf] / scale, '.', color='red', markersize=3)
+    ax.set_aspect('equal')
+    ax.set_title(f'Trajectory (gray) + {len(sf)} spikes (red)', fontsize=10)
+    ax.set_xlabel(f'x {unit}')
+    ax.set_ylabel(f'y {unit}')
+
+
+def _mp_plot_cell_2d(ctx: dict, plot_fields: list, title: str, save_path: str) -> None:
+    nx, ny     = ctx['n_bins_x'], ctx['n_bins_y']
+    valid_mask = ctx['valid_mask']
+
+    in_field = np.zeros((nx, ny), dtype=bool)
+    sub_id   = np.zeros((nx, ny), dtype=int)      # unique id per (field, sub-field)
+    kde_map  = np.full((nx, ny), np.nan)
+    uid = 0
+    for pf in plot_fields:
+        for (bx, by), lab, val in zip(pf['nodes'], pf['labels'], pf['rate']):
+            in_field[bx, by] = True
+            kde_map[bx, by]  = val
+            sub_id[bx, by]   = uid + max(int(lab), 1)
+        uid += max(int(pf['labels'].max()), 1)
+
+    bg       = np.where(valid_mask & ~in_field, 1.0, np.nan)
+    outline  = _mask_outline_segments(in_field)
+    cuts     = _label_cut_segments(sub_id)
+    extent   = (0, nx, 0, ny)
+
+    fig = Figure(figsize=(25, 5.8))
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(1, 4)
+
+    # Same axis units and limits as the ratemaps; the hidden colorbar keeps the panel sizes equal.
+    _mp_plot_trajectory(axes[0], ctx, MP_BIN_CM, 'bin')
+    axes[0].set_xlim(0, nx)
+    axes[0].set_ylim(0, ny)
+    fig.colorbar(ScalarMappable(), ax=axes[0], fraction=0.046, pad=0.04).ax.set_visible(False)
+
+    panels = ((axes[1], ctx['fr_smooth'], f'Gaussian-smoothed ratemap (σ = {MP_GAUSSIAN_SIGMA_CM} cm)'),
+              (axes[2], ctx['kde_in'],    f'KDE input map: {KDE_RATEMAP_TYPE}'),
+              (axes[3], kde_map,          f'Field KDE ({KDE_BW_METHOD}), peaks ≥ {PEAK_REL_HEIGHT_FRAC:.0%} of field max'))
+    for ax, data, panel_title in panels:
+        ax.imshow(bg.T, origin='lower', extent=extent, cmap=_MP_GRAY_CMAP,
+                  vmin=0, vmax=1, interpolation='nearest')
+        shown = np.ma.masked_where(~in_field, np.nan_to_num(data))
+        finite = data[in_field & np.isfinite(data)]
+        vmax  = float(finite.max()) if finite.size and finite.max() > 0 else 1.0
+        im = ax.imshow(shown.T, origin='lower', extent=extent, cmap='jet',
+                       vmin=0, vmax=vmax, interpolation='nearest')
+        fig.colorbar(im, ax=ax, label='Firing rate (Hz)', fraction=0.046, pad=0.04)
+
+        ax.add_collection(LineCollection(outline, colors='black', linewidths=2.0))
+        if cuts:
+            ax.add_collection(LineCollection(cuts, colors='white', linewidths=2.5))
+
+        for pf in plot_fields:
+            for i in pf['local_max']:
+                if i not in pf['counted']:
+                    bx, by = pf['nodes'][i]
+                    ax.plot(bx + 0.5, by + 0.5, 'x', color='black', ms=6, mew=1.5)
+            for k, i in enumerate(pf['counted'], start=1):
+                bx, by = pf['nodes'][i]
+                ax.plot(bx + 0.5, by + 0.5, '*', ms=13, mfc='white', mec='black', mew=1.0)
+                label = f"{pf['field_number']}.{k}" if pf['multi'] else f"F{pf['field_number']}"
+                ax.text(bx + 0.5, by + 1.6, label, color='white', fontsize=8,
+                        ha='center', va='bottom', path_effects=_MP_TXT_FX)
+
+        ax.set_xlim(0, nx)
+        ax.set_ylim(0, ny)
+        ax.set_aspect('equal')
+        ax.set_title(panel_title, fontsize=10)
+        ax.set_xlabel('x bin')
+        ax.set_ylabel('y bin')
+
+    fig.suptitle(f'{title}\n{_field_summary_title(plot_fields)}   '
+                 f'(star = counted peak, × = peak < {PEAK_REL_HEIGHT_FRAC:.0%}, white line = trough cut)',
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+
+
+def _nan_at_wrap(deg: np.ndarray, *ys: np.ndarray):
+    """Insert NaN where the angle wraps 360 -> 0, so a seam-straddling field
+    is drawn as two pieces instead of a line across the whole axis."""
+    breaks = np.where(np.diff(deg) < 0)[0] + 1
+    return (np.insert(deg.astype(float), breaks, np.nan),
+            *(np.insert(y.astype(float), breaks, np.nan) for y in ys))
+
+
+def _mp_plot_cell_circular(ctx: dict, cc: dict, plot_fields: list, title: str, save_path: str) -> None:
+    n          = cc['n_bins_theta']
+    bw         = cc['bin_width_rad']
+    r_min      = cc['r_min']
+    r_max      = cc['r_max']
+    valid_mask = cc['valid_mask']
+    fr_smooth  = cc['fr_smooth']
+    r_mid      = 0.5 * (r_min + r_max)
+
+    in_field = np.zeros(n, dtype=bool)
+    for pf in plot_fields:
+        in_field[pf['nodes']] = True
+
+    fig = Figure(figsize=(21, 5.8))
+    FigureCanvasAgg(fig)
+    _mp_plot_trajectory(fig.add_subplot(1, 3, 1), ctx, 1.0, '(cm)')
+    ax_ring = fig.add_subplot(1, 3, 2, projection='polar')
+    ax_lin  = fig.add_subplot(1, 3, 3)
+
+    # ── Ring heatmap ──────────────────────────────────────────────────────────
+    theta_mesh, r_mesh = np.meshgrid(np.arange(n + 1) * bw, np.array([r_min, r_max]))
+    bg = np.ma.masked_invalid(np.where(valid_mask & ~in_field, 1.0, np.nan).reshape(1, n))
+    ax_ring.pcolormesh(theta_mesh, r_mesh, bg, cmap=_MP_GRAY_CMAP, vmin=0, vmax=1, shading='flat')
+    vmax = float(fr_smooth[in_field].max()) if in_field.any() else 1.0
+    mesh = ax_ring.pcolormesh(theta_mesh, r_mesh,
+                              np.ma.masked_where(~in_field, fr_smooth).reshape(1, n),
+                              cmap='jet', vmin=0, vmax=vmax, shading='flat')
+    fig.colorbar(mesh, ax=ax_ring, label='Firing rate (Hz)', fraction=0.046, pad=0.08)
+
+    for pf in plot_fields:
+        L  = len(pf['nodes'])
+        t0 = pf['nodes'][0] * bw
+        t1 = t0 + L * bw
+        th = np.linspace(t0, t1, max(20, 4 * L))
+        for r in (r_min, r_max):
+            ax_ring.plot(th, np.full_like(th, r), color='black', lw=2.0)
+        for t in (t0, t1):
+            ax_ring.plot([t, t], [r_min, r_max], color='black', lw=2.0)
+        for p in range(1, L):
+            if pf['labels'][p] != pf['labels'][p - 1]:
+                ax_ring.plot([t0 + p * bw] * 2, [r_min, r_max], color='white', lw=2.5)
+        for i in pf['local_max']:
+            if i not in pf['counted']:
+                ax_ring.plot(t0 + (i + 0.5) * bw, r_mid, 'x', color='black', ms=6, mew=1.5)
+        for k, i in enumerate(pf['counted'], start=1):
+            ax_ring.plot(t0 + (i + 0.5) * bw, r_mid, '*', ms=13, mfc='white', mec='black')
+            label = f"{pf['field_number']}.{k}" if pf['multi'] else f"F{pf['field_number']}"
+            ax_ring.text(t0 + (i + 0.5) * bw, r_max * 1.12, label, fontsize=8,
+                         ha='center', va='center')
+
+    ax_ring.set_theta_zero_location('E')
+    ax_ring.set_theta_direction(1)
+    ax_ring.set_ylim(0, r_max * 1.2)
+    ax_ring.set_yticklabels([])
+    ax_ring.set_title(f'Gaussian-smoothed angular ratemap (σ = {MP_GAUSSIAN_SIGMA_CM} cm)', fontsize=10)
+
+    # ── Linearised profile: smoothed rate + field KDE vs track angle ──────────
+    deg_per_bin = np.degrees(bw)
+    all_deg = (np.arange(n) + 0.5) * deg_per_bin
+    ax_lin.plot(all_deg, np.where(valid_mask, fr_smooth, np.nan), color='#bdbdbd', lw=1.2,
+                label='smoothed ratemap')
+    for n_pf, pf in enumerate(plot_fields):
+        nodes = np.asarray(pf['nodes'])
+        deg = (nodes + 0.5) * deg_per_bin
+        x, y_sm, y_in, y_kde = _nan_at_wrap(deg, fr_smooth[nodes], cc['kde_in'][nodes], pf['rate'])
+        ax_lin.plot(x, y_sm, color='tab:blue', lw=2.0, label='field (smoothed)' if n_pf == 0 else None)
+        ax_lin.plot(x, y_in, color='tab:green', lw=1.2,
+                    label=f'KDE input: {KDE_RATEMAP_TYPE}' if n_pf == 0 else None)
+        ax_lin.plot(x, y_kde, color='tab:red', lw=1.5, ls='--', label='field KDE' if n_pf == 0 else None)
+        x_thr, y_thr = _nan_at_wrap(deg, np.full(len(nodes), PEAK_REL_HEIGHT_FRAC * pf['ref_hz']))
+        ax_lin.plot(x_thr, y_thr, color='tab:red', lw=0.8, ls=':',
+                    label=f'{PEAK_REL_HEIGHT_FRAC:.0%} of KDE max' if n_pf == 0 else None)
+        for p in range(1, len(nodes)):
+            if pf['labels'][p] != pf['labels'][p - 1]:
+                ax_lin.axvline(((nodes[0] + p) % n) * deg_per_bin, color='black', lw=1.2, ls='-.')
+        for i in pf['local_max']:
+            if i not in pf['counted']:
+                ax_lin.plot(deg[i], pf['rate'][i], 'x', color='black', ms=6, mew=1.5)
+        for k, i in enumerate(pf['counted'], start=1):
+            ax_lin.plot(deg[i], pf['rate'][i], '*', ms=13, mfc='white', mec='black')
+            label = f"{pf['field_number']}.{k}" if pf['multi'] else f"F{pf['field_number']}"
+            ax_lin.annotate(label, (deg[i], pf['rate'][i]), textcoords='offset points',
+                            xytext=(0, 8), ha='center', fontsize=8)
+    ax_lin.set_xlim(0, 360)
+    ax_lin.set_xlabel('Track angle (deg)')
+    ax_lin.set_ylabel('Firing rate (Hz)')
+    ax_lin.set_title('Field profiles (dash-dot line = trough cut)', fontsize=10)
+    ax_lin.legend(fontsize=7, loc='upper right')
+
+    fig.suptitle(f'{title}\n{_field_summary_title(plot_fields)}   '
+                 f'(star = counted peak, × = peak < {PEAK_REL_HEIGHT_FRAC:.0%}, white line = trough cut)',
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+
+
+# ── Multi-peak: per-session job (called from thread pool) ───────────────────
+
+def _mp_png_name(session: str, unit: str) -> str:
+    """File name of a cell's multi-peak figure (in MP_RATEMAP_DIR\\MultiPeak or SinglePeak)."""
+    return session.replace('\\', '_').replace('/', '_') + '__' + os.path.splitext(unit)[0] + '.png'
+
+
+def _mp_run_session(args):
+    sess_idx, n_sessions, session, units = args
+    dirpath = os.path.join(MP_PLACE_CELL_FOLDER, session)
+    field_rows, sub_rows, cell_rows = [], [], []
+
+    with _print_lock:
+        print(f'[{sess_idx}/{n_sessions}]  {session}  ({len(units)} cell(s))')
+
+    if not os.path.isdir(dirpath):
+        with _print_lock:
+            print(f'  [SKIP] session folder not found: {dirpath}')
+        return field_rows, sub_rows, cell_rows
+
+    names = os.listdir(dirpath)
+    if MP_COORD_UNITS == 'cm':
+        tracking = [f for f in names if f.lower().endswith('_cm.csv')]
+    else:
+        tracking = [f for f in names if f.lower().endswith(('.csv', '.xlsx'))
+                    and not f.lower().endswith('_cm.csv')]
+    if len(tracking) != 1:
+        with _print_lock:
+            print(f'  [SKIP] expected 1 tracking file in {dirpath}, found {len(tracking)}')
+        return field_rows, sub_rows, cell_rows
+
+    try:
+        track = _mp_load_session_track(os.path.join(dirpath, tracking[0]))
+    except Exception as e:
+        with _print_lock:
+            print(f'  TRACKING ERROR in {session}: {e}')
+        return field_rows, sub_rows, cell_rows
+    if track is None:
+        with _print_lock:
+            print(f'  [SKIP] no usable tracking samples in {session}')
+        return field_rows, sub_rows, cell_rows
+
+    for unit, fdf in units:
+        ntt_path = os.path.join(dirpath, unit)
+        if not os.path.isfile(ntt_path):
+            with _print_lock:
+                print(f'  [SKIP] .ntt not found: {ntt_path}')
+            continue
+        arena_type = str(fdf['arena_type'].iloc[0])
+        try:
+            ctx = _mp_build_unit_ratemap(track, ntt_path)
+            ctx['kde_in'] = _mp_kde_input_map_2d(ctx)
+            cc  = _mp_build_ratemap_circular(ctx) if arena_type == 'Circle' else None
+            if cc is not None:
+                cc['kde_in'] = _mp_kde_input_map_circular(cc)
+            f_rows, s_rows, plot_fields = _analyse_cell(ctx, cc, fdf, arena_type, session, unit)
+        except Exception as e:
+            with _print_lock:
+                print(f'  ERROR in {session} | {unit}: {e}')
+            continue
+
+        n_multi = sum(r['multi_peak'] for r in f_rows)
+        check   = all(r['ratemap_check'] for r in f_rows)
+        if not check:
+            with _print_lock:
+                print(f'  [WARN] {session} | {unit}: recomputed field peak != Excel peak_fr_hz '
+                      f'(check the ratemap settings match the PlaceCell_Main run)')
+
+        sub_dir   = os.path.join(MP_RATEMAP_DIR, 'MultiPeak' if n_multi else 'SinglePeak')
+        save_path = os.path.join(sub_dir, _mp_png_name(session, unit))
+        try:
+            title = f'{session}  |  {unit}'
+            if cc is not None:
+                _mp_plot_cell_circular(ctx, cc, plot_fields, title, save_path)
+            else:
+                _mp_plot_cell_2d(ctx, plot_fields, title, save_path)
+        except Exception as e:
+            with _print_lock:
+                print(f'  PLOT ERROR in {session} | {unit}: {e}')
+            save_path = ''
+
+        field_rows += f_rows
+        sub_rows   += s_rows
+        cell_rows.append({
+            'session': session, 'unit': unit, 'arena_type': arena_type,
+            'n_fields': len(f_rows),
+            'n_multi_peak_fields': int(n_multi),
+            'has_multi_peak_field': bool(n_multi),
+            'max_n_peaks': max(r['n_peaks'] for r in f_rows),
+            'ratemap_check': check,
+            'ratemap_png': save_path,
+        })
+
+    return field_rows, sub_rows, cell_rows
+
+
+# ── Multi-peak: batch run + comparison tables ───────────────────────────────
+
+MP_FIELD_COLUMNS = ['session', 'unit', 'arena_type', 'field_number',
+                    'multi_peak', 'n_peaks', 'n_kde_local_maxima', 'peak_fallback',
+                    'kde_peak_hz', 'peak_threshold_hz', 'peak_kde_hz', 'peak_bins',
+                    'local_max_rel_heights', 'local_max_trough_rel',
+                    'shallowest_trough_rel', 'troughs_rel', 'lowest_counted_peak_rel',
+                    'peak_separation_cm', 'peak_separations_cm',
+                    'kde_n_points', 'kde_n_eff', 'kde_factor', 'kde_axes', 'kde_bw_cm', 'kde_note',
+                    'n_bins', 'area_cm2', 'pct_of_occupied_area',
+                    'peak_fr_hz', 'recomputed_peak_fr_hz', 'ratemap_check', 'bin_coords']
+
+MP_SUBFIELD_COLUMNS = ['session', 'unit', 'arena_type', 'field_number',
+                       'sub_field_number', 'sub_field_id',
+                       'kde_peak_hz', 'kde_peak_rel', 'max_saddle_hz', 'max_saddle_rel',
+                       'peak_fr_hz', 'peak_fr_hz_raw', 'field_raw_max_fr_hz',
+                       'n_bins', 'area_cm2', 'pct_of_field_area',
+                       # 2-D grid (Open field / Linear track)
+                       'kde_peak_bin_x', 'kde_peak_bin_y', 'peak_bin_x', 'peak_bin_y',
+                       'com_bin_x', 'com_bin_y', 'com_cm_x', 'com_cm_y',
+                       # Angular (Circle track)
+                       'kde_peak_bin_theta', 'kde_peak_theta_deg', 'peak_bin_theta',
+                       'peak_theta_deg', 'com_theta_deg', 'arc_length_cm',
+                       'bin_coords']
+
+MP_CELL_COLUMNS = ['session', 'unit', 'arena_type', 'n_fields', 'n_multi_peak_fields',
+                   'has_multi_peak_field', 'max_n_peaks', 'ratemap_check', 'ratemap_png']
+
+
+def run_multipeak_kde(full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataFrame:
+    """KDE multi-peak analysis of every field of every place cell (place_cell
+    == True in `full`, fields from `fields` = INPUT_EXCEL 'PlaceFields');
+    writes the per-cell figures to MP_RATEMAP_DIR and MULTIPEAK_EXCEL
+    (sheets Fields, SubFields, Cells, Settings). Returns the Fields table."""
+    os.makedirs(os.path.join(MP_RATEMAP_DIR, 'MultiPeak'),  exist_ok=True)
+    os.makedirs(os.path.join(MP_RATEMAP_DIR, 'SinglePeak'), exist_ok=True)
+
+    # PlaceFields also lists cells that were overruled AFTER field detection
+    # (per-field / total area caps) -- keep only final place_cell == True cells.
+    is_pc = full['place_cell'].apply(_to_bool)
+    place_keys = set(zip(full.loc[is_pc, 'session'], full.loc[is_pc, 'unit']))
+    keep = np.array([(s, u) in place_keys for s, u in zip(fields['session'], fields['unit'])],
+                    dtype=bool)
+    df_fields = fields[keep & fields['bin_coords'].notna().to_numpy()]
+
+    sessions: dict[str, list] = {}
+    for (session, unit), fdf in df_fields.groupby(['session', 'unit'], sort=True):
+        sessions.setdefault(session, []).append((unit, fdf))
+    n_cells = sum(len(u) for u in sessions.values())
+    print(f'\nMulti-peak KDE: {len(place_keys)} place cell(s) in {INPUT_EXCEL}; '
+          f'{n_cells} with fields, across {len(sessions)} session(s).\n')
+
+    job_args = [(i, len(sessions), session, units)
+                for i, (session, units) in enumerate(sessions.items(), start=1)]
+
+    all_fields, all_subs, all_cells = [], [], []
+    # The figures keep the full axes box (the stats-plot style hides the top
+    # and right spines).
+    with matplotlib.rc_context({'axes.spines.top': True, 'axes.spines.right': True}), \
+            concurrent.futures.ThreadPoolExecutor(max_workers=MP_MAX_WORKERS) as executor:
+        for f_rows, s_rows, c_rows in executor.map(_mp_run_session, job_args):
+            all_fields += f_rows
+            all_subs   += s_rows
+            all_cells  += c_rows
+
+    out_fields = pd.DataFrame(all_fields, columns=MP_FIELD_COLUMNS)
+    out_subs   = pd.DataFrame(all_subs,   columns=MP_SUBFIELD_COLUMNS)
+    out_cells  = pd.DataFrame(all_cells,  columns=MP_CELL_COLUMNS)
+    out_settings = pd.DataFrame(
+        [{'parameter': 'script_name',   'value': os.path.basename(__file__)},
+         {'parameter': 'run_timestamp', 'value': datetime.now().isoformat(timespec='seconds')}]
+        + [{'parameter': name, 'value': str(globals()[name])} for name in MP_RUN_CONFIG_VARS])
+
+    with pd.ExcelWriter(MULTIPEAK_EXCEL, engine='openpyxl') as writer:
+        out_fields.to_excel(writer,   sheet_name='Fields',    index=False)
+        out_subs.to_excel(writer,     sheet_name='SubFields', index=False)
+        out_cells.to_excel(writer,    sheet_name='Cells',     index=False)
+        out_settings.to_excel(writer, sheet_name='Settings',  index=False)
+
+    n_bad_check = int((~out_cells['ratemap_check'].astype(bool)).sum())
+    print(f'\nDone. Multi-peak results saved to {MULTIPEAK_EXCEL}')
+    print(f'Multi-peak ratemaps saved to        : {MP_RATEMAP_DIR}')
+    print(f'Cells analysed                      : {len(out_cells)} / {n_cells}')
+    print(f'Fields analysed                     : {len(out_fields)}')
+    print(f'Multi-peak fields (>= 2 peaks at '
+          f'{PEAK_REL_HEIGHT_FRAC:.0%}) : {int(out_fields["multi_peak"].sum())}  '
+          f'({len(out_subs)} sub-fields)')
+    print(f'Cells with >= 1 multi-peak field    : {int(out_cells["has_multi_peak_field"].sum())}')
+    if n_bad_check:
+        print(f'[WARN] {n_bad_check} cell(s) failed ratemap_check -- their recomputed '
+              f'smoothed ratemap does not match the Excel; check the MP_ ratemap settings.')
+    return out_fields
+
+
+def build_multipeak_dfs(full: pd.DataFrame, fields: pd.DataFrame) -> dict:
+    """Multi-peak tables to compare, {'Cell': one row per place cell,
+    'Field': one row per field, 'MultiField': multi-peak fields only}, tagged
+    with arena type, session type, animal and cell_id like the other
+    dataframes. Fields come from run_multipeak_kde if RUN_MULTIPEAK_KDE, else
+    from the 'Fields' sheet of MULTIPEAK_EXCEL; EXCLUDE_NO_KDE_FIELDS /
+    EXCLUDE_RATEMAP_MISMATCH fields are dropped before the per-cell values are
+    computed (a cell with 3 fields, one dropped, counts as a 2-field cell)."""
+    if RUN_MULTIPEAK_KDE:
+        mp_fields = run_multipeak_kde(full, fields)
+    else:
+        print(f'Loading Fields sheet of {MULTIPEAK_EXCEL} ...')
+        mp_fields = pd.read_excel(MULTIPEAK_EXCEL, sheet_name='Fields')
+    n_all = len(mp_fields)
+    if EXCLUDE_NO_KDE_FIELDS:
+        mp_fields = mp_fields[mp_fields['kde_note'].fillna('').astype(str).str.strip() == '']
+    if EXCLUDE_RATEMAP_MISMATCH:
+        mp_fields = mp_fields[mp_fields['ratemap_check'].apply(_to_bool)]
+    print(f'Multi-peak: {len(mp_fields)} of {n_all} fields kept '
+          f'(EXCLUDE_NO_KDE_FIELDS={EXCLUDE_NO_KDE_FIELDS}, '
+          f'EXCLUDE_RATEMAP_MISMATCH={EXCLUDE_RATEMAP_MISMATCH}).')
+
+    # 'arena_type' in the Fields sheet is the field geometry ('2D'/'Circle');
+    # _tag_groups replaces it with the arena (Circle / Linear / Open).
+    mp_fields = mp_fields.drop(columns=['arena_type'])
+    mp_fields['multi_peak'] = mp_fields['multi_peak'].apply(_to_bool)
+
+    cells = (mp_fields.groupby(['session', 'unit'])
+                      .agg(n_fields=('field_number', 'count'),
+                           n_multi_peak_fields=('multi_peak', 'sum'),
+                           max_n_peaks=('n_peaks', 'max'))
+                      .reset_index())
+    cells['pct_multi_peak_fields'] = 100.0 * cells['n_multi_peak_fields'] / cells['n_fields']
+    cells['has_multi_peak_field']  = cells['n_multi_peak_fields'] > 0
+
+    fields_df = _tag_groups(mp_fields, 'place field(s) (multi-peak)')
+    return {'Cell':       _tag_groups(cells, 'place cell(s) (multi-peak)'),
+            'Field':      fields_df,
+            'MultiField': fields_df[fields_df['multi_peak']]}
+
+
+def _mp_map_path(session: str, unit: str) -> str:
+    """Multi-peak figure written by _mp_run_session for this cell (MultiPeak or
+    SinglePeak subfolder; the MultiPeak path if neither exists)."""
+    paths = [os.path.join(MP_RATEMAP_DIR, sub, _mp_png_name(session, unit))
+             for sub in ('MultiPeak', 'SinglePeak')]
+    return next((p for p in paths if os.path.isfile(p)), paths[0])
+
+
+# ── Wall distance: arena geometry ───────────────────────────────────────────
+# Every arena's bins are one flat index (bx * ny + by). Per bin: geom_valid (inside
+# the arena), dist_to_wall (cm) and bin_x / bin_y (cm; open field: x, y; linear
+# track: along, across the track; circle: arc length at the mean radius, distance
+# from the inner wall).
+
+class OpenFieldGeometry:
+    def __init__(self):
+        d = WD_OPEN_DIAMETER_CM
+        self.nx = self.ny = int(np.ceil(d / WD_BIN_CM))
+        self.n_bins = self.nx * self.ny
+        self.cx = self.cy = d / 2.0
+        self.arena_width_cm = d
+
+        XX, YY = np.meshgrid((np.arange(self.nx) + 0.5) * WD_BIN_CM,
+                             (np.arange(self.ny) + 0.5) * WD_BIN_CM, indexing='ij')
+        r = np.hypot(XX - self.cx, YY - self.cy)
+        self.geom_valid = (r <= d / 2.0).ravel()
+        self.dist_to_wall = np.clip(d / 2.0 - r, 0.0, None).ravel()
+        self.bin_x, self.bin_y = XX.ravel(), YY.ravel()
+
+    def orient(self, x_cm, y_cm):
+        return x_cm, y_cm
+
+    def to_bins(self, x_cm, y_cm):
+        bx = np.clip((x_cm / WD_BIN_CM).astype(int), 0, self.nx - 1)
+        by = np.clip((y_cm / WD_BIN_CM).astype(int), 0, self.ny - 1)
+        on_arena = np.hypot(x_cm - self.cx, y_cm - self.cy) <= WD_OPEN_DIAMETER_CM / 2.0 + WD_BIN_CM
+        return bx * self.ny + by, on_arena
+
+
+class CircularTrackGeometry:
+    def __init__(self):
+        self.outer_r = WD_CIRCLE_OUTER_DIAMETER_CM / 2.0
+        self.inner_r = WD_CIRCLE_INNER_DIAMETER_CM / 2.0
+        self.cx = self.cy = self.outer_r
+        self.arena_width_cm = WD_CIRCLE_OUTER_DIAMETER_CM
+        self.radial_tol_cm = 4.0
+        self.track_width_cm = self.outer_r - self.inner_r
+        mean_r = (self.outer_r + self.inner_r) / 2.0
+
+        circumference = 2 * np.pi * mean_r
+        self.nx = max(8, 4 * int(round(circumference / WD_BIN_CM / 4.0)))
+        self.ny = max(2, int(round(self.track_width_cm / WD_BIN_CM)))
+        self.n_bins = self.nx * self.ny
+        self.bin_width_deg = 360.0 / self.nx
+        self.bin_cm_y = self.track_width_cm / self.ny
+        self.geom_valid = np.ones(self.n_bins, dtype=bool)
+
+        r_from_inner = (np.arange(self.ny) + 0.5) * self.bin_cm_y
+        self.dist_to_wall = np.tile(np.minimum(r_from_inner, self.track_width_cm - r_from_inner),
+                                    self.nx)
+        self.bin_x = np.repeat((np.arange(self.nx) + 0.5) * circumference / self.nx, self.ny)
+        self.bin_y = np.tile(r_from_inner, self.nx)
+
+    def orient(self, x_cm, y_cm):
+        return x_cm, y_cm
+
+    def to_bins(self, x_cm, y_cm):
+        r = np.hypot(x_cm - self.cx, y_cm - self.cy)
+        theta = np.degrees(np.arctan2(y_cm - self.cy, x_cm - self.cx)) % 360.0
+        bx = np.clip((theta / self.bin_width_deg).astype(int), 0, self.nx - 1)
+        rel_r = np.clip(r - self.inner_r, 0.0, self.track_width_cm)
+        by = np.clip((rel_r / self.bin_cm_y).astype(int), 0, self.ny - 1)
+        on_track = ((r >= self.inner_r - self.radial_tol_cm)
+                    & (r <= self.outer_r + self.radial_tol_cm))
+        return bx * self.ny + by, on_track
+
+
+class LinearTrackGeometry:
+    def __init__(self):
+        self.length, self.width = WD_LINEAR_LENGTH_CM, WD_LINEAR_WIDTH_CM
+        self.nx = max(4, int(round(self.length / WD_BIN_CM)))
+        self.ny = max(2, int(round(self.width / WD_BIN_CM)))
+        self.n_bins = self.nx * self.ny
+        self.bin_cm_x = self.length / self.nx
+        self.bin_cm_y = self.width / self.ny
+        self.arena_width_cm = self.length
+        self.geom_valid = np.ones(self.n_bins, dtype=bool)
+
+        XX, YY = np.meshgrid((np.arange(self.nx) + 0.5) * self.bin_cm_x,
+                             (np.arange(self.ny) + 0.5) * self.bin_cm_y, indexing='ij')
+        DX = np.minimum(XX, self.length - XX)     # distance from the nearer track end
+        DY = np.minimum(YY, self.width - YY)      # distance from the nearer long wall
+        self.dist_to_wall = np.minimum(DX, DY).ravel()
+        self.bin_x, self.bin_y = XX.ravel(), YY.ravel()
+
+    def orient(self, x_cm, y_cm):
+        """Vertical sessions rotated 90 deg CCW so the track runs along x."""
+        if len(x_cm) == 0:
+            return x_cm, y_cm
+        if (y_cm.max() - y_cm.min()) > (x_cm.max() - x_cm.min()):
+            xr, yr = -y_cm, x_cm
+            return xr - xr.min(), yr - yr.min()
+        return x_cm, y_cm
+
+    def to_bins(self, x_cm, y_cm):
+        bx = np.clip((np.clip(x_cm, 0, self.length) / self.bin_cm_x).astype(int), 0, self.nx - 1)
+        by = np.clip((np.clip(y_cm, 0, self.width) / self.bin_cm_y).astype(int), 0, self.ny - 1)
+        return bx * self.ny + by, np.ones(len(x_cm), dtype=bool)
+
+
+def make_geometries() -> dict:
+    return {'Open': OpenFieldGeometry(), 'Linear': LinearTrackGeometry(),
+            'Circle': CircularTrackGeometry()}
+
+
+def wall_dist_units(geom, arena: str) -> np.ndarray:
+    """Integer wall distance (bins) of every flat bin of `geom`; -1 outside the arena."""
+    bx, by = np.divmod(np.arange(geom.n_bins), geom.ny)
+    if arena == 'Open':
+        radius = WD_OPEN_DIAMETER_CM / 2.0
+        n_rings = int(round(radius / WD_BIN_CM))
+        r = np.hypot(geom.bin_x - geom.cx, geom.bin_y - geom.cy)
+        units = np.clip(np.floor((radius - r) / WD_BIN_CM), 0, n_rings - 1).astype(int)
+    elif arena == 'Linear':
+        units = np.minimum(by, geom.ny - 1 - by)
+        if LINEAR_ENDS_ARE_WALLS:
+            units = np.minimum(units, np.minimum(bx, geom.nx - 1 - bx))
+    else:
+        units = np.minimum(by, geom.ny - 1 - by)
+    return np.where(geom.geom_valid, units, -1)
+
+
+# ── Wall distance: session occupancy and per-cell raw-map peak ──────────────
+
+def _wd_load_tracking(csv_path: str, arena_width_cm: float) -> tuple:
+    data = (pd.read_excel(csv_path) if csv_path.lower().endswith('.xlsx')
+            else pd.read_csv(csv_path))
+
+    if WD_COORD_UNITS == 'cm':
+        t = np.asarray(data.iloc[:, 0], dtype=float)
+        x = np.asarray(data.iloc[:, 3], dtype=float)
+        y = np.asarray(data.iloc[:, 4], dtype=float)
+    else:
+        x = np.asarray(data['x'],    dtype=float)
+        y = np.asarray(data['y'],    dtype=float)
+        t = np.asarray(data['time'], dtype=float)
+
+    mask = ~np.isin(x, [1, -1])
+    x, y, t = x[mask], y[mask], t[mask]
+
+    dxy = np.hypot(np.append(np.diff(x), 0), np.append(np.diff(y), 0))
+    dt = np.append(np.diff(t), 1)
+    valid_dt = dt > 0
+    speed = np.zeros_like(dxy)
+    speed[valid_dt] = dxy[valid_dt] / dt[valid_dt]
+    keep = np.where(valid_dt & (speed < 0.006))[0]
+    x, y, t = x[keep], y[keep], t[keep]
+
+    order = np.argsort(t)
+    x, y, t = x[order], y[order], t[order]
+    if len(t) == 0:
+        return x, y, t
+
+    if WD_COORD_UNITS == 'cm':
+        return x - x.min(), y - y.min(), t
+    px_per_cm = max(x.max() - x.min(), y.max() - y.min()) / arena_width_cm
+    return (x - x.min()) / px_per_cm, (y - y.min()) / px_per_cm, t
+
+
+def _wd_speed_mask(x_cm: np.ndarray, y_cm: np.ndarray, t_us: np.ndarray) -> np.ndarray:
+    n = len(t_us)
+    if not WD_SPEED_FILTER_ENABLED or n < 2:
+        return np.ones(n, dtype=bool)
+    dt_s = np.diff(t_us) * 1e-6
+    step_cm = np.hypot(np.diff(x_cm), np.diff(y_cm))
+    speed = np.full(n - 1, np.nan)
+    ok = dt_s > 0
+    speed[ok] = step_cm[ok] / dt_s[ok]
+    speed = np.concatenate(([speed[0]], speed))
+    return (speed >= WD_MIN_SPEED_CMS) & (speed <= WD_MAX_SPEED_CMS)
+
+
+def session_occupancy(csv_path: str, geom, arena: str) -> dict | None:
+    """One session's on-arena frames (time, flat bin, speed-filter flag), occupancy map (s) and
+    valid bins. Every cell of a session shares these. None if the tracking is unusable."""
+    x, y, t = _wd_load_tracking(csv_path, geom.arena_width_cm)
+    if len(t) < 2:
+        return None
+    x, y = _mp_smooth_tracking_position(x, y, t)
+    if arena == 'Open' and WD_CENTRE_OPEN_FIELD_TRACKING:
+        x = x + (geom.cx - 0.5 * (x.min() + x.max()))
+        y = y + (geom.cy - 0.5 * (y.min() + y.max()))
+    x, y = geom.orient(x, y)
+    moving = _wd_speed_mask(x, y, t)
+    bin_idx, on_arena = geom.to_bins(x, y)
+    t, bin_idx, moving = t[on_arena], bin_idx[on_arena], moving[on_arena]
+    if len(t) < 2:
+        return None
+
+    dt = np.empty(len(t), dtype=np.float64)
+    dt[0] = 1.0 / WD_FPS
+    dt[1:] = np.minimum(np.diff(t) * 1e-6, 2.0 / WD_FPS)
+    occ_frame = moving if WD_SPEED_FILTER_OCCUPANCY else np.ones(len(t), dtype=bool)
+
+    occ_map = np.zeros(geom.n_bins, dtype=np.float64)
+    np.add.at(occ_map, bin_idx[occ_frame], dt[occ_frame])
+    visits = _mp_bin_visit_counts(bin_idx[occ_frame], geom.n_bins)
+
+    valid = (occ_map > 0) & geom.geom_valid
+    if WD_USE_MIN_OCC_S:
+        valid &= occ_map >= WD_MIN_OCC_S
+    if WD_USE_MIN_VISITS:
+        valid &= visits >= WD_MIN_VISITS
+    return dict(t=t, bin_idx=bin_idx, moving=moving, occ_map=occ_map, valid=valid)
+
+
+def distance_dwell_pct(units: np.ndarray, sess: dict) -> np.ndarray:
+    """% of the dwell in valid bins spent at each wall distance 0 .. units.max()."""
+    occ, valid = sess['occ_map'], sess['valid']
+    dwell = np.bincount(units[valid], weights=occ[valid], minlength=units.max() + 1)
+    total = dwell.sum()
+    return 100.0 * dwell / total if total > 0 else np.full(len(dwell), np.nan)
+
+
+def raw_map_peak(sess: dict, spike_ts: np.ndarray, geom) -> dict:
+    """Peak bin of the raw rate map (spikes / occupancy per valid bin) of one cell."""
+    t = sess['t']
+    idx = np.searchsorted(t, spike_ts, side='left')
+    idx_l = np.clip(idx - 1, 0, len(t) - 1)
+    idx_r = np.clip(idx,     0, len(t) - 1)
+    dist_l = np.abs(spike_ts - t[idx_l])
+    dist_r = np.abs(spike_ts - t[idx_r])
+    nearest = np.where(dist_l <= dist_r, idx_l, idx_r)
+    ok = (np.minimum(dist_l, dist_r) <= WD_MAX_GAP_US) & sess['moving'][nearest]
+
+    spike_map = np.bincount(sess['bin_idx'][nearest[ok]], minlength=geom.n_bins).astype(float)
+    valid, occ = sess['valid'], sess['occ_map']
+    rate = np.zeros(geom.n_bins, dtype=np.float64)
+    rate[valid] = spike_map[valid] / occ[valid]
+
+    out = dict(n_spikes_raw_map=int(ok.sum()), peak_bin=None, peak_rate_raw_hz=np.nan,
+               peak_bin_x_cm=np.nan, peak_bin_y_cm=np.nan, peak_dist_from_wall_cm=np.nan)
+    if not valid.any() or rate[valid].max() <= 0:
+        return out
+    peak = int(np.argmax(np.where(valid, rate, -np.inf)))
+    out.update(peak_bin=peak, peak_rate_raw_hz=round(float(rate[peak]), 4),
+               peak_bin_x_cm=round(float(geom.bin_x[peak]), 3),
+               peak_bin_y_cm=round(float(geom.bin_y[peak]), 3),
+               peak_dist_from_wall_cm=round(float(geom.dist_to_wall[peak]), 3))
+    return out
+
+
+def _load_spike_ts(ntt_path: str) -> np.ndarray:
+    spikes = np.memmap(ntt_path, dtype=MP_NTT_DTYPE, mode='r', offset=16 * 1024)
+    spikes = spikes[spikes['cell_number'] != 0]
+    return np.sort(spikes['timestamp'].astype(np.float64))
+
+
+# ── Wall distance: matching cells between the workbook and WD_PLACE_CELL_DIR ──
+
+def _session_key(path) -> str:
+    """Session path from the animal folder onwards, lower case, '/'-separated
+    ('X:\\...\\Fa1059\\Linear\\Day10\\1_0' and 'Fa1059\\Linear\\Day10\\1_0' -> 'fa1059/linear/day10/1_0')."""
+    parts = [p.strip().lower() for p in re.split(r'[\\/]+', str(path).strip())
+             if p.strip() not in ('', '.')]
+    for i, p in enumerate(parts):
+        if re.match(ccs.ANIMAL_PATTERN, p, flags=re.IGNORECASE):
+            return '/'.join(parts[i:])
+    return '/'.join(parts)
+
+
+def _unit_key(unit) -> str:
+    return os.path.basename(str(unit).strip()).lower()
+
+
+def _wd_tracking_files(filenames: list) -> list:
+    tracking = [f for f in filenames if f.lower().endswith(('.csv', '.xlsx'))]
+    if WD_COORD_UNITS == 'cm':
+        return [f for f in tracking if f.lower().endswith('_cm.csv')]
+    return [f for f in tracking if not f.lower().endswith('_cm.csv')]
+
+
+def scan_place_cell_dir(geoms: dict, units: dict) -> tuple:
+    """Dwell per wall distance of every session folder in WD_PLACE_CELL_DIR and the raw-map peak
+    bin / wall distance of every .ntt unit in it. Returns (sessions_df, cells_df)."""
+    out_dir = os.path.normcase(os.path.abspath(OUTPUT_DIR))
+    folders = []
+    for dirpath, dirnames, filenames in os.walk(WD_PLACE_CELL_DIR):
+        dirnames[:] = [d for d in dirnames
+                       if os.path.normcase(os.path.abspath(os.path.join(dirpath, d))) != out_dir]
+        ntt_files = sorted(f for f in filenames if f.lower().endswith('.ntt'))
+        if ntt_files:
+            folders.append((dirpath, _wd_tracking_files(filenames), ntt_files))
+
+    session_rows, cell_rows = [], []
+    for i, (dirpath, tracking, ntt_files) in enumerate(sorted(folders), start=1):
+        rel = os.path.relpath(dirpath, WD_PLACE_CELL_DIR)
+        arena = extract_arena_type(rel)
+        srow = dict(session=rel, _skey=_session_key(rel), arena_type=arena,
+                    session_type=extract_session_type(rel, arena),
+                    animal=ccs._path_token(rel, ccs.ANIMAL_PATTERN), n_units=len(ntt_files),
+                    total_dwell_s=np.nan, note='')
+        print(f'[{i}/{len(folders)}] {rel}  ({arena}, {len(ntt_files)} unit(s))')
+
+        sess, dwell = None, None
+        if arena is None:
+            srow['note'] = 'no recognizable arena in path'
+        elif len(tracking) != 1:
+            srow['note'] = f'{len(tracking)} tracking files (need exactly 1)'
+        else:
+            try:
+                sess = session_occupancy(os.path.join(dirpath, tracking[0]), geoms[arena], arena)
+            except Exception as e:
+                srow['note'] = f'tracking error: {e}'
+            if sess is None and not srow['note']:
+                srow['note'] = 'unusable tracking'
+        if sess is not None:
+            dwell = distance_dwell_pct(units[arena], sess)
+            srow['total_dwell_s'] = round(float(sess['occ_map'][sess['valid']].sum()), 2)
+            srow.update({f'dwell_pct_d{k}': round(float(v), 3) for k, v in enumerate(dwell)})
+        if srow['note']:
+            print(f'    SKIPPED: {srow["note"]}')
+        session_rows.append(srow)
+
+        for ntt in ntt_files:
+            crow = dict(session=rel, unit=ntt, _skey=srow['_skey'], _ukey=_unit_key(ntt),
+                        arena_type=arena, session_type=srow['session_type'],
+                        animal=srow['animal'], wall_dist=np.nan, peak_dist_dwell_pct=np.nan,
+                        excluded_because=srow['note'])
+            if sess is not None:
+                try:
+                    peak = raw_map_peak(sess, _load_spike_ts(os.path.join(dirpath, ntt)),
+                                        geoms[arena])
+                except Exception as e:
+                    peak = {}
+                    crow['excluded_because'] = f'spike/rate map error: {e}'
+                crow.update(peak)
+                if peak.get('peak_bin') is not None:
+                    d = int(units[arena][peak['peak_bin']])
+                    crow.update(wall_dist=d, peak_dist_dwell_pct=round(float(dwell[d]), 3))
+                elif not crow['excluded_because']:
+                    crow['excluded_because'] = 'no spikes in valid bins'
+            cell_rows.append(crow)
+
+    cells_df = pd.DataFrame(cell_rows).drop(columns=['peak_bin'], errors='ignore')
+    return pd.DataFrame(session_rows), cells_df
+
+
+def attach_distance(df: pd.DataFrame, cells_df: pd.DataFrame, what: str) -> pd.DataFrame:
+    """Add 'wall_dist' (+ peak-bin) columns of cells_df to the rows in df; rows with no distance
+    (unit not in WD_PLACE_CELL_DIR, no spikes, unusable tracking) are dropped, with a report."""
+    df = df.copy()
+    df['_skey'] = df['session'].map(_session_key)
+    df['_ukey'] = df['unit'].map(_unit_key)
+    zcols = ['_skey', '_ukey', 'arena_type', 'wall_dist', 'peak_dist_dwell_pct',
+             'peak_rate_raw_hz', 'peak_bin_x_cm', 'peak_bin_y_cm', 'peak_dist_from_wall_cm',
+             'excluded_because']
+    z = cells_df[[c for c in zcols if c in cells_df.columns]].rename(
+        columns={'arena_type': '_scan_arena'})
+    dup = z.duplicated(['_skey', '_ukey'], keep='first')
+    if dup.any():
+        print(f'WARNING: {int(dup.sum())} unit(s) appear twice in WD_PLACE_CELL_DIR under the same '
+              f'animal-relative path; the first is used.')
+        z = z[~dup]
+    merged = df.merge(z, on=['_skey', '_ukey'], how='left', indicator=True)
+
+    not_found = merged['_merge'] == 'left_only'
+    no_dist = ~not_found & merged['wall_dist'].isna()
+    print(f'\n{what}: {len(merged)} row(s); '
+          f'{int(merged["wall_dist"].notna().sum())} with a wall distance, '
+          f'{int(not_found.sum())} not found in WD_PLACE_CELL_DIR, {int(no_dist.sum())} excluded:')
+    for reason, n in merged.loc[no_dist, 'excluded_because'].fillna('').value_counts().items():
+        print(f'    {n:4d}  {reason or "unknown"}')
+    if not_found.any():
+        print('  Not found in WD_PLACE_CELL_DIR (first 20):')
+        for s, u in merged.loc[not_found, ['session', 'unit']].head(20).itertuples(index=False):
+            print(f'    {s} | {u}')
+
+    out = merged[merged['wall_dist'].notna()].drop(columns=['_merge'])
+    bad = out['arena_type'] != out['_scan_arena']
+    if bad.any():
+        print(f'WARNING: {int(bad.sum())} row(s) whose arena does not match their folder; dropped.')
+        out = out[~bad]
+    out['wall_dist'] = out['wall_dist'].astype(int)
+    return out.drop(columns=['_scan_arena'])
+
+
+def add_speed_direction_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """'is_p_speed' / 'is_n_speed' (True/False/None) from speed_class."""
+    df = df.copy()
+    for col, k in (('is_p_speed', 'p'), ('is_n_speed', 'n')):
+        df[col] = df['speed_class'].map(lambda c, k=k: None if c is None or pd.isna(c) else c == k)
+    return df
+
+
+# ── Wall distance: metrics and tests ────────────────────────────────────────
+
+class WDMetric(NamedTuple):
+    """One metric related to wall distance: plot name (as the metric's box/bar plot), kind ('box',
+    'cat' or 'speed_dir'), table of wd_dfs, column, label and the stability type the cells are
+    restricted to (None = all cells)."""
+    stem: str
+    kind: str
+    table: str
+    col: str
+    label: str
+    stab_type: str | None = None
+
+
+def wd_metric_specs() -> list:
+    """The metrics of run_comparison (except place-cell yield); speed direction is compared as a
+    whole and, for the trend tests and plots, as two yes/no outcomes."""
+    specs = [WDMetric(f'Full_{c}', 'box', 'full', c, l)
+             for c, l in {**FULL_METRICS, **EXTRA_FULL_METRICS}.items()]
+    specs += [WDMetric(f'Fields_{c}', 'box', 'field', c, l) for c, l in FIELD_METRICS.items()]
+    specs += [WDMetric(f'FieldShape_{c}', 'box', 'shape', c, l)
+              for c, l in FIELD_SHAPE_METRICS.items()]
+    specs += [WDMetric(f'Full_stability_score_{k}', 'box', 'full', 'stability_score',
+                       f'Stability score ({d})', k) for k, d in STABILITY_TYPES.items()]
+    specs += [WDMetric(f'Categorical_{c}', 'cat', 'full', c, l)
+              for c, l in CATEGORICAL_METRICS_PLACE_CELLS.items()]
+    specs += [WDMetric('Categorical_p_speed', 'cat', 'full', 'is_p_speed',
+                       'p-type speed cells (% of place cells)'),
+              WDMetric('Categorical_n_speed', 'cat', 'full', 'is_n_speed',
+                       'n-type speed cells (% of place cells)'),
+              WDMetric('Categorical_speed_direction', 'speed_dir', 'full', 'speed_class',
+                       'Speed-direction classification (speed score)')]
+    specs += [WDMetric(f'TemporalStability_{c}', 'box', 'ts', c, l)
+              for c, l in TEMPORAL_STABILITY_METRICS.items()]
+    specs += [WDMetric(f'MultiPeak_{level}_{c}', 'box', f'MP_{level}', c, l)
+              for level, metrics in MULTIPEAK_METRICS.items() for c, l in metrics.items()]
+    specs += [WDMetric(f'MultiPeak_Categorical_{c}', 'cat', f'MP_{level}', c, l)
+              for level, metrics in MULTIPEAK_CATEGORICAL.items() for c, l in metrics.items()]
+    return specs
+
+
+def _wd_cells(wd_dfs: dict, m: WDMetric, grp: Grouping) -> pd.DataFrame:
+    """Cells of the groups of `grp` with a value of m.col, in '_y' (numeric; 1.0 / 0.0 for yes/no
+    metrics; the class for speed direction), and the group label in 'grp'."""
+    sub = wd_dfs[m.table]
+    sub = sub[sub[grp.col].isin(grp.order)]
+    if m.stab_type:
+        sub = sub[sub['stability_type'] == m.stab_type]
+    sub = sub.copy()
+    if m.kind == 'box':
+        sub['_y'] = pd.to_numeric(sub[m.col], errors='coerce')
+    elif m.kind == 'cat':
+        sub['_y'] = sub[m.col].apply(_to_tri_bool).map(
+            lambda v: np.nan if v is None else float(v))
+    else:
+        sub['_y'] = sub[m.col]
+    sub['grp'] = sub[grp.col].astype(str)
+    return sub.dropna(subset=['_y'])
+
+
+def _wd_compare(df: pd.DataFrame, m: WDMetric, grp: Grouping) -> tuple:
+    """The test of this metric's kind across the groups of `grp`: (desc_df, omnibus, posthoc_df)."""
+    if m.kind == 'box':
+        return compare_groups(df, '_y', m.label, grp)
+    if m.kind == 'cat':
+        return compare_categorical(df, '_y', m.label, grp)
+    return compare_speed_direction(df, grp)
+
+
+def across_distance(sub: pd.DataFrame, m: WDMetric) -> tuple:
+    """One group's metric compared across its wall-distance levels, the levels as the groups:
+    (desc_df, omnibus or None if < 2 levels are tested, posthoc_df). Continuous metrics: levels
+    with a single value are described but left out of the test."""
+    counts = sub['wall_dist'].value_counts()
+    levels = sorted(int(d) for d in counts.index)
+    tested = [d for d in levels if counts[d] >= 2] if m.kind == 'box' else levels
+    desc, omni, posthoc = _wd_compare(sub, m, Grouping('wall_dist', tested, 'wall distances'))
+    rest = [d for d in levels if d not in tested]
+    if rest:
+        rest_desc, _, _ = _wd_compare(sub, m, Grouping('wall_dist', rest, 'wall distances'))
+        desc = _concat_tables([desc, rest_desc]).sort_values('wall_dist', ignore_index=True)
+    return desc, (omni if omni['n_groups'] >= 2 else None), posthoc
+
+
+def _levels_str(d) -> str:
+    lv = np.unique(d)
+    return f'{lv[0]}' if len(lv) == 1 else f'{lv[0]}-{lv[-1]}'
+
+
+def _p_str(p) -> str:
+    return f'p = {_fmt_p(p)} {_stars(p)}'
+
+
+def _model_data(sub: pd.DataFrame, y: np.ndarray) -> pd.DataFrame:
+    """Model frame: y, dist, grp and the nesting ids (as in CellClusteredStats_Utils; rows whose
+    animal / day could not be parsed are their own unit)."""
+    sess = 'unparsed:' + sub['session'].astype(str)
+    animal = sub['animal'].astype(object).where(sub['animal'].notna(), sess).astype(str)
+    day = np.where(sub['rec_day'].notna(),
+                   animal + '|' + sub['rec_day'].astype(str).str.lower(), sess)
+    return pd.DataFrame({'y': y, 'dist': sub['wall_dist'].to_numpy(float),
+                         'grp': sub['grp'].astype(str).to_numpy(), 'animal': animal.to_numpy(),
+                         'day': day, 'cell': sub['cell_id'].astype(str).to_numpy()})
+
+
+def _random_levels(data: pd.DataFrame) -> list:
+    if CONTINUOUS_TEST != 'LMM':
+        return []
+    n_anim, n_day = data['animal'].nunique(), data['day'].nunique()
+    n_rep = int((data.groupby('cell').size() > 1).sum())
+    return ((['animal'] if n_anim > 1 else []) + (['day'] if n_day > n_anim else [])
+            + (['cell'] if n_rep else []))
+
+
+def rank_model_test(sub: pd.DataFrame, full: str, reduced: str) -> dict:
+    """Likelihood-ratio test of `full` vs `reduced` on the ranks (METRIC_TRANSFORM) of sub['_y'],
+    standardized; mixed model with nested random intercepts if CONTINUOUS_TEST == 'LMM' (the
+    outermost level is dropped until the fit works), else a linear model. 'slope' = the 'dist'
+    coefficient of the full model (REML fit), in SD of the ranks per bin, when it is the tested
+    effect (the reduced model has no distance term)."""
+    y = sub['_y'].to_numpy(float)
+    if METRIC_TRANSFORM == 'rank':
+        y = stats.rankdata(y)
+    if not y.std() > 0:
+        return dict(test='n/a', text='metric is constant')
+    data = _model_data(sub, (y - y.mean()) / y.std())
+    re_full = _random_levels(data)
+
+    final, err = None, None
+    for re_levels in ([re_full[i:] for i in range(len(re_full))] or [[]]):
+        try:
+            ml_full = ccs._fit_lmm(data, full, re_levels, reml=False)
+            ml_red  = ccs._fit_lmm(data, reduced, re_levels, reml=False)
+            final   = ccs._fit_lmm(data, full, re_levels, reml=True)
+            break
+        except Exception as e:  # noqa: BLE001
+            final, err = None, e
+    if final is None:
+        return dict(test='n/a', text=f'model failed ({err})', model_note=f'model failed ({err})')
+
+    def _n_fe(res):
+        return len(res.fe_params) if hasattr(res, 'fe_params') else len(res.params)
+
+    lrt = max(2.0 * (ml_full.llf - ml_red.llf), 0.0)
+    dof = _n_fe(ml_full) - _n_fe(ml_red)
+    p = float(stats.chi2.sf(lrt, dof))
+    what = 'ranks' if METRIC_TRANSFORM == 'rank' else 'raw values'
+    if re_levels:
+        note = (f'LMM on {what}, random intercepts: '
+                f'{" / ".join(ccs._RE_LABELS[l] for l in re_levels)}')
+        try:
+            note += ccs._variance_note(final, re_levels)
+        except Exception:  # noqa: BLE001
+            pass
+        test = 'LMM likelihood-ratio test'
+    else:
+        note, test = f'Linear model on {what} (rows treated as independent)', 'Linear model LRT'
+    out = dict(test=test, statistic=lrt, stat_name='χ²', dof=dof, p_value=p, model_note=note,
+               text=f'χ²({dof}) = {lrt:.2f}, {_p_str(p)}')
+    if 'dist' not in reduced:
+        slope = float(final.params['dist'])
+        out.update(slope_sd_per_bin=slope, slope_se=float(final.bse['dist']),
+                   text=f'slope = {slope:+.3f} SD/bin, {out["text"]}')
+    return out
+
+
+def logit_test(sub: pd.DataFrame, formula: str, interaction: bool = False) -> dict:
+    """Wald test of the 'dist' coefficient (or, interaction=True, of every 'dist:group'
+    coefficient) of a logistic model of sub['_y']; GEE clustered by cell if CONTINUOUS_TEST ==
+    'LMM' and some cell repeats, else ordinary logistic regression."""
+    data = _model_data(sub, sub['_y'].to_numpy(float))
+    clustered = CONTINUOUS_TEST == 'LMM' and bool((data.groupby('cell').size() > 1).any())
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            if clustered:
+                res = smf.gee(formula, 'cell', data, family=sm.families.Binomial(),
+                              cov_struct=sm.cov_struct.Exchangeable()).fit()
+                test = 'Logistic GEE Wald test (clustered by cell)'
+            else:
+                res = smf.glm(formula, data, family=sm.families.Binomial()).fit()
+                test = 'Logistic regression Wald test (rows independent)'
+        names = ([n for n in res.params.index if ':' in n] if interaction else ['dist'])
+        b = res.params[names].to_numpy(float)
+        V = res.cov_params().loc[names, names].to_numpy(float)
+        if not (np.all(np.isfinite(b)) and np.all(np.isfinite(V))):
+            raise ValueError('non-finite estimates')
+        wald = float(b @ np.linalg.solve(V, b))
+    except Exception as e:  # noqa: BLE001
+        return dict(test='n/a', text=f'logistic model failed ({e})',
+                    model_note=f'logistic model failed ({e})')
+    dof = len(names)
+    p = float(stats.chi2.sf(wald, dof))
+    out = dict(test=test, statistic=wald, stat_name='χ²', dof=dof, p_value=p, model_note=test)
+    text = f'χ²({dof}) = {wald:.2f}, {_p_str(p)}'
+    if not interaction:
+        with np.errstate(over='ignore'):   # near-separated fits: CI overflows to inf
+            out.update(odds_ratio_per_bin=float(np.exp(b[0])),
+                       or_ci_low=float(np.exp(b[0] - 1.96 * np.sqrt(V[0, 0]))),
+                       or_ci_high=float(np.exp(b[0] + 1.96 * np.sqrt(V[0, 0]))))
+        text = f'OR = {out["odds_ratio_per_bin"]:.3f} per bin, ' + text
+    out['text'] = text
+    return out
+
+
+def group_trend(sub: pd.DataFrame, m: WDMetric) -> dict:
+    """Trend of one metric with wall_dist within one group."""
+    d, y = sub['wall_dist'].to_numpy(float), sub['_y'].to_numpy(float)
+    row = dict(n=len(sub), n_cells=sub['cell_id'].nunique(), n_dist_levels=len(np.unique(d)),
+               dist_levels=_levels_str(d.astype(int)) if len(d) else '')
+    if row['n_dist_levels'] < 2:
+        return dict(row, test='n/a', text='one distance level, no trend test')
+    if len(sub) < 3 or np.ptp(y) == 0:
+        return dict(row, test='n/a', text='too few values / constant')
+    if m.kind != 'box':
+        return dict(row, **logit_test(sub, 'y ~ dist'))
+
+    rho, p_s = stats.spearmanr(d, y)
+    row.update(spearman_rho=float(rho), spearman_p=float(p_s))
+    if CONTINUOUS_TEST == 'LMM':
+        return dict(row, **rank_model_test(sub, 'y ~ dist', 'y ~ 1'))
+    return dict(row, test='Spearman rank correlation', statistic=float(rho), stat_name='ρ',
+                p_value=float(p_s), model_note='Spearman (rows treated as independent)',
+                text=f'Spearman ρ = {rho:+.3f}, {_p_str(p_s)}')
+
+
+def pooled_trend(subs: list, m: WDMetric) -> tuple:
+    """(group-adjusted distance effect, distance x group interaction) over the groups in `subs`
+    with >= 2 distance levels, or (None, None) if fewer than 2 such groups."""
+    subs = [s for s in subs if s['wall_dist'].nunique() >= 2 and np.ptp(s['_y'].to_numpy(float)) > 0]
+    if len(subs) < 2:
+        return None, None
+    sub = pd.concat(subs, ignore_index=True)
+    info = dict(groups=', '.join(_label(s['grp'].iloc[0]) for s in subs), n=len(sub),
+                n_cells=sub['cell_id'].nunique())
+    if m.kind == 'box':
+        main = rank_model_test(sub, 'y ~ dist + C(grp)', 'y ~ C(grp)')
+        inter = rank_model_test(sub, 'y ~ dist * C(grp)', 'y ~ dist + C(grp)')
+    else:
+        main = logit_test(sub, 'y ~ dist + C(grp)')
+        inter = logit_test(sub, 'y ~ dist * C(grp)', interaction=True)
+    return dict(info, **main), dict(info, **inter)
+
+
+def matched_distance(subs: list, m: WDMetric, grp: Grouping) -> tuple:
+    """The groups compared at every distance held by >= 2 of them (continuous metrics: with >= 2
+    values). Returns (omnibus rows, posthoc frames)."""
+    if len(subs) < 2:
+        return [], []
+    cells = pd.concat(subs, ignore_index=True)
+    min_n = 2 if m.kind == 'box' else 1
+    omni_rows, posthoc = [], []
+    for d in sorted(cells['wall_dist'].unique()):
+        at_d = cells[cells['wall_dist'] == d]
+        counts = at_d[grp.col].value_counts()
+        present = [g for g in grp.order if counts.get(g, 0) >= min_n]
+        if len(present) < 2:
+            continue
+        _, omni, ph = _wd_compare(at_d, m, Grouping(grp.col, present, grp.noun))
+        omni_rows.append(dict(wall_dist=int(d), **omni))
+        if len(ph):
+            ph.insert(0, 'wall_dist', int(d))
+            posthoc.append(ph)
+    return omni_rows, posthoc
+
+
+# ── Wall distance: plots ────────────────────────────────────────────────────
+
+def _wd_offsets(n: int) -> np.ndarray:
+    step = min(WD_GROUP_OFFSET, 0.75 / max(n, 1))
+    return (np.arange(n) - (n - 1) / 2.0) * step
+
+
+def _wilson(k: float, n: int, z: float = 1.96) -> tuple:
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return centre - half, centre + half
+
+
+def _wd_across_text(omni) -> str:
+    if omni is None or pd.isna(omni.get('p_value')):
+        return ''
+    return (f'; across distances: {omni["test"]} {omni["stat_name"]}({int(omni["dof"])}) = '
+            f'{omni["statistic"]:.2f}, {_p_str(omni["p_value"])}')
+
+
+def _wd_stats_lines(res: dict, grp: Grouping) -> list:
+    noun = grp.noun.rstrip('s')
+    lines = [f'{_label(g)} (n={r["n"]}, distance {r["dist_levels"]}): {r["text"]}'
+             f'{_wd_across_text(res["across"].get(g))}' for g, r in res['trend'].items()]
+    if res['pooled'] is not None:
+        lines.append(f'Pooled ({res["pooled"]["groups"]}), {noun}-adjusted distance effect: '
+                     f'{res["pooled"]["text"]}')
+        lines.append(f'Distance × {noun} interaction (do the slopes differ?): '
+                     f'{res["interaction"]["text"]}')
+    matched = [o for o in res['matched'] if pd.notna(o.get('p_value'))]
+    if matched:
+        lines.append(f'{grp.noun.capitalize()} at matched distance ({matched[0]["test"]}): '
+                     + '; '.join(f'd={o["wall_dist"]}: {_p_str(o["p_value"])}' for o in matched))
+    return lines
+
+
+def _draw_stats_top(ax_info, stats_lines: list, legend_rows: int):
+    """Stats text at the TOP of the info panel, under the legend rows (_draw_stats puts it at the
+    bottom, which leaves a gap under the plot when there are many lines; the empty space at the
+    bottom is cropped by the tight bounding box when saving)."""
+    if stats_lines:
+        ax_info.annotate('\n'.join(stats_lines), xy=(0.5, 1.0), xycoords='axes fraction',
+                         xytext=(0, -(legend_rows * LEGEND_ROW_IN * 72 + 6)),
+                         textcoords='offset points', ha='center', va='top',
+                         fontsize=FS_STATS, linespacing=1.3)
+
+
+def _wd_finish(fig, ax, ax_info, handles: list, ncol: int, max_d: int, ylabel: str, title: str,
+               out_path: str):
+    ax_info.legend(handles=handles, loc='upper center', ncol=ncol, fontsize=FS_LEGEND)
+    ax.set_xticks(range(max_d + 1))
+    ax.set_xlim(-0.6, max_d + 0.6)
+    ax.set_xlabel(WD_DIST_LABEL, fontsize=FS_LABEL, labelpad=6)
+    ax.set_ylabel(ylabel, fontsize=FS_LABEL, labelpad=8)
+    _set_title(ax, title)
+    _style_axes(ax)
+    fig.tight_layout()
+    _save(fig, out_path)
+
+
+def _wd_fig(lines: list, n_handles: int, one_column: bool, max_d: int) -> tuple:
+    """Figure sized for the distance axis and its legend / stats panel. Returns (fig, ax, ax_info,
+    legend columns)."""
+    fig_w = max(6.0, (max_d + 1) * WD_DIST_W + AXIS_PAD_W)
+    ncol = 1 if one_column else min(n_handles, 3)
+    legend_rows = int(np.ceil(n_handles / ncol))
+    lines = _wrap_stats(lines, fig_w)
+    fig, ax, ax_info = _new_fig((fig_w, 5.0), legend_rows=legend_rows, stats_lines=lines)
+    _draw_stats_top(ax_info, lines, legend_rows)
+    return fig, ax, ax_info, ncol
+
+
+def _wd_group_handle(g: str, n: int, r: dict) -> Line2D:
+    c = _color(g)
+    stars = _stars(r.get('p_value')) if r.get('test') != 'n/a' else ''
+    return Line2D([0], [0], marker='D', color=c['dark'], markerfacecolor=c['dark'],
+                  markeredgecolor=PAL_BLACK, markeredgewidth=0.6, linewidth=1.5,
+                  label=f'{_label(g)} (n={n}) {stars}'.strip())
+
+
+def plot_wd_continuous(m: WDMetric, res: dict, grp: Grouping, out_path: str):
+    """Every cell as a point at its wall distance (shaded and marked as in the box plots), median
+    + IQR of each group at each distance."""
+    subs = res['subs']
+    if not subs:
+        return
+    max_d = max(int(s['wall_dist'].max()) for s in subs.values())
+    lines = _wd_stats_lines(res, grp)
+    if grp.shade:
+        lines.append(f'Point shade: the cell\'s {FULL_METRICS[SHADE_METRIC].lower()} '
+                     f'({"rank" if SHADE_SCALE == "rank" else "value"} within this comparison), '
+                     f'darker = higher')
+    handles = [_wd_group_handle(g, len(s), res['trend'][g]) for g, s in subs.items()]
+    sig_entries = _SIGNIFICANCE_LEGENDS.get(m.col, [])
+    face = _cell_color(next(iter(subs)), 0.5)
+    handles += [Line2D([0], [0], marker=marker, linestyle='None', markersize=8,
+                       markerfacecolor=face, markeredgecolor=PAL_BLACK, markeredgewidth=0.5,
+                       label=label) for marker, label in sig_entries]
+    fig, ax, ax_info, ncol = _wd_fig(lines, len(handles), bool(sig_entries), max_d)
+
+    rng = np.random.default_rng(0)
+    for (g, sub), off in zip(subs.items(), _wd_offsets(len(subs))):
+        c = _color(g)
+        d, y = sub['wall_dist'].to_numpy(float), sub['_y'].to_numpy(float)
+        styles  = _point_styles(m.col, sub, g, grp.shade)
+        faces   = np.array([fc for fc, _m in styles])
+        markers = np.array([mk for _fc, mk in styles])
+        x = d + off + rng.uniform(-0.05, 0.05, len(d))
+        for mk in dict.fromkeys(markers):
+            sel = markers == mk
+            ax.scatter(x[sel], y[sel], s=MARKER_SIZE.get(mk, 30), marker=mk, alpha=0.75,
+                       facecolors=faces[sel], edgecolors=PAL_BLACK, linewidths=0.4, zorder=2)
+        lv = np.unique(d)
+        med = np.array([np.median(y[d == l]) for l in lv])
+        q1 = np.array([np.percentile(y[d == l], 25) for l in lv])
+        q3 = np.array([np.percentile(y[d == l], 75) for l in lv])
+        ax.errorbar(lv + off, med, yerr=[med - q1, q3 - med], fmt='-D', color=c['dark'],
+                    markersize=6, markeredgecolor=PAL_BLACK, markeredgewidth=0.6,
+                    linewidth=1.5, elinewidth=1.2, capsize=3, zorder=4)
+    _wd_finish(fig, ax, ax_info, handles, ncol, max_d, textwrap.fill(m.label, 30),
+               _titled(f'{m.label} vs wall distance', grp), out_path)
+
+
+def plot_wd_binary(m: WDMetric, res: dict, grp: Grouping, out_path: str):
+    """% yes of each group at each wall distance, Wilson 95 % CI."""
+    subs = res['subs']
+    if not subs:
+        return
+    max_d = max(int(s['wall_dist'].max()) for s in subs.values())
+    handles = [_wd_group_handle(g, len(s), res['trend'][g]) for g, s in subs.items()]
+    fig, ax, ax_info, ncol = _wd_fig(_wd_stats_lines(res, grp) + ['Error bars: Wilson 95 % CI.'],
+                                     len(handles), False, max_d)
+    for (g, sub), off in zip(subs.items(), _wd_offsets(len(subs))):
+        c = _color(g)
+        lv, pct, lo, hi = [], [], [], []
+        for d, at_d in sub.groupby('wall_dist'):
+            k, n = at_d['_y'].sum(), len(at_d)
+            a, b = _wilson(k, n)
+            lv.append(d)
+            pct.append(100.0 * k / n)
+            lo.append(100.0 * a)
+            hi.append(100.0 * b)
+        lv, pct = np.array(lv, float), np.array(pct)
+        yerr = np.clip([pct - np.array(lo), np.array(hi) - pct], 0, None)   # rounding at 0 / 100 %
+        ax.errorbar(lv + off, pct, yerr=yerr, fmt='-D',
+                    color=c['dark'], markerfacecolor=c['face'], markersize=6,
+                    markeredgecolor=PAL_BLACK, markeredgewidth=0.6, linewidth=1.5,
+                    elinewidth=1.2, capsize=3, zorder=4)
+    ax.set_ylim(0, 105)
+    ax.set_yticks(np.arange(0, 101, 20))
+    _wd_finish(fig, ax, ax_info, handles, ncol, max_d, '% of cells',
+               _titled(f'{m.label} vs wall distance', grp), out_path)
+
+
+def plot_peak_distribution(full_df: pd.DataFrame, sessions_df: pd.DataFrame, units: dict,
+                           out_path: str) -> pd.DataFrame:
+    """Per arena: % of place-cell rows whose peak is at each wall distance, vs the % expected
+    from where the animals were (sum over rows of their session's dwell fraction at each
+    distance) and the % of the arena's bins at that distance; chi-square goodness of fit of the
+    observed against the dwell-expected counts. Returns the per-distance table."""
+    sess = sessions_df.drop_duplicates('_skey').set_index('_skey')
+    arenas = [a for a in ARENA_TYPES if (full_df['arena_type'] == a).any()]
+    if not arenas:
+        return pd.DataFrame()
+    widths = [max(units[a].max() + 1, 4) for a in arenas]
+    fig, axes = plt.subplots(1, len(arenas), figsize=(max(7.0, 0.5 * sum(widths) + 2.5), 4.6),
+                             gridspec_kw={'width_ratios': widths}, squeeze=False)
+    rows = []
+    for arena, ax in zip(arenas, axes[0]):
+        sub = full_df[full_df['arena_type'] == arena]
+        u = units[arena]
+        levels = np.arange(u.max() + 1)
+        obs = np.bincount(sub['wall_dist'], minlength=len(levels)).astype(float)
+        dcols = [f'dwell_pct_d{k}' for k in levels]
+        frac = sess.reindex(sub['_skey'])[dcols].to_numpy(float) / 100.0
+        exp = np.nansum(frac, axis=0)
+        exp *= obs.sum() / exp.sum() if exp.sum() > 0 else np.nan
+        area = 100.0 * np.bincount(u[u >= 0], minlength=len(levels)) / (u >= 0).sum()
+
+        ok = exp > 0
+        gof = ''
+        if ok.sum() >= 2:
+            chi2, p = stats.chisquare(obs[ok], exp[ok] * obs[ok].sum() / exp[ok].sum())
+            n_low = int((exp[ok] < 5).sum())
+            gof = f'\nvs dwell: χ²({ok.sum() - 1}) = {chi2:.1f}\n{_p_str(p)}'
+            if n_low:
+                gof += f' ({n_low} exp. < 5)'
+        else:
+            chi2 = p = np.nan
+        for k in levels:
+            rows.append(dict(arena_type=arena, wall_dist=int(k), n_rows_observed=int(obs[k]),
+                             pct_observed=100.0 * obs[k] / obs.sum(), n_rows_expected_dwell=exp[k],
+                             pct_expected_dwell=100.0 * exp[k] / obs.sum(), pct_arena_bins=area[k],
+                             gof_chi2=chi2, gof_p=p))
+
+        c = _color(arena)
+        ax.bar(levels, 100.0 * obs / obs.sum(), color=c['face'], edgecolor=BAR_EDGE,
+               linewidth=BAR_EDGE_LW, width=0.8, zorder=2, label='Place-cell peaks')
+        ax.plot(levels, 100.0 * exp / obs.sum(), '-o', color=c['dark'], markersize=5,
+                markeredgecolor=PAL_BLACK, markeredgewidth=0.5, linewidth=1.5, zorder=3,
+                label='Expected from dwell')
+        ax.plot(levels, area, linestyle=(0, (3, 2)), marker='s', color=PAL_GRAY,
+                markersize=4, linewidth=1.2, zorder=3, label='% of arena bins')
+        ax.set_xticks(levels)
+        ax.set_xlim(-0.6, max(levels[-1], 1) + 0.6)
+        ax.set_title(f'{arena} (n={int(obs.sum())}){gof}', fontsize=FS_LABEL - 1, pad=8)
+        _style_axes(ax)
+    axes[0][0].set_ylabel('% of place-cell rows', fontsize=FS_LABEL)
+    axes[0][-1].legend(loc='upper right', fontsize=FS_LEGEND - 1)
+    fig.supxlabel(WD_DIST_LABEL, fontsize=FS_LABEL, fontweight='bold')
+    fig.tight_layout()
+    _save(fig, out_path)
+    print(f'Peak-distance distribution saved to {out_path}')
+    return pd.DataFrame(rows)
+
+
+WD_ARENA_SIZE_NOTES = {
+    'Open':   f'dia {WD_OPEN_DIAMETER_CM:g} cm',
+    'Linear': f'{WD_LINEAR_LENGTH_CM:g} x {WD_LINEAR_WIDTH_CM:g} cm',
+    'Circle': f'outer dia {WD_CIRCLE_OUTER_DIAMETER_CM:g} cm, inner dia {WD_CIRCLE_INNER_DIAMETER_CM:g} cm',
+}
+
+
+def _bin_patches(geom, arena: str) -> tuple:
+    """(patches, flat bin indices) of every bin inside the arena, drawn in cm."""
+    patches, idx = [], np.flatnonzero(geom.geom_valid)
+    for b in idx:
+        bx, by = divmod(int(b), geom.ny)
+        if arena == 'Circle':
+            t0 = bx * geom.bin_width_deg
+            patches.append(Wedge((geom.cx, geom.cy), geom.inner_r + (by + 1) * geom.bin_cm_y,
+                                 t0, t0 + geom.bin_width_deg, width=geom.bin_cm_y))
+        elif arena == 'Linear':
+            patches.append(Rectangle((bx * geom.bin_cm_x, by * geom.bin_cm_y),
+                                     geom.bin_cm_x, geom.bin_cm_y))
+        else:
+            patches.append(Rectangle((bx * WD_BIN_CM, by * WD_BIN_CM), WD_BIN_CM, WD_BIN_CM))
+    return patches, idx
+
+
+def plot_distance_schematics(geoms: dict, units: dict, out_dir: str):
+    """<out_dir>\\WallDistanceSchematic_<arena>.png: every bin shaded by its wall distance (dark
+    = at the wall, light = far from it), numbered (linear track: every bin; open field: along
+    one radius)."""
+    for arena, geom in geoms.items():
+        u = units[arena]
+        patches, idx = _bin_patches(geom, arena)
+        base = ARENA_COLORS[arena]
+        cmap = LinearSegmentedColormap.from_list(f'dist_{arena}', [base['dark'], base['light']])
+        norm = Normalize(0, max(1, u.max()))
+        fig, ax = plt.subplots(figsize=(9.0, 2.4) if arena == 'Linear' else (6.2, 5.5))
+        ax.add_collection(PatchCollection(patches, facecolors=cmap(norm(u[idx])),
+                                          edgecolors='white', linewidths=0.4, zorder=2))
+        wall_kw = dict(fill=False, edgecolor=PAL_BLACK, linewidth=BOX_LW, zorder=3)
+        if arena == 'Linear':
+            ax.add_patch(Rectangle((0, 0), geom.length, geom.width, **wall_kw))
+            w, h = geom.length, geom.width
+            numbered = idx
+            ax.set_xlabel('Along the track (cm)', fontsize=FS_LABEL)
+            ax.set_ylabel('Width\n(cm)', fontsize=FS_LABEL, rotation=0, ha='right', va='center')
+        else:
+            radii = ((WD_OPEN_DIAMETER_CM / 2.0,) if arena == 'Open' else (geom.outer_r, geom.inner_r))
+            for r in radii:
+                ax.add_patch(Circle((geom.cx, geom.cy), r, **wall_kw))
+            w = h = 2.0 * radii[0]
+            numbered = (idx[(np.divmod(idx, geom.ny)[1] == geom.ny // 2) & (geom.bin_x[idx] > geom.cx)]
+                        if arena == 'Open' else [])
+            ax.set_xlabel('x (cm)', fontsize=FS_LABEL)
+            ax.set_ylabel('y (cm)', fontsize=FS_LABEL)
+        for b in numbered:
+            x, y = ((geom.bin_x[b], geom.bin_y[b]) if arena != 'Linear' else
+                    ((b // geom.ny + 0.5) * geom.bin_cm_x, (b % geom.ny + 0.5) * geom.bin_cm_y))
+            ax.text(x, y, str(u[b]), ha='center', va='center', fontsize=5, zorder=4,
+                    color=PAL_BLACK if norm(u[b]) > 0.5 else 'white')
+
+        pad = 2.0
+        ax.set_xlim(-pad, w + pad)
+        ax.set_ylim(-pad, h + pad)
+        ax.set_aspect('equal')
+        cb = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.8, pad=0.03,
+                          ticks=range(u.max() + 1))
+        cb.set_label('Wall distance (bins)', fontsize=FS_LABEL - 2)
+        ax.set_title(f'{arena} arena: distance from the nearest wall\n'
+                     f'({WD_ARENA_SIZE_NOTES[arena]}; {WD_BIN_CM:g} x {WD_BIN_CM:g} cm bins; '
+                     f'levels 0-{u.max()})', fontsize=FS_TITLE - 2, pad=12)
+        _style_axes(ax)
+        fig.tight_layout()
+        out_path = os.path.join(out_dir, f'WallDistanceSchematic_{arena}.png')
+        _save(fig, out_path)
+        print(f'Wall-distance schematic saved to {out_path}')
+
+
+# ── Wall distance: data and one comparison ──────────────────────────────────
+
+def build_wall_distance_dfs(full_df: pd.DataFrame, field_df: pd.DataFrame, shape_df: pd.DataFrame,
+                            ts_df: pd.DataFrame = None, mp_dfs: dict = None) -> tuple:
+    """The analysis tables restricted to the rows with a wall distance, with its columns:
+    ({'full', 'field', 'shape', 'ts', 'MP_<level>'}: table), and the workbook-wide tables
+    {'WD_Sessions', 'WD_Cells', 'WD_PeakOccupancy'}. Saves the schematics and the
+    peak-distance plot to OUTPUT_DIR\\WD_PLOTS_SUBDIR."""
+    wd_dir = os.path.join(OUTPUT_DIR, WD_PLOTS_SUBDIR)
+    os.makedirs(wd_dir, exist_ok=True)
+    geoms = make_geometries()
+    units = {a: wall_dist_units(g, a) for a, g in geoms.items()}
+    plot_distance_schematics(geoms, units, wd_dir)
+
+    print(f'Scanning {WD_PLACE_CELL_DIR} ...')
+    sessions_df, cells_df = scan_place_cell_dir(geoms, units)
+    print(f'\n{len(sessions_df)} session folder(s), '
+          f'{int(sessions_df["total_dwell_s"].notna().sum())} with usable tracking.')
+
+    wd_dfs = {'full': full_df, 'field': field_df, 'shape': shape_df}
+    if ts_df is not None:
+        wd_dfs['ts'] = ts_df
+    if mp_dfs is not None:
+        wd_dfs.update({f'MP_{level}': d for level, d in mp_dfs.items()})
+    wd_dfs = {name: attach_distance(d, cells_df, f'Wall distance, table {name!r}')
+              for name, d in wd_dfs.items()}
+    wd_dfs['full'] = add_speed_direction_flags(wd_dfs['full'])
+
+    print('\nPlace cells by arena and wall distance (Full sheet):')
+    print(pd.crosstab(wd_dfs['full']['arena_type'], wd_dfs['full']['wall_dist'], margins=True).to_string())
+
+    occ_df = plot_peak_distribution(wd_dfs['full'], sessions_df, units,
+                                    os.path.join(wd_dir, 'WallDist_PeakDistance_vs_Dwell.png'))
+    tables = {'WD_Sessions': sessions_df.drop(columns=['_skey']),
+              'WD_Cells': cells_df.drop(columns=['_skey', '_ukey']),
+              'WD_PeakOccupancy': occ_df}
+    return wd_dfs, tables
+
+
+def run_wall_distance(grp: Grouping, wd_dfs: dict, plots_dir: str) -> dict:
+    """Every metric of the wall-distance analysis over the groups of `grp` (`wd_dfs`: already
+    restricted to the cells to compare): tests of the module docstring, plots
+    'WallDist_<metric>.png' in `plots_dir`. Returns {table_name: table}."""
+    name = grp.title or grp.noun.capitalize()
+    print(f'\n{"-" * 70}\n{name} -- wall distance\n{"-" * 70}')
+    full = wd_dfs['full']
+    counts = []
+    for g in grp.order:
+        c = (full[full[grp.col] == g].groupby('wall_dist')
+             .agg(n_rows=('cell_id', 'size'), n_cells=('cell_id', 'nunique')).reset_index())
+        if len(c):
+            print(f'  {_label(g)}: ' + ', '.join(f'd{r.wall_dist}={r.n_rows}' for r in c.itertuples()))
+            c.insert(0, grp.col, g)
+            counts.append(c)
+    if not counts:
+        print('No place cells with a wall distance; skipping.')
+        return {}
+
+    metrics = [m for m in wd_metric_specs() if m.table in wd_dfs]
+    results = {}
+    trend_rows, pooled_rows, omni_rows, match_rows = [], [], [], []
+    desc_tables, posthoc_tables, match_posthoc_tables = [], [], []
+    for m in metrics:
+        cells = _wd_cells(wd_dfs, m, grp)
+        subs = {g: cells[cells[grp.col] == g] for g in grp.order if (cells[grp.col] == g).any()}
+        res = dict(subs=subs, trend={}, across={}, pooled=None, interaction=None, matched=[])
+        for g, sub in subs.items():
+            desc, omni, posthoc = across_distance(sub, m)
+            if len(desc):
+                desc.insert(0, grp.col, g)
+                desc_tables.append(desc)
+            if omni is not None:
+                res['across'][g] = omni
+                omni_rows.append({grp.col: g, **omni})
+            if len(posthoc):
+                posthoc.insert(0, grp.col, g)
+                posthoc_tables.append(posthoc)
+            if m.kind != 'speed_dir':
+                res['trend'][g] = group_trend(sub, m)
+                trend_rows.append({grp.col: g, 'metric': m.label, 'metric_col': m.col,
+                                   'stab_type': m.stab_type or '', 'kind': m.kind,
+                                   **res['trend'][g]})
+        if m.kind != 'speed_dir':
+            res['pooled'], res['interaction'] = pooled_trend(list(subs.values()), m)
+            for what, r in (('distance (group-adjusted)', res['pooled']),
+                            ('distance x group interaction', res['interaction'])):
+                if r is not None:
+                    pooled_rows.append(dict(metric=m.label, metric_col=m.col, effect=what, **r))
+        res['matched'], match_posthoc = matched_distance(list(subs.values()), m, grp)
+        match_rows += res['matched']
+        match_posthoc_tables += match_posthoc
+        results[m.stem] = res
+
+    # Holm across the metrics of each group.
+    trend_df = pd.DataFrame(trend_rows)
+    if 'p_value' not in trend_df.columns:
+        trend_df['p_value'] = np.nan
+    trend_df['p_holm_metrics'] = trend_df.groupby(grp.col)['p_value'].transform(
+        lambda p: ccs.holm(p.to_numpy(float)))
+    trend_df['significant'] = trend_df['p_value'] < ALPHA
+
+    sig = trend_df[trend_df['significant']]
+    print(f'  Significant trends with wall distance (p < {ALPHA}): {len(sig)}')
+    for _, r in sig.iterrows():
+        print(f'    {_label(r[grp.col]):12s} {r["metric"][:60]:60s} p = {_fmt_p(r["p_value"])} '
+              f'(Holm over metrics {_fmt_p(r["p_holm_metrics"])})')
+
+    if full['wall_dist'].nunique() >= 2:
+        os.makedirs(plots_dir, exist_ok=True)
+        for m in metrics:
+            out_path = os.path.join(plots_dir, f'WallDist_{m.stem}.png')
+            if m.kind == 'box':
+                plot_wd_continuous(m, results[m.stem], grp, out_path)
+            elif m.kind == 'cat':
+                plot_wd_binary(m, results[m.stem], grp, out_path)
+        print(f'  Wall-distance plots saved to {plots_dir}')
+    else:
+        print('  Every group has a single distance level; no plots.')
+
+    return {'WD_Counts':        pd.concat(counts, ignore_index=True),
+            'WD_Trend':         trend_df.drop(columns=['text']),
+            'WD_Pooled':        pd.DataFrame(pooled_rows).drop(columns=['text'], errors='ignore'),
+            'WD_Desc':          _concat_tables(desc_tables),
+            'WD_Omnibus':       pd.DataFrame(omni_rows),
+            'WD_PostHoc':       _concat_tables(posthoc_tables),
+            'WD_MatchOmnibus':  pd.DataFrame(match_rows),
+            'WD_MatchPostHoc':  _concat_tables(match_posthoc_tables)}
+
+
+# ── Red-ring flags (V20) ────────────────────────────────────────────────────
+
+def add_peak_dwell_flag(full_df: pd.DataFrame, ts_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Add 'peak_fr_bin_dwell_s' (dwell, s, in the raw-map bin behind peak_fr; from the
+    temporal stability PerCell table, matched by animal-relative session path + unit) and
+    'low_peak_dwell' (dwell <= the LOW_DWELL_PCTILE-th percentile over every place cell
+    with a dwell; one pooled threshold) to full_df. Rows with no dwell are not flagged."""
+    df = full_df.copy()
+    df['peak_fr_bin_dwell_s'] = np.nan
+    df['low_peak_dwell'] = False
+    if ts_df is None or 'peak_fr_bin_dwell_s' not in ts_df.columns:
+        print('\nPeak-bin dwell: no temporal stability table (INCLUDE_TEMPORAL_STABILITY = False); '
+              'Full_peak_fr.png gets no red rings.')
+        return df
+
+    cols = ['peak_fr_bin_dwell_s', 'peak_fr_bin_rate_hz', 'peak_fr_bin_n_tied']
+    z = ts_df[['session', 'unit'] + cols].copy()
+    z['_skey'] = z['session'].map(_session_key)
+    z['_ukey'] = z['unit'].map(_unit_key)
+    z = z.drop(columns=['session', 'unit']).drop_duplicates(['_skey', '_ukey'], keep='first')
+    keys = pd.DataFrame({'_skey': df['session'].map(_session_key).to_numpy(),
+                         '_ukey': df['unit'].map(_unit_key).to_numpy()})
+    m = keys.merge(z, on=['_skey', '_ukey'], how='left')       # keeps the row order of df
+    for c in cols:
+        df[c] = m[c].to_numpy()
+
+    dwell = pd.to_numeric(df['peak_fr_bin_dwell_s'], errors='coerce')
+    ok = dwell.notna()
+    if not ok.any():
+        print('\nPeak-bin dwell: no place cell matched the temporal stability table; no red rings.')
+        return df
+    thr = float(np.percentile(dwell[ok], LOW_DWELL_PCTILE))
+    df['low_peak_dwell'] = (dwell <= thr) & ok
+
+    rate_diff = (pd.to_numeric(df['peak_fr_bin_rate_hz'], errors='coerce')
+                 - pd.to_numeric(df['peak_fr'], errors='coerce')).abs()
+    n_mismatch = int((rate_diff > 0.002).sum())
+    n_tied = int((pd.to_numeric(df['peak_fr_bin_n_tied'], errors='coerce') > 1).sum())
+    n_low = int(df['low_peak_dwell'].sum())
+    print(f'\nPeak-bin dwell (raw map, bin behind peak_fr): {int(ok.sum())}/{len(df)} place-cell rows '
+          f'with a dwell; {LOW_DWELL_PCTILE:g}th percentile = {thr:.4f} s; '
+          f'{n_low} rows ({100.0 * n_low / ok.sum():.1f} %) at or below it.')
+    print(f'    dwell (s): min {dwell[ok].min():.4f}, median {dwell[ok].median():.4f}, '
+          f'max {dwell[ok].max():.4f}')
+    if n_tied:
+        print(f'    {n_tied} row(s) have several valid bins at the peak rate; the first bin is used.')
+    if n_mismatch:
+        print(f'    WARNING: {n_mismatch} row(s) whose rebuilt raw peak differs from the Excel peak_fr '
+              f'by > 0.002 Hz (the dwell is that of the rebuilt peak bin):')
+        for s, u, a, b in df.loc[rate_diff > 0.002, ['session', 'unit', 'peak_fr',
+                                                    'peak_fr_bin_rate_hz']].head(20).itertuples(index=False):
+            print(f'        {s} | {u}: Excel {a}, rebuilt {b}')
+    if (~ok).any():
+        print(f'    {int((~ok).sum())} row(s) not found in the temporal stability table (never ringed).')
+
+    if LOW_DWELL_SCOPE == 'group':
+        print(f'    LOW_DWELL_SCOPE = \'group\': the plots use one threshold per box instead '
+              f'(flag_low_dwell_per_group, printed per comparison).')
+
+    _RING_TEXT['peak_fr'] = (
+        f'peak-bin dwell ≤ {thr:.3g} s',
+        f'Red ring: dwell in the raw-map peak bin (the bin of peak_fr) ≤ {thr:.3g} s, the '
+        f'{LOW_DWELL_PCTILE:g}th percentile over all {int(ok.sum())} place-cell rows (every arena).')
+    return df
+
+
+def flag_low_dwell_per_group(full_df: pd.DataFrame, grp: Grouping):
+    """LOW_DWELL_SCOPE = 'group': recompute 'low_peak_dwell' within each box (group of
+    grp.col) of this comparison: a row is flagged if its peak_fr_bin_dwell_s is <= the
+    LOW_DWELL_PCTILE-th percentile of the rows of the same box (rows with both a dwell and
+    a peak_fr, i.e. the plotted points). full_df must already be restricted to the cells of
+    the comparison (run_comparison). Returns (df, ring_text for run_all_comparisons);
+    with 'pooled' scope or no dwell, (full_df unchanged, None)."""
+    if (LOW_DWELL_SCOPE != 'group' or 'peak_fr' not in _RING_TEXT
+            or 'peak_fr_bin_dwell_s' not in full_df.columns):
+        return full_df, None
+    df = full_df.copy()
+    dwell = pd.to_numeric(df['peak_fr_bin_dwell_s'], errors='coerce')
+    ok = dwell.notna() & pd.to_numeric(df['peak_fr'], errors='coerce').notna()
+    flag = pd.Series(False, index=df.index)
+    thr = {}
+    print(f'Peak-bin dwell red rings, {LOW_DWELL_PCTILE:g}th percentile within each box:')
+    for g in grp.order:
+        sel = ok & (df[grp.col] == g)
+        if not sel.any():
+            continue
+        thr[g] = float(np.percentile(dwell[sel], LOW_DWELL_PCTILE))
+        flag[sel] = dwell[sel] <= thr[g]
+        n_low, n = int(flag[sel].sum()), int(sel.sum())
+        print(f'    {_label(g)}: threshold {thr[g]:.4f} s; {n_low}/{n} rows '
+              f'({100.0 * n_low / n:.1f} %) at or below it')
+    df['low_peak_dwell'] = flag
+    if not thr:
+        return df, None
+    ring_text = {'peak_fr': (
+        f'peak-bin dwell ≤ {LOW_DWELL_PCTILE:g}th pctile of its box',
+        f'Red ring: dwell in the raw-map peak bin (the bin of peak_fr) ≤ the '
+        f'{LOW_DWELL_PCTILE:g}th percentile of the cells in the same box ('
+        + ', '.join(f'{_label(g)} {t:.3g} s' for g, t in thr.items()) + ').')}
+    return df, ring_text
+
+
+def add_wall_field_flag(shape_df: pd.DataFrame, wd_dfs: dict = None) -> pd.DataFrame:
+    """Add 'cell_peak_wall_dist' (wall distance of the cell's raw-map peak bin, which every
+    field of the cell inherits in the wall-distance analysis) and 'peak_at_wall' (that
+    distance == 0) to shape_df. Fields with no distance are not flagged."""
+    df = shape_df.copy()
+    df['cell_peak_wall_dist'] = np.nan
+    df['peak_at_wall'] = False
+    if wd_dfs is None or 'shape' not in wd_dfs:
+        print('\nWall flag: no wall-distance tables (INCLUDE_WALL_DISTANCE = False); '
+              'FieldShape_fld_width_ratio.png gets no red rings.')
+        return df
+
+    keys = ['session', 'unit', 'field_number']
+    w = (wd_dfs['shape'][keys + ['wall_dist']]
+         .drop_duplicates(keys, keep='first').rename(columns={'wall_dist': 'cell_peak_wall_dist'}))
+    m = df[keys].merge(w, on=keys, how='left')                  # keeps the row order of df
+    df['cell_peak_wall_dist'] = m['cell_peak_wall_dist'].to_numpy()
+    d = pd.to_numeric(df['cell_peak_wall_dist'], errors='coerce')
+    df['peak_at_wall'] = (d == 0)
+
+    n_at = int(df['peak_at_wall'].sum())
+    print(f'\nWall flag (field shape): {int(d.notna().sum())}/{len(df)} field(s) with a wall distance; '
+          f'{n_at} at distance 0 (cell peak at the wall), {int(d.isna().sum())} with none (never ringed).')
+    print(pd.crosstab(df['arena_type'], d.fillna(-1).astype(int).rename('cell_peak_wall_dist (-1 = none)'),
+                      margins=True).to_string())
+
+    _RING_TEXT['fld_width_ratio'] = (
+        'cell peak at the wall (d = 0)',
+        'Red ring: field of a cell whose raw-map peak bin is at wall distance 0 (fields inherit '
+        'their cell\'s distance; see WallDistanceSchematic_<arena>.png).')
+    if NEG_CONTROL_EXCLUDE_UNKNOWN:
+        _NEG_RING_TEXT['fld_width_ratio'] = (
+            'cell peak not at the wall (d > 0)',
+            'Green ring: field of a cell whose raw-map peak bin is at wall distance > 0 '
+            '(every field with a distance that is not red-ringed); fields without a '
+            'distance are left out.')
+    else:
+        _NEG_RING_TEXT['fld_width_ratio'] = (
+            'cell peak not at the wall (d > 0 or none)',
+            'Green ring: every field not red-ringed, i.e. its cell\'s raw-map peak bin is at '
+            f'wall distance > 0 or has no distance ({int(d.isna().sum())} field(s) of all '
+            'arenas without one).')
+    return df
+
+
+# ── One full comparison (session types of one arena, or arena types) ────────
+
+def _print_significant(tbl: pd.DataFrame, title: str, metric_width: int, test_width: int):
+    sig = tbl[tbl['significant'] == True]  # noqa: E712
+    if not len(sig):
+        print(f'\nNo significant differences found ({title}).')
+        return
+    print(f'\nSignificant differences, {title} (p < 0.05):')
+    for _, row in sig.iterrows():
+        stat = row['statistic']
+        stat_str = f'{stat:.3f}' if pd.notna(stat) else 'nan'
+        print(f"  {row['metric']:{metric_width}s} {row['test']:{test_width}s} "
+              f"stat={stat_str}  p={row['p_value']:.4g}")
+
+
+def _concat_tables(tables: list) -> pd.DataFrame:
+    tables = [t for t in tables if len(t)]
+    return pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+
+
+def _subset_mp(mp_dfs: dict, select) -> dict:
+    """`select` applied to every multi-peak table (None stays None)."""
+    return None if mp_dfs is None else {level: select(d) for level, d in mp_dfs.items()}
+
+
+def run_comparison(grp: Grouping, full_df: pd.DataFrame, field_df: pd.DataFrame,
+                   shape_df: pd.DataFrame, all_units_df: pd.DataFrame, plots_dir: str,
+                   ts_df: pd.DataFrame = None, mp_dfs: dict = None,
+                   wd_dfs: dict = None) -> dict:
+    """Compare every metric across the groups of `grp` -- statistics, box/bar
+    plots in `plots_dir` and histograms in `plots_dir`/Histograms. The
+    dataframes must already be restricted to the cells to compare; `ts_df`
+    (temporal stability PerCell table), `mp_dfs` (multi-peak tables,
+    build_multipeak_dfs) and `wd_dfs` (wall-distance tables,
+    build_wall_distance_dfs) are optional. Returns {table_name: table}."""
+    name = grp.title or grp.noun.capitalize()
+    what = (f'comparing {grp.noun}: {[_label(g) for g in grp.order]}' if grp.tests
+            else f'{", ".join(grp.order)} pooled, no tests')
+    print(f'\n{"=" * 70}\n{name} -- {what}\n{"=" * 70}')
+    print('Place cells per group (Full sheet):')
+    print(full_df[grp.col].value_counts().reindex(grp.order).fillna(0).astype(int))
+    if not len(full_df):
+        print('No place cells; skipping.')
+        return {}
+
+    # Each cell's shade, from this comparison's place cells only.
+    grp = replace(grp, shade=cell_shades(full_df))
+
+    # Red rings on Full_peak_fr.png: low peak-bin dwell, threshold per box (V20).
+    full_df, full_ring_text = flag_low_dwell_per_group(full_df, grp)
+
+    # ── Continuous metrics ──────────────────────────────────────────────────
+    full_desc, full_omnibus, full_posthoc = run_all_comparisons(
+        full_df, FULL_METRICS, 'Full', grp, plots_dir, ring_text=full_ring_text)
+    field_desc, field_omnibus, field_posthoc = run_all_comparisons(
+        field_df, FIELD_METRICS, 'Fields', grp, plots_dir)
+    shape_desc, shape_omnibus, shape_posthoc = run_all_comparisons(
+        shape_df, FIELD_SHAPE_METRICS, 'FieldShape', grp, plots_dir)
+
+    desc_df    = pd.concat([full_desc, field_desc, shape_desc], ignore_index=True)
+    omnibus_df = pd.concat([full_omnibus, field_omnibus, shape_omnibus], ignore_index=True)
+    posthoc_df = pd.concat([full_posthoc, field_posthoc, shape_posthoc], ignore_index=True)
+
+    extra_desc, extra_omnibus, extra_posthoc = run_all_comparisons(
+        full_df, EXTRA_FULL_METRICS, 'Full', grp, plots_dir)
+
+    # ── Stability score within each stability type ─────────────────────────
+    stab_desc_all, stab_omni_all, stab_post_all = [], [], []
+    for key, desc in STABILITY_TYPES.items():
+        sub = full_df[full_df['stability_type'] == key]
+        label = f'Stability score ({desc})'
+        d, o, p = compare_groups(sub, 'stability_score', label, grp)
+        stab_desc_all.append(d)
+        stab_omni_all.append(o)
+        if len(p):
+            stab_post_all.append(p)
+        plot_metric(sub, 'stability_score', label,
+                    os.path.join(plots_dir, f'Full_stability_score_{key}.png'), grp,
+                    stats_lines=_continuous_stats_lines(d, o, p, grp), posthoc_df=p)
+
+    stab_desc_df    = pd.concat(stab_desc_all, ignore_index=True)
+    stab_omnibus_df = pd.DataFrame(stab_omni_all)
+    stab_posthoc_df = pd.concat(stab_post_all, ignore_index=True) if stab_post_all else pd.DataFrame()
+
+    # ── Categorical (proportion) comparisons ────────────────────────────────
+    cat_desc_all, cat_omni_all, cat_post_all = [], [], []
+    for pop, metrics in ((all_units_df, CATEGORICAL_METRICS_ALL_UNITS),
+                         (full_df, CATEGORICAL_METRICS_PLACE_CELLS)):
+        for col, label in metrics.items():
+            d, o, p = compare_categorical(pop, col, label, grp)
+            cat_desc_all.append(d)
+            cat_omni_all.append(o)
+            if len(p):
+                cat_post_all.append(p)
+            plot_categorical(pop, col, label,
+                             os.path.join(plots_dir, f'Categorical_{col}.png'), grp,
+                             stats_lines=_categorical_stats_lines(d, o, p, grp),
+                             posthoc_df=p)
+
+    cat_desc_df    = pd.concat(cat_desc_all, ignore_index=True) if cat_desc_all else pd.DataFrame()
+    cat_omnibus_df = pd.DataFrame(cat_omni_all)
+    cat_posthoc_df = pd.concat(cat_post_all, ignore_index=True) if cat_post_all else pd.DataFrame()
+
+    speed_dir_desc, speed_dir_omnibus, speed_dir_posthoc = compare_speed_direction(full_df, grp)
+    plot_speed_direction(full_df, os.path.join(plots_dir, 'Categorical_speed_direction.png'), grp,
+                         stats_lines=_speed_dir_stats_lines(speed_dir_desc, speed_dir_omnibus,
+                                                            speed_dir_posthoc, grp),
+                         posthoc_df=speed_dir_posthoc)
+    speed_dir_omnibus_df = pd.DataFrame([speed_dir_omnibus])
+
+    # ── Temporal stability (one value per cell; points shaded like full_df) ─
+    ts_tables = {}
+    if ts_df is not None:
+        print('Place cells per group (temporal stability):')
+        print(ts_df[grp.col].value_counts().reindex(grp.order).fillna(0).astype(int))
+        ts_desc, ts_omnibus, ts_posthoc = run_all_comparisons(
+            ts_df, TEMPORAL_STABILITY_METRICS, 'TemporalStability', grp,
+            os.path.join(plots_dir, TS_PLOTS_SUBDIR))
+        ts_tables = {'TS_Desc': ts_desc, 'TS_Omnibus': ts_omnibus, 'TS_PostHoc': ts_posthoc}
+
+    # ── Multi-peak fields (per cell / field / multi-peak field; shaded like full_df) ─
+    mp_tables = {}
+    if mp_dfs is not None:
+        print('Place cells / fields / multi-peak fields per group (multi-peak):')
+        print(pd.DataFrame({level: d[grp.col].value_counts() for level, d in mp_dfs.items()})
+              .reindex(grp.order).fillna(0).astype(int))
+        mp_dir = os.path.join(plots_dir, MP_PLOTS_SUBDIR)
+        os.makedirs(mp_dir, exist_ok=True)
+        mp_desc, mp_omni, mp_post = [], [], []
+        for level, metrics in MULTIPEAK_METRICS.items():
+            d, o, p = run_all_comparisons(mp_dfs[level], metrics, f'MultiPeak_{level}',
+                                          grp, mp_dir)
+            mp_desc.append(d)
+            mp_omni.append(o)
+            mp_post.append(p)
+        mp_cat_desc, mp_cat_omni, mp_cat_post = [], [], []
+        for level, metrics in MULTIPEAK_CATEGORICAL.items():
+            for col, label in metrics.items():
+                d, o, p = compare_categorical(mp_dfs[level], col, label, grp)
+                mp_cat_desc.append(d)
+                mp_cat_omni.append(o)
+                mp_cat_post.append(p)
+                plot_categorical(mp_dfs[level], col, label,
+                                 os.path.join(mp_dir, f'MultiPeak_Categorical_{col}.png'), grp,
+                                 stats_lines=_categorical_stats_lines(d, o, p, grp),
+                                 posthoc_df=p,
+                                 ylabel='% of place fields' if level == 'Field' else '% of cells')
+        mp_tables = {'MP_Desc':       _concat_tables(mp_desc),
+                     'MP_Omnibus':    _concat_tables(mp_omni),
+                     'MP_PostHoc':    _concat_tables(mp_post),
+                     'MP_CatDesc':    _concat_tables(mp_cat_desc),
+                     'MP_CatOmnibus': pd.DataFrame(mp_cat_omni),
+                     'MP_CatPostHoc': _concat_tables(mp_cat_post)}
+
+    print(f'Box/bar plots saved to {plots_dir}')
+    if grp.tests:
+        _print_significant(omnibus_df, f'{name}, continuous metrics', 45, 16)
+        _print_significant(
+            pd.concat([extra_omnibus, stab_omnibus_df, cat_omnibus_df, speed_dir_omnibus_df],
+                      ignore_index=True),
+            f'{name}, extra/categorical metrics', 65, 30)
+    if ts_tables and grp.tests:
+        _print_significant(ts_tables['TS_Omnibus'], f'{name}, temporal stability', 65, 16)
+    if mp_tables and grp.tests:
+        _print_significant(pd.concat([mp_tables['MP_Omnibus'], mp_tables['MP_CatOmnibus']],
+                                     ignore_index=True),
+                           f'{name}, multi-peak fields', 65, 30)
+
+    # ── Histograms ──────────────────────────────────────────────────────────
+    hist_dir = os.path.join(plots_dir, 'Histograms')
+    os.makedirs(hist_dir, exist_ok=True)
+    for col, label in HIST_FULL_METRICS.items():
+        plot_histogram_by_group(full_df, col, label,
+                                os.path.join(hist_dir, f'Hist_Full_{col}.png'), grp)
+    for col, label in FIELD_METRICS.items():
+        plot_histogram_by_group(field_df, col, label,
+                                os.path.join(hist_dir, f'Hist_Fields_{col}.png'), grp)
+    for col, label in FIELD_SHAPE_METRICS.items():
+        plot_histogram_by_group(shape_df, col, label,
+                                os.path.join(hist_dir, f'Hist_FieldShape_{col}.png'), grp)
+    for col, label in SPEED_METRICS.items():
+        plot_speed_histograms_by_group(full_df, col, label,
+                                       os.path.join(hist_dir, f'Hist_Speed_{col}.png'), grp)
+    if ts_df is not None:
+        ts_hist_dir = os.path.join(plots_dir, TS_PLOTS_SUBDIR, 'Histograms')
+        os.makedirs(ts_hist_dir, exist_ok=True)
+        for col, label in TEMPORAL_STABILITY_METRICS.items():
+            plot_histogram_by_group(ts_df, col, label,
+                                    os.path.join(ts_hist_dir, f'Hist_TemporalStability_{col}.png'), grp)
+        print(f'Temporal stability histograms saved to {ts_hist_dir}')
+    if mp_dfs is not None:
+        mp_hist_dir = os.path.join(plots_dir, MP_PLOTS_SUBDIR, 'Histograms')
+        os.makedirs(mp_hist_dir, exist_ok=True)
+        for level, metrics in MULTIPEAK_METRICS.items():
+            for col, label in metrics.items():
+                plot_histogram_by_group(mp_dfs[level], col, label,
+                                        os.path.join(mp_hist_dir, f'Hist_MultiPeak_{level}_{col}.png'),
+                                        grp)
+        print(f'Multi-peak histograms saved to {mp_hist_dir}')
+    print(f'Histogram plots saved to {hist_dir}')
+
+    # ── Wall distance (points shaded like full_df) ──────────────────────────
+    wd_tables = (run_wall_distance(grp, wd_dfs, os.path.join(plots_dir, WD_PLOTS_SUBDIR))
+                 if wd_dfs is not None else {})
+
+    return {
+        'Desc':             desc_df,
+        'Omnibus':          omnibus_df,
+        'PostHoc':          posthoc_df,
+        'Desc_Extra':       extra_desc,
+        'Omnibus_Extra':    extra_omnibus,
+        'PostHoc_Extra':    extra_posthoc,
+        'StabType_Desc':    stab_desc_df,
+        'StabType_Omnibus': stab_omnibus_df,
+        'StabType_PostHoc': stab_posthoc_df,
+        'CatDesc':          cat_desc_df,
+        'CatOmnibus':       cat_omnibus_df,
+        'CatPostHoc':       cat_posthoc_df,
+        'SpeedDir_Desc':    speed_dir_desc,
+        'SpeedDir_Omnibus': speed_dir_omnibus_df,
+        'SpeedDir_PostHoc': speed_dir_posthoc,
+        **ts_tables,
+        **mp_tables,
+        **wd_tables,
+    }
+
+
+def _stitch_side_by_side(paths: list, out_path: str):
+    """Save the images `paths` side by side (top-aligned, PANEL_GAP_IN apart,
+    on white) as one image. A missing image (None) leaves a blank space as
+    wide as the widest one, so every comparison keeps its position."""
+    imgs = []
+    for p in paths:
+        if p is None:
+            imgs.append(None)
+            continue
+        with Image.open(p) as im:
+            imgs.append(im.convert('RGB'))
+    present = [im for im in imgs if im is not None]
+    blank_w = max(im.width for im in present)
+    widths = [im.width if im is not None else blank_w for im in imgs]
+    gap = int(round(PANEL_GAP_IN * FIG_DPI))
+    canvas = Image.new('RGB', (sum(widths) + gap * (len(imgs) - 1),
+                               max(im.height for im in present)), 'white')
+    x = 0
+    for im, w in zip(imgs, widths):
+        if im is not None:
+            canvas.paste(im, (x, 0))
+        x += w + gap
+    canvas.save(out_path, dpi=(FIG_DPI, FIG_DPI))
+
+
+def _combine_side_by_side(src_dirs: list, out_dir: str):
+    """For every .png found in any of `src_dirs` (by path relative to it,
+    e.g. 'Histograms\\Hist_Full_sir.png'), save the versions from all
+    `src_dirs` side by side, in that order, to the same path in `out_dir`."""
+    rel_paths = sorted({os.path.relpath(os.path.join(root, f), d)
+                        for d in src_dirs for root, _dirs, files in os.walk(d)
+                        for f in files if f.lower().endswith('.png')})
+    for rel in rel_paths:
+        out_path = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        srcs = [os.path.join(d, rel) for d in src_dirs]
+        _stitch_side_by_side([p if os.path.isfile(p) else None for p in srcs], out_path)
+    print(f'\n{len(rel_paths)} side-by-side plots '
+          f'({" | ".join(os.path.basename(d) for d in src_dirs)}) saved to {out_dir}')
+
+
+def run_animal_controlled(full_df: pd.DataFrame, field_df: pd.DataFrame, shape_df: pd.DataFrame,
+                          all_units_df: pd.DataFrame, out_dir: str,
+                          ts_df: pd.DataFrame = None, mp_dfs: dict = None,
+                          wd_dfs: dict = None) -> dict:
+    """Level 3: for each entry of ANIMAL_CONTROLLED_COMPARISONS, compare its
+    arenas using only the cells of its animals (same tests/plots as the
+    arena-type comparison). Each plot is saved to out_dir (histograms to
+    out_dir\\Histograms) with the comparisons side by side, each with its own
+    statistics -- the comparisons are not tested against each other. The
+    tables are also saved to out_dir\\AnimalControlled_Stats.xlsx. With
+    `ts_df` / `mp_dfs`, the temporal stability / multi-peak example maps of
+    every comparison go to out_dir\\EXAMPLE_MAPS_SUBDIR. Returns
+    {sheet_name: table}."""
+    all_tables = {}
+    ex_dir = os.path.join(out_dir, EXAMPLE_MAPS_SUBDIR)
+    if (ts_df is not None or mp_dfs is not None) and os.path.isdir(ex_dir):
+        # Old example maps are removed first so a re-run never leaves stale ones.
+        for f in os.listdir(ex_dir):
+            if f.lower().endswith('.png'):
+                os.remove(os.path.join(ex_dir, f))
+    # Each comparison's plots are first saved to its own temporary folder,
+    # then combined side by side.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+            grp = animal_controlled_grouping(animals, arenas)
+            wanted = {a.lower() for a in animals}
+
+            def _select(d):
+                if d is None:
+                    return None
+                return d[d['animal'].astype(str).str.lower().isin(wanted)
+                         & d['arena_type'].isin(grp.order)]
+
+            sel_full = _select(full_df)
+            print(f'\n{name}: place cells per animal and arena (Full sheet):')
+            print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
+            for arena in grp.order:
+                missing = [a for a in animals
+                           if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
+                                   & (sel_full['arena_type'] == arena)).any()]
+                if missing:
+                    print(f'WARNING: no place cells of {missing} in the {arena} arena.')
+
+            sel_ts = _select(ts_df)
+            if sel_ts is not None:
+                print(f'\n{name}: place cells per animal and arena (temporal stability):')
+                print(pd.crosstab(sel_ts['animal'], sel_ts['arena_type'], margins=True))
+
+            sel_mp = _subset_mp(mp_dfs, _select)
+            if sel_mp is not None:
+                print(f'\n{name}: place cells per animal and arena (multi-peak):')
+                print(pd.crosstab(sel_mp['Cell']['animal'], sel_mp['Cell']['arena_type'],
+                                  margins=True))
+
+            tables = run_comparison(grp, sel_full, _select(field_df), _select(shape_df),
+                                    _select(all_units_df), os.path.join(tmp_dir, name),
+                                    ts_df=sel_ts, mp_dfs=sel_mp,
+                                    wd_dfs=_subset_mp(wd_dfs, _select))
+            tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
+            for tname, tbl in tables.items():
+                if len(tbl):
+                    tbl.insert(0, 'animals', ', '.join(animals))
+                all_tables[f'{tag}_{tname}'] = tbl
+            if sel_ts is not None and len(sel_ts):
+                _save_example_maps(grp, sel_ts, ex_dir, name, EXAMPLE_METRIC, _map_path)
+            if sel_mp is not None and len(sel_mp['Cell']):
+                _save_example_maps(grp, sel_mp['Cell'], ex_dir, f'MultiPeak_{name}',
+                                   MP_EXAMPLE_METRIC, _mp_map_path)
+
+        _combine_side_by_side([os.path.join(tmp_dir, name) for name in ANIMAL_CONTROLLED_COMPARISONS],
+                              out_dir)
+
+    if all_tables:
+        os.makedirs(out_dir, exist_ok=True)
+        xlsx = os.path.join(out_dir, 'AnimalControlled_Stats.xlsx')
+        with pd.ExcelWriter(xlsx, engine='openpyxl') as writer:
+            for sheet_name, tbl in all_tables.items():
+                tbl.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        print(f'\nAnimal-controlled statistics saved to {xlsx}')
+    return all_tables
+
+
+# ── Run snapshot (code + metadata, saved before the analysis) ───────────────
+
+_SNAPSHOT_VALUE_TYPES = (str, int, float, bool, list, tuple, dict, type(None))
+_SNAPSHOT_PACKAGES = ['numpy', 'pandas', 'scipy', 'matplotlib', 'statsmodels',
+                      'openpyxl', 'pillow']
+
+
+def _module_parameters(mod) -> list[dict]:
+    """Every public plain-valued (str / number / bool / list / dict ...)
+    module-level setting of `mod`, as {module, parameter, value} rows."""
+    return [{'module': mod.__name__, 'parameter': k, 'value': str(v)}
+            for k, v in vars(mod).items()
+            if not k.startswith('_') and isinstance(v, _SNAPSHOT_VALUE_TYPES)]
+
+
+def _git(*args) -> str:
+    """Output of a git command run in this script's folder ('' if git fails)."""
+    try:
+        return subprocess.run(['git', *args], cwd=os.path.dirname(os.path.abspath(__file__)),
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
+def save_run_snapshot() -> str:
+    """Copy this script and its local modules (PlaceCell_Main_v21,
+    CellClusteredStats_Utils, PlaceFieldShape_Utils) to
+    OUTPUT_DIR\\RUN_SNAPSHOT_SUBDIR\\<timestamp>\\code, and write RunMetadata.xlsx
+    there: 'Run' (time, script, git commit / uncommitted changes, Python and
+    package versions, machine) and 'Parameters' (every setting of this script
+    and of those modules at the start of the run). Returns the folder."""
+    now = datetime.now()
+    snap_dir = os.path.join(OUTPUT_DIR, RUN_SNAPSHOT_SUBDIR, now.strftime('%Y%m%d_%H%M%S'))
+    code_dir = os.path.join(snap_dir, 'code')
+    os.makedirs(code_dir, exist_ok=True)
+
+    script = os.path.abspath(__file__)
+    local_modules = [ccs, pfs, pc]
+    for path in [script] + [m.__file__ for m in local_modules]:
+        shutil.copy2(path, code_dir)
+
+    git_status = _git('status', '--porcelain', '--', script,
+                      *[m.__file__ for m in local_modules])
+    run_rows = [
+        ('run_timestamp',  now.isoformat(timespec='seconds')),
+        ('script',         script),
+        ('command',        ' '.join(sys.argv)),
+        ('working_dir',    os.getcwd()),
+        ('git_commit',     _git('rev-parse', 'HEAD') or 'n/a'),
+        ('git_branch',     _git('rev-parse', '--abbrev-ref', 'HEAD') or 'n/a'),
+        ('git_uncommitted_changes (script + local modules)', git_status or 'none'),
+        ('python',         sys.version.replace('\n', ' ')),
+        ('python_executable', sys.executable),
+        ('platform',       platform.platform()),
+        ('machine',        platform.node()),
+    ]
+    for pkg in _SNAPSHOT_PACKAGES:
+        try:
+            run_rows.append((f'{pkg}_version', importlib.metadata.version(pkg)))
+        except importlib.metadata.PackageNotFoundError:
+            run_rows.append((f'{pkg}_version', 'not installed'))
+    run_rows.append(('code_snapshot', code_dir))
+
+    params = [row for mod in [sys.modules[__name__]] + local_modules
+              for row in _module_parameters(mod)]
+    with pd.ExcelWriter(os.path.join(snap_dir, 'RunMetadata.xlsx'), engine='openpyxl') as writer:
+        pd.DataFrame(run_rows, columns=['item', 'value']).to_excel(
+            writer, sheet_name='Run', index=False)
+        pd.DataFrame(params, columns=['module', 'parameter', 'value']).to_excel(
+            writer, sheet_name='Parameters', index=False)
+    print(f'Run snapshot (code + metadata) saved to {snap_dir}')
+    return snap_dir
+
+
+def main():
+    save_run_snapshot()
+
+    print(f'Loading {INPUT_EXCEL} ...')
+    full, fields = load_sheets()
+
+    if INCLUDE_FIELD_DIMENSION_MAPS:
+        run_field_dimension_maps()
+
+    full_df      = build_full_metrics_df(full)
+    field_df     = build_field_metrics_df(full, fields)
+    shape_df     = build_field_shape_df(full, fields)
+    all_units_df = build_all_units_df(full)
+
+    print('\nPlace cells by arena and session type (Full sheet):')
+    print(pd.crosstab(full_df['arena_type'], full_df['session_type'].fillna('unrecognized'),
+                      margins=True))
+
+    ts_df = None
+    if INCLUDE_TEMPORAL_STABILITY:
+        ts_df = build_temporal_stability_df()
+        print('\nPlace cells by arena and session type (temporal stability):')
+        print(pd.crosstab(ts_df['arena_type'], ts_df['session_type'].fillna('unrecognized'),
+                          margins=True))
+
+    # Red rings on Full_peak_fr.png: low dwell in the peak_fr bin (V20).
+    full_df = add_peak_dwell_flag(full_df, ts_df)
+
+    mp_dfs = None
+    if INCLUDE_MULTIPEAK:
+        mp_dfs = build_multipeak_dfs(full, fields)
+        print('\nPlace cells by arena and session type (multi-peak):')
+        print(pd.crosstab(mp_dfs['Cell']['arena_type'],
+                          mp_dfs['Cell']['session_type'].fillna('unrecognized'), margins=True))
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    all_tables = {}
+
+    wd_dfs, wd_tables = None, {}
+    if INCLUDE_WALL_DISTANCE:
+        wd_dfs, wd_tables = build_wall_distance_dfs(full_df, field_df, shape_df, ts_df, mp_dfs)
+    # Red rings on FieldShape_fld_width_ratio.png: cell peak at the wall (V20).
+    shape_df = add_wall_field_flag(shape_df, wd_dfs)
+
+    # ── 1. Session types within each arena ──────────────────────────────────
+    for arena in ARENA_TYPES:
+        grp = session_grouping(arena)
+
+        def _in_arena(d):
+            if d is None:
+                return None
+            return d[(d['arena_type'] == arena) & d['session_type'].isin(grp.order)]
+
+        tables = run_comparison(grp, _in_arena(full_df), _in_arena(field_df),
+                                _in_arena(shape_df), _in_arena(all_units_df),
+                                os.path.join(OUTPUT_DIR, 'SessionType', arena),
+                                ts_df=_in_arena(ts_df), mp_dfs=_subset_mp(mp_dfs, _in_arena),
+                                wd_dfs=_subset_mp(wd_dfs, _in_arena))
+        for name, tbl in tables.items():
+            if len(tbl) and 'arena_type' not in tbl.columns:
+                tbl.insert(0, 'arena_type', arena)
+            all_tables[f'Ses{arena}_{name}'] = tbl
+
+    # ── 2. Arena types as a whole (all session types pooled) ────────────────
+    tables = run_comparison(ARENA_GROUPING, full_df, field_df, shape_df, all_units_df,
+                            os.path.join(OUTPUT_DIR, 'ArenaType'), ts_df=ts_df, mp_dfs=mp_dfs,
+                            wd_dfs=wd_dfs)
+    for name, tbl in tables.items():
+        all_tables[f'Arena_{name}'] = tbl
+
+    # ── 3. Arena types, only animals recorded in all compared arenas ────────
+    all_tables.update(run_animal_controlled(
+        full_df, field_df, shape_df, all_units_df,
+        os.path.join(OUTPUT_DIR, ANIMAL_CONTROLLED_DIR), ts_df=ts_df, mp_dfs=mp_dfs,
+        wd_dfs=wd_dfs))
+
+    # ── 4. Animal IDs (every arena and session type pooled; V20) ────────────
+    animal_grp = animal_id_grouping(all_units_df)
+    print(f'\nAnimal-ID comparison: {animal_grp.order}')
+    print(pd.crosstab(full_df['animal_id'].fillna('unrecognized'), full_df['arena_type'],
+                      margins=True))
+    if CONTINUOUS_TEST == 'LMM':
+        print('NOTE: with the animal as the compared group, the LMM\'s animal random intercept '
+              'is confounded with the group effect.')
+    tables = run_comparison(animal_grp, full_df, field_df, shape_df, all_units_df,
+                            os.path.join(OUTPUT_DIR, ANIMAL_ID_DIR), ts_df=ts_df, mp_dfs=mp_dfs,
+                            wd_dfs=wd_dfs)
+    for name, tbl in tables.items():
+        all_tables[f'Animal_{name}'] = tbl
+
+    # ── 5. All cells pooled (one group, no tests; V20) ──────────────────────
+    tables = run_comparison(ALL_CELLS_GROUPING, full_df, field_df, shape_df, all_units_df,
+                            os.path.join(OUTPUT_DIR, ALL_CELLS_DIR), ts_df=ts_df, mp_dfs=mp_dfs)
+    for name, tbl in tables.items():
+        if 'Omnibus' not in name and 'PostHoc' not in name:   # one group: nothing tested
+            all_tables[f'All_{name}'] = tbl
+
+    all_tables.update(wd_tables)
+
+    # ── Save all statistics (new workbook + one long-format CSV) ────────────
+    # Sheet names are capped at 31 characters by Excel.
+    with pd.ExcelWriter(STATS_XLSX, engine='openpyxl') as writer:
+        for sheet_name, tbl in all_tables.items():
+            tbl.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    print(f'\nAll statistics saved to {STATS_XLSX}')
+
+    # 'table' names the source sheet; the tables have different columns, so
+    # cells that don't apply to a table are left blank.
+    stats_csv_parts = []
+    for sheet_name, tbl in all_tables.items():
+        if tbl is None or not len(tbl) or sheet_name in WD_TABLES_NOT_IN_CSV:
+            continue
+        tbl = tbl.copy()
+        tbl.insert(0, 'table', sheet_name)
+        stats_csv_parts.append(tbl)
+    if stats_csv_parts:
+        pd.concat(stats_csv_parts, ignore_index=True).to_csv(
+            STATS_CSV, index=False, encoding='utf-8-sig')
+        print(f'All statistics also saved to {STATS_CSV}')
+
+    print(f'\nContinuous-metric test used: '
+          f'{"Kruskal-Wallis + Mann-Whitney U (Holm), independence assumed" if CONTINUOUS_TEST == "KW" else "nested LMM"}')
+    print(f'\nDone. Plots saved under {OUTPUT_DIR}')
+
+
+if __name__ == '__main__':
+    main()

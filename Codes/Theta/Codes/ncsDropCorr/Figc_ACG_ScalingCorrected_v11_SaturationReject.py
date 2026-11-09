@@ -163,8 +163,8 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_BP1-20_Demean_SaturationRejection')
-FIGURE_DIR = os.path.join(OUTPUT_DIR,'Results' , 'ACG' ,'figures')
+OUTPUT_DIR = os.path.join(ROOT_DIR,'Results' , 'ACG' , 'ACG_theta_continuity_Fin')
+FIGURE_DIR = os.path.join(OUTPUT_DIR,'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
 META_DIR = os.path.join(OUTPUT_DIR, 'meta')
@@ -1626,18 +1626,32 @@ def plot_example_epoch(row, epoch_waveform, ax_trace=None, ax_acg=None,
     return ax_trace, ax_acg
 
 
-def _matched_epochs(df):
+def _matched_epochs(df, theta_only=True):
     """Epochs shown on the frequency vs. peak-range plots: every epoch matched to
     a reference sinusoid anywhere in ACG_REF_BANK (theta and non-theta), i.e. all
     but too-short epochs. Epochs matched below ~1.75 Hz have no peak range (see
-    create_sine_ref_xcorrs) and can't be drawn."""
-    matched = ~df['skipped'] | df['skipped_outofband']
+    create_sine_ref_xcorrs) and can't be drawn.
+
+    `theta_only=True` keeps only the accepted theta epochs (ED_min sinusoid in
+    ACG_FREQ_RANGE) -- display-only theta-range figures; nothing else changes."""
+    matched = ~df['skipped'] if theta_only else (~df['skipped'] | df['skipped_outofband'])
     return df[matched & np.isfinite(df['peakrangenorm'])]
 
 
-def _freq_plot_bins():
-    """Frequency marginal-histogram bin edges spanning the whole ACG_REF_BANK."""
-    return np.arange(ACG_REF_BANK[0], ACG_REF_BANK[1] + FREQ_PLOT_BIN_HZ / 2, FREQ_PLOT_BIN_HZ)
+def _freq_plot_bins(theta_only=False):
+    """Frequency marginal-histogram bin edges spanning the whole ACG_REF_BANK
+    (or only ACG_FREQ_RANGE with `theta_only`)."""
+    lo, hi = ACG_FREQ_RANGE if theta_only else ACG_REF_BANK
+    return np.arange(lo, hi + FREQ_PLOT_BIN_HZ / 2, FREQ_PLOT_BIN_HZ)
+
+
+THETA_ONLY_SUFFIX = f'_theta{ACG_FREQ_RANGE[0]:g}-{ACG_FREQ_RANGE[1]:g}Hz'
+
+
+def _theta_display_note():
+    """Footer line marking a display-only theta-range figure."""
+    return (f'Display only: accepted theta epochs ({_band_label()}) shown; '
+            f'non-theta epochs omitted from the plot')
 
 
 def _darken(color, factor):
@@ -1645,8 +1659,12 @@ def _darken(color, factor):
     return tuple(factor * np.array(to_rgba(color)[:3]))
 
 
-def _mark_theta_band(ax_main, ax_top):
-    """Dashed lines at the ACG_FREQ_RANGE edges, x-axis over the whole ACG_REF_BANK."""
+def _mark_theta_band(ax_main, ax_top, theta_only=False):
+    """Dashed lines at the ACG_FREQ_RANGE edges, x-axis over the whole ACG_REF_BANK.
+    With `theta_only`, the x-axis spans ACG_FREQ_RANGE alone and no lines are drawn."""
+    if theta_only:
+        ax_main.set_xlim(ACG_FREQ_RANGE)
+        return
     for ax in (ax_main, ax_top):
         for edge in ACG_FREQ_RANGE:
             ax.axvline(edge, color='0.3', linestyle='--', linewidth=0.8, zorder=4)
@@ -1696,7 +1714,7 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  immobile_cmap='magma', immobile_alpha=1.0,
                                  immobile_edgecolor='#FFB3BA', immobile_edgewidth=0.8,
                                  moving_centroid_cmap_pos=0.8, immobile_centroid_color='#FF1493',
-                                 n_bins=25, log_counts=True):
+                                 n_bins=25, log_counts=True, theta_only=False):
     """Shared drawing routine for the Fig. 4e/h-style scatter: frequency vs.
     normalised autocorrelogram peak range. Immobile epochs are drawn in
     `immobile_cmap` (coloured by per-epoch running speed over
@@ -1724,11 +1742,16 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     plot_freq_peakrange_summary(), plot_figure4_style(), and
     plot_freq_peakrange_by_movement().
 
+    `theta_only=True` (display only): just the accepted theta epochs, with the
+    frequency axis and histogram bins over ACG_FREQ_RANGE; non-theta points,
+    bars and legend entries are left out. Centroids are unchanged (they already
+    use accepted theta epochs only).
+
     Returns (sc_moving, sc_immobile, centroids) -- either scatter handle is
     None when that group isn't drawn (see `mode`); pass them to
     _add_speed_colorbars.
     """
-    sub = _matched_epochs(df).copy()
+    sub = _matched_epochs(df, theta_only=theta_only).copy()
     if animal is not None:
         sub = sub[sub['animal'] == animal]
     sub = sub[sub['movement'].isin(['moving', 'immobile'])]
@@ -1752,10 +1775,11 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                                  cmap=immobile_cmap, vmin=0, vmax=immobile_speed_vmax, s=16,
                                  edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
                                  alpha=immobile_alpha, label='immobile', zorder=2)
-        ax_main.scatter(imm_non['freq'], imm_non['peakrangenorm'],
-                        color=NONTHETA_COLORS['immobile'], s=16,
-                        edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
-                        alpha=immobile_alpha, label='immobile, non-theta', zorder=2)
+        if not theta_only:
+            ax_main.scatter(imm_non['freq'], imm_non['peakrangenorm'],
+                            color=NONTHETA_COLORS['immobile'], s=16,
+                            edgecolor=immobile_edgecolor, linewidth=immobile_edgewidth,
+                            alpha=immobile_alpha, label='immobile, non-theta', zorder=2)
     sc = None
     if show_moving:
         speed = np.clip(mov_theta['median_speed_cms'].to_numpy(), 0, speed_vmax)
@@ -1763,9 +1787,10 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
                              cmap=moving_cmap, vmin=0, vmax=speed_vmax, s=14,
                              edgecolor='none', alpha=moving_alpha, label='moving', zorder=3)
         # opaque: at moving_alpha the dark colour reads as grey over white
-        ax_main.scatter(mov_non['freq'], mov_non['peakrangenorm'],
-                        color=NONTHETA_COLORS['moving'], s=14, edgecolor='none',
-                        label='moving, non-theta', zorder=3)
+        if not theta_only:
+            ax_main.scatter(mov_non['freq'], mov_non['peakrangenorm'],
+                            color=NONTHETA_COLORS['moving'], s=14, edgecolor='none',
+                            label='moving, non-theta', zorder=3)
 
     centroids_all = compute_group_centroids(sub)
     shown = {g for g, show in (('moving', show_moving), ('immobile', show_immobile)) if show}
@@ -1829,7 +1854,7 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
 
     # bins always span the whole ACG_REF_BANK, so mode='moving' / 'immobile'
     # single-group panels stay axis-comparable with the merged one
-    _movement_hist(ax_top.bar, 'width', 'freq', _freq_plot_bins())
+    _movement_hist(ax_top.bar, 'width', 'freq', _freq_plot_bins(theta_only))
     ax_top.set_ylabel('Count')
     ax_top.tick_params(labelbottom=False)
     if log_counts:
@@ -1841,7 +1866,7 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
     if log_counts:
         ax_right.set_xscale('log')
 
-    _mark_theta_band(ax_main, ax_top)
+    _mark_theta_band(ax_main, ax_top, theta_only=theta_only)
     if animal:
         ax_top.set_title(animal)
 
@@ -1881,7 +1906,8 @@ def _add_speed_colorbars(fig, ax_right, sc_moving, sc_immobile, fraction=0.2, pa
 def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
                                 moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
                                 immobile_cmap='magma', immobile_alpha=1.0,
-                                immobile_edgecolor='#FFB3BA', figsize=(5.5, 5)):
+                                immobile_edgecolor='#FFB3BA', figsize=(5.5, 5),
+                                theta_only=False):
     """Frequency vs. normalised autocorrelogram peak range. Immobile epochs
     are coloured by per-epoch running speed in `immobile_cmap` with a
     pastel-red outline; moving epochs are coloured by per-epoch running
@@ -1903,19 +1929,23 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
         df, ax_main, ax_top, ax_right, animal=animal, speed_vmax=speed_vmax,
         moving_cmap=moving_cmap, moving_alpha=moving_alpha,
         immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
+        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
+        theta_only=theta_only)
 
     _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
 
     scope = df if animal is None else df[df['animal'] == animal]
+    notes = _rejection_note(scope)
+    if theta_only:
+        notes = f'{_theta_display_note()}\n{notes}'
     _legend_and_notes_below(fig, [ax_main], [ax_main, ax_right],
-                            *ax_main.get_legend_handles_labels(), notes=_rejection_note(scope))
+                            *ax_main.get_legend_handles_labels(), notes=notes)
 
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
 
 def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_size=14,
-                                alpha=1.0, n_bins=25, log_counts=True):
+                                alpha=1.0, n_bins=25, log_counts=True, theta_only=False):
     """Movement-pooled counterpart of _draw_freq_peakrange_scatter: frequency
     vs. normalised autocorrelogram peak range for every matched epoch over
     ACG_REF_BANK, with moving and immobile epochs combined and no speed
@@ -1930,24 +1960,25 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     the two movement-segregated clouds. With several animals, the one with the
     most epochs is drawn first so smaller animals' points stay visible on top.
     Like _draw_freq_peakrange_scatter, no legend / rejection annotation is drawn
-    on `ax_main` (see _legend_and_notes_below).
+    on `ax_main` (see _legend_and_notes_below). `theta_only=True` (display only)
+    draws just the accepted theta epochs over ACG_FREQ_RANGE.
 
     Returns centroids DataFrame (animal, freq_centroid, peakrangenorm_centroid, n).
     """
     scope = df[df['animal'].isin(animals)]
-    sub = _matched_epochs(scope)
+    sub = _matched_epochs(scope, theta_only=theta_only)
     sub = sub[sub['movement'].isin(['moving', 'immobile'])]
     if sub.empty:
         raise ValueError(f'No matched moving/immobile epochs for {", ".join(animals)}.')
 
-    freq_bins = _freq_plot_bins()
+    freq_bins = _freq_plot_bins(theta_only)
     pr_bins = np.linspace(0, 1, n_bins)
     edge = MARKER_EDGE['markeredgecolor']
 
     # theta epochs of every animal first, then non-theta epochs (the animal's colour
     # darkened by NONTHETA_ANIMAL_DARKEN) on top, so no animal's theta layer hides them
     draw_order = sorted(animals, key=lambda a: -int((sub['animal'] == a).sum()))
-    for nontheta in (False, True):
+    for nontheta in ((False,) if theta_only else (False, True)):
         for animal_label in draw_order:
             a_sub = sub[(sub['animal'] == animal_label) & (sub['skipped_outofband'] == nontheta)]
             if a_sub.empty:
@@ -1983,11 +2014,12 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     ax_top.tick_params(labelbottom=False)
     ax_right.set_xlabel('Count')
     ax_right.tick_params(labelleft=False)
-    _mark_theta_band(ax_main, ax_top)
+    _mark_theta_band(ax_main, ax_top, theta_only=theta_only)
     return centroids
 
 
-def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5)):
+def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5),
+                               theta_only=False):
     """Frequency vs. normalised autocorrelogram peak range with moving and
     immobile epochs combined (no movement segregation, no speed colormap) --
     each animal in its ANIMAL_COLORS colour, with marginal count histograms
@@ -2011,13 +2043,16 @@ def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5)):
     ax_right = fig.add_subplot(gs[1, 1], sharey=ax_main)
 
     centroids = _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals,
-                                            alpha=alpha)
-    ax_top.set_title(f'{animals[0]}: all epochs' if len(animals) == 1
-                     else 'All animals: all epochs')
+                                            alpha=alpha, theta_only=theta_only)
+    shown = f'theta epochs ({_band_label()})' if theta_only else 'all epochs'
+    ax_top.set_title(f'{animals[0]}: {shown}' if len(animals) == 1
+                     else f'All animals: {shown}')
 
+    notes = _rejection_note(df[df['animal'].isin(animals)])
+    if theta_only:
+        notes = f'{_theta_display_note()}\n{notes}'
     _legend_and_notes_below(fig, [ax_main], [ax_main, ax_right],
-                            *ax_main.get_legend_handles_labels(),
-                            notes=_rejection_note(df[df['animal'].isin(animals)]))
+                            *ax_main.get_legend_handles_labels(), notes=notes)
 
     return fig, {'main': ax_main, 'top': ax_top, 'right': ax_right}, centroids
 
@@ -2025,7 +2060,8 @@ def plot_freq_peakrange_pooled(df, animals=None, alpha=1.0, figsize=(5.5, 5)):
 def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cmap='viridis',
                                     moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
                                     immobile_cmap='magma', immobile_alpha=1.0,
-                                    immobile_edgecolor='#FFB3BA', figsize=(15, 5)):
+                                    immobile_edgecolor='#FFB3BA', figsize=(15, 5),
+                                    theta_only=False):
     """Three side-by-side Fig. 4e/h-style panels -- mobility only, immobility
     only, and both merged -- sharing the same frequency/peak-range axes and
     bins so the two point clouds can first be inspected on their own, then
@@ -2062,7 +2098,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
             df, ax_main, ax_top, ax_right, animal=animal, mode=mode,
             speed_vmax=speed_vmax, moving_cmap=moving_cmap, moving_alpha=moving_alpha,
             immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-            immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
+            immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
+            theta_only=theta_only)
         ax_top.set_title(title)
         _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.25, pad=0.45,
                              label_fontsize=7)
@@ -2104,6 +2141,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
              f'{pct_immobile_rej_of_immobile:.1f}% ({n_rej_immobile}/{n_immobile_total}) | '
              f'% of total mobility epochs rejected as non-theta: '
              f'{pct_moving_rej_of_moving:.1f}% ({n_rej_moving}/{n_moving_total})')
+    if theta_only:
+        notes = f'{_theta_display_note()}\n{notes}'
     _legend_and_notes_below(fig, main_axes + right_axes, main_axes + right_axes,
                             legend_handles, legend_labels, notes=notes,
                             ncol=len(legend_handles) or 1, notes_fontsize=8)
@@ -2116,7 +2155,8 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
                        moving_alpha=0.5, immobile_speed_vmax=SPEED_THRESH_CMS,
                        immobile_cmap='magma', immobile_alpha=1.0,
                        immobile_edgecolor='#FFB3BA',
-                       moving_row=None, immobile_row=None, figsize=(9, 4)):
+                       moving_row=None, immobile_row=None, figsize=(9, 4),
+                       theta_only=False):
     """Full Dunn et al. Fig. 4-style panel group: an example moving epoch
     (trace + autocorrelogram), an example immobile epoch (trace +
     autocorrelogram), and the frequency-vs-peak-range summary scatter with
@@ -2160,13 +2200,17 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
         df, ax_main, ax_top, ax_right, animal=animal, speed_vmax=speed_vmax,
         moving_cmap=moving_cmap, moving_alpha=moving_alpha,
         immobile_speed_vmax=immobile_speed_vmax, immobile_cmap=immobile_cmap,
-        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor)
+        immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
+        theta_only=theta_only)
 
     _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
 
     scope = df if animal is None else df[df['animal'] == animal]
+    notes = _rejection_note(scope)
+    if theta_only:
+        notes = f'{_theta_display_note()}\n{notes}'
     _legend_and_notes_below(fig, [ax_main], [ax_main, ax_right, ax_acg_m, ax_acg_i],
-                            *ax_main.get_legend_handles_labels(), notes=_rejection_note(scope))
+                            *ax_main.get_legend_handles_labels(), notes=notes)
 
     if animal:
         fig.suptitle(animal)
@@ -2742,16 +2786,23 @@ def run_pipeline(results_df, output_dir, figure_dir, title=None):
             centroids = out[0]
             centroids['animal'] = animal_label
             all_centroids.append(centroids)
+        # display-only copy: accepted theta epochs, 3-7 Hz axis
+        _plot_and_save(_fig(f'{animal_label}_figure4_style{THETA_ONLY_SUFFIX}.png'),
+                       plot_figure4_style, results_df, animal=animal_label,
+                       theta_only=True, suptitle=_title(animal_label))
 
-        # mobility-only / immobility-only / merged, side by side
-        _plot_and_save(_fig(f'{animal_label}_freq_peakrange_by_movement.png'),
-                       plot_freq_peakrange_by_movement, results_df, animal=animal_label,
-                       suptitle=_title(animal_label))
+        # mobility-only / immobility-only / merged, side by side (+ theta-only copy)
+        for theta_only, suffix in ((False, ''), (True, THETA_ONLY_SUFFIX)):
+            _plot_and_save(_fig(f'{animal_label}_freq_peakrange_by_movement{suffix}.png'),
+                           plot_freq_peakrange_by_movement, results_df, animal=animal_label,
+                           theta_only=theta_only, suptitle=_title(animal_label))
 
         # moving + immobile epochs pooled (no movement segregation / speed
-        # colouring), in this animal's colour
-        _plot_and_save(_fig(f'{animal_label}_freq_peakrange_pooled.png'),
-                       plot_freq_peakrange_pooled, results_df, animals=animal_label)
+        # colouring), in this animal's colour (+ theta-only copy)
+        for theta_only, suffix in ((False, ''), (True, THETA_ONLY_SUFFIX)):
+            _plot_and_save(_fig(f'{animal_label}_freq_peakrange_pooled{suffix}.png'),
+                           plot_freq_peakrange_pooled, results_df, animals=animal_label,
+                           theta_only=theta_only)
 
     # moving + immobile epochs pooled, every animal on one figure in its own
     # colour, with per-animal centroids
@@ -2761,6 +2812,8 @@ def run_pipeline(results_df, output_dir, figure_dir, title=None):
         pooled_centroids_path = os.path.join(output_dir, 'acg_theta_continuity_centroids_pooled.csv')
         out[1].to_csv(pooled_centroids_path, index=False)
         print(f'Saved pooled (moving + immobile) centroids -> {pooled_centroids_path}')
+    _plot_and_save(_fig(f'ALL_freq_peakrange_pooled{THETA_ONLY_SUFFIX}.png'),
+                   plot_freq_peakrange_pooled, results_df, theta_only=True, suptitle=title)
 
     # Fig. 4-style (moving/immobile, speed-coloured) with every animal's
     # epochs on one figure -- example epochs picked from the all-animal
@@ -2771,11 +2824,15 @@ def run_pipeline(results_df, output_dir, figure_dir, title=None):
         centroids_all = out[0]
         centroids_all['animal'] = 'ALL'
         all_centroids.append(centroids_all)
+    _plot_and_save(_fig(f'ALL_figure4_style{THETA_ONLY_SUFFIX}.png'), plot_figure4_style,
+                   results_df, animal=None, theta_only=True, suptitle=_title('All animals'))
 
     # mobility-only / immobility-only / merged, every animal's epochs together
-    _plot_and_save(_fig('ALL_freq_peakrange_by_movement.png'),
-                   plot_freq_peakrange_by_movement, results_df, animal=None,
-                   suptitle=_title('All animals'))
+    # (+ display-only theta-range copy)
+    for theta_only, suffix in ((False, ''), (True, THETA_ONLY_SUFFIX)):
+        _plot_and_save(_fig(f'ALL_freq_peakrange_by_movement{suffix}.png'),
+                       plot_freq_peakrange_by_movement, results_df, animal=None,
+                       theta_only=theta_only, suptitle=_title('All animals'))
 
     # freq_est line-overlays (accepted / non-theta rejected epochs), one line
     # per animal on shared axes for direct comparison
