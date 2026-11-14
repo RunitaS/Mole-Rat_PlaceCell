@@ -8,10 +8,14 @@ phase-precession fit and no pass index.
 
 Per unit (one .ntt file = one already-isolated unit):
 
-  1. Theta phase. The LFP is cleaned (clean_lfp: resampled to 1 kHz, 50/100/150/200 Hz notched,
-     detrended), bandpass filtered (LFP_FILTER_BAND) and Hilbert transformed: 0 deg at a theta
-     peak, 180 deg at a trough. Only spikes in ACG theta-positive 1 s epochs (Dunn et al. 2022;
-     USE_ACG_THETA_EPOCHS) enter any phase below.
+  1. Theta phase. The LFP is loaded onto a timestamp-anchored grid (ncs_repair.py), cleaned as in
+     Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py (clean_lfp: resampled to 1 kHz, 50/100/150/200 Hz
+     notched, wavelet denoised, detrended, outliers filled, 100 Hz low-passed), bandpass filtered
+     (LFP_FILTER_BAND) and Hilbert transformed: 0 deg at a theta peak, 180 deg at a trough. Only
+     spikes in ACG theta epochs (Dunn et al. 2022; USE_ACG_THETA_EPOCHS) enter any phase below: 1 s
+     epochs that pass the noise rejection (delta > theta power, peak-to-peak MAD outlier) and whose
+     closest reference sinusoid, matched over a 1-20 Hz bank, is in 3-7 Hz (v8's broadband fitting;
+     no ED_min threshold). Noise and out-of-band epochs are thrown out.
   2. Theta modulation, on the ACG theta-epoch spikes with an LFP phase (>= MIN_SPIKES_FOR_TMI):
        Rayleigh+  Rayleigh test p < ALPHA                                      (Rayleigh_Significant)
        TMI+       TMI (Frank et al. 2001), burst-preserving shuffle p < ALPHA  (TMI_Significant)
@@ -61,9 +65,9 @@ PeakOnsetOffset); the PolarPlot / PhaseHistogram / TMIShuffle figures are also c
 RESULTS_FOLDER\\<class folder> (THETA_MOD_CLASS_FOLDERS: ThetaModulated, TMI, Rayleigh,
 NonThetaModulated). RESULTS_FOLDER: OUTPUT_EXCEL_NAME (README, Units = one row per unit, Summary, and the
 statistics sheets 'All_*', 'Ses<arena>_*', 'Arena_*', 'AC<A><B>_*'), the same statistics in one
-long-format CSV, the ACG ED_min QC plot / table and a metadata CSV.
+long-format CSV, the ACG epoch QC plot / table and a metadata CSV.
 
-Requires: numpy, scipy, pandas, matplotlib, pillow, openpyxl.
+Requires: numpy, scipy, pandas, matplotlib, pillow, openpyxl, pywavelets, and ncs_repair.py (NCS_REPAIR_DIR).
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ from __future__ import annotations
 import functools
 import re
 import shutil
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -78,14 +83,24 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pywt
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
+from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image
 from scipy import signal, stats
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, distance_transform_edt, label as nd_label
+
+# Timestamp-anchored .ncs loading: ncs_repair.py corrects the partial-record and sample-loss timing
+# error of the raw .ncs files (see its header).
+NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCorr'
+if NCS_REPAIR_DIR not in sys.path:
+    sys.path.insert(0, NCS_REPAIR_DIR)
+from ncs_repair import load_repaired_uv, record_lengths  # noqa: E402
+import PlotLayout_Utils as plu  # noqa: E402  shared y-range of side-by-side plots, % labels on bars
 
 
 # ============================================================================
@@ -93,10 +108,10 @@ from scipy.ndimage import gaussian_filter, gaussian_filter1d, distance_transform
 # ============================================================================
 ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final")
 # All pooled results (Excel/CSV files, comparison plots) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'ThetaMod_Pure_v1'
-OUTPUT_EXCEL_NAME = 'ThetaMod_Pure_v1.xlsx'          # written to RESULTS_FOLDER
-STATS_CSV_NAME = 'ThetaMod_Pure_v1_AllStats.csv'     # every statistics table, long format, in RESULTS_FOLDER
-SESSION_OUTPUT_FOLDER = 'ThetaMod_Pure_v1'           # per-unit figures, in each session folder
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'ThetaMod_Pure_v2'
+OUTPUT_EXCEL_NAME = 'ThetaMod_Pure_v2.xlsx'          # written to RESULTS_FOLDER
+STATS_CSV_NAME = 'ThetaMod_Pure_v2_AllStats.csv'     # every statistics table, long format, in RESULTS_FOLDER
+SESSION_OUTPUT_FOLDER = 'ThetaMod_Pure_v2'           # per-unit figures, in each session folder
 # ThetaModClass -> RESULTS_FOLDER sub-folder that gets a copy of the unit's Rayleigh / TMI figures
 # (PolarPlot, PhaseHistogram, TMIShuffle). Units with too few spikes have no such figures.
 THETA_MOD_CLASS_FOLDERS = {
@@ -116,30 +131,50 @@ TRACKING_TIME_UNIT = 'us'     # 'us', 'ms', or 's' -- units of the tracking time
 MATCH_SPIKE_LFP_FILE = True
 
 
-# --- ACG theta-positive epoch criterion (Dunn et al. 2022; see acg_theta_epoch_mask) ---
-# True: only spikes falling in 1 s LFP epochs whose autocorrelogram matches a 3-7 Hz sinusoid well
-# (ED_min < ACG_ED_MIN_THRESH) are used for every theta phase. The rate map / place fields are still
-# built from all spikes. False: use the entire signal.
+# --- ACG theta epochs (Dunn et al. 2022; protocol of Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py,
+# see acg_theta_epochs) ---
+# True: only spikes falling in 1 s theta epochs are used for every theta phase. An epoch is a theta
+# epoch if it survives the noise rejection (delta/theta power, peak-to-peak MAD outlier) AND the
+# reference sinusoid whose autocorrelogram is closest to its own (ED_min), matched over the whole
+# ACG_REF_BANK, lies in ACG_FREQ_RANGE. There is no threshold on the ED_min value itself. Noise and
+# out-of-band (non-theta) epochs are thrown out. The rate map / place fields are still built from
+# all spikes. False: use the entire signal.
 USE_ACG_THETA_EPOCHS = True
-ACG_ED_MIN_THRESH = 1.0          # keep epochs with ED_min strictly below this
 ACG_EPOCH_SEC = 1.0
 ACG_FS = 1000.0                  # Hz, LFP is resampled to this rate (clean_lfp: Hilbert phase + ACG)
-ACG_FREQ_RANGE = (3.0, 7.0)      # Hz, reference sinusoid bank
+ACG_FREQ_RANGE = (3.0, 7.0)      # Hz, theta band: an epoch is accepted only if its freq_est falls here
+ACG_REF_BANK = (1.0, 20.0)       # Hz, span of the reference sinusoid bank every epoch is matched against.
+                                 # References below ~1.75 Hz have no side peak within a 1 s epoch: they
+                                 # still take part in the ED_min match, but give no peak range
 ACG_FREQ_RES = 0.1               # Hz, bank step
-ACG_LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]   # mains notch (clean_lfp: Hilbert phase + ACG)
+NCS_NATIVE_FS = 32000            # Hz, grid of the repaired .ncs trace (ncs_repair.py)
+ACG_REJECT_PARTIAL_RECORD_EPOCHS = False   # True: also drop every epoch containing a short .ncs record
+# LFP cleaning (clean_lfp, shared by the Hilbert phase and the ACG epochs): resample to ACG_FS ->
+# mains notch -> wavelet denoise -> linear detrend -> outlier fill (-> median filter -> Savitzky-Golay,
+# if ACG_APPLY_SMOOTHING) -> low-pass. Sample-based windows assume ACG_FS = 1000 Hz.
+ACG_LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]   # mains notch
 ACG_NOTCH_Q = 30.0
+ACG_WAVELET_NAME = 'sym4'            # wdenoise default
+ACG_WAVELET_LEVEL = 4                # wdenoise(x, 4)
+ACG_OUTLIER_WINDOW = 400             # 0.4 s: filloutliers(x, 'linear', 'movmedian', 100) at 250 Hz
+ACG_OUTLIER_THRESH = 3.0             # local scaled MADs (filloutliers default)
+ACG_APPLY_SMOOTHING = False          # medfilt1(x, 5) + smoothdata(x, 'sgolay', 15) at 250 Hz; off, as in v8
+ACG_MEDFILT_KERNEL = 21
+ACG_SGOLAY_WINDOW = 61
+ACG_SGOLAY_POLY = 2
 ACG_LOWPASS_CUTOFF_HZ = 100.0
 ACG_LOWPASS_ORDER = 4
+# Noise rejection, per epoch
 ACG_REJECT_DELTA_OVER_THETA = True   # drop epochs whose 1-3 Hz power exceeds 3-7 Hz power
 ACG_DELTA_BAND = (1.0, 3.0)
 ACG_REJECT_MAD_ARTIFACTS = True      # drop epochs with outlier peak-to-peak amplitude
 ACG_MAD_THRESH = 5.0
 ACG_PEAK_PROMINENCE = 0.05           # reference-ACG peak/trough prominence (findMinMax(refxc, 0.05, 'fixed'));
-                                     # only used for the ED_min QC plot's normalised peak range
-# ED_min QC plot (ED_min vs. normalised ACG peak range of every fitted epoch, coloured by animal,
-# ED_min-rejected epochs highlighted) and its per-epoch table, both written to RESULTS_FOLDER
-EDMIN_PLOT_NAME = 'ACG_EDmin_vs_PeakRange.png'
-EDMIN_EPOCHS_CSV_NAME = 'ACG_EDmin_epochs.csv'
+                                     # only used for the QC plot's normalised peak range
+# ACG QC plot (freq_est vs. normalised ACG peak range of every fitted epoch, coloured by animal,
+# non-theta epochs highlighted) and its per-epoch table, both written to RESULTS_FOLDER
+ACG_QC_PLOT_NAME = 'ACG_FreqEst_vs_PeakRange.png'
+ACG_EPOCHS_CSV_NAME = 'ACG_epochs.csv'
 # Per-animal colors — first 4 colors of matplotlib's Pastel1 palette.
 ANIMAL_COLORS = {
     'Fa8477': '#FBB4AE',  # Pastel1[0] red
@@ -275,15 +310,19 @@ def _header_field(header_text: str, name: str, default=None, cast=float):
 
 
 def load_ncs(path: Path):
-    """Load a Neuralynx .ncs file. Returns (samples_uV, timestamps_s, fs_hz).
+    """Load a Neuralynx .ncs file onto a uniform, timestamp-anchored NCS_NATIVE_FS grid
+    (ncs_repair.load_repaired_uv, as in Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py): only each
+    record's first NumValidSamples samples are data, each is placed by its own record's absolute
+    (PTP-synced) timestamp, and missing samples are linearly interpolated. A gap longer than 1 s
+    raises ValueError.
 
-    Only each record's first NumValidSamples samples are kept: the rest of a partial
-    record holds stale buffer values, and the next record's timestamp starts right after
-    the valid ones. Each sample's time is its record's absolute (PTP-synced) timestamp
-    plus its offset within the record.
+    Returns (samples_uV, start_s, fs_hz, records): sample i is at start_s + i / fs_hz; records holds
+    each record's first grid index ('start') and NumValidSamples ('nvalid'), for the short-record
+    check of acg_theta_epochs.
     """
     header_text = _read_header_text(path)
     adbitvolts = _header_field(header_text, 'ADBitVolts', default=DEFAULT_ADBITVOLTS)
+    samples_uV, start_us = load_repaired_uv(path, adbitvolts)
 
     ncs_dtype = np.dtype([
         ('TimeStamp', '<u8'),
@@ -292,21 +331,11 @@ def load_ncs(path: Path):
         ('NumValidSamples', '<u4'),
         ('Samples', '<i2', (NCS_SAMPLES_PER_RECORD,)),
     ])
-    records = np.fromfile(path, dtype=ncs_dtype, offset=HEADER_BYTES)
-    if len(records) == 0:
-        raise ValueError(f'No records found in {path}')
-
-    fs = float(records['SampleFreq'][0])
-    if fs <= 0:
-        fs = _header_field(header_text, 'SamplingFrequency', default=32000.0)
-
-    sample_period_us = 1e6 / fs
-    offsets_us = np.arange(NCS_SAMPLES_PER_RECORD) * sample_period_us
-    valid = np.arange(NCS_SAMPLES_PER_RECORD)[None, :] < records['NumValidSamples'][:, None]
-    timestamps_us = (records['TimeStamp'][:, None].astype(np.float64) + offsets_us[None, :])[valid]
-    samples_uV = (records['Samples'].astype(np.float64) * adbitvolts * 1e6)[valid]
-
-    return samples_uV, timestamps_us / 1e6, fs
+    data = np.memmap(path, dtype=ncs_dtype, mode='r', offset=HEADER_BYTES)
+    start = np.round((np.asarray(data['TimeStamp']).astype(np.int64) - start_us)
+                     * NCS_NATIVE_FS / 1e6).astype(np.int64)
+    records = {'start': start, 'nvalid': record_lengths(data['NumValidSamples'])}
+    return samples_uV, start_us / 1e6, float(NCS_NATIVE_FS), records
 
 
 def load_ntt_spike_times(path: Path):
@@ -791,17 +820,18 @@ def compute_peak_onset_offset(pos_ts, pos_xy, maps, spk_ts, lfp_ts, lfp_fs, lfp_
 
 
 # ============================================================================
-# ACG theta-positive epoch detection (Dunn et al. 2022, Nat Commun 13:6997,
-# Supp. Fig. 5; ported from ACG_theta_continuity_TT_Thresholded_EDmin_LFPclean_v3.py).
+# ACG theta epoch detection (Dunn et al. 2022, Nat Commun 13:6997, Supp. Fig. 5;
+# protocol of Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py).
 #
-# The LFP is resampled to ACG_FS, line-noise notched, detrended (clean_lfp, shared
-# with the Hilbert phase path) and low-passed,
-# split into ACG_EPOCH_SEC epochs, and each epoch's autocorrelogram is compared
-# with a bank of reference-sinusoid autocorrelograms spanning ACG_FREQ_RANGE.
-# ED_min = the normalised Euclidean distance to the closest reference sinusoid
-# (0 = perfect sinusoid). An epoch is "theta-positive" if ED_min < ACG_ED_MIN_THRESH.
-# Optionally (same as the ACG script) epochs are first rejected if delta power
-# exceeds theta power or if their peak-to-peak amplitude is a robust MAD outlier.
+# The repaired LFP is cleaned (clean_lfp, shared with the Hilbert phase path:
+# resample to ACG_FS -> notch -> wavelet denoise -> detrend -> outlier fill ->
+# low-pass) and split into ACG_EPOCH_SEC epochs. Noise epochs are thrown out:
+# delta power above theta power, then robust (MAD) peak-to-peak outliers. Each
+# remaining epoch's autocorrelogram is compared with a bank of reference-sinusoid
+# autocorrelograms spanning the broad ACG_REF_BANK; freq_est = the frequency of
+# the closest one (ED_min = normalised Euclidean distance to it). The epoch is a
+# theta epoch only if freq_est lies in ACG_FREQ_RANGE; out-of-band epochs are
+# thrown out. There is no threshold on the ED_min value itself.
 # ============================================================================
 
 def _acg_notch(x, fs_hz, freqs, q):
@@ -813,29 +843,64 @@ def _acg_notch(x, fs_hz, freqs, q):
     return y
 
 
-def clean_lfp(lfp_sig, lfp_ts, lfp_fs):
-    """ACG-pipeline LFP cleaning, applied before both the Hilbert phase and the
-    ACG epoch detection: resample to ACG_FS, notch the ACG_LINE_HARMONICS mains
-    harmonics, remove the linear trend. Returns (x, ts, ACG_FS); ts gives each
-    resampled sample's time, interpolated from the original sample timestamps
-    so the recording's own clock is kept."""
-    up, down = int(ACG_FS), int(round(lfp_fs))
-    x = signal.resample_poly(lfp_sig, up, down)
+def _denoise_wavelet(x):
+    """Soft-threshold the ACG_WAVELET_NAME detail coefficients, with the noise level estimated
+    from the finest level. BayesShrink (Chang et al. 2000), standing in for wdenoise's default
+    empirical Bayes threshold; a level with no signal above noise is zeroed."""
+    coeffs = pywt.wavedec(x, ACG_WAVELET_NAME, level=ACG_WAVELET_LEVEL)
+    noise_sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+    denoised = [coeffs[0]]
+    for detail in coeffs[1:]:
+        signal_var = max(np.mean(detail ** 2) - noise_sigma ** 2, 0)
+        thresh = noise_sigma ** 2 / np.sqrt(signal_var) if signal_var > 0 else np.abs(detail).max()
+        denoised.append(pywt.threshold(detail, thresh, 'soft'))
+    return pywt.waverec(denoised, ACG_WAVELET_NAME)[:len(x)]
+
+
+def _fill_outliers(x, window=ACG_OUTLIER_WINDOW, thresh=ACG_OUTLIER_THRESH, chunk=20000):
+    """MATLAB's filloutliers(x, 'linear', 'movmedian', window): a sample more than `thresh`
+    scaled MADs from its moving median is replaced by linear interpolation. Windows are k/2
+    back and k/2 - 1 forward, shrinking at the ends. Returns the filled trace and the outlier mask."""
+    n = len(x)
+    n_before = window // 2
+    n_after = window - n_before - 1
+    med, mad = np.empty(n), np.empty(n)
+    windows = sliding_window_view(x, window)
+    for j in range(0, len(windows), chunk):
+        block = windows[j:j + chunk]
+        m = np.median(block, axis=1)
+        med[j + n_before:j + n_before + len(block)] = m
+        mad[j + n_before:j + n_before + len(block)] = np.median(np.abs(block - m[:, None]), axis=1)
+    for k in [*range(n_before), *range(n - n_after, n)]:
+        block = x[max(0, k - n_before):min(n, k + n_after + 1)]
+        med[k] = np.median(block)
+        mad[k] = np.median(np.abs(block - med[k]))
+    is_outlier = np.abs(x - med) > thresh * 1.482602218505602 * mad
+
+    filled = x.copy()
+    filled[is_outlier] = np.interp(np.flatnonzero(is_outlier), np.flatnonzero(~is_outlier), x[~is_outlier])
+    return filled, is_outlier
+
+
+def clean_lfp(lfp_sig, start_s, lfp_fs):
+    """ACG-pipeline LFP cleaning (clean_lfp of Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py),
+    applied before both the Hilbert phase and the ACG epoch detection: the repaired native-rate
+    trace (load_ncs) -> ACG_FS -> ACG_LINE_HARMONICS notch -> wavelet denoise -> linear detrend ->
+    outlier fill (-> median filter -> Savitzky-Golay, if ACG_APPLY_SMOOTHING) -> low-pass.
+    Returns (x, ts, ACG_FS, outlier_frac); ts = start_s + i / ACG_FS, on the recording's own
+    (timestamp-anchored) clock; outlier_frac = fraction of samples outlier-filled."""
+    x = signal.resample_poly(lfp_sig, int(ACG_FS), int(round(lfp_fs)))
     x = _acg_notch(x, ACG_FS, ACG_LINE_HARMONICS, ACG_NOTCH_Q)
+    x = _denoise_wavelet(x)
     x = signal.detrend(x, type='linear')
-    ts = np.interp(np.arange(len(x)) * (down / up), np.arange(len(lfp_ts)), lfp_ts)
-    return x, ts, ACG_FS
-
-
-def _acg_reference_bank(ref_freqs, datsize, fs):
-    """Normalised autocorrelogram of each reference sinusoid -> (refXC, refED)."""
-    reft = np.arange(datsize) / fs
-    refXC = np.empty((2 * datsize - 1, len(ref_freqs)))
-    for n, freq in enumerate(ref_freqs):
-        refsig = np.sin(2 * np.pi * freq * reft)
-        xc = signal.correlate(refsig, refsig, mode='full', method='auto')
-        refXC[:, n] = xc / np.max(xc)
-    return refXC, np.linalg.norm(refXC, axis=0)
+    x, is_outlier = _fill_outliers(x)
+    if ACG_APPLY_SMOOTHING:
+        x = signal.medfilt(x, ACG_MEDFILT_KERNEL)
+        x = signal.savgol_filter(x, ACG_SGOLAY_WINDOW, ACG_SGOLAY_POLY)
+    b, a = signal.butter(ACG_LOWPASS_ORDER, ACG_LOWPASS_CUTOFF_HZ / (ACG_FS / 2.0), btype='low')
+    x = signal.filtfilt(b, a, x)
+    ts = start_s + np.arange(len(x)) / ACG_FS
+    return x, ts, ACG_FS, float(is_outlier.mean())
 
 
 def _zero_crossings(x):
@@ -846,106 +911,144 @@ def _zero_crossings(x):
     return idx - x[idx] / (x[idx + 1] - x[idx])
 
 
-def _acg_reference_windows(refXC, datsize):
-    """Peak-range search windows of each reference autocorrelogram, as in
-    create_sine_ref_xcorrs.m (ported from
-    ACG_theta_continuity_TT_ThetaVsSpeed_v4_FerretOLS.py).
+def _acg_reference_bank(ref_freqs, datsize, fs):
+    """Reference sinusoid autocorrelograms and their peak-range search windows, as in
+    create_sine_ref_xcorrs.m (create_sine_ref_xcorrs of Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py).
 
-    Returns (refRange, p1, t1, t2): refRange is each reference's own peak range
-    (first side peak minus mean of its flanking troughs); p1/t1/t2 are (2, n_freqs)
-    [lo, hi] sample-index windows bracketing that side peak and the troughs before
-    and after it, used to find the matching peak/troughs in a data autocorrelogram.
+    Returns (refXC, refED, refRange, p1, t1, t2): refXC is each reference's normalised
+    autocorrelogram and refED its L2 norm; refRange is each reference's own peak range (first
+    side peak minus mean of its flanking troughs); p1/t1/t2 are (2, n_freqs) [lo, hi] sample-index
+    windows bracketing that side peak and the troughs before and after it, used to find the
+    matching peak/troughs in a data autocorrelogram. References too slow to show a side peak and
+    its flanking troughs within one epoch (below ~1.75 Hz for 1 s epochs) keep refXC / refED, so
+    they still take part in the ED_min match, but get refRange = NaN and windows of -1.
     """
+    reft = np.arange(datsize) / fs
     center = datsize - 1
-    n_freqs = refXC.shape[1]
-    refRange = np.empty(n_freqs)
-    p1, t1, t2 = (np.empty((2, n_freqs), dtype=int) for _ in range(3))
-    for n in range(n_freqs):
-        refxc = refXC[:, n]
+    n_freqs = len(ref_freqs)
+    refXC = np.empty((2 * datsize - 1, n_freqs))
+    refRange = np.full(n_freqs, np.nan)
+    p1, t1, t2 = (np.full((2, n_freqs), -1, dtype=int) for _ in range(3))
+    for n, freq in enumerate(ref_freqs):
+        refsig = np.sin(2 * np.pi * freq * reft)
+        xc = signal.correlate(refsig, refsig, mode='full', method='auto')
+        refxc = xc / np.max(xc)
+        refXC[:, n] = refxc
+
         max_idx, _ = signal.find_peaks(refxc, prominence=ACG_PEAK_PROMINENCE)
         min_idx, _ = signal.find_peaks(-refxc, prominence=ACG_PEAK_PROMINENCE)
-        peak1 = max_idx[max_idx > center][0]
-        trough1 = min_idx[min_idx < peak1][-1]
-        trough2 = min_idx[min_idx > peak1][0]
-        refRange[n] = refxc[peak1] - (refxc[trough1] + refxc[trough2]) / 2
+        side = max_idx[max_idx > center]
+        if not side.size:
+            continue   # no side peak after the zero-lag peak within the epoch
+        peak1 = side[0]
+        before, after = min_idx[min_idx < peak1], min_idx[min_idx > peak1]
+        if not (before.size and after.size):
+            continue   # can't bracket troughs around the first side peak
+        trough1, trough2 = before[-1], after[0]
 
         zc = _zero_crossings(refxc)
-        below_p1 = int(round(zc[zc < peak1][-1]))
-        above_p1 = int(round(zc[zc > peak1][0]))
-        p1[:, n] = [below_p1, above_p1]
-        t1[:, n] = [int(round(zc[zc < trough1][-1])), below_p1]
-        t2[:, n] = [above_p1, int(round(zc[zc > trough2][0]))]
-    return refRange, p1, t1, t2
+        below_t1, above_t2 = zc[zc < trough1], zc[zc > trough2]
+        below_p1, above_p1 = zc[zc < peak1], zc[zc > peak1]
+        if not (below_t1.size and above_t2.size and below_p1.size and above_p1.size):
+            continue   # no bounding zero-crossings for the search windows
+        refRange[n] = refxc[peak1] - (refxc[trough1] + refxc[trough2]) / 2
+        lo_p1, hi_p1 = int(round(below_p1[-1])), int(round(above_p1[0]))
+        p1[:, n] = [lo_p1, hi_p1]
+        t1[:, n] = [int(round(below_t1[-1])), lo_p1]
+        t2[:, n] = [hi_p1, int(round(above_t2[0]))]
+    return refXC, np.linalg.norm(refXC, axis=0), refRange, p1, t1, t2
 
 
-def acg_theta_epoch_mask(lfp_clean, return_peakrange=False):
-    """Per-epoch theta-positive mask for one LFP trace, already cleaned by
-    clean_lfp (resampled to ACG_FS, notched, detrended).
+def acg_theta_epochs(lfp_clean, records=None):
+    """Per-epoch ACG theta-epoch detection for one LFP trace, already cleaned by clean_lfp.
 
     Epoch i is the i-th block of ACG_EPOCH_SEC * ACG_FS consecutive samples; use
     times_in_ok_epochs to match absolute times to epochs by the samples' timestamps.
-    Returns (ok, ed_min): boolean mask and ED_min
-    per epoch (NaN where the epoch was rejected before/without an ACG fit).
-    With return_peakrange=True, returns (ok, ed_min, peakrangenorm), adding each
-    fitted epoch's autocorrelogram peak range normalised by its matched reference
-    sinusoid's own peak range (Dunn et al. 2022 Supp. Fig. 5; 1 = clean sinusoid,
-    0 = flat) -- used only for the ED_min QC plot, the mask is unchanged.
+    `records` (from load_ncs) is only needed with ACG_REJECT_PARTIAL_RECORD_EPOCHS.
+
+    Returns a dict of per-epoch arrays:
+      ok             True for theta epochs (status 'accepted')
+      status         'accepted', or the first rejection: 'rejected_partial' (short .ncs record),
+                     'rejected_deltatheta' (delta power > theta power), 'rejected_artifact'
+                     (peak-to-peak MAD outlier), 'rejected_flat' (no autocorrelogram), or
+                     'rejected_outofband' (freq_est outside ACG_FREQ_RANGE: non-theta)
+      ED_min         normalised distance to the closest reference sinusoid (NaN if not fitted)
+      freq_est       frequency of that reference (Hz)
+      peakrangenorm  autocorrelogram peak range normalised by the matched reference's own peak
+                     range (1 = clean sinusoid, 0 = flat; NaN if the matched reference is too slow
+                     to have one) -- QC plot only, it does not decide anything
     """
     x = lfp_clean
-    b, a = signal.butter(ACG_LOWPASS_ORDER, ACG_LOWPASS_CUTOFF_HZ / (ACG_FS / 2.0), btype='low')
-    x = signal.filtfilt(b, a, x)
-
     nperseg = int(round(ACG_FS * ACG_EPOCH_SEC))
     n_total = len(x) // nperseg
+    status = np.full(n_total, 'accepted', dtype=object)
+    ed_min, freq_est, peakrangenorm = (np.full(n_total, np.nan) for _ in range(3))
     if n_total == 0:
-        empty = (np.zeros(0, dtype=bool), np.zeros(0))
-        return (*empty, np.zeros(0)) if return_peakrange else empty
+        return dict(ok=np.zeros(0, dtype=bool), status=status, ED_min=ed_min, freq_est=freq_est,
+                    peakrangenorm=peakrangenorm)
     epochs = x[:n_total * nperseg].reshape(n_total, nperseg)
 
     keep = np.ones(n_total, dtype=bool)
+    if ACG_REJECT_PARTIAL_RECORD_EPOCHS and records is not None:
+        # map each epoch's first / last sample back to the native-rate grid and its records
+        step = NCS_NATIVE_FS / ACG_FS
+        i = np.arange(n_total)
+        first = np.round(i * nperseg * step).astype(np.int64)
+        last = np.round(((i + 1) * nperseg - 1) * step).astype(np.int64)
+        short_cum = np.concatenate(([0], np.cumsum(records['nvalid'] < NCS_SAMPLES_PER_RECORD)))
+        r0 = np.searchsorted(records['start'], first, side='right') - 1
+        r1 = np.searchsorted(records['start'], last, side='right') - 1
+        partial = (short_cum[r1 + 1] - short_cum[r0]) > 0
+        status[partial] = 'rejected_partial'
+        keep &= ~partial
     if ACG_REJECT_DELTA_OVER_THETA:
         win = signal.get_window('hann', nperseg)
-        for i in range(n_total):
+        for i in np.flatnonzero(keep):
             f, pxx = signal.welch(epochs[i], fs=ACG_FS, window=win, nperseg=nperseg,
                                   noverlap=0, detrend='constant')
             low = pxx[(f >= ACG_DELTA_BAND[0]) & (f <= ACG_DELTA_BAND[1])].sum()
             theta = pxx[(f >= ACG_FREQ_RANGE[0]) & (f <= ACG_FREQ_RANGE[1])].sum()
-            keep[i] = low <= theta
+            if low > theta:
+                keep[i] = False
+                status[i] = 'rejected_deltatheta'
     if ACG_REJECT_MAD_ARTIFACTS and keep.any():
+        # median / MAD from the epochs still kept, so epochs rejected above can't skew the threshold
         p2p = epochs.max(axis=1) - epochs.min(axis=1)
         med = np.median(p2p[keep])
         mad = np.median(np.abs(p2p[keep] - med)) or 1e-20
-        keep &= ~(0.6745 * (p2p - med) / mad > ACG_MAD_THRESH)
+        artifact = keep & (0.6745 * (p2p - med) / mad > ACG_MAD_THRESH)
+        status[artifact] = 'rejected_artifact'
+        keep &= ~artifact
 
-    ref_freqs = np.arange(ACG_FREQ_RANGE[0], ACG_FREQ_RANGE[1] + ACG_FREQ_RES / 2, ACG_FREQ_RES)
-    refXC, refED = _acg_reference_bank(ref_freqs, nperseg, ACG_FS)
-    if return_peakrange:
-        refRange, p1, t1, t2 = _acg_reference_windows(refXC, nperseg)
+    # round so 0.1 Hz steps compare exactly with the ACG_FREQ_RANGE edges
+    ref_freqs = np.round(np.arange(ACG_REF_BANK[0], ACG_REF_BANK[1] + ACG_FREQ_RES / 2, ACG_FREQ_RES), 6)
+    refXC, refED, refRange, p1, t1, t2 = _acg_reference_bank(ref_freqs, nperseg, ACG_FS)
 
-    ed_min = np.full(n_total, np.nan)
-    peakrangenorm = np.full(n_total, np.nan)
     for i in np.flatnonzero(keep):
         xc = signal.correlate(epochs[i], epochs[i], mode='full', method='auto')
         peak = np.max(xc)
         if not np.isfinite(peak) or peak <= 0:
+            status[i] = 'rejected_flat'
             continue
         xc = xc / peak
         ed = np.sqrt(np.sum((refXC - xc[:, None]) ** 2, axis=0)) / refED
         mi = int(np.argmin(ed))
-        ed_min[i] = ed[mi]
-        if return_peakrange:
+        ed_min[i], freq_est[i] = ed[mi], ref_freqs[mi]
+        if not ACG_FREQ_RANGE[0] <= freq_est[i] <= ACG_FREQ_RANGE[1]:
+            status[i] = 'rejected_outofband'
+        if np.isfinite(refRange[mi]):
             pk = xc[p1[0, mi]:p1[1, mi] + 1].max()
             tr1 = xc[t1[0, mi]:t1[1, mi] + 1].min()
             tr2 = xc[t2[0, mi]:t2[1, mi] + 1].min()
             peakrangenorm[i] = (pk - (tr1 + tr2) / 2) / refRange[mi]
 
-    ok = np.isfinite(ed_min) & (ed_min < ACG_ED_MIN_THRESH)
-    return (ok, ed_min, peakrangenorm) if return_peakrange else (ok, ed_min)
+    return dict(ok=status == 'accepted', status=status, ED_min=ed_min, freq_est=freq_est,
+                peakrangenorm=peakrangenorm)
 
 
 def times_in_ok_epochs(t_s, lfp_ts, lfp_fs, epoch_ok):
     """Boolean mask over absolute times `t_s` (s, on the same PTP-synced clock as
-    `lfp_ts`) that fall inside a theta-positive epoch. Epoch i is the i-th block of
+    `lfp_ts`) that fall inside an ACG theta epoch. Epoch i is the i-th block of
     ACG_EPOCH_SEC * ACG_FS LFP samples, so each time is matched to its nearest LFP
     sample by timestamp and takes that sample's epoch, which stays correct across
     recording gaps. Times with no LFP sample within one inter-sample interval (see
@@ -1918,7 +2021,7 @@ def compare_proportion(counts_df: pd.DataFrame, col: str, metric: str, group_col
 def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
                               out_path: Path, group_col: str, title_prefix: str = '', pooled: str = ''):
     """% of all units that are Rayleigh+, TMI+ and Rayleigh+ & TMI+ per group, three bars side by
-    side in the group colour (hatch = criterion), 'n units' above each bar; stars over pairs of
+    side in the group colour (hatch = criterion), '%' and 'n units' above each bar; stars over pairs of
     Rayleigh+ & TMI+ bars whose Holm-corrected pairwise chi-square p < ALPHA. Counts and tests in a
     panel underneath."""
     groups = counts_df[group_col].tolist()
@@ -1951,10 +2054,10 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
         ax.bar(positions + off, pct, width=0.92 * width, color=faces, edgecolor=PAL_BLACK, hatch=hatch,
                linewidth=FIG_BOX_LW, zorder=2)
         for x, p_, n_k in zip(positions + off, pct, counts_df[f'n_{col}']):
-            ax.text(x, p_ + 1.5, str(n_k), ha='center', va='bottom', fontsize=FS_TICK - 3)
+            ax.text(x, p_ + 1.5, f'{p_:.1f}%\n{n_k}', ha='center', va='bottom', fontsize=FS_TICK - 3)
     top = _draw_sig_brackets(ax, dict(zip(groups, positions + offsets[-1])), pairwise_df,
-                             y_base=pct_max + 10, y_step=8, y_text=3, group_col=group_col)
-    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 6) + 8))
+                             y_base=pct_max + 15, y_step=8, y_text=3, group_col=group_col)
+    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 11) + 8))
     ax.set_yticks(np.arange(0, 101, 20))
     ax.set_xticks(positions)
     ax.set_xticklabels([f'{_label(g)}\n(n={n})' for g, n in zip(groups, n_all)])
@@ -1975,7 +2078,7 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
 def plot_theta_mod_tested_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
                                      out_path: Path, group_col: str, title_prefix: str = '', pooled: str = ''):
     """% of TESTED units (>= MIN_SPIKES_FOR_TMI theta-epoch spikes) that are Rayleigh+ & TMI+ per
-    group, one bar per group in the group colour, 'k/n' above each bar; stars over pairs whose
+    group, one bar per group in the group colour, '%' and 'k/n' above each bar; stars over pairs whose
     Holm-corrected pairwise chi-square p < ALPHA. Counts and tests in a panel underneath.
     `counts_df` holds only groups with >= 1 tested unit."""
     test_col, test_name = THETA_MOD_CRITERIA[-1][0], THETA_MOD_CRITERIA[-1][1]
@@ -1999,11 +2102,11 @@ def plot_theta_mod_tested_proportion(counts_df: pd.DataFrame, omnibus_df: pd.Dat
     ax.bar(positions, pct, width=0.55, color=[GROUP_COLORS.get(g, _DEFAULT_COLOR)['face'] for g in groups],
            edgecolor=PAL_BLACK, linewidth=FIG_BOX_LW, zorder=2)
     for x, p_, k, n in zip(positions, pct, n_yes, n_tested):
-        ax.text(x, p_ + 1.5, f'{k}/{n}', ha='center', va='bottom', fontsize=FS_TICK - 3)
+        ax.text(x, p_ + 1.5, f'{p_:.1f}%\n{k}/{n}', ha='center', va='bottom', fontsize=FS_TICK - 3)
     pct_max = float(pct.max())
     top = _draw_sig_brackets(ax, dict(zip(groups, positions)), pairwise_df,
-                             y_base=pct_max + 10, y_step=8, y_text=3, group_col=group_col)
-    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 6) + 8))
+                             y_base=pct_max + 15, y_step=8, y_text=3, group_col=group_col)
+    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 11) + 8))
     ax.set_yticks(np.arange(0, 101, 20))
     ax.set_xticks(positions)
     ax.set_xticklabels([f'{_label(g)}\n(n={n})' for g, n in zip(groups, n_tested)])
@@ -2420,119 +2523,107 @@ def run_animal_controlled(df: pd.DataFrame, out_dir: Path) -> dict[str, pd.DataF
     all_tables = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
         src_dirs = []
-        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
-            order = [a for a in ARENA_LABELS if a in arenas]
-            wanted = {a.lower() for a in animals}
-            sel = df[df['Animal'].astype(str).str.lower().isin(wanted) & df['Arena'].isin(order)]
-            print(f'\n=== Animal-controlled {name}: units per animal and arena ===')
-            if sel.empty:
-                print('No units; skipped.')
-                continue
-            print(pd.crosstab(sel['Animal'], sel['Arena'], margins=True))
-            for arena in order:
-                missing = [a for a in animals if not ((sel['Animal'].astype(str).str.lower() == a.lower())
-                                                      & (sel['Arena'] == arena)).any()]
-                if missing:
-                    print(f'WARNING: no units of {missing} in the {arena} arena.')
-            src = Path(tmp_dir) / name
-            src_dirs.append(src)
-            tables = run_group_comparisons(sel, 'Arena', order, src, 'AnimalControlled', 'arena',
-                                           title_prefix=f'{" + ".join(animals)} only: ')
-            tag = 'AC' + ''.join(order)
-            for key, table in tables.items():
-                table.insert(0, 'Animals', ', '.join(animals))
-                all_tables[f'{tag}_{key}'] = table
+        # Same y-range for the versions of every plot (plu.shared_y_axes): the lowest lower and
+        # highest upper limit of the comparisons.
+        with plu.shared_y_axes([Path(tmp_dir) / n for n in ANIMAL_CONTROLLED_COMPARISONS]):
+            for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+                order = [a for a in ARENA_LABELS if a in arenas]
+                wanted = {a.lower() for a in animals}
+                sel = df[df['Animal'].astype(str).str.lower().isin(wanted) & df['Arena'].isin(order)]
+                print(f'\n=== Animal-controlled {name}: units per animal and arena ===')
+                if sel.empty:
+                    print('No units; skipped.')
+                    continue
+                print(pd.crosstab(sel['Animal'], sel['Arena'], margins=True))
+                for arena in order:
+                    missing = [a for a in animals if not ((sel['Animal'].astype(str).str.lower() == a.lower())
+                                                          & (sel['Arena'] == arena)).any()]
+                    if missing:
+                        print(f'WARNING: no units of {missing} in the {arena} arena.')
+                src = Path(tmp_dir) / name
+                src_dirs.append(src)
+                tables = run_group_comparisons(sel, 'Arena', order, src, 'AnimalControlled', 'arena',
+                                               title_prefix=f'{" + ".join(animals)} only: ')
+                tag = 'AC' + ''.join(order)
+                for key, table in tables.items():
+                    table.insert(0, 'Animals', ', '.join(animals))
+                    all_tables[f'{tag}_{key}'] = table
         if src_dirs:
             _combine_side_by_side(src_dirs, out_dir)
     return all_tables
 
 
 # ============================================================================
-# ACG ED_min QC plot
+# ACG theta-epoch QC plot
 # ============================================================================
 
-PAL_EDMIN_REJECT = '#C44E52'
+PAL_NONTHETA = '#C44E52'
 
 
 @_arena_fig_style
-def plot_edmin_epochs(edmin_df: pd.DataFrame, out_path: Path):
-    """ED_min vs. normalised ACG peak range for every epoch that got an ACG fit
-    (i.e. passed the delta/theta + MAD artifact screening), pooled across all
-    sessions -- style of plot_edmin_vs_peakrangenorm in
-    ACG_theta_continuity_TT_ThetaVsSpeed_v4_FerretOLS.py. Each point is coloured
-    by its animal; epochs rejected by the ED_min gate (ED_min >= ACG_ED_MIN_THRESH)
-    get a red outline and sit in a red-shaded region right of the dashed threshold.
-    Pearson r / Spearman rho and a least-squares line are computed over all fitted
-    epochs. The panel underneath gives, per animal and pooled, the percentage of
-    fitted epochs accepted and rejected.
+def plot_acg_epochs(acg_df: pd.DataFrame, out_path: Path):
+    """Matched reference-sinusoid frequency (freq_est) vs. normalised ACG peak range for every
+    epoch that got an ACG fit (passed the noise rejection), pooled across all sessions -- the
+    frequency vs. peak-range view of Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py. Each point is
+    coloured by its animal; non-theta epochs (freq_est outside ACG_FREQ_RANGE) get a red outline;
+    dashed lines mark the theta band. Epochs matched to a reference too slow to have a peak range
+    are counted but can't be drawn. The panel underneath gives, per animal and pooled, the
+    percentage of ALL epochs kept as theta, thrown out as non-theta and thrown out as noise.
     """
-    fitted = edmin_df[edmin_df['Status'] != 'rejected_prescreen']
-    if fitted.empty:
-        print('No epochs with an ACG fit -- ED_min plot skipped.')
+    if acg_df.empty:
+        print('No ACG epochs -- ACG QC plot skipped.')
         return None
-    thr = ACG_ED_MIN_THRESH
-    animals = sorted(fitted['Animal'].unique())
+    fitted = acg_df[acg_df['Status'].isin(['accepted', 'rejected_outofband'])]
+    animals = sorted(acg_df['Animal'].unique())
     cmap = plt.get_cmap('tab10' if len(animals) <= 10 else 'tab20')
     colors = {a: ANIMAL_COLORS.get(a, cmap(i % cmap.N)) for i, a in enumerate(animals)}
+    band = f'{ACG_FREQ_RANGE[0]:g}-{ACG_FREQ_RANGE[1]:g} Hz'
 
-    def _acc_rej_line(label, sub):
+    def _status_line(label, sub):
         n = len(sub)
         n_acc = int((sub['Status'] == 'accepted').sum())
-        n_rej = n - n_acc
-        return (f'{label}: accepted {100 * n_acc / n:.1f}% ({n_acc}/{n}) | '
-                f'rejected {100 * n_rej / n:.1f}% ({n_rej}/{n})')
+        n_oob = int((sub['Status'] == 'rejected_outofband').sum())
+        n_noise = n - n_acc - n_oob
+        return (f'{label}: theta {100 * n_acc / n:.1f}% ({n_acc}/{n}) | '
+                f'non-theta {100 * n_oob / n:.1f}% ({n_oob}/{n}) | '
+                f'noise {100 * n_noise / n:.1f}% ({n_noise}/{n})')
 
-    stats_lines = [f'Epochs with an ACG fit (passed delta/theta + artifact screening); '
-                   f'rejected = ED_min ≥ {thr:g}']
-    stats_lines += [_acc_rej_line(a, fitted[fitted['Animal'] == a]) for a in animals]
+    stats_lines = [f'All epochs. Theta = freq_est (bank {ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz) in {band}; '
+                   f'noise = delta > theta power or peak-to-peak MAD outlier']
+    stats_lines += [_status_line(a, acg_df[acg_df['Animal'] == a]) for a in animals]
     if len(animals) > 1:
-        stats_lines.append(_acc_rej_line('All animals', fitted))
+        stats_lines.append(_status_line('All animals', acg_df))
     stats_lines = _wrap_stats(stats_lines, 7.0)
 
     fig, ax, ax_info = _new_fig((7.0, 5.5), stats_lines=stats_lines)
     for a in animals:
         sub = fitted[fitted['Animal'] == a]
         acc = sub[sub['Status'] == 'accepted']
-        rej = sub[sub['Status'] == 'rejected_EDmin']
-        ax.scatter(acc['ED_min'], acc['peakrangenorm'], s=10, color=colors[a], alpha=0.4,
+        oob = sub[sub['Status'] == 'rejected_outofband']
+        ax.scatter(acc['freq_est'], acc['peakrangenorm'], s=10, color=colors[a], alpha=0.4,
                    edgecolor='none', zorder=2)
-        ax.scatter(rej['ED_min'], rej['peakrangenorm'], s=18, color=colors[a], alpha=0.8,
-                   edgecolor=PAL_EDMIN_REJECT, linewidth=0.8, zorder=3)
-
-    xy = fitted.dropna(subset=['ED_min', 'peakrangenorm'])
-    x, y = xy['ED_min'].to_numpy(float), xy['peakrangenorm'].to_numpy(float)
-    has_fit = len(x) >= 3 and np.ptp(x) > 0 and np.ptp(y) > 0
-    if has_fit:
-        slope, intercept = np.polyfit(x, y, 1)
-        x_line = np.array([x.min(), x.max()])
-        ax.plot(x_line, slope * x_line + intercept, color=PAL_BLACK, lw=FIG_BOX_LW * 1.5, zorder=4)
-        r_p, p_p = stats.pearsonr(x, y)
-        r_s, p_s = stats.spearmanr(x, y)
-        ax.text(0.02, 0.02, f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
-                            f'Spearman ρ = {r_s:.3f} (p = {p_s:.2e})\nn = {len(x)} epochs',
-                transform=ax.transAxes, ha='left', va='bottom', fontsize=FS_STATS,
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'), zorder=5)
-
-    x_lo, x_hi = ax.get_xlim()
-    ax.axvspan(thr, max(x_hi, thr), color=PAL_EDMIN_REJECT, alpha=0.08, lw=0, zorder=0)
-    ax.axvline(thr, color=PAL_EDMIN_REJECT, ls='--', lw=FIG_AXIS_LW, zorder=1)
-    ax.set_xlim(x_lo, max(x_hi, thr))
+        ax.scatter(oob['freq_est'], oob['peakrangenorm'], s=18, color=colors[a], alpha=0.8,
+                   edgecolor=PAL_NONTHETA, linewidth=0.8, zorder=3)
+    for edge in ACG_FREQ_RANGE:
+        ax.axvline(edge, color=PAL_BLACK, ls='--', lw=FIG_AXIS_LW, zorder=1)
+    ax.set_xlim(ACG_REF_BANK)
+    n_no_pr = int(fitted['peakrangenorm'].isna().sum())
+    if n_no_pr:
+        ax.text(0.98, 0.02, f'{n_no_pr} fitted epochs have no peak range (not drawn)',
+                transform=ax.transAxes, ha='right', va='bottom', fontsize=FS_STATS, zorder=5)
 
     handles = [Line2D([], [], ls='', marker='o', markersize=6, color=colors[a],
                       label=f'{a} (n={int((fitted["Animal"] == a).sum())})') for a in animals]
     handles += [Line2D([], [], ls='', marker='o', markersize=6, markerfacecolor='white',
-                       markeredgecolor=PAL_EDMIN_REJECT, markeredgewidth=1.2,
-                       label=f'ED_min rejected (≥ {thr:g})'),
-                Line2D([], [], color=PAL_EDMIN_REJECT, ls='--', lw=FIG_AXIS_LW,
-                       label=f'ED_min threshold ({thr:g})')]
-    if has_fit:
-        handles.append(Line2D([], [], color=PAL_BLACK, lw=FIG_BOX_LW * 1.5, label='linear fit'))
+                       markeredgecolor=PAL_NONTHETA, markeredgewidth=1.2,
+                       label=f'non-theta (outside {band})'),
+                Line2D([], [], color=PAL_BLACK, ls='--', lw=FIG_AXIS_LW, label=f'theta band ({band})')]
     ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=FS_LEGEND - 2)
 
-    ax.set_xlabel('ED_min (distance to closest reference sinusoid)', fontsize=FS_LABEL - 2)
+    ax.set_xlabel('Matched sinusoid frequency, freq_est (Hz)', fontsize=FS_LABEL - 2)
     ax.set_ylabel('ACG peak range (norm.)', fontsize=FS_LABEL - 2)
     ax.tick_params(labelsize=FS_TICK)
-    _set_title(ax, 'ACG theta epochs: ED_min vs. peak range')
+    _set_title(ax, 'ACG theta epochs: frequency vs. peak range')
     _draw_stats(ax_info, stats_lines)
     _save_fig(fig, out_path)
     return out_path
@@ -2545,11 +2636,11 @@ def plot_edmin_epochs(edmin_df: pd.DataFrame, out_path: Path):
 PLOT_SUFFIXES = ('PolarPlot', 'PhaseHistogram', 'TMIShuffle', 'PeakOnsetOffset')
 
 
-def process_session(data_folder: Path, rng, edmin_records: list | None = None) -> list[dict]:
+def process_session(data_folder: Path, rng, acg_records: list | None = None) -> list[dict]:
     """Run Steps 1-4 on every unit in one session; returns one row per unit.
-    If `edmin_records` is given (and USE_ACG_THETA_EPOCHS), one dict per ACG
+    If `acg_records` is given (and USE_ACG_THETA_EPOCHS), one dict per ACG
     epoch of each LFP file used (Animal, Session, lfp_file, epoch_index, ED_min,
-    peakrangenorm, Status) is appended to it, for the pooled ED_min QC plot."""
+    freq_est, peakrangenorm, Status) is appended to it, for the pooled ACG QC plot."""
     output_dir = data_folder / SESSION_OUTPUT_FOLDER
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2591,10 +2682,16 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
 
         if theta_ncs not in lfp_cache:
             print(f'  Using LFP file: {theta_ncs.name}')
-            lfp_sig, lfp_ts, lfp_fs = load_ncs(theta_ncs)
-            # Clean (resample to ACG_FS, mains notch, detrend) before the Hilbert
-            # phase; everything downstream then works on this 1 kHz trace.
-            lfp_sig, lfp_ts, lfp_fs = clean_lfp(lfp_sig, lfp_ts, lfp_fs)
+            try:
+                lfp_sig, lfp_start, lfp_fs, ncs_records = load_ncs(theta_ncs)
+            except ValueError as exc:
+                print(f'  {theta_ncs.name}: {exc} -- skipping every tetrode referenced to it.')
+                lfp_cache[theta_ncs] = None
+                continue
+            # Clean (resample to ACG_FS, notch, wavelet denoise, detrend, outlier fill, low-pass)
+            # before the Hilbert phase; everything downstream then works on this 1 kHz trace.
+            lfp_sig, lfp_ts, lfp_fs, outlier_frac = clean_lfp(lfp_sig, lfp_start, lfp_fs)
+            print(f'  noise cleaning: {100 * outlier_frac:.2f}% samples outlier-filled')
             filtered_lfp = bandpass_filter(lfp_sig, LFP_FILTER_BAND[0], LFP_FILTER_BAND[1], lfp_fs)
             lfp_phase_unwrapped = np.unwrap(hilbert_phase(filtered_lfp, lfp_fs)[0])
             del filtered_lfp
@@ -2606,24 +2703,27 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
 
             acg_epoch_ok = None
             if USE_ACG_THETA_EPOCHS:
-                acg_epoch_ok, acg_ed_min, acg_peakrange = acg_theta_epoch_mask(lfp_sig, return_peakrange=True)
-                n_fit = int(np.isfinite(acg_ed_min).sum())
-                print(f'  ACG theta-positive epochs (ED_min < {ACG_ED_MIN_THRESH:g}): '
-                      f'{int(acg_epoch_ok.sum())}/{len(acg_epoch_ok)} '
-                      f'({n_fit} passed delta/theta + artifact screening)')
-                if edmin_records is not None:
-                    status = np.where(acg_epoch_ok, 'accepted',
-                                      np.where(np.isfinite(acg_ed_min), 'rejected_EDmin', 'rejected_prescreen'))
-                    edmin_records.extend(
+                acg = acg_theta_epochs(lfp_sig, ncs_records)
+                acg_epoch_ok = acg['ok']
+                rejected = pd.Series(acg['status'][~acg_epoch_ok]).value_counts()
+                print(f'  ACG theta epochs (freq_est in {ACG_FREQ_RANGE[0]:g}-{ACG_FREQ_RANGE[1]:g} Hz): '
+                      f'{int(acg_epoch_ok.sum())}/{len(acg_epoch_ok)}; thrown out: '
+                      + (', '.join(f'{n} {s.removeprefix("rejected_")}' for s, n in rejected.items()) or 'none'))
+                if acg_records is not None:
+                    acg_records.extend(
                         dict(Animal=animal_id, Session=session_label, FolderPath=str(data_folder),
-                             lfp_file=theta_ncs.name, epoch_index=i, ED_min=acg_ed_min[i],
-                             peakrangenorm=acg_peakrange[i], Status=status[i])
+                             lfp_file=theta_ncs.name, epoch_index=i, ED_min=acg['ED_min'][i],
+                             freq_est=acg['freq_est'][i], peakrangenorm=acg['peakrangenorm'][i],
+                             Status=acg['status'][i])
                         for i in range(len(acg_epoch_ok)))
 
             lfp_cache[theta_ncs] = dict(lfp_ts=lfp_ts, lfp_fs=lfp_fs, lfp_phase_unwrapped=lfp_phase_unwrapped,
                                         t_start=t_start, t_stop=t_stop, acg_epoch_ok=acg_epoch_ok)
 
         lfp_data = lfp_cache[theta_ncs]
+        if lfp_data is None:
+            print(f'  {theta_ncs.name} could not be loaded -- skipping this tetrode.')
+            continue
         lfp_ts, lfp_fs = lfp_data['lfp_ts'], lfp_data['lfp_fs']
         lfp_phase_unwrapped = lfp_data['lfp_phase_unwrapped']
         t_start, t_stop = lfp_data['t_start'], lfp_data['t_stop']
@@ -2647,7 +2747,7 @@ def process_session(data_folder: Path, rng, edmin_records: list | None = None) -
                 for suffix in THETA_MOD_PLOT_SUFFIXES:
                     (RESULTS_FOLDER / class_dir_name / f'{class_prefix}_{suffix}.png').unlink(missing_ok=True)
 
-            # ---- ACG theta-positive spike selection (every phase uses only these spikes) ----
+            # ---- ACG theta-epoch spike selection (every phase uses only these spikes) ----
             spk_ts_all = spk_ts
             if USE_ACG_THETA_EPOCHS:
                 spk_ts = spk_ts_all[times_in_ok_epochs(spk_ts_all, lfp_ts, lfp_fs, acg_epoch_ok)]
@@ -2808,6 +2908,12 @@ def save_metadata_csv(csv_path: Path) -> Path:
         ('TMI_HIST_SMOOTH_KERNEL_N', 7),                      # calc_tmi histogram smoothing
         ('TMI_HIST_SMOOTH_SIGMA', 0.5),
         ('ACG_WELCH_WINDOW', 'hann'),
+        ('ACG_WAVELET_THRESHOLD', 'BayesShrink, soft (noise sigma from finest level)'),
+        ('ACG_THETA_EPOCH_CRITERION', 'passes delta/theta + peak-to-peak MAD noise rejection AND ED_min reference '
+                                      'sinusoid (matched over ACG_REF_BANK) within ACG_FREQ_RANGE; no ED_min '
+                                      'value threshold'),
+        ('NCS_LOADER', 'ncs_repair.load_repaired_uv: valid samples on a timestamp-anchored grid, gaps up to 1 s '
+                       'interpolated, files with a longer gap skipped'),
         ('THETA_MODULATED_CRITERION', 'Rayleigh p < ALPHA AND TMI burst-preserving shuffle p < ALPHA'),
         ('PROPORTION_TESTS', 'chi-square test of independence + pairwise chi-square (Yates for 2 x 2), Holm'),
         ('PHASE_TESTS', 'Mardia-Watson-Wheeler (permutation p) + Watson-Williams, Holm'),
@@ -2819,7 +2925,10 @@ def save_metadata_csv(csv_path: Path) -> Path:
 README_NOTES = [
     'Units sheet: ONE ROW PER UNIT (one .ntt cluster in one session). Theta phase = Hilbert phase of the cleaned, '
     f'{LFP_FILTER_BAND[0]:g}-{LFP_FILTER_BAND[1]:g} Hz filtered LFP, 0 deg = theta peak, 180 deg = trough; only spikes in '
-    'ACG theta-positive epochs enter any phase.',
+    f'ACG theta epochs enter any phase: {ACG_EPOCH_SEC:g} s epochs that pass the noise rejection (delta > theta power, '
+    f'peak-to-peak MAD outlier) and whose closest reference sinusoid ({ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz bank) lies '
+    f'in {ACG_FREQ_RANGE[0]:g}-{ACG_FREQ_RANGE[1]:g} Hz (Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py; no ED_min threshold). '
+    'n_spikes_ACGtheta / ACGtheta_epoch_frac: the unit\'s spikes in theta epochs / fraction of its LFP\'s epochs that are theta.',
     f'Theta modulation (units with >= {MIN_SPIKES_FOR_TMI} theta-epoch spikes): Rayleigh_Significant = Rayleigh p < {ALPHA:g}; '
     f'TMI_Significant = burst-preserving TMI shuffle p < {ALPHA:g} (Frank et al. 2001); ThetaModulated = both. Units with too '
     'few spikes are negative on all three. ThetaModClass is the exclusive split.',
@@ -2918,24 +3027,24 @@ def main():
         raise FileNotFoundError(f'No folders with both .ncs and .ntt files found under {ROOT_FOLDER}')
 
     all_rows = []
-    edmin_records: list[dict] = []
+    acg_records: list[dict] = []
     for data_folder in session_folders:
         print(f'\n=== Session: {data_folder} ===')
         try:
-            all_rows.extend(process_session(data_folder, rng, edmin_records))
+            all_rows.extend(process_session(data_folder, rng, acg_records))
         except Exception as exc:
             print(f'ERROR processing {data_folder}: {exc}')
             continue
 
-    # ---- ACG ED_min QC: per-epoch table + ED_min vs. peak range plot, all sessions pooled ----
-    if edmin_records:
-        edmin_df = pd.DataFrame(edmin_records)
-        edmin_csv = RESULTS_FOLDER / EDMIN_EPOCHS_CSV_NAME
-        edmin_df.to_csv(edmin_csv, index=False)
-        print(f'\nACG per-epoch ED_min table saved to {edmin_csv}')
-        edmin_png = plot_edmin_epochs(edmin_df, RESULTS_FOLDER / EDMIN_PLOT_NAME)
-        if edmin_png is not None:
-            print(f'ED_min vs. peak range plot saved to {edmin_png}')
+    # ---- ACG QC: per-epoch table + freq_est vs. peak range plot, all sessions pooled ----
+    if acg_records:
+        acg_df = pd.DataFrame(acg_records)
+        acg_csv = RESULTS_FOLDER / ACG_EPOCHS_CSV_NAME
+        acg_df.to_csv(acg_csv, index=False)
+        print(f'\nACG per-epoch table saved to {acg_csv}')
+        acg_png = plot_acg_epochs(acg_df, RESULTS_FOLDER / ACG_QC_PLOT_NAME)
+        if acg_png is not None:
+            print(f'ACG frequency vs. peak range plot saved to {acg_png}')
 
     finish_population(pd.DataFrame(all_rows), RESULTS_FOLDER / OUTPUT_EXCEL_NAME)
 

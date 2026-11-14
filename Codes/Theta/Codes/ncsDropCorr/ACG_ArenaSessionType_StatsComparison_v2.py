@@ -16,6 +16,10 @@ ArenaSessionType_StatsComparison_v18.py:
          Linear vs Open : Fa1059, Fa23BD
      The comparisons are drawn side by side in one figure, each panel with its
      own statistics; they are not tested against each other.
+  4. All LFP files pooled (POOLED_DIR): every recording, irrespective of arena
+     and session type, as one group. Only the immobility-vs-mobility tests
+     apply (paired Wilcoxon for metrics 2-4); metric 1 and the split of
+     metric 2 are descriptive only (no groups to compare).
 
 Copied LFP files (DROP_DUPLICATE_LFP): some session folders hold copies of one
 LFP signal under several .ncs names (placed there so that every tetrode had a
@@ -108,6 +112,7 @@ Output (OUTPUT_DIR = <ACG_RUN_DIR>\\Stats):
     SessionType\\<arena>\\*.png          session types of <arena>
     ArenaType\\*.png                     arena types
     AnimalControlledArenaType\\*.png     the animal-controlled comparisons side by side
+    AllLFP\\*.png                        all LFP files pooled (sheet prefix 'AllLFP')
       NonTheta_Rejected_Overall.png      metric 1
       NonTheta_Rejected_ImmobileVsMobile.png  metric 2, per-movement-state rates
       NonTheta_Rejected_Split.png        metric 2, split of the rejected epochs
@@ -115,7 +120,7 @@ Output (OUTPUT_DIR = <ACG_RUN_DIR>\\Stats):
       Centroid_PeakRange.png             metric 3, peak range
       Theta_ImmobileVsMobile.png         metric 4
     ACG_SessionArena_Stats.xlsx          sheets '<prefix>_<table>', prefix
-                                         'Ses<arena>', 'Arena' or 'AC<A><B>'
+                                         'Ses<arena>', 'Arena', 'AC<A><B>' or 'AllLFP'
                                          (+ 'Recordings', 'Centroids').
                                          Metric 4: measures 'theta_immobile' /
                                          'theta_moving' in Prev_Desc / Prev_Tests,
@@ -154,6 +159,7 @@ PLACECELL_CODES_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\PlaceCell\Codes'
 if PLACECELL_CODES_DIR not in sys.path:
     sys.path.append(PLACECELL_CODES_DIR)
 import CellClusteredStats_Utils as ccs
+import PlotLayout_Utils as plu    # shared y-range of side-by-side panels, % labels on bars
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -163,7 +169,7 @@ ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\Spik
 # (The 5 Nov v8_NoiseCleaning run of the same format was moved to
 #  ROOT_DIR\Results\ACG\ACG_theta_continuity_BroadBandFitting_NcsDropCorr_NoiseCleaned.)
 ACG_RUN_DIR = os.path.join(ROOT_DIR, 'Results', 'ACG',
-                           'ACG_theta_continuity_BP1-20_Demean_SaturationRejection')
+                           'ACG_theta_continuity_Fin_DeltaThetaFilt')
 INPUT_CSV   = os.path.join(ACG_RUN_DIR, 'acg_theta_continuity_epochs.csv')
 ACG_META_CSV = os.path.join(ACG_RUN_DIR, 'meta', 'run_metadata.csv')
 
@@ -193,6 +199,10 @@ ANIMAL_CONTROLLED_COMPARISONS = {
     'Circle_vs_Open': (['Fa8477', 'Fa5834'], ['Circle', 'Open']),
     'Linear_vs_Open': (['Fa1059', 'Fa23BD'], ['Linear', 'Open']),
 }
+
+# All LFP files pooled (level 4): one group holding every recording.
+POOLED_DIR = 'AllLFP'
+POOLED_GROUP = 'All LFP'
 
 # True: the same channel recorded in two arenas on the same day is one 'cell'
 # (repeated measure) for the LMM; False: arenas are kept apart.
@@ -249,6 +259,22 @@ class Grouping:
 
 ARENA_GROUPING = Grouping('arena_type', ARENA_TYPES, 'arena types', 'Arena types')
 MOVEMENT_GROUPING = Grouping('movement', MOVEMENTS, 'movement states')
+# Level 4: column 'pooled' (= POOLED_GROUP for every row, set in main).
+POOLED_GROUPING = Grouping('pooled', [POOLED_GROUP], 'conditions', 'All LFP files')
+
+
+def _single(grp: Grouping) -> bool:
+    """One group only (the pooled level): no across-group tests, no Holm across groups."""
+    return len(grp.order) == 1
+
+
+def _within_scope(grp: Grouping) -> str:
+    return (f'all {grp.noun} pooled' if _single(grp)
+            else f'within each {grp.noun.rstrip("s")}')
+
+
+def _holm_scope(grp: Grouping) -> str:
+    return '' if _single(grp) else f', Holm across {grp.noun}'
 
 
 def session_grouping(arena: str) -> Grouping:
@@ -570,6 +596,8 @@ def compare_groups(df: pd.DataFrame, metric_col: str, metric_label: str, grp: Gr
                     groups, f'Kruskal-Wallis + Mann-Whitney U (rows treated as independent): {summary}')
             except ValueError:  # e.g. all values identical
                 omni, rows = None, []
+    elif len(groups) < 2:
+        omni, rows = None, []
     elif CONTINUOUS_TEST == 'LMM':
         omni, rows = ccs.compare_continuous_nested(df, grp.col, grp.order, metric_col,
                                                    transform=METRIC_TRANSFORM)
@@ -879,6 +907,7 @@ PLOT_H = 5.0
 FIG_DPI = 500
 AXIS_LW, BOX_LW, MEDIAN_LW = 0.8, 1.0, 1.5
 BAR_EDGE, BAR_EDGE_LW, BAR_WIDTH = 'white', 0.6, 0.6
+BAR_PCT_FS = 9         # font size of the % value above / inside every % bar (plu.label_bars)
 GROUP_W, PAIR_GROUP_W, AXIS_PAD_W = 1.1, 1.6, 1.4
 
 plt.rcParams.update({
@@ -908,6 +937,7 @@ GROUP_FACE = {
     'Cntrl': '#7FB3E5', 'Rotate': '#0066CC', 'Zero': '#BFBFBF',
     '0': '#008080', '90': '#00B3B3', '180': '#33D6D6', '270': '#7FFAFA',
     'Stnd': '#FDC4FD', 'NoRot': '#FA7FFA', 'Rot': '#C000C0',
+    POOLED_GROUP: '#A6A6A6',
 }
 # Movement states (magma(0.5) immobile, viridis(0.5) moving, the colormaps of the
 # ACG script's scatter) and their centroid diamonds (_draw_freq_peakrange_scatter:
@@ -1053,6 +1083,24 @@ def _groups_with(df: pd.DataFrame, grp: Grouping) -> list:
     return [g for g in grp.order if (df[grp.col] == g).any()]
 
 
+def _pooled_desc_lines(desc: pd.DataFrame, unit: str) -> list:
+    """Single-group descriptives of a compare_prevalence() 'desc' table."""
+    r = desc.iloc[0]
+    lines = [f'Epochs pooled: {int(r["n_rejected"])} of {int(r["n_epochs"])} '
+             f'({r["pct_epochs"]:.1f}%), {int(r["n_recordings"])} recordings.']
+    if pd.notna(r.get('rec_pct_median', np.nan)):
+        lines.append(f'Per {unit} %: median {r["rec_pct_median"]:.1f} '
+                     f'[Q1 {r["rec_pct_q1"]:.1f}, Q3 {r["rec_pct_q3"]:.1f}], '
+                     f'mean {r["rec_pct_mean"]:.1f}')
+    return lines
+
+
+def _p_text(r, grp) -> str:
+    """p of a within-group paired test; p(Holm) only with several groups."""
+    return (f'p = {_fmt_p(r.p_raw)} {_stars(r.p_raw)}' if _single(grp) else
+            f'p = {_fmt_p(r.p_raw)}, p(Holm) = {_fmt_p(r.p_holm)} {_stars(r.p_holm)}')
+
+
 def draw_overall(ax, grp, res):
     """Metric 1: % of all epochs rejected (bars: epochs pooled; dots: recordings)."""
     pr = res['prev']['overall']
@@ -1061,8 +1109,9 @@ def draw_overall(ax, grp, res):
         return [], ['No epochs']
     groups, x = list(desc['group']), np.arange(len(desc))
     pct = desc['pct_epochs'].to_numpy(float)
-    ax.bar(x, pct, width=BAR_WIDTH, color=[GROUP_FACE.get(g, '#BFBFBF') for g in groups],
-           edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+    bars = ax.bar(x, pct, width=BAR_WIDTH, color=[GROUP_FACE.get(g, '#BFBFBF') for g in groups],
+                  edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+    plu.label_bars(ax, bars, fontsize=BAR_PCT_FS)
     top = max(np.nanmax(pct), _rec_dots(ax, res['rec'], grp.col, groups, x, 'pct_overall'))
     _fit_ylim(ax, 0, top if top > 0 else 1, _posthoc_pairs(pr['epoch'][1], dict(zip(groups, x))),
               pct=True)
@@ -1073,6 +1122,10 @@ def draw_overall(ax, grp, res):
     ax.set_title(textwrap.fill(_titled(PREVALENCE_MEASURES['overall'][0], grp), 40),
                  fontsize=FS_TITLE - 2)
 
+    if _single(grp):
+        lines = ['Descriptive only (one group, no comparison).'] + _pooled_desc_lines(desc, 'recording')
+        lines.append('Bar: epochs pooled; dots: one recording each (animal colour)')
+        return _animal_handles(res['rec']['animal'].dropna().unique()), lines
     lines = ['Epoch level (all epochs of a group pooled):'] + _test_lines(*pr['epoch'])
     lines += _note_line(pr['epoch'][0])
     lines += ['Recording level (one % per recording):'] + _test_lines(*pr['recording'])
@@ -1093,8 +1146,10 @@ def draw_immobile_vs_mobile(ax, grp, res, family='nontheta'):
     groups, x = list(within['group']), np.arange(len(within))
     off = {'immobile': -0.2, 'moving': 0.2}
     for m in MOVEMENTS:
-        ax.bar(x + off[m], np.nan_to_num(within[f'mean_pct_{m}'].to_numpy(float)), width=0.38,
-               color=MOVEMENT_FILL[m], edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+        mean_pct = within[f'mean_pct_{m}'].to_numpy(float)
+        bars = ax.bar(x + off[m], np.nan_to_num(mean_pct), width=0.38,
+                      color=MOVEMENT_FILL[m], edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+        plu.label_bars(ax, bars, values=mean_pct, fontsize=BAR_PCT_FS - 1)
     rng = np.random.default_rng(0)
     top = 0.0
     for xi, g in zip(x, groups):
@@ -1137,8 +1192,8 @@ def draw_immobile_vs_mobile(ax, grp, res, family='nontheta'):
                      f'of that movement state.')
     unit_def = ('one recording (.ncs file) = one pair' if PAIRED_UNIT == 'recording' else
                 'one session = one pair, epoch counts of its channels summed')
-    lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")}, paired '
-                 f'({unit_def}): Wilcoxon signed-rank test, Holm across {grp.noun}:')
+    lines.append(f'Immobility vs mobility, {_within_scope(grp)}, paired '
+                 f'({unit_def}): Wilcoxon signed-rank test{_holm_scope(grp)}:')
     for r in within.itertuples():
         if r.test == 'insufficient data':
             lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs): insufficient data')
@@ -1146,17 +1201,22 @@ def draw_immobile_vs_mobile(ax, grp, res, family='nontheta'):
         lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs, {r.n_animals} animals): '
                      f'median Δ(mob − imm) = {r.median_diff_mob_minus_imm:+.1f} pp '
                      f'(mob higher in {r.n_mob_higher}, imm higher in {r.n_imm_higher}), '
-                     f'W = {r.statistic:.1f}, p = {_fmt_p(r.p_raw)}, '
-                     f'p(Holm) = {_fmt_p(r.p_holm)} {_stars(r.p_holm)}')
+                     f'W = {r.statistic:.1f}, {_p_text(r, grp)}')
     if PAIRED_UNIT == 'recording':
         lines.append('Pairs treated as independent; the channels of one session are separate pairs.')
-    for m in MOVEMENTS:
-        lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs:')
-        lines += _test_lines(*res['prev'][keys[m]]['epoch'])
-    lines += _note_line(res['prev'][keys['immobile']]['epoch'][0])
+    if _single(grp):
+        r = within.iloc[0]
+        lines.append(f'Epochs pooled: immobility {r["pct_immobile_pooled"]:.1f}% '
+                     f'(n={int(r["n_immobile"])}), mobility {r["pct_moving_pooled"]:.1f}% '
+                     f'(n={int(r["n_moving"])})')
+    else:
+        for m in MOVEMENTS:
+            lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()} epochs:')
+            lines += _test_lines(*res['prev'][keys[m]]['epoch'])
+        lines += _note_line(res['prev'][keys['immobile']]['epoch'][0])
     lines.append(f'Bars: mean of the per-{_unit_word(False)} %; dots: one {_unit_word(False)} each '
                  f'(animal colour), joined across movement states; brackets: paired immobility '
-                 f'vs mobility test, Holm p < {ALPHA:g}')
+                 f'vs mobility test, {"" if _single(grp) else "Holm "}p < {ALPHA:g}')
     handles = [Patch(facecolor=MOVEMENT_FILL[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
     return handles + _animal_handles(res['rec']['animal'].dropna().unique()), lines
 
@@ -1169,10 +1229,11 @@ def draw_split(ax, grp, res):
         return [], ['No non-theta rejected epochs']
     groups, x = list(desc['group']), np.arange(len(desc))
     imm = desc['pct_epochs'].to_numpy(float)
-    ax.bar(x, imm, width=BAR_WIDTH, color=MOVEMENT_FILL['immobile'], edgecolor=BAR_EDGE,
-           linewidth=BAR_EDGE_LW, zorder=2)
-    ax.bar(x, 100 - imm, bottom=imm, width=BAR_WIDTH, color=MOVEMENT_FILL['moving'],
-           edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+    for bars in (ax.bar(x, imm, width=BAR_WIDTH, color=MOVEMENT_FILL['immobile'], edgecolor=BAR_EDGE,
+                        linewidth=BAR_EDGE_LW, zorder=2),
+                 ax.bar(x, 100 - imm, bottom=imm, width=BAR_WIDTH, color=MOVEMENT_FILL['moving'],
+                        edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)):
+        plu.label_bars(ax, bars, inside=True, fontsize=BAR_PCT_FS)   # stacked: % in each segment
     _fit_ylim(ax, 0, 100, _posthoc_pairs(pr['epoch'][1], dict(zip(groups, x))), pct=True)
     ax.set_xticks(x)
     ax.set_xticklabels([f'{_label(g)}\nImm {p:.1f}%\nMob {100 - p:.1f}%\n(n={n} rejected)'
@@ -1181,11 +1242,15 @@ def draw_split(ax, grp, res):
     ax.set_title(textwrap.fill(_titled(f'Non-theta (outside {_band()}) rejected epochs: '
                                        f'immobility vs mobility share', grp), 40),
                  fontsize=FS_TITLE - 2)
+    handles = [Patch(facecolor=MOVEMENT_FILL[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
+    if _single(grp):
+        lines = ['Descriptive only (one group, no comparison). Rejected epochs in immobility:']
+        lines += _pooled_desc_lines(desc, 'recording (>= 1 rejected epoch)')
+        return handles, lines
     lines = ['Epoch level (rejected epochs pooled; groups x (immobility, mobility)):']
     lines += _test_lines(*pr['epoch']) + _note_line(pr['epoch'][0])
     lines += ['Recording level (one % per recording with >= 1 rejected epoch):']
     lines += _test_lines(*pr['recording']) + _note_line(pr['recording'][0])
-    handles = [Patch(facecolor=MOVEMENT_FILL[m], label=MOVEMENT_LABELS[m]) for m in MOVEMENTS]
     return handles, lines
 
 
@@ -1270,15 +1335,16 @@ def draw_centroid(ax, grp, res, metric):
         lines.append(f'{_label(r.group)} {MOVEMENT_LABELS[r.movement].lower()} (n={r.n}, '
                      f'{int(r.n_epochs)} epochs): mean {r.mean:.3g} ± {sd} SD | '
                      f'median {r.median:.3g} [Q1 {r.q1:.3g}, Q3 {r.q3:.3g}]')
-    for m in MOVEMENTS:
-        lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()}:')
-        lines += _test_lines(*c['across'][m])
+    if not _single(grp):
+        for m in MOVEMENTS:
+            lines.append(f'Across {grp.noun}, {MOVEMENT_LABELS[m].lower()}:')
+            lines += _test_lines(*c['across'][m])
     if len(c['within']):
         unit_def = ('one recording = one pair (its immobility and mobility centroids)'
                     if PAIRED_UNIT == 'recording' else
                     'one session = one pair, accepted epochs of its recordings pooled')
-        lines.append(f'Immobility vs mobility within each {grp.noun.rstrip("s")}, paired '
-                     f'({unit_def}): Wilcoxon signed-rank test, Holm across {grp.noun}:')
+        lines.append(f'Immobility vs mobility, {_within_scope(grp)}, paired '
+                     f'({unit_def}): Wilcoxon signed-rank test{_holm_scope(grp)}:')
         for r in c['within'].itertuples():
             if r.test == 'insufficient data':
                 lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs): insufficient data')
@@ -1286,12 +1352,15 @@ def draw_centroid(ax, grp, res, metric):
             lines.append(f'{_label(r.group)} (n = {r.n_pairs} pairs, {r.n_animals} animals): '
                          f'median Δ(mob − imm) = {r.median_diff_mob_minus_imm:+.3g} '
                          f'(mob higher in {r.n_mob_higher}, imm higher in {r.n_imm_higher}), '
-                         f'W = {r.statistic:.1f}, p = {_fmt_p(r.p_raw)}, '
-                         f'p(Holm) = {_fmt_p(r.p_holm)} {_stars(r.p_holm)}')
-    lines += _note_line(c['across']['immobile'][0])
-    lines.append(f'Brackets: Holm p < {ALPHA:g} (across {grp.noun} within a movement state; '
-                 f'paired immobility vs mobility within a {grp.noun.rstrip("s")})'
-                 + ('; grey lines join the two centroids of one recording' if join else ''))
+                         f'W = {r.statistic:.1f}, {_p_text(r, grp)}')
+    if _single(grp):
+        lines.append(f'Brackets: paired immobility vs mobility test, p < {ALPHA:g}'
+                     + ('; grey lines join the two centroids of one recording' if join else ''))
+    else:
+        lines += _note_line(c['across']['immobile'][0])
+        lines.append(f'Brackets: Holm p < {ALPHA:g} (across {grp.noun} within a movement state; '
+                     f'paired immobility vs mobility within a {grp.noun.rstrip("s")})'
+                     + ('; grey lines join the two centroids of one recording' if join else ''))
     handles = [Patch(facecolor=MOVEMENT_FILL[m], edgecolor=PAL_BLACK, label=MOVEMENT_LABELS[m])
                for m in MOVEMENTS]
     handles += [Line2D([0], [0], marker='D', linestyle='None', markersize=8,
@@ -1326,8 +1395,10 @@ def save_panels(results: list, draw, group_w: float, out_path: str):
     fig = plt.figure(figsize=(sum(widths) + 0.3 * (len(results) - 1), PLOT_H + info_h),
                      layout='constrained')
     subfigs = fig.subfigures(1, len(results), width_ratios=widths, wspace=0.03, squeeze=False)[0]
+    plot_axes = []
     for sf, r, ls, n in zip(subfigs, results, lines, n_leg):
         ax, ax_info = sf.subplots(2, 1, gridspec_kw={'height_ratios': [PLOT_H, info_h]})
+        plot_axes.append(ax)
         handles, _l = draw(ax, r['grp'], r)
         _style(ax)
         ax_info.axis('off')
@@ -1336,6 +1407,9 @@ def save_panels(results: list, draw, group_w: float, out_path: str):
         ax_info.text(0.5, 1 - (n * LEGEND_ROW_IN + 0.1) / info_h, '\n'.join(ls),
                      transform=ax_info.transAxes, ha='center', va='top', fontsize=FS_STATS,
                      linespacing=1.3)
+    # Side-by-side panels (the animal-controlled comparisons) share one y-range: the lowest
+    # lower and the highest upper limit of the panels.
+    plu.match_ylims(plot_axes)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=FIG_DPI, bbox_inches='tight')
     plt.close(fig)
@@ -1486,6 +1560,14 @@ def main():
         _store('AC' + ''.join(grp.order), tables, ac_comparison=name, animals=', '.join(animals))
     if ac_results:
         plot_all(ac_results, os.path.join(OUTPUT_DIR, ANIMAL_CONTROLLED_DIR))
+
+    # ── 4. All LFP files pooled (arena and session types ignored) ───────────
+    res = analyse(POOLED_GROUPING, rec.assign(pooled=POOLED_GROUP),
+                  cen.assign(pooled=POOLED_GROUP))
+    plot_all([res], os.path.join(OUTPUT_DIR, POOLED_DIR))
+    tables = result_tables(res)
+    print_significant(tables, POOLED_GROUPING.title)
+    _store('AllLFP', tables)
 
     # ── Save ────────────────────────────────────────────────────────────────
     with pd.ExcelWriter(STATS_XLSX, engine='openpyxl') as writer:

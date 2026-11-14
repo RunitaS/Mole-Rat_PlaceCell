@@ -65,7 +65,7 @@ NEW workbook (+ one long-format CSV) in OUTPUT_DIR, together with the plots:
     OUTPUT_DIR\\WallDistance\\                      WallDistanceSchematic_<arena>.png and
                                                     WallDist_PeakDistance_vs_Dwell.png
     OUTPUT_DIR\\RunSnapshots\\<YYYYmmdd_HHMMSS>\\       saved BEFORE the analysis runs:
-        code\\                                      this script + PlaceCell_Main_v21,
+        code\\                                      this script + PlaceCell_Main_v22,
                                                     CellClusteredStats_Utils, PlaceFieldShape_Utils
         RunMetadata.xlsx                            'Run' (time, git commit, versions)
                                                     and 'Parameters' (every setting)
@@ -99,6 +99,17 @@ Metrics compared (all restricted to place_cell == True):
                         p-type if final_speed_score > 0, n-type if < 0. Cells
                         with speed_cell False / 'not tested' are non-speed.
     - mean_fr          Mean firing rate ('Extra' sheets)
+    - infield_mean_fr  (V20) Within-field mean firing rate: spikes while the
+                        animal was inside any of the cell's place fields / time
+                        spent inside them, pooled over all of its fields, moving
+                        frames only (PlaceCell_Main_v22._infield_firing_rate).
+                        Taken from INPUT_EXCEL 'Full' if it has the column (a
+                        PlaceCell_Main_v22 run), else rebuilt from the .ntt +
+                        tracking files with INPUT_EXCEL's fields
+                        (INFIELD_RATE_SOURCE; per-cell / per-field results in
+                        OUTPUT_DIR\\IFR_RESULTS_XLSX). Box plot
+                        Full_infield_mean_fr.png + histogram at every level, and
+                        the wall-distance tests. Off with INCLUDE_INFIELD_RATE.
 
   Sheet 'PlaceFields' (aggregated per cell):
     - n_fields         Number of place fields per cell
@@ -108,7 +119,7 @@ Metrics compared (all restricted to place_cell == True):
     - in_out_spike_ratio  (V19) in / out, where in = spikes inside any place
                         field of the cell (sum of field_n_spikes) and out =
                         n_spikes ('Full') - in. Both are moving-only spikes
-                        (immobility filter of PlaceCell_Main_v21); spikes in
+                        (immobility filter of PlaceCell_Main_v22); spikes in
                         bins outside every field, valid or not, count as out.
                         NaN when out = 0.
     - within_field_firing_index  (V19) (in - out) / (in + out), -1 to 1.
@@ -137,19 +148,19 @@ Metrics compared (all restricted to place_cell == True):
   comparison folder; sheets '*_TS_Desc', '*_TS_Omnibus',
   '*_TS_PostHoc'). Switched off with INCLUDE_TEMPORAL_STABILITY = False.
   The cells are every .ntt under TS_PLACE_CELL_FOLDER (the Output_PlaceTrue
-  folder of a PlaceCell_Main_v21 run; all already place cells). Everything is
+  folder of a PlaceCell_Main_v22 run; all already place cells). Everything is
   computed in this script from each cell's .ntt + tracking file (no precomputed
   temporal stability table is read), as follows:
     1. Rebuild the session trajectory, spike positions and bin grid with
-       PlaceCell_Main_v21.compute_metrics (same cleaning, smoothing, immobility
+       PlaceCell_Main_v22.compute_metrics (same cleaning, smoothing, immobility
        filter and spike assignment as the run that detected the fields).
-    2. Detect its place fields with PlaceCell_Main_v21's threshold method
+    2. Detect its place fields with PlaceCell_Main_v22's threshold method
        (detect_place_fields_threshold_2d / _circular) on those maps. A cell
        with no field under the current criteria is kept: its field metrics are
        NaN, its whole-map and peak-bin metrics and its map are still produced.
     3. For every field bin, split the trajectory into visits: a visit is one
        contiguous run of tracking frames inside that bin (entry -> exit), the
-       same definition PlaceCell_Main_v21 uses for its visit count. Visits
+       same definition PlaceCell_Main_v22 uses for its visit count. Visits
        shorter than MIN_VISIT_S are ignored.
     4. Per field bin: % of visits during which the cell fired >= 1 spike
        (a spike belongs to a visit if it was assigned to one of its frames).
@@ -197,7 +208,7 @@ Metrics compared (all restricted to place_cell == True):
   OUTPUT_DIR\\AnimalControlledArenaType\\ExampleMaps\\
   ('<comparison>_<arena>_<Best|Mean|Worst><rank>_<session>_<unit>.png').
   Analysis settings (bin size, smoothing, filters, field thresholds,
-  COORD_UNITS, ...) come from PlaceCell_Main_v21.
+  COORD_UNITS, ...) come from PlaceCell_Main_v22.
 
   Multi-peak fields (V15, merged from PlaceCell_MultiPeak_KDE_v2.py and
   MultiPeak_StatsComparison.py; switched off with INCLUDE_MULTIPEAK = False).
@@ -320,7 +331,7 @@ FD_FIELDS_EXCEL with 2-D fields (Circle-track fields are 1-D and have no
 widths), saved as <session>\\FIELD_DIM_SUBDIR\\<unit>_field_dimensions.png
 under FD_PLACE_CELL_FOLDER, next to the session's ratemap folder. The cell's
 Gaussian-smoothed full-session ratemap is rebuilt with
-PlaceCell_Main_v21.compute_metrics; the field bins keep their values and the
+PlaceCell_Main_v22.compute_metrics; the field bins keep their values and the
 colour scale of the whole map (min-max over all valid bins, as in the
 ratemap figure), the other visited bins are gray, never-visited bins blank.
 Each field is outlined and gets its max-width line (white) and min-width
@@ -344,7 +355,7 @@ comparison folder only (not histograms or WallDist_* plots). Each ringed plot is
 saved twice: <name>.png without the rings (and without the ringed-only stats section),
 <name>_control.png with them (CONTROL_SUFFIX):
   Full_peak_fr.png              cells whose peak_fr bin has a low dwell: the bin is the
-                                max of PlaceCell_Main_v21's raw map (pc.compute_metrics,
+                                max of PlaceCell_Main_v22's raw map (pc.compute_metrics,
                                 rebuilt in the temporal stability step; 2-D grid in every
                                 arena), its dwell = moving-only occupancy (s) of that bin
                                 (PerCell column peak_fr_bin_dwell_s). Ringed if dwell <=
@@ -447,17 +458,20 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
 # CellClusteredStats_Utils.py lives one folder up from FinalCodes\ (appended, so
-# that this folder's PlaceCell_Main_v21.py comes first).
+# that this folder's PlaceCell_Main_v22.py comes first).
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import CellClusteredStats_Utils as ccs
 import PlaceFieldShape_Utils as pfs
-import PlaceCell_Main_v21 as pc   # temporal stability maps
+# v22 = v21 + the within-field mean firing rate (pc._infield_firing_rate); every
+# other function used here is unchanged from v21.
+import PlaceCell_Main_v22 as pc   # temporal stability maps, within-field firing rate
+import PlotLayout_Utils as plu    # shared y-range of side-by-side plots, % labels on bars
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
 INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Main\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Char\v3'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PC_Char\v4'
 
 # Copy of INPUT_EXCEL with the place-field shape columns added to its
 # 'PlaceFields' sheet.
@@ -484,7 +498,7 @@ WD_PLOTS_SUBDIR = 'WallDistance'
 # False: no temporal stability comparison at all.
 INCLUDE_TEMPORAL_STABILITY = True
 
-# Place-cell folder (Output_PlaceTrue of a PlaceCell_Main_v21 run): every .ntt under
+# Place-cell folder (Output_PlaceTrue of a PlaceCell_Main_v22 run): every .ntt under
 # it is analysed; each session folder also holds its tracking file.
 TS_PLACE_CELL_FOLDER = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
@@ -518,17 +532,50 @@ INCLUDE_FIELD_DIMENSION_MAPS = True
 
 # Workbook whose place cells ('Full') and fields ('PlaceFields', bin_coords) are
 # drawn -- figures only, the statistics always use INPUT_EXCEL. It should come
-# from the PlaceCell_Main_v21 run that drew the current ratemap figures (same
+# from the PlaceCell_Main_v22 run that drew the current ratemap figures (same
 # tracking files), so that its fields sit on the rebuilt Gaussian-smoothed map;
 # a field whose rebuilt peak differs from its peak_fr_hz is flagged on the figure.
 FD_FIELDS_EXCEL = os.path.join(TS_PLACE_CELL_FOLDER, 'All_TT_PlaceChar_SiSkaggsAdptBin_Final_OnlyPC.xlsx')
 
 # Folder with the .ntt + tracking files of those place cells; one figure per
 # cell goes in FIELD_DIM_SUBDIR of its session folder (next to
-# PlaceCell_Main_v21's ratemap folder, pc.RATEMAPS_SUBDIR).
+# PlaceCell_Main_v22's ratemap folder, pc.RATEMAPS_SUBDIR).
 FD_PLACE_CELL_FOLDER = TS_PLACE_CELL_FOLDER
 FIELD_DIM_SUBDIR     = 'field_dimensions'
 FD_MAX_WORKERS       = pc.MAX_WORKERS
+
+# ── Within-field mean firing rate (V20) ─────────────────────────────────────
+
+# False: no within-field firing rate comparison.
+INCLUDE_INFIELD_RATE = True
+
+# Where the per-cell value comes from:
+#   'auto'   : INPUT_EXCEL 'Full' column infield_mean_fr if it holds values (a
+#              PlaceCell_Main_v22 run), else rebuilt here (run_infield_rate)
+#   'excel'  : that column only (error if INPUT_EXCEL has none)
+#   'rebuild': always rebuilt here from the .ntt + tracking files
+INFIELD_RATE_SOURCE = 'auto'
+
+# Rebuild: .ntt + tracking files of the place cells; the fields are those of
+# INPUT_EXCEL 'PlaceFields' (bin_coords). Per-cell / per-field results go to
+# OUTPUT_DIR\IFR_RESULTS_XLSX (output only).
+IFR_PLACE_CELL_FOLDER = TS_PLACE_CELL_FOLDER
+IFR_RESULTS_XLSX      = 'InFieldFiringRate.xlsx'
+IFR_MAX_WORKERS       = pc.MAX_WORKERS
+
+# A field whose rebuilt PLACE_FIELD_RATEMAP_TYPE peak differs from its INPUT_EXCEL
+# peak_fr_hz by more than IFR_RATEMAP_CHECK_TOL_HZ may not line up with the rebuilt
+# bin grid (INPUT_EXCEL predates the 2 Nov tracking edits); its cell gets
+# ratemap_check = False. True: those cells are left out of the comparison.
+IFR_RATEMAP_CHECK_TOL_HZ     = 0.002
+IFR_EXCLUDE_RATEMAP_MISMATCH = False
+
+INFIELD_RATE_COL   = 'infield_mean_fr'
+INFIELD_RATE_LABEL = 'Within-field mean firing rate (Hz)'
+_INFIELD_SOURCES = ('auto', 'excel', 'rebuild')
+if INFIELD_RATE_SOURCE not in _INFIELD_SOURCES:
+    raise ValueError(f"INFIELD_RATE_SOURCE must be one of {_INFIELD_SOURCES}, "
+                     f"got {INFIELD_RATE_SOURCE!r}")
 
 # ── Multi-peak fields (merged from PlaceCell_MultiPeak_KDE_v2.py) ───────────
 
@@ -759,6 +806,10 @@ FULL_METRICS = {
     'stability_score':   'Stability score',
     'final_speed_score': 'Speed score',
 }
+# Within-field mean firing rate (V20): one value per place cell, compared like the
+# other 'Full' metrics (box plot Full_infield_mean_fr.png, histogram, wall distance).
+if INCLUDE_INFIELD_RATE:
+    FULL_METRICS[INFIELD_RATE_COL] = INFIELD_RATE_LABEL
 
 FIELD_METRICS = {
     'n_fields':       'Number of place fields per cell',
@@ -1987,12 +2038,20 @@ def compare_categorical(df: pd.DataFrame, col: str, label: str, grp: Grouping):
     return desc_df, omnibus, posthoc_df
 
 
-def _set_percent_ylim(ax, pos_by_group: dict, posthoc_df, bar_top: float):
+# Font size of the % value written above / inside every % bar (plu.label_bars), and the
+# room (in % units) kept above a bar for it.
+BAR_PCT_FS = 10
+BAR_PCT_ROOM = 7
+
+
+def _set_percent_ylim(ax, pos_by_group: dict, posthoc_df, bar_top: float,
+                      label_room: float = 0.0):
     """Draw significance lines above 100 %-scale bars and extend the y-axis to
-    fit them, keeping the ticks at 0-100."""
-    top = _draw_sig_brackets(ax, pos_by_group, posthoc_df, y_base=bar_top + 4,
+    fit them, keeping the ticks at 0-100. `label_room`: % units left free
+    above the bars for their % labels."""
+    top = _draw_sig_brackets(ax, pos_by_group, posthoc_df, y_base=bar_top + label_room + 4,
                              y_step=8, y_text=3)
-    ax.set_ylim(0, 100 if top is None else max(100, top + 8))
+    ax.set_ylim(0, max(100, bar_top + label_room + 2) if top is None else max(100, top + 8))
     ax.set_yticks(np.arange(0, 101, 20))
 
 
@@ -2017,14 +2076,16 @@ def plot_categorical(df: pd.DataFrame, col: str, label: str, out_path: str,
 
     positions = np.arange(len(present))
     faces = [_color(g)['face'] for g in present]
-    ax.bar(positions, pct_true, color=faces, edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW,
-           width=BAR_WIDTH, zorder=2)
+    bars = ax.bar(positions, pct_true, color=faces, edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW,
+                  width=BAR_WIDTH, zorder=2)
+    plu.label_bars(ax, bars, fontsize=BAR_PCT_FS)
 
     tick_labels = [f'{_label(g)}\n(n={n})' for g, n in zip(present, ns)]
     ax.set_xticks(positions)
     ax.set_xticklabels(tick_labels)
     ax.set_ylabel(ylabel, fontsize=FS_LABEL, labelpad=8)
-    _set_percent_ylim(ax, dict(zip(present, positions)), posthoc_df, max(pct_true))
+    _set_percent_ylim(ax, dict(zip(present, positions)), posthoc_df, max(pct_true),
+                      label_room=BAR_PCT_ROOM)
     _set_title(ax, _titled(label, grp))
     _style_axes(ax)
     fig.tight_layout()
@@ -2096,10 +2157,11 @@ def plot_speed_direction(df: pd.DataFrame, out_path: str, grp: Grouping,
     light  = [_color(g)['light'] for g in present]
     bottoms2 = [p + n for p, n in zip(pct_p, pct_n)]
     bar_kw = dict(edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, width=BAR_WIDTH, zorder=2)
-    ax.bar(positions, pct_p, color=dark, label='p-Speed', **bar_kw)
-    ax.bar(positions, pct_n, bottom=pct_p, color=light, label='n-Speed', **bar_kw)
-    ax.bar(positions, pct_non, bottom=bottoms2, color=SIG_GRAY['face'],
-           label='non-speed', **bar_kw)
+    for bars in (ax.bar(positions, pct_p, color=dark, label='p-Speed', **bar_kw),
+                 ax.bar(positions, pct_n, bottom=pct_p, color=light, label='n-Speed', **bar_kw),
+                 ax.bar(positions, pct_non, bottom=bottoms2, color=SIG_GRAY['face'],
+                        label='non-speed', **bar_kw)):
+        plu.label_bars(ax, bars, inside=True, fontsize=BAR_PCT_FS)   # stacked: % in each segment
 
     tick_labels = [f'{_label(g)}\n(n={n})' for g, n in zip(present, ns)]
     ax.set_xticks(positions)
@@ -2274,7 +2336,7 @@ _print_lock = threading.Lock()
 
 
 def _find_tracking_csv(dirpath: str) -> str | None:
-    """Same tracking-file selection as PlaceCell_Main_v21's batch scan."""
+    """Same tracking-file selection as PlaceCell_Main_v22's batch scan."""
     tracking = [f for f in os.listdir(dirpath) if f.lower().endswith(('.csv', '.xlsx'))]
     if pc.COORD_UNITS == 'cm':
         tracking = [f for f in tracking if f.lower().endswith('_cm.csv')]
@@ -2404,7 +2466,7 @@ def _plot_stability_2d(ax, fig, pct: np.ndarray, field_mask: np.ndarray,
 def _plot_stability_ring(ax, fig, pct: np.ndarray, field_mask: np.ndarray,
                          valid: np.ndarray, ctx_circ: dict):
     """Angular analogue of _plot_stability_2d, drawn as a ring like
-    PlaceCell_Main_v21._plot_ratemap_ring."""
+    PlaceCell_Main_v22._plot_ratemap_ring."""
     n_theta, bw = ctx_circ['n_bins_theta'], ctx_circ['bin_width_rad']
     r_min, r_max = ctx_circ['r_min'], ctx_circ['r_max']
     theta_mesh, r_mesh = np.meshgrid(np.arange(n_theta + 1) * bw, [r_min, r_max])
@@ -2452,7 +2514,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
     spike_frame = ctx['spike_frame']
 
     # ── Place fields + the bin sequence / grid they are defined on ───────────
-    # Same detection as PlaceCell_Main_v21._run_job (Circle track: angular bins).
+    # Same detection as PlaceCell_Main_v22._run_job (Circle track: angular bins).
     if is_circle:
         ctx_circ  = pc._build_ratemap_circular(ctx, bin_cm)
         fields, _ = pc.detect_place_fields_threshold_circular(ctx_circ, bin_cm)
@@ -2492,7 +2554,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
     # ── Temporal stability at the raw-ratemap peak bin ───────────────────────
     # Peak over all valid bins of the RAW (unsmoothed) ratemap, first bin on ties.
     # Circle track: the raw angular map (spikes / occupancy per angular bin, as in
-    # PlaceCell_Main_v21._ratemap_circular). The peak need not lie in a field.
+    # PlaceCell_Main_v22._ratemap_circular). The peak need not lie in a field.
     if is_circle:
         raw_rate = np.zeros(grid)
         np.divide(spk_bins, occ, out=raw_rate, where=valid)
@@ -2570,7 +2632,7 @@ def _ts_run_cell(args) -> tuple[dict | None, list[dict], list[dict]]:
                      'pct_at_peak_bin': round(float(peak_pct), 2)})
 
     # ── Dwell at the bin behind peak_fr (V20) ────────────────────────────────
-    # PlaceCell_Main_v21's peak_fr is the max of its FIRING_RATE_RATEMAP_TYPE map
+    # PlaceCell_Main_v22's peak_fr is the max of its FIRING_RATE_RATEMAP_TYPE map
     # ('raw') over the 2-D grid -- for every arena, the Circle track included -- so
     # the bin is taken from that map (first bin on ties) and its dwell (s) from the
     # raw, moving-only occupancy map.
@@ -2794,7 +2856,7 @@ _FD_LINE_STYLES = {   # (label, line colour, outline colour)
 
 def _fd_run_cell(args) -> bool:
     """Field dimension figure for one place cell: its Gaussian-smoothed
-    full-session ratemap (PlaceCell_Main_v21.compute_metrics, same bins, values
+    full-session ratemap (PlaceCell_Main_v22.compute_metrics, same bins, values
     and colour scale as the 'Gaussian-smoothed' panel of its ratemap figure),
     field bins in colour, the cell's other visited bins gray, each field
     outlined with its max- and min-width lines (PlaceFieldShape_Utils).
@@ -2841,7 +2903,7 @@ def _fd_run_cell(args) -> bool:
     if mismatch:
         with _print_lock:
             print(f'  [WARN] {session} | {unit}: rebuilt ratemap peak != Excel peak_fr_hz '
-                  f'in field(s) {mismatch} (check the PlaceCell_Main_v21 settings)')
+                  f'in field(s) {mismatch} (check the PlaceCell_Main_v22 settings)')
 
     aspect = n_by / n_bx
     fig_w  = 14.0 if aspect < 0.5 else 9.0
@@ -2948,6 +3010,178 @@ def run_field_dimension_maps() -> None:
                 print(f'  ERROR in {a[2]} | {a[3]}: {e}')
     print(f'Done. {n_saved}/{len(cells)} field dimension map(s) saved in '
           f'<session>\\{FIELD_DIM_SUBDIR}\\ under {FD_PLACE_CELL_FOLDER}')
+
+
+# ── Within-field mean firing rate (V20) ─────────────────────────────────────
+# Per place cell: spikes while the animal was inside any of the cell's fields /
+# time spent inside them, pooled over the fields, moving frames only
+# (PlaceCell_Main_v22._infield_firing_rate). The fields are INPUT_EXCEL's
+# ('PlaceFields', bin_coords); the spike and occupancy maps are rebuilt with
+# PlaceCell_Main_v22.compute_metrics (Circle track: its angular maps,
+# _build_ratemap_circular), the maps the fields were detected on.
+
+IFR_CELL_COLUMNS = ['session', 'unit', 'field_geometry', 'n_fields', 'infield_n_spikes',
+                    'infield_dwell_s', 'infield_mean_fr', 'ratemap_check', 'spikes_match',
+                    'status']
+
+
+def _ifr_run_cell(args) -> list[dict]:
+    """Per-field rows (field_n_spikes / field_dwell_s / field_mean_fr_hz + checks) of
+    one place cell; every row carries 'status' ('ok' or why the cell was skipped)."""
+    idx, total, session, unit, fdf, folder = args
+    dirpath  = os.path.join(folder, session)
+    ntt_path = os.path.join(dirpath, unit)
+    with _print_lock:
+        print(f'[{idx}/{total}]  {session}  |  {unit}  ({len(fdf)} field(s))')
+    base = [{'session': session, 'unit': unit, 'field_number': int(f['field_number']),
+             'field_geometry': f['arena_type'], 'n_bins': f.get('n_bins'),
+             'field_n_spikes_excel': f.get('field_n_spikes'),
+             'peak_fr_hz_excel': f.get('peak_fr_hz'), 'bin_coords': f['bin_coords']}
+            for _, f in fdf.iterrows()]
+
+    def _fail(msg):
+        with _print_lock:
+            print(f'  [SKIP] {session} | {unit}: {msg}')
+        return [dict(b, status=msg) for b in base]
+
+    if not os.path.isfile(ntt_path):
+        return _fail('.ntt not found')
+    csv_path = _find_tracking_csv(dirpath)
+    if csv_path is None:
+        return _fail('no single tracking file')
+    _, ctx = pc.compute_metrics(csv_path, ntt_path, pc.arena_width_cm, pc.target_bin_cm)
+    if not ctx or not ctx['valid_mask'].any():
+        return _fail('no valid occupancy after rebuild')
+
+    is_circle = pc._is_circle_arena(dirpath)
+    if is_circle != (str(fdf['arena_type'].iloc[0]) == 'Circle'):
+        return _fail(f'arena mismatch (folder Circle = {is_circle}, workbook '
+                     f'{fdf["arena_type"].iloc[0]})')
+    maps = pc._build_ratemap_circular(ctx, pc.target_bin_cm) if is_circle else ctx
+    spike_map, occ_map, fr_field = maps['spike_map'], maps['occ_map'], maps['fr_field']
+
+    rows = []
+    for b in base:
+        bins = np.array(_field_bins(b['bin_coords'], is_circle))
+        if (bins < 0).any() or (bins >= np.array(occ_map.shape)).any():
+            return _fail(f'field {b["field_number"]} outside the rebuilt '
+                         f'{" x ".join(map(str, occ_map.shape))} bin grid')
+        idx_b = tuple(bins.T)
+        peak = float(fr_field[idx_b].max())
+        rows.append(dict(b, field_n_spikes=int(spike_map[idx_b].sum()),
+                         rebuilt_peak_fr_hz=round(peak, 4),
+                         ratemap_check=bool(abs(peak - float(b['peak_fr_hz_excel']))
+                                            <= IFR_RATEMAP_CHECK_TOL_HZ)))
+    # Same computation as PlaceCell_Main_v22 (adds field_dwell_s / field_mean_fr_hz).
+    cell = pc._infield_firing_rate(rows, spike_map, occ_map, is_circle)
+    for r in rows:
+        r.update(status='ok', infield_mean_fr=cell['infield_mean_fr'])
+    return rows
+
+
+def run_infield_rate(full: pd.DataFrame, fields: pd.DataFrame, out_xlsx: str,
+                     place_cell_folder: str = None) -> tuple:
+    """Within-field mean firing rate of every place cell of `full` (place_cell True)
+    with fields in `fields` (bin_coords), rebuilt from the .ntt + tracking files in
+    `place_cell_folder` (default IFR_PLACE_CELL_FOLDER). Writes `out_xlsx` (sheets
+    PerCell, PerField) and returns (per_cell, per_field)."""
+    folder = place_cell_folder or IFR_PLACE_CELL_FOLDER
+    is_pc = full['place_cell'].apply(_to_bool)
+    keys = set(zip(full.loc[is_pc, 'session'], full.loc[is_pc, 'unit']))
+    keep = np.array([(s, u) in keys for s, u in zip(fields['session'], fields['unit'])], dtype=bool)
+    f = fields[keep & fields['bin_coords'].notna().to_numpy()]
+    cells = list(f.groupby(['session', 'unit'], sort=True))
+    print(f'\nWithin-field firing rate: {len(keys)} place cell(s); {len(cells)} with fields, '
+          f'{len(f)} field(s); files from {folder}\n')
+
+    job_args = [(i, len(cells), s, u, d.sort_values('field_number'), folder)
+                for i, ((s, u), d) in enumerate(cells, start=1)]
+    rows = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=IFR_MAX_WORKERS) as ex:
+        futures = {ex.submit(_ifr_run_cell, a): a for a in job_args}
+        for fut in concurrent.futures.as_completed(futures):
+            a = futures[fut]
+            try:
+                rows += fut.result()
+            except Exception as e:  # noqa: BLE001
+                print(f'  ERROR in {a[2]} | {a[3]}: {e}')
+    per_field = (pd.DataFrame(rows).sort_values(['session', 'unit', 'field_number'], ignore_index=True)
+                 if rows else pd.DataFrame(columns=['session', 'unit', 'field_number', 'status']))
+
+    cell_rows = []
+    for (s, u), d in per_field.groupby(['session', 'unit'], sort=True):
+        ok = (d['status'] == 'ok').all()
+        row = {'session': s, 'unit': u, 'field_geometry': d['field_geometry'].iloc[0],
+               'n_fields': len(d), 'status': d['status'].iloc[0]}
+        if ok:
+            spk, dwell = float(d['field_n_spikes'].sum()), float(d['field_dwell_s'].sum())
+            row.update(infield_n_spikes=int(spk), infield_dwell_s=round(dwell, 4),
+                       infield_mean_fr=d['infield_mean_fr'].iloc[0],
+                       ratemap_check=bool(d['ratemap_check'].all()),
+                       spikes_match=bool((pd.to_numeric(d['field_n_spikes'])
+                                          == pd.to_numeric(d['field_n_spikes_excel'],
+                                                           errors='coerce')).all()))
+        cell_rows.append(row)
+    per_cell = pd.DataFrame(cell_rows, columns=IFR_CELL_COLUMNS)
+
+    os.makedirs(os.path.dirname(out_xlsx), exist_ok=True)
+    with pd.ExcelWriter(out_xlsx, engine='openpyxl') as w:
+        per_cell.to_excel(w, sheet_name='PerCell', index=False)
+        per_field.drop(columns=['infield_mean_fr'], errors='ignore').to_excel(
+            w, sheet_name='PerField', index=False)
+    n_ok = int((per_cell['status'] == 'ok').sum())
+    print(f'\nWithin-field firing rate: {n_ok}/{len(per_cell)} cell(s) computed; saved to {out_xlsx}')
+    for status, n in per_cell.loc[per_cell['status'] != 'ok', 'status'].value_counts().items():
+        print(f'    {n:4d}  skipped: {status}')
+    ok_cells = per_cell[per_cell['status'] == 'ok']
+    n_bad = int((~ok_cells['ratemap_check'].astype(bool)).sum())
+    n_spk = int((~ok_cells['spikes_match'].astype(bool)).sum())
+    if n_bad:
+        print(f'[WARN] {n_bad} cell(s) with a field whose rebuilt peak != INPUT_EXCEL peak_fr_hz '
+              f'(IFR_EXCLUDE_RATEMAP_MISMATCH = {IFR_EXCLUDE_RATEMAP_MISMATCH}).')
+    if n_spk:
+        print(f'[NOTE] {n_spk} cell(s): rebuilt in-field spikes != INPUT_EXCEL field_n_spikes.')
+    return per_cell, per_field
+
+
+def merge_infield_rate(full_df: pd.DataFrame, per_cell: pd.DataFrame) -> pd.DataFrame:
+    """Add per_cell's infield_* / ratemap_check columns to full_df (matched on session +
+    unit, row order kept). IFR_EXCLUDE_RATEMAP_MISMATCH: infield_mean_fr of cells that
+    failed ratemap_check is set to NaN (left out of every comparison)."""
+    cols = ['infield_n_spikes', 'infield_dwell_s', INFIELD_RATE_COL]
+    df = full_df.drop(columns=cols + ['infield_ratemap_check'], errors='ignore').copy()
+    pcell = per_cell[per_cell['status'] == 'ok'].rename(
+        columns={'ratemap_check': 'infield_ratemap_check'})
+    m = df[['session', 'unit']].merge(pcell[['session', 'unit', *cols, 'infield_ratemap_check']],
+                                      on=['session', 'unit'], how='left')
+    for c in cols + ['infield_ratemap_check']:
+        df[c] = m[c].to_numpy()
+    df[INFIELD_RATE_COL] = pd.to_numeric(df[INFIELD_RATE_COL], errors='coerce')
+    if IFR_EXCLUDE_RATEMAP_MISMATCH:
+        bad = ~df['infield_ratemap_check'].fillna(True).astype(bool)
+        df.loc[bad, INFIELD_RATE_COL] = np.nan
+        print(f'IFR_EXCLUDE_RATEMAP_MISMATCH: {int(bad.sum())} place-cell row(s) left out.')
+    print(f'Within-field firing rate: {int(df[INFIELD_RATE_COL].notna().sum())}/{len(df)} '
+          f'place-cell rows with a value.')
+    return df
+
+
+def add_infield_rate(full_df: pd.DataFrame, full: pd.DataFrame, fields: pd.DataFrame) -> pd.DataFrame:
+    """full_df with the within-field mean firing rate (INFIELD_RATE_SOURCE): INPUT_EXCEL's
+    own column, or rebuilt here (run_infield_rate -> OUTPUT_DIR\\IFR_RESULTS_XLSX)."""
+    has_col = (INFIELD_RATE_COL in full.columns
+               and pd.to_numeric(full[INFIELD_RATE_COL], errors='coerce').notna().any())
+    if INFIELD_RATE_SOURCE == 'excel' or (INFIELD_RATE_SOURCE == 'auto' and has_col):
+        if not has_col:
+            raise RuntimeError(f"INFIELD_RATE_SOURCE = 'excel', but INPUT_EXCEL has no "
+                               f"{INFIELD_RATE_COL} values (run PlaceCell_Main_v22 first).")
+        df = full_df.copy()
+        df[INFIELD_RATE_COL] = pd.to_numeric(df[INFIELD_RATE_COL], errors='coerce')
+        print(f'\nWithin-field firing rate: column {INFIELD_RATE_COL} of INPUT_EXCEL '
+              f'({int(df[INFIELD_RATE_COL].notna().sum())}/{len(df)} place-cell rows with a value).')
+        return df
+    per_cell, _ = run_infield_rate(full, fields, os.path.join(OUTPUT_DIR, IFR_RESULTS_XLSX))
+    return merge_infield_rate(full_df, per_cell)
 
 
 # ── Multi-peak: ratemap reconstruction (copied from PlaceCell_Main, CPU only) ─
@@ -5053,8 +5287,10 @@ def plot_peak_distribution(full_df: pd.DataFrame, sessions_df: pd.DataFrame, uni
                              gof_chi2=chi2, gof_p=p))
 
         c = _color(arena)
-        ax.bar(levels, 100.0 * obs / obs.sum(), color=c['face'], edgecolor=BAR_EDGE,
-               linewidth=BAR_EDGE_LW, width=0.8, zorder=2, label='Place-cell peaks')
+        obs_pct = 100.0 * obs / obs.sum()
+        bars = ax.bar(levels, obs_pct, color=c['face'], edgecolor=BAR_EDGE,
+                      linewidth=BAR_EDGE_LW, width=0.8, zorder=2, label='Place-cell peaks')
+        plu.label_bars(ax, bars, fontsize=BAR_PCT_FS - 3)
         ax.plot(levels, 100.0 * exp / obs.sum(), '-o', color=c['dark'], markersize=5,
                 markeredgecolor=PAL_BLACK, markeredgewidth=0.5, linewidth=1.5, zorder=3,
                 label='Expected from dwell')
@@ -5062,6 +5298,7 @@ def plot_peak_distribution(full_df: pd.DataFrame, sessions_df: pd.DataFrame, uni
                 markersize=4, linewidth=1.2, zorder=3, label='% of arena bins')
         ax.set_xticks(levels)
         ax.set_xlim(-0.6, max(levels[-1], 1) + 0.6)
+        ax.set_ylim(0, max(ax.get_ylim()[1], np.nanmax(obs_pct) * 1.12))   # room for the % labels
         ax.set_title(f'{arena} (n={int(obs.sum())}){gof}', fontsize=FS_LABEL - 1, pad=8)
         _style_axes(ax)
     axes[0][0].set_ylabel('% of place-cell rows', fontsize=FS_LABEL)
@@ -5714,53 +5951,55 @@ def run_animal_controlled(full_df: pd.DataFrame, field_df: pd.DataFrame, shape_d
             if f.lower().endswith('.png'):
                 os.remove(os.path.join(ex_dir, f))
     # Each comparison's plots are first saved to its own temporary folder,
-    # then combined side by side.
+    # then combined side by side. plu.shared_y_axes: the two versions of every
+    # plot get the same y-range (lowest lower / highest upper limit of the two).
     with tempfile.TemporaryDirectory() as tmp_dir:
-        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
-            grp = animal_controlled_grouping(animals, arenas)
-            wanted = {a.lower() for a in animals}
+        with plu.shared_y_axes([os.path.join(tmp_dir, n) for n in ANIMAL_CONTROLLED_COMPARISONS]):
+            for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+                grp = animal_controlled_grouping(animals, arenas)
+                wanted = {a.lower() for a in animals}
 
-            def _select(d):
-                if d is None:
-                    return None
-                return d[d['animal'].astype(str).str.lower().isin(wanted)
-                         & d['arena_type'].isin(grp.order)]
+                def _select(d):
+                    if d is None:
+                        return None
+                    return d[d['animal'].astype(str).str.lower().isin(wanted)
+                             & d['arena_type'].isin(grp.order)]
 
-            sel_full = _select(full_df)
-            print(f'\n{name}: place cells per animal and arena (Full sheet):')
-            print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
-            for arena in grp.order:
-                missing = [a for a in animals
-                           if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
-                                   & (sel_full['arena_type'] == arena)).any()]
-                if missing:
-                    print(f'WARNING: no place cells of {missing} in the {arena} arena.')
+                sel_full = _select(full_df)
+                print(f'\n{name}: place cells per animal and arena (Full sheet):')
+                print(pd.crosstab(sel_full['animal'], sel_full['arena_type'], margins=True))
+                for arena in grp.order:
+                    missing = [a for a in animals
+                               if not ((sel_full['animal'].astype(str).str.lower() == a.lower())
+                                       & (sel_full['arena_type'] == arena)).any()]
+                    if missing:
+                        print(f'WARNING: no place cells of {missing} in the {arena} arena.')
 
-            sel_ts = _select(ts_df)
-            if sel_ts is not None:
-                print(f'\n{name}: place cells per animal and arena (temporal stability):')
-                print(pd.crosstab(sel_ts['animal'], sel_ts['arena_type'], margins=True))
+                sel_ts = _select(ts_df)
+                if sel_ts is not None:
+                    print(f'\n{name}: place cells per animal and arena (temporal stability):')
+                    print(pd.crosstab(sel_ts['animal'], sel_ts['arena_type'], margins=True))
 
-            sel_mp = _subset_mp(mp_dfs, _select)
-            if sel_mp is not None:
-                print(f'\n{name}: place cells per animal and arena (multi-peak):')
-                print(pd.crosstab(sel_mp['Cell']['animal'], sel_mp['Cell']['arena_type'],
-                                  margins=True))
+                sel_mp = _subset_mp(mp_dfs, _select)
+                if sel_mp is not None:
+                    print(f'\n{name}: place cells per animal and arena (multi-peak):')
+                    print(pd.crosstab(sel_mp['Cell']['animal'], sel_mp['Cell']['arena_type'],
+                                      margins=True))
 
-            tables = run_comparison(grp, sel_full, _select(field_df), _select(shape_df),
-                                    _select(all_units_df), os.path.join(tmp_dir, name),
-                                    ts_df=sel_ts, mp_dfs=sel_mp,
-                                    wd_dfs=_subset_mp(wd_dfs, _select))
-            tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
-            for tname, tbl in tables.items():
-                if len(tbl):
-                    tbl.insert(0, 'animals', ', '.join(animals))
-                all_tables[f'{tag}_{tname}'] = tbl
-            if sel_ts is not None and len(sel_ts):
-                _save_example_maps(grp, sel_ts, ex_dir, name, EXAMPLE_METRIC, _map_path)
-            if sel_mp is not None and len(sel_mp['Cell']):
-                _save_example_maps(grp, sel_mp['Cell'], ex_dir, f'MultiPeak_{name}',
-                                   MP_EXAMPLE_METRIC, _mp_map_path)
+                tables = run_comparison(grp, sel_full, _select(field_df), _select(shape_df),
+                                        _select(all_units_df), os.path.join(tmp_dir, name),
+                                        ts_df=sel_ts, mp_dfs=sel_mp,
+                                        wd_dfs=_subset_mp(wd_dfs, _select))
+                tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
+                for tname, tbl in tables.items():
+                    if len(tbl):
+                        tbl.insert(0, 'animals', ', '.join(animals))
+                    all_tables[f'{tag}_{tname}'] = tbl
+                if sel_ts is not None and len(sel_ts):
+                    _save_example_maps(grp, sel_ts, ex_dir, name, EXAMPLE_METRIC, _map_path)
+                if sel_mp is not None and len(sel_mp['Cell']):
+                    _save_example_maps(grp, sel_mp['Cell'], ex_dir, f'MultiPeak_{name}',
+                                       MP_EXAMPLE_METRIC, _mp_map_path)
 
         _combine_side_by_side([os.path.join(tmp_dir, name) for name in ANIMAL_CONTROLLED_COMPARISONS],
                               out_dir)
@@ -5800,7 +6039,7 @@ def _git(*args) -> str:
 
 
 def save_run_snapshot() -> str:
-    """Copy this script and its local modules (PlaceCell_Main_v21,
+    """Copy this script and its local modules (PlaceCell_Main_v22,
     CellClusteredStats_Utils, PlaceFieldShape_Utils) to
     OUTPUT_DIR\\RUN_SNAPSHOT_SUBDIR\\<timestamp>\\code, and write RunMetadata.xlsx
     there: 'Run' (time, script, git commit / uncommitted changes, Python and
@@ -5859,6 +6098,9 @@ def main():
         run_field_dimension_maps()
 
     full_df      = build_full_metrics_df(full)
+    if INCLUDE_INFIELD_RATE:
+        # Within-field mean firing rate (V20), compared with the other 'Full' metrics.
+        full_df = add_infield_rate(full_df, full, fields)
     field_df     = build_field_metrics_df(full, fields)
     shape_df     = build_field_shape_df(full, fields)
     all_units_df = build_all_units_df(full)

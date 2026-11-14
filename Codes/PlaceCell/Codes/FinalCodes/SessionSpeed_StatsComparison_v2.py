@@ -117,6 +117,7 @@ from matplotlib.patches import Patch
 
 # Also applies v19's figure style (rcParams).
 import ArenaSessionType_StatsComparison_v19 as asc
+import PlotLayout_Utils as plu    # shared y-range of the side-by-side plots
 
 ccs = asc.ccs
 pc  = asc.pc
@@ -615,18 +616,20 @@ def run_animal_controlled(df: pd.DataFrame, out_dir: str) -> dict:
     each with its own statistics. Returns {sheet_name: table}."""
     all_tables = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
-        for name, (animals, arenas) in asc.ANIMAL_CONTROLLED_COMPARISONS.items():
-            grp = asc.animal_controlled_grouping(animals, arenas)
-            wanted = {a.lower() for a in animals}
-            sel = df[df['animal'].astype(str).str.lower().isin(wanted) & df['arena_type'].isin(grp.order)]
-            print(f'\n{name}: sessions per animal and arena:')
-            print(pd.crosstab(sel['animal'], sel['arena_type'], margins=True))
-            tables = run_comparison(grp, sel, os.path.join(tmp_dir, name))
-            tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
-            for tname, tbl in tables.items():
-                if len(tbl):
-                    tbl.insert(0, 'animals', ', '.join(animals))
-                all_tables[f'{tag}_{tname}'] = tbl
+        # Same y-range for the two versions of every plot (plu.shared_y_axes).
+        with plu.shared_y_axes([os.path.join(tmp_dir, n) for n in asc.ANIMAL_CONTROLLED_COMPARISONS]):
+            for name, (animals, arenas) in asc.ANIMAL_CONTROLLED_COMPARISONS.items():
+                grp = asc.animal_controlled_grouping(animals, arenas)
+                wanted = {a.lower() for a in animals}
+                sel = df[df['animal'].astype(str).str.lower().isin(wanted) & df['arena_type'].isin(grp.order)]
+                print(f'\n{name}: sessions per animal and arena:')
+                print(pd.crosstab(sel['animal'], sel['arena_type'], margins=True))
+                tables = run_comparison(grp, sel, os.path.join(tmp_dir, name))
+                tag = 'AC' + ''.join(grp.order)   # e.g. 'ACCircleOpen'
+                for tname, tbl in tables.items():
+                    if len(tbl):
+                        tbl.insert(0, 'animals', ', '.join(animals))
+                    all_tables[f'{tag}_{tname}'] = tbl
         asc._combine_side_by_side([os.path.join(tmp_dir, name) for name in asc.ANIMAL_CONTROLLED_COMPARISONS],
                                   out_dir)
     if all_tables:

@@ -36,9 +36,10 @@ There is no threshold on the ED_min value itself.
 LFP cleaning (clean_lfp): the whole trace is filtered before epoching, with
 the noise reduction of LFP_Speed_Spectrogram_ScalingCorrected.py (after
 SpeedSpectrogram_v2.m): timestamp-anchored .ncs loading -> resample to 1 kHz
--> mains notch -> wavelet denoising -> linear detrend -> outlier fill, then the
-100 Hz low-pass. The epoch-wise delta/theta and peak-to-peak MAD rejection
-still run on the cleaned epochs.
+-> mains notch -> wavelet denoising (only if APPLY_WAVELET_DENOISE; off by default,
+since it leaves <20 Hz unchanged) -> linear detrend -> outlier fill, then the
+100 Hz low-pass. The epoch-wise delta/theta (only if REJECT_DELTATHETA_EPOCHS)
+and peak-to-peak MAD rejection still run on the cleaned epochs.
 
 ACG input (v10): the reference-sinusoid matching runs on a separate copy of the
 cleaned trace, zero-phase band-passed to ACG_BANDPASS_HZ (1-20 Hz, the span of
@@ -99,8 +100,9 @@ from scipy.stats import (pearsonr, spearmanr, chi2_contingency, fisher_exact,
 
 import seaborn as sns
 import matplotlib.pyplot as plt
-from matplotlib.colorbar import make_axes
 from matplotlib.colors import to_rgba
+from matplotlib.font_manager import FontProperties
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -114,6 +116,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv, record_lengths, find_runs
+import PlotLayout_Utils as plu    # shared y-range of the animal-controlled plots, % labels on bars
 
 #!Remove Noise!
 #!Use noise profile on reference tetrode to detect noise epochs.
@@ -163,7 +166,7 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
-OUTPUT_DIR = os.path.join(ROOT_DIR,'Results' , 'ACG' , 'ACG_theta_continuity_Fin')
+OUTPUT_DIR = os.path.join(ROOT_DIR,'Results' , 'ACG' , 'ACG_theta_continuity_Fin_woDeltaThetaFilt')
 FIGURE_DIR = os.path.join(OUTPUT_DIR,'figures')
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
@@ -238,6 +241,11 @@ ACG_DEMEAN_EPOCHS  = True         # subtract each epoch's mean before its autoco
 # Applied to the whole trace after the notch, before the low-pass (see clean_lfp).
 # Sample-based windows have the same duration as SpeedSpectrogram_v2.m's at 250 Hz,
 # so the outlier and smoothing windows assume FS_ACG = 1000 Hz.
+# Wavelet denoising only shrinks the detail levels (31-500 Hz at 1 kHz, level 4); the
+# 0-31 Hz approximation passes unchanged. Measured on 4 sessions (one per animal,
+# first 10 min): it keeps 100.00% of 1-12 Hz power and >=99.95% of 12-20 Hz power, so
+# it does not clean the <20 Hz range the ACG matching uses. Off: True restores v11.
+APPLY_WAVELET_DENOISE = False
 WAVELET_NAME     = 'sym4'         # wdenoise default
 WAVELET_LEVEL    = 4              # wdenoise(x, 4)
 OUTLIER_WINDOW   = 400            # 0.4 s: filloutliers(x, 'linear', 'movmedian', 100) at 250 Hz
@@ -256,6 +264,9 @@ MAD_THRESH = 5.0
 # An epoch is rejected if its delta-band power exceeds its theta-band power --
 # noisy epochs are often dominated by low-frequency artifact that would
 # otherwise pass through amplitude-based (MAD) rejection as slow theta.
+# False: the filter is skipped, and the MAD artifact threshold is then computed
+# from every epoch that passed the record-integrity and saturation checks.
+REJECT_DELTATHETA_EPOCHS = False  # True: drop epochs with delta power > theta power
 DELTA_BAND = (1.0, 3.0)  # Hz
 THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 
@@ -270,7 +281,7 @@ THETA_BAND = (3.0, 7.0)  # Hz -- matches ACG_FREQ_RANGE
 # interpolated over, then the x/y traces are Gaussian-smoothed with sigma
 # POS_SMOOTH_SIGMA_SMP (in samples). Matches the protocol in
 # PlaceCellCharacterization_SpeedModv3.py.
-POS_JUMP_THRESH_CMS  = 80.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
+POS_JUMP_THRESH_CMS  = 90.0   # frame-to-frame jumps implying a speed above this (cm/s) are tracking artifacts
 POS_SMOOTH_SIGMA_SMP = 1.0    # Gaussian smoothing sigma (in samples) applied to x/y tracking position
 
 # The original MATLAB (create_sine_ref_xcorrs.m) hardcodes its reference-sine
@@ -489,12 +500,14 @@ def fill_outliers(x, window=OUTLIER_WINDOW, thresh=OUTLIER_THRESH, chunk=20000):
 
 
 def clean_lfp(lfp, fs_acg):
-    """Native-rate repaired trace (uV) -> fs_acg -> notch -> wavelet denoise ->
-    detrend -> outlier fill (-> median filter -> Savitzky-Golay, if APPLY_SMOOTHING)
-    -> low-pass. Returns the cleaned trace and the fraction of samples outlier-filled."""
+    """Native-rate repaired trace (uV) -> fs_acg -> notch -> wavelet denoise (if
+    APPLY_WAVELET_DENOISE) -> detrend -> outlier fill (-> median filter ->
+    Savitzky-Golay, if APPLY_SMOOTHING) -> low-pass. Returns the cleaned trace and
+    the fraction of samples outlier-filled."""
     lfp = signal.resample_poly(lfp, int(fs_acg), int(NATIVE_FS))
     lfp = notch_filter(lfp, fs_acg, LINE_HARMONICS, NOTCH_Q)
-    lfp = denoise_wavelet(lfp)
+    if APPLY_WAVELET_DENOISE:
+        lfp = denoise_wavelet(lfp)
     lfp = detrend_signal(lfp, dtype='linear')
     lfp, is_outlier = fill_outliers(lfp)
     if APPLY_SMOOTHING:
@@ -1143,7 +1156,12 @@ def process_ncs_for_acg(fpath, freq_range=ACG_FREQ_RANGE, freq_resolution=ACG_FR
               f'clipping; {int((near_clip & keep_records).sum())} of these not already '
               f'rejected for record integrity; {100 * sat_native.mean():.3f}% of samples clipped')
     keep_records = keep_records & keep_sat
-    keep_deltatheta = keep_records & reject_deltatheta_epochs(epochs, fs_acg)
+    if REJECT_DELTATHETA_EPOCHS:
+        keep_deltatheta = keep_records & reject_deltatheta_epochs(epochs, fs_acg)
+        print(f'    delta/theta: {int((keep_records & ~keep_deltatheta).sum())}/'
+              f'{int(keep_records.sum())} remaining epochs rejected (delta power > theta power)')
+    else:
+        keep_deltatheta = keep_records   # filter off (REJECT_DELTATHETA_EPOCHS = False)
     keep_artifact = keep_deltatheta & reject_artifact_epochs(
         epochs, ref_mask=keep_deltatheta)
 
@@ -1292,15 +1310,17 @@ def _add_rejection_footer(ax, scope):
     """Footer below `ax`'s x-axis label, over every epoch in `scope`: the
     percentage rejected as non-theta, i.e. whose ED_min sinusoid (matched over
     the full ACG_REF_BANK) fell outside ACG_FREQ_RANGE ('skipped_outofband').
-    Drawn in axes coordinates, so it is kept by savefig(bbox_inches='tight')
-    whether or not `ax` was passed in."""
+    Anchored to the bottom of the x-axis label (not a fixed axes fraction), so
+    it can never overlap it whatever the figure size; kept by
+    savefig(bbox_inches='tight') whether or not `ax` was passed in."""
     n_total = len(scope)
     n_outofband = int(scope['skipped_outofband'].sum())
     pct_outofband = 100 * n_outofband / n_total if n_total else 0.0
-    ax.text(0.5, -0.18,
-            f'Rejected as non-theta (ED_min sinusoid outside {_band_label()}): '
-            f'{pct_outofband:.1f}% ({n_outofband}/{n_total} epochs)',
-            transform=ax.transAxes, ha='center', va='top', fontsize=8, color='0.2')
+    ax.annotate(f'Rejected as non-theta (ED_min sinusoid outside {_band_label()}): '
+                f'{pct_outofband:.1f}% ({n_outofband}/{n_total} epochs)',
+                xy=(0.5, 0.0), xycoords=ax.xaxis.label, xytext=(0, -4),
+                textcoords='offset points', ha='center', va='top', fontsize=8,
+                color='0.2', annotation_clip=False)
 
 
 def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
@@ -1333,7 +1353,9 @@ def plot_freq_est_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 4)):
             **MARKER_EDGE)
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
-    title = f'freq_est of accepted epochs (n={len(accepted)} epochs, {n_files} recordings)'
+    # counts on a second line: on one line the title is wider than the axes and
+    # can touch the top y tick label
+    title = f'freq_est of accepted epochs\n(n={len(accepted)} epochs, {n_files} recordings)'
     ax.set_title(f'{animal}: {title}' if animal else title)
     _add_rejection_footer(ax, scope)
     fig.tight_layout()
@@ -1372,7 +1394,8 @@ def plot_freq_est_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title('freq_est of accepted epochs, by animal')
-    ax.legend(fontsize=7, frameon=False)
+    # outside the axes, so the legend can't cover any animal's line
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=7, frameon=False)
     _add_rejection_footer(ax, df)
     fig.tight_layout()
     return fig, ax
@@ -1409,7 +1432,7 @@ def plot_rejected_freq_histogram(df, animal=None, bins=30, ax=None, figsize=(5, 
             **MARKER_EDGE)
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
-    title = (f'freq_est of non-theta rejected epochs '
+    title = (f'freq_est of non-theta rejected epochs\n'
              f'(n={len(rejected)} epochs, {n_files} recordings)')
     ax.set_title(f'{animal}: {title}' if animal else title)
     fig.tight_layout()
@@ -1448,7 +1471,8 @@ def plot_rejected_freq_histogram_overlay(df, bins=30, ax=None, figsize=(6, 4)):
     ax.set_xlabel('Matched sinusoid frequency estimate, freq_est (Hz)')
     ax.set_ylabel('Mean epoch count per recording')
     ax.set_title('freq_est of non-theta rejected epochs, by animal')
-    ax.legend(fontsize=7, frameon=False)
+    # outside the axes, so the legend can't cover any animal's line
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=7, frameon=False)
     fig.tight_layout()
     return fig, ax
 
@@ -1508,13 +1532,14 @@ def plot_edmin_vs_peakrangenorm(df, animal=None, ax=None, figsize=(6, 5),
     ax.set_ylabel('Autocorr. peak range (norm.)')
     title = 'ED_min vs. normalised peak range'
     ax.set_title(f'{animal}: {title}' if animal else title)
-    ax.legend(loc='upper right', fontsize=7, frameon=False)
+    # legend and stats box to the right of the axes, so neither covers any epoch
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=7, frameon=False)
 
-    stats_text = (f'Pearson r = {r_p:.3f} (p = {p_p:.2e})\n'
-                 f'Spearman rho = {r_s:.3f} (p = {p_s:.2e})\n'
+    stats_text = (f'Pearson r = {r_p:.3f}\n(p = {p_p:.2e})\n'
+                 f'Spearman rho = {r_s:.3f}\n(p = {p_s:.2e})\n'
                  f'n = {len(sub)}')
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, ha='left', va='bottom',
-           fontsize=8, color='0.1',
+    ax.text(1.03, 0.0, stats_text, transform=ax.transAxes, ha='left', va='bottom',
+           fontsize=8, color='0.1', clip_on=False,
            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='0.7'))
 
     fig.tight_layout()
@@ -1533,6 +1558,9 @@ def plot_moving_vs_immobile(df, animal, ax=None, channel_order=None):
     ax.set_ylabel('Autocorr. peak range (norm.)')
     ax.set_xlabel('Channel')
     ax.set_title(animal)
+    # outside the axes, so the legend can't cover a violin
+    if ax.get_legend() is not None:
+        sns.move_legend(ax, 'upper left', bbox_to_anchor=(1.01, 1.0), frameon=False)
     return ax
 
 
@@ -1596,9 +1624,10 @@ def plot_example_epoch(row, epoch_waveform, ax_trace=None, ax_acg=None,
     ax_trace.set_xlim(0, winlength / fs)
     ax_trace.axis('off')
     if 'median_speed_cms' in row and np.isfinite(row['median_speed_cms']):
-        ax_trace.text(0.02, 0.95, f"{row['median_speed_cms']:.1f} cm s$^{{-1}}$",
+        # above the axes, not inside them, so the label never sits on the trace
+        ax_trace.text(0.02, 1.02, f"{row['median_speed_cms']:.1f} cm s$^{{-1}}$",
                       transform=ax_trace.transAxes, color=color, fontsize=9,
-                      va='top')
+                      va='bottom', clip_on=False)
 
     if ax_acg is None:
         return ax_trace, None
@@ -1669,6 +1698,78 @@ def _mark_theta_band(ax_main, ax_top, theta_only=False):
         for edge in ACG_FREQ_RANGE:
             ax.axvline(edge, color='0.3', linestyle='--', linewidth=0.8, zorder=4)
     ax_main.set_xlim(ACG_REF_BANK)
+
+
+def _tidy_log_ticks(ax, which='y', max_labels=3, edge_pts=0.0, labelsize=None):
+    """Label only as many ticks of a log-scaled count axis as fit along it, so
+    its tick labels never crowd or overlap: whole decades when the axis spans
+    two or more, otherwise 1/2/5 x 10^n steps (left to matplotlib, a sub-decade
+    axis labels its minor ticks too, which pile up). Labelled ticks are at least
+    1.6 label heights apart (measured on the axes' size in the figure, so this
+    must be called once the axes have their final position), at most
+    `max_labels`, and none closer than `edge_pts` points to either end, so a
+    label can't stick out past the axis into a neighbouring panel's labels.
+    Minor ticks stay, unlabelled. The current limits are frozen, so call this
+    once every bar is drawn."""
+    fig = ax.figure
+    axis = ax.yaxis if which == 'y' else ax.xaxis
+    get_lim, set_lim = (ax.get_ylim, ax.set_ylim) if which == 'y' else (ax.get_xlim, ax.set_xlim)
+    lo, hi = sorted(get_lim())
+    lo = max(lo, np.finfo(float).tiny)
+    hi = max(hi, lo * 1.0001)
+    set_lim(lo, hi)
+
+    pos = ax.get_position()
+    length = 72 * (pos.height * fig.get_figheight() if which == 'y'
+                   else pos.width * fig.get_figwidth())
+    if labelsize is None:
+        labelsize = FontProperties(size=plt.rcParams[f'{which}tick.labelsize']).get_size_in_points()
+    min_gap = 1.6 * labelsize
+
+    def at(t):  # position of tick value t along the axis, in points
+        return (np.log10(t) - np.log10(lo)) / (np.log10(hi) - np.log10(lo)) * length
+
+    exps = range(int(np.floor(np.log10(lo))) - 1, int(np.ceil(np.log10(hi))) + 1)
+    fits = lambda t: edge_pts <= at(t) <= length - edge_pts  # noqa: E731
+    # coarsest step that gives two ticks: decades, then 1/2/5, then 1-9 x 10^n
+    # (an axis spanning well under a decade may hold no 1/2/5 value at all)
+    for mants in ((1,), (1, 2, 5), tuple(range(1, 10))):
+        ticks = [m * 10.0 ** e for e in exps for m in mants if fits(m * 10.0 ** e)]
+        if len(ticks) >= 2:
+            break
+    if len(ticks) > max_labels:
+        idx = np.unique(np.linspace(0, len(ticks) - 1, max_labels).round().astype(int))
+        ticks = [ticks[i] for i in idx]
+    keep = []
+    for t in sorted(ticks, reverse=True):  # largest first: the top count is kept
+        if not keep or at(keep[-1]) - at(t) >= min_gap:
+            keep.append(t)
+    if keep:
+        axis.set_major_locator(FixedLocator(sorted(keep)))
+        # every chosen tick gets a label: LogFormatterSciNotation blanks 2x / 5x
+        # ticks whenever the axis spans more than one decade
+        axis.set_major_formatter(FuncFormatter(_log_tick_label))
+    axis.set_minor_formatter(NullFormatter())
+
+
+def _log_tick_label(value, _pos=None):
+    """'10^n' or 'm x 10^n' mathtext label for a 1/2/5 x 10^n tick value."""
+    if value <= 0:
+        return ''
+    exp = int(np.floor(np.log10(value) + 1e-9))
+    mant = int(round(value / 10.0 ** exp))
+    return f'$10^{{{exp}}}$' if mant == 1 else f'${mant}\\times10^{{{exp}}}$'
+
+
+def _count_axis_on_top(ax_right):
+    """Move the right marginal histogram's count axis (ticks, tick labels and
+    'Count' label) to its top edge, into the empty corner beside the top
+    histogram. Along the bottom, its first tick label ran into the scatter's last
+    frequency tick label, and the axis is too narrow for horizontal labels, so
+    they are drawn vertically."""
+    ax_right.xaxis.set_ticks_position('top')
+    ax_right.xaxis.set_label_position('top')
+    ax_right.tick_params(axis='x', which='both', labelrotation=90, labelsize=8)
 
 
 def _rejection_note(scope):
@@ -1867,38 +1968,43 @@ def _draw_freq_peakrange_scatter(df, ax_main, ax_top, ax_right, animal=None,
         ax_right.set_xscale('log')
 
     _mark_theta_band(ax_main, ax_top, theta_only=theta_only)
+    if log_counts:
+        # edge_pts: the top histogram's lowest label stays clear of the
+        # scatter's '1.0' label just below it; the right one's of the corner
+        _tidy_log_ticks(ax_top, 'y', max_labels=3, edge_pts=10)
+        _tidy_log_ticks(ax_right, 'x', max_labels=3, edge_pts=5, labelsize=8)
+    _count_axis_on_top(ax_right)
     if animal:
         ax_top.set_title(animal)
 
     return sc, sc_imm, centroids
 
 
-def _add_speed_colorbars(fig, ax_right, sc_moving, sc_immobile, fraction=0.2, pad=0.35,
-                         label_fontsize=None):
-    """Speed colorbar(s) to the right of `ax_right` for whichever of the
-    moving (`sc_moving`) / immobile (`sc_immobile`) scatters were drawn.
-    Space is taken from `ax_right` once (same as a single fig.colorbar call
-    with `fraction`/`pad`) and split vertically when both are present --
-    moving on top, immobile below -- so the panel doesn't shrink twice.
+CBAR_WIDTH_RATIO = 0.22  # colorbar column width, relative to the scatter's 4 and the right histogram's 1
+
+
+def _add_speed_colorbars(fig, cbar_slot, sc_moving, sc_immobile, label_fontsize=8):
+    """Speed colorbar(s) in `cbar_slot` (the gridspec cell to the right of the
+    right marginal histogram) for whichever of the moving (`sc_moving`) /
+    immobile (`sc_immobile`) scatters were drawn, split vertically when both are
+    present -- moving on top, immobile below. The colorbars have their own
+    gridspec column instead of taking width from the right histogram, which left
+    that histogram too narrow for its count tick labels. Labels are on two lines
+    so each stays within its own (half-height) bar instead of running into the
+    other bar's label.
     """
     mappables = [(sc, label) for sc, label in (
-        (sc_moving, 'moving speed (cm s$^{-1}$)'),
-        (sc_immobile, 'immobile speed (cm s$^{-1}$)')) if sc is not None]
+        (sc_moving, 'moving speed\n(cm s$^{-1}$)'),
+        (sc_immobile, 'immobile speed\n(cm s$^{-1}$)')) if sc is not None]
     if not mappables:
         return []
 
-    cax, _kw = make_axes(ax_right, fraction=fraction, pad=pad)
-    pos = cax.get_position()
-    cax.remove()
-
-    n = len(mappables)
-    gap = 0.1 * pos.height if n > 1 else 0.0
-    height = (pos.height - gap * (n - 1)) / n
+    slots = cbar_slot.subgridspec(len(mappables), 1, hspace=0.12)
     cbars = []
     for i, (sc, label) in enumerate(mappables):
-        y0 = pos.y1 - (i + 1) * height - i * gap
-        cbar = fig.colorbar(sc, cax=fig.add_axes([pos.x0, y0, pos.width, height]))
+        cbar = fig.colorbar(sc, cax=fig.add_subplot(slots[i, 0]))
         cbar.set_label(label, fontsize=label_fontsize)
+        cbar.ax.tick_params(labelsize=label_fontsize + 1)
         cbars.append(cbar)
     return cbars
 
@@ -1919,7 +2025,7 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
     Returns (fig, axes_dict, centroids_df).
     """
     fig = plt.figure(figsize=figsize)
-    gs = fig.add_gridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
+    gs = fig.add_gridspec(2, 3, width_ratios=(4, 1, CBAR_WIDTH_RATIO), height_ratios=(1, 4),
                           wspace=0.05, hspace=0.05)
     ax_main = fig.add_subplot(gs[1, 0])
     ax_top = fig.add_subplot(gs[0, 0], sharex=ax_main)
@@ -1932,7 +2038,7 @@ def plot_freq_peakrange_summary(df, animal=None, speed_vmax=50.0, moving_cmap='v
         immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
         theta_only=theta_only)
 
-    _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
+    _add_speed_colorbars(fig, gs[1, 2], sc, sc_imm)
 
     scope = df if animal is None else df[df['animal'] == animal]
     notes = _rejection_note(scope)
@@ -2015,6 +2121,12 @@ def _draw_freq_peakrange_pooled(df, ax_main, ax_top, ax_right, animals, point_si
     ax_right.set_xlabel('Count')
     ax_right.tick_params(labelleft=False)
     _mark_theta_band(ax_main, ax_top, theta_only=theta_only)
+    if log_counts:
+        # edge_pts: the top histogram's lowest label stays clear of the
+        # scatter's '1.0' label just below it; the right one's of the corner
+        _tidy_log_ticks(ax_top, 'y', max_labels=3, edge_pts=10)
+        _tidy_log_ticks(ax_right, 'x', max_labels=3, edge_pts=5, labelsize=8)
+    _count_axis_on_top(ax_right)
     return centroids
 
 
@@ -2088,8 +2200,8 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
     for col, (mode, title) in enumerate((('moving', 'Mobility'),
                                          ('immobile', 'Immobility'),
                                          ('both', 'Merged'))):
-        sub_gs = outer[0, col].subgridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
-                                           wspace=0.05, hspace=0.05)
+        sub_gs = outer[0, col].subgridspec(2, 3, width_ratios=(4, 1, CBAR_WIDTH_RATIO),
+                                           height_ratios=(1, 4), wspace=0.05, hspace=0.05)
         ax_main = fig.add_subplot(sub_gs[1, 0])
         ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
         ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
@@ -2101,8 +2213,7 @@ def plot_freq_peakrange_by_movement(df, animal=None, speed_vmax=50.0, moving_cma
             immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
             theta_only=theta_only)
         ax_top.set_title(title)
-        _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.25, pad=0.45,
-                             label_fontsize=7)
+        _add_speed_colorbars(fig, sub_gs[1, 2], sc, sc_imm, label_fontsize=7)
         main_axes.append(ax_main)
         right_axes.append(ax_right)
         if mode == 'both':
@@ -2191,8 +2302,8 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
     plot_example_epoch(immobile_row, immobile_wave, ax_trace=ax_trace_i,
                        ax_acg=ax_acg_i, color=trace_color)
 
-    sub_gs = gs[:, 2].subgridspec(2, 2, width_ratios=(4, 1), height_ratios=(1, 4),
-                                  wspace=0.05, hspace=0.05)
+    sub_gs = gs[:, 2].subgridspec(2, 3, width_ratios=(4, 1, CBAR_WIDTH_RATIO),
+                                  height_ratios=(1, 4), wspace=0.05, hspace=0.05)
     ax_main = fig.add_subplot(sub_gs[1, 0])
     ax_top = fig.add_subplot(sub_gs[0, 0], sharex=ax_main)
     ax_right = fig.add_subplot(sub_gs[1, 1], sharey=ax_main)
@@ -2203,7 +2314,7 @@ def plot_figure4_style(df, animal=None, trace_color='tab:blue',
         immobile_alpha=immobile_alpha, immobile_edgecolor=immobile_edgecolor,
         theta_only=theta_only)
 
-    _add_speed_colorbars(fig, ax_right, sc, sc_imm, fraction=0.2, pad=0.35)
+    _add_speed_colorbars(fig, sub_gs[1, 2], sc, sc_imm)
 
     scope = df if animal is None else df[df['animal'] == animal]
     notes = _rejection_note(scope)
@@ -2268,6 +2379,7 @@ def save_run_metadata(meta_dir=META_DIR):
         'FS_ACG':                   FS_ACG,
         'LINE_HARMONICS':           LINE_HARMONICS,
         'NOTCH_Q':                  NOTCH_Q,
+        'APPLY_WAVELET_DENOISE':    APPLY_WAVELET_DENOISE,
         'WAVELET_NAME':             WAVELET_NAME,
         'WAVELET_LEVEL':            WAVELET_LEVEL,
         'wavelet_threshold':        'BayesShrink, soft (noise sigma from finest level)',
@@ -2289,6 +2401,7 @@ def save_run_metadata(meta_dir=META_DIR):
         'epoch_rejection_input':    'clean_lfp trace (not band-passed)',
         # ---- epoching / epoch rejection ----
         'EPOCH_SEC':                EPOCH_SEC,
+        'REJECT_DELTATHETA_EPOCHS': REJECT_DELTATHETA_EPOCHS,
         'DELTA_BAND':               DELTA_BAND,
         'THETA_BAND':               THETA_BAND,
         'welch_window':             'hann',
@@ -2599,7 +2712,8 @@ def plot_rejection_prevalence(desc, sessions, tests, title=None):
     groups = list(desc['group'])
     x = np.arange(len(groups))
     faces = [GROUP_FACE.get(g, '#BFBFBF') for g in groups]
-    fig, axes = plt.subplots(1, 4, figsize=(4 * (1.6 + 0.7 * len(groups)), 4.6))
+    # 0.9 in per group: the 'k/n' tick labels of neighbouring bars touched at 0.7
+    fig, axes = plt.subplots(1, 4, figsize=(4 * (1.6 + 0.9 * len(groups)), 4.6))
     rng = np.random.default_rng(0)
 
     def _pair_tests(key):
@@ -2608,8 +2722,9 @@ def plot_rejection_prevalence(desc, sessions, tests, title=None):
 
     for ax, (key, measure_desc, k_col, n_col) in zip(axes[:3], PREVALENCE_MEASURES[:3]):
         pct = desc[f'pct_{key}'].to_numpy(dtype=float)
-        ax.bar(x, np.nan_to_num(pct), width=0.6, color=faces, edgecolor='0.25',
-               linewidth=0.6, zorder=2)
+        bars = ax.bar(x, np.nan_to_num(pct), width=0.6, color=faces, edgecolor='0.25',
+                      linewidth=0.6, zorder=2)
+        plu.label_bars(ax, bars, values=pct, fontsize=7.5)
         top = np.nanmax(pct) if np.isfinite(pct).any() else 0.0
         for xi, g in zip(x, groups):
             v = sessions.loc[sessions['group'] == g, f'pct_{key}'].dropna().to_numpy(dtype=float)
@@ -2618,7 +2733,8 @@ def plot_rejection_prevalence(desc, sessions, tests, title=None):
             if len(v):
                 top = max(top, v.max())
         top = top if top > 0 else 1.0
-        y_hi = _draw_sig_brackets(ax, groups, _pair_tests(key), top * 1.08, top * 0.12)
+        # brackets start above the bars' % labels (~ 10 % of the axis height)
+        y_hi = _draw_sig_brackets(ax, groups, _pair_tests(key), top * 1.15, top * 0.12)
         ax.set_ylim(0, (y_hi if y_hi is not None else top) * 1.15)
         ax.set_xticks(x)
         ax.set_xticklabels([f'{_label(g)}\n{p:.1f}%\n({int(k)}/{int(n)})' if np.isfinite(p)
@@ -2627,17 +2743,14 @@ def plot_rejection_prevalence(desc, sessions, tests, title=None):
                            fontsize=8)
         ax.set_ylabel('% of epochs')
         ax.set_title(textwrap.fill(measure_desc, 30), fontsize=9)
-    axes[0].scatter([], [], s=12, facecolor='white', edgecolor='0.25', linewidth=0.6,
-                    label='one session')
-    axes[0].legend(loc='upper right', fontsize=7, frameon=False)
-
     ax = axes[3]
     imm = np.nan_to_num(desc['pct_rejected_in_immobility'].to_numpy(dtype=float))
     mov = np.nan_to_num(desc['pct_rejected_in_mobility'].to_numpy(dtype=float))
-    ax.bar(x, imm, width=0.6, color=IMMOBILE_COLOR, edgecolor='white', linewidth=0.6,
-           label='immobility', zorder=2)
-    ax.bar(x, mov, bottom=imm, width=0.6, color=MOVING_COLOR, edgecolor='white',
-           linewidth=0.6, label='mobility', zorder=2)
+    for bars in (ax.bar(x, imm, width=0.6, color=IMMOBILE_COLOR, edgecolor='white', linewidth=0.6,
+                        label='immobility', zorder=2),
+                 ax.bar(x, mov, bottom=imm, width=0.6, color=MOVING_COLOR, edgecolor='white',
+                        linewidth=0.6, label='mobility', zorder=2)):
+        plu.label_bars(ax, bars, inside=True, fontsize=7.5)   # stacked: % in each segment
     y_hi = _draw_sig_brackets(ax, groups, _pair_tests('rejected_in_immobility'), 104, 8)
     ax.set_ylim(0, max(100, y_hi or 100) + 8)
     ax.set_yticks(np.arange(0, 101, 20))
@@ -2646,6 +2759,10 @@ def plot_rejection_prevalence(desc, sessions, tests, title=None):
                         for g, n in zip(groups, desc['n_rejected'])], fontsize=8)
     ax.set_ylabel('% of non-theta rejected epochs')
     ax.set_title(textwrap.fill(PREVALENCE_MEASURES[3][1], 30), fontsize=9)
+    # the session-dot key (panels 1-3) shares this legend outside the axes, rather
+    # than sitting in panel 1 where it covered session dots
+    ax.scatter([], [], s=12, facecolor='white', edgecolor='0.25', linewidth=0.6,
+               label='one session\n(panels 1-3)')
     ax.legend(loc='upper left', bbox_to_anchor=(1.0, 1.0), fontsize=7, frameon=False)
 
     for a in axes:
@@ -2930,37 +3047,42 @@ def run_arena_session_pipelines(results_df):
     _compare(results_df, 'arena_type', ARENA_TYPES, 'Arena types', ARENA_FIGURE_DIR)
 
     # animal-controlled arena types: only the animals recorded in all of the
-    # compared arenas
-    for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
-        order = [a for a in ARENA_TYPES if a in arenas]
-        animals_label = ' + '.join(animals)
-        ac_df = results_df[results_df['animal'].map(lambda a: matches_animal(a, animals))
-                           & results_df['arena_type'].isin(order)]
-        print(f'\n{"=" * 70}\nAnimal-controlled {name}: {animals_label} only '
-              f'({len(ac_df)} epochs, {ac_df["file"].nunique()} .ncs files)\n{"=" * 70}')
-        if ac_df.empty:
-            print('No epochs; skipping.')
-            continue
-        ac_files = ac_df.drop_duplicates('file')
-        print('.ncs files by animal and arena:')
-        print(pd.crosstab(ac_files['animal'], ac_files['arena_type'], margins=True))
-        for arena in order:
-            in_arena = ac_df.loc[ac_df['arena_type'] == arena, 'animal']
-            missing = [a for a in animals if not in_arena.map(lambda x: matches_animal(x, [a])).any()]
-            if missing:
-                print(f'WARNING: no epochs of {missing} in the {arena} arena.')
-
-        ac_dir = os.path.join(ANIMAL_CONTROLLED_FIGURE_DIR, name)
-        for arena in order:
-            sub = ac_df[ac_df['arena_type'] == arena]
-            if sub.empty:
+    # compared arenas. The comparison figures of the ANIMAL_CONTROLLED_COMPARISONS
+    # (ANIMAL_CONTROLLED_FIGURE_DIR\<name>\*.png, not the per-arena pipeline
+    # folders) share one y-range: the lowest lower and highest upper limit of the two.
+    with plu.shared_y_axes([os.path.join(ANIMAL_CONTROLLED_FIGURE_DIR, n)
+                            for n in ANIMAL_CONTROLLED_COMPARISONS],
+                           match=lambda rel: os.sep not in rel):
+        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+            order = [a for a in ARENA_TYPES if a in arenas]
+            animals_label = ' + '.join(animals)
+            ac_df = results_df[results_df['animal'].map(lambda a: matches_animal(a, animals))
+                               & results_df['arena_type'].isin(order)]
+            print(f'\n{"=" * 70}\nAnimal-controlled {name}: {animals_label} only '
+                  f'({len(ac_df)} epochs, {ac_df["file"].nunique()} .ncs files)\n{"=" * 70}')
+            if ac_df.empty:
+                print('No epochs; skipping.')
                 continue
-            print(f'\n--- {name}: {arena} arena, {animals_label} only ({len(sub)} epochs, '
-                  f'{sub["file"].nunique()} .ncs files) ---')
-            arena_dir = os.path.join(ac_dir, arena)
-            run_pipeline(sub, arena_dir, arena_dir, title=f'{arena} arena ({animals_label} only)')
+            ac_files = ac_df.drop_duplicates('file')
+            print('.ncs files by animal and arena:')
+            print(pd.crosstab(ac_files['animal'], ac_files['arena_type'], margins=True))
+            for arena in order:
+                in_arena = ac_df.loc[ac_df['arena_type'] == arena, 'animal']
+                missing = [a for a in animals if not in_arena.map(lambda x: matches_animal(x, [a])).any()]
+                if missing:
+                    print(f'WARNING: no epochs of {missing} in the {arena} arena.')
 
-        _compare(ac_df, 'arena_type', order, f'Arena types ({animals_label} only)', ac_dir)
+            ac_dir = os.path.join(ANIMAL_CONTROLLED_FIGURE_DIR, name)
+            for arena in order:
+                sub = ac_df[ac_df['arena_type'] == arena]
+                if sub.empty:
+                    continue
+                print(f'\n--- {name}: {arena} arena, {animals_label} only ({len(sub)} epochs, '
+                      f'{sub["file"].nunique()} .ncs files) ---')
+                arena_dir = os.path.join(ac_dir, arena)
+                run_pipeline(sub, arena_dir, arena_dir, title=f'{arena} arena ({animals_label} only)')
+
+            _compare(ac_df, 'arena_type', order, f'Arena types ({animals_label} only)', ac_dir)
 
     if not tests_all:
         print('No arena/session-type groups to compare.')

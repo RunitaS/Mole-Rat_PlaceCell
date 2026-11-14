@@ -2898,10 +2898,10 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
 
     ax_p.bar(positions, pct, width=0.6, color=faces, edgecolor=PAL_BLACK, linewidth=FIG_BOX_LW, zorder=2)
     for x, p_, a, b in zip(positions, pct, n_tm, n_all):
-        ax_p.text(x, p_ + 2, f'{a}/{b}', ha='center', va='bottom', fontsize=FS_TICK)
+        ax_p.text(x, p_ + 2, f'{p_:.1f}%\n{a}/{b}', ha='center', va='bottom', fontsize=FS_TICK)
     top = _draw_sig_brackets(ax_p, dict(zip(groups, positions)), pairwise_df,
-                             y_base=pct.max() + 12, y_step=10, y_text=3, group_col=group_col)
-    ax_p.set_ylim(0, max(100.0, (top if top is not None else pct.max() + 8) + 8))
+                             y_base=pct.max() + 18, y_step=10, y_text=3, group_col=group_col)
+    ax_p.set_ylim(0, max(100.0, (top if top is not None else pct.max() + 14) + 8))
     ax_p.set_ylabel('Theta-modulated units (% of all units)', fontsize=FS_LABEL - 2, labelpad=8)
     _set_title(ax_p, f'{title_prefix}Theta-modulated proportion')
 

@@ -73,6 +73,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv
+import PlotLayout_Utils as plu    # % labels on bars
 
 
 # %% ==================== Per-animal colours ======================================
@@ -2149,8 +2150,9 @@ def plot_edmin_prevalence(desc, sessions, tests, title=None):
 
     for ax, (key, measure_desc, k_col, n_col) in zip(axes[:3], PREVALENCE_MEASURES[:3]):
         pct = desc[f'pct_{key}'].to_numpy(dtype=float)
-        ax.bar(x, np.nan_to_num(pct), width=0.6, color=faces, edgecolor='0.25',
-               linewidth=0.6, zorder=2)
+        bars = ax.bar(x, np.nan_to_num(pct), width=0.6, color=faces, edgecolor='0.25',
+                      linewidth=0.6, zorder=2)
+        plu.label_bars(ax, bars, values=pct, fontsize=7.5)
         top = np.nanmax(pct) if np.isfinite(pct).any() else 0.0
         for xi, g in zip(x, groups):
             v = sessions.loc[sessions['group'] == g, f'pct_{key}'].dropna().to_numpy(dtype=float)
@@ -2159,7 +2161,8 @@ def plot_edmin_prevalence(desc, sessions, tests, title=None):
             if len(v):
                 top = max(top, v.max())
         top = top if top > 0 else 1.0
-        y_hi = _draw_sig_brackets(ax, groups, _pair_tests(key), top * 1.08, top * 0.12)
+        # brackets start above the bars' % labels
+        y_hi = _draw_sig_brackets(ax, groups, _pair_tests(key), top * 1.15, top * 0.12)
         ax.set_ylim(0, (y_hi if y_hi is not None else top) * 1.15)
         ax.set_xticks(x)
         ax.set_xticklabels([f'{_label(g)}\n{p:.1f}%\n({int(k)}/{int(n)})' if np.isfinite(p)
@@ -2175,10 +2178,11 @@ def plot_edmin_prevalence(desc, sessions, tests, title=None):
     ax = axes[3]
     imm = np.nan_to_num(desc['pct_rejected_in_immobility'].to_numpy(dtype=float))
     mov = np.nan_to_num(desc['pct_rejected_in_mobility'].to_numpy(dtype=float))
-    ax.bar(x, imm, width=0.6, color=IMMOBILE_COLOR, edgecolor='white', linewidth=0.6,
-           label='immobility', zorder=2)
-    ax.bar(x, mov, bottom=imm, width=0.6, color=MOVING_COLOR, edgecolor='white',
-           linewidth=0.6, label='mobility', zorder=2)
+    for bars in (ax.bar(x, imm, width=0.6, color=IMMOBILE_COLOR, edgecolor='white', linewidth=0.6,
+                        label='immobility', zorder=2),
+                 ax.bar(x, mov, bottom=imm, width=0.6, color=MOVING_COLOR, edgecolor='white',
+                        linewidth=0.6, label='mobility', zorder=2)):
+        plu.label_bars(ax, bars, inside=True, fontsize=7.5)   # stacked: % in each segment
     y_hi = _draw_sig_brackets(ax, groups, _pair_tests('rejected_in_immobility'), 104, 8)
     ax.set_ylim(0, max(100, y_hi or 100) + 8)
     ax.set_yticks(np.arange(0, 101, 20))

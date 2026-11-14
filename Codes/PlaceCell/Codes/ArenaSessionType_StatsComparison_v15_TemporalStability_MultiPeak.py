@@ -298,8 +298,8 @@ import PlaceCell_Main_v21 as pc   # temporal stability maps
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Alpha200.xlsx'
-OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\PlaceCellChar_v2'
+INPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\PC_SmoothCompare\CrossCheck_DoubleRun\All_TT_PlaceChar_SiSkaggsAdptBin_Final.xlsx'
+OUTPUT_DIR  = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\PlaceCellChar_v3'
 
 # Copy of INPUT_EXCEL with the place-field shape columns added to its
 # 'PlaceFields' sheet.
@@ -324,10 +324,10 @@ RUN_TS_MAPS = True
 
 # Place-cell folder (Output_PlaceTrue of a PlaceCell_Main_v21 run): every .ntt under
 # it is analysed; each session folder also holds its tracking file.
-TS_PLACE_CELL_FOLDER = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+TS_PLACE_CELL_FOLDER = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # Per-cell / per-field / per-bin temporal stability table.
-TS_OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\Results\TemporalStability.xlsx'
+TS_OUTPUT_EXCEL = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\TemporalStability.xlsx'
 
 # Temporal stability figures go in this subfolder of each session folder (next to the .ntt).
 TEMPORAL_STABILITY_SUBDIR = 'temporal_stability'

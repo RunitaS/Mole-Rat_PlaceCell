@@ -13,7 +13,9 @@ Per unit (one .ntt file = one already-isolated unit):
      notched, wavelet denoised, detrended, outliers filled, 100 Hz low-passed), bandpass filtered
      (LFP_FILTER_BAND) and Hilbert transformed: 0 deg at a theta peak, 180 deg at a trough. Only
      spikes in ACG theta epochs (Dunn et al. 2022; USE_ACG_THETA_EPOCHS) enter any phase below: 1 s
-     epochs that pass the noise rejection (delta > theta power, peak-to-peak MAD outlier) and whose
+     epochs that are not within SATURATION_MARGIN_S of ADC clipping (+/-InputRange from each file's
+     header, as Figc_ACG_ScalingCorrected_v11_SaturationReject.py), pass the noise rejection (delta >
+     theta power, peak-to-peak MAD outlier) and whose
      closest reference sinusoid, matched over a 1-20 Hz bank, is in 3-7 Hz (v8's broadband fitting;
      no ED_min threshold). Noise and out-of-band epochs are thrown out.
   2. Theta modulation, on the ACG theta-epoch spikes with an LFP phase (>= MIN_SPIKES_FOR_TMI):
@@ -58,6 +60,8 @@ ArenaSessionType_StatsComparison_v18.py), at that script's three levels:
     chi-square (Yates for 2 x 2), Holm-Bonferroni within the comparison. AllUnits_ThetaModProportion.png
     pools every unit. <prefix>_ThetaModProportion_Tested.png: % of TESTED units (>= MIN_SPIKES_FOR_TMI
     theta-epoch spikes) that are Both+, the same tests ('*_TMTested_Omni' / '_Pair' sheets).
+    Across animals (arenas and session types pooled within each animal): the same two plots and tests,
+    RESULTS_FOLDER\\ANIMAL_DIR\\Animal_ThetaModProportion(_Tested).png, 'Animal_*' sheets.
   Peak-bin, onset and offset phase: once for all units, once for theta-modulated (Both+) units only.
     Mardia-Watson-Wheeler (permutation p) and Watson-Williams, omnibus + Holm-corrected pairwise.
     Points coloured by theta trough range (THETA_TROUGH_RANGE_DEG) / theta peak range (the rest).
@@ -72,7 +76,8 @@ ArenaSessionType_StatsComparison_v18.py), at that script's three levels:
     T = sum_g n_g * integral (group mean density - grand mean)^2), omnibus + pairwise; spans:
     Kruskal-Wallis + pairwise Mann-Whitney U; Holm per test. Spans grow with the number of spikes.
 
-v3 changes from v2: main-field fallback to the smoothed-map peak bin; the peak-bin phase span analysis.
+v3 changes from v2: main-field fallback to the smoothed-map peak bin; the peak-bin phase span analysis;
+ADC-saturated epochs thrown out (ACG_REJECT_SATURATED_EPOCHS); proportions compared across animals.
 
 Output: <session>\\SESSION_OUTPUT_FOLDER\\ per-unit figures (PolarPlot, PhaseHistogram, TMIShuffle,
 PeakOnsetOffset); the PolarPlot / PhaseHistogram / TMIShuffle figures are also copied to
@@ -116,7 +121,8 @@ from scipy.ndimage import gaussian_filter, gaussian_filter1d, distance_transform
 NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCorr'
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
-from ncs_repair import load_repaired_uv, record_lengths  # noqa: E402
+from ncs_repair import load_repaired_uv, record_lengths, find_runs  # noqa: E402
+import PlotLayout_Utils as plu  # noqa: E402  shared y-range of side-by-side plots, % labels on bars
 
 
 # ============================================================================
@@ -124,7 +130,7 @@ from ncs_repair import load_repaired_uv, record_lengths  # noqa: E402
 # ============================================================================
 ROOT_FOLDER = Path(r"X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final")
 # All pooled results (Excel/CSV files, comparison plots) go here
-RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'ThetaMod_Pure_v3'
+RESULTS_FOLDER = ROOT_FOLDER / 'Results' / 'ThetaMod' / 'ThetaMod_Pure_v3'
 OUTPUT_EXCEL_NAME = 'ThetaMod_Pure_v3.xlsx'          # written to RESULTS_FOLDER
 STATS_CSV_NAME = 'ThetaMod_Pure_v3_AllStats.csv'     # every statistics table, long format, in RESULTS_FOLDER
 SESSION_OUTPUT_FOLDER = 'ThetaMod_Pure_v3'           # per-unit figures, in each session folder
@@ -165,6 +171,18 @@ ACG_REF_BANK = (1.0, 20.0)       # Hz, span of the reference sinusoid bank every
 ACG_FREQ_RES = 0.1               # Hz, bank step
 NCS_NATIVE_FS = 32000            # Hz, grid of the repaired .ncs trace (ncs_repair.py)
 ACG_REJECT_PARTIAL_RECORD_EPOCHS = False   # True: also drop every epoch containing a short .ncs record
+# ADC saturation (as Figc_ACG_ScalingCorrected_v11_SaturationReject.py). The amplifier clips at
+# +/-InputRange, read from each file's own .ncs header (-InputRange, uV: 1500 or 1000 depending on the
+# recording); clipped samples sit flat at the rail (+/-32767 counts). They are found on the raw,
+# repaired native-rate trace, before any filtering: a sample is clipped if |value| >= InputRange -
+# SATURATION_TOL_STEPS ADC steps (one step = ADBitVolts; 1.5 flags exactly the rail and is safe against
+# rounding). Each clipped run is widened by SATURATION_MARGIN_S on both sides, since filtering spreads
+# the clip edges, and every epoch overlapping a widened run is thrown out ('rejected_saturated'), right
+# after the record-integrity check and before the delta/theta and MAD rejection, so its spikes enter no
+# theta phase. Files without -InputRange in the header get no check.
+ACG_REJECT_SATURATED_EPOCHS = True
+SATURATION_TOL_STEPS = 1.5       # ADC steps below +/-InputRange that still count as clipped
+SATURATION_MARGIN_S = 0.2        # s, either side of each clipped run
 # LFP cleaning (clean_lfp, shared by the Hilbert phase and the ACG epochs): resample to ACG_FS ->
 # mains notch -> wavelet denoise -> linear detrend -> outlier fill (-> median filter -> Savitzky-Golay,
 # if ACG_APPLY_SMOOTHING) -> low-pass. Sample-based windows assume ACG_FS = 1000 Hz.
@@ -273,6 +291,10 @@ ANIMAL_CONTROLLED_COMPARISONS = {
     'Linear_vs_Open': (['Fa1059', 'Fa23BD'], ['Linear', 'Open']),
 }
 PANEL_GAP_IN = 0.3   # white gap between the side-by-side panels (inches)
+# Per-animal comparison of the theta-modulated proportions (arenas and session types pooled within each
+# animal): RESULTS_FOLDER\ANIMAL_DIR\Animal_ThetaModProportion(_Tested).png. Animals in ANIMAL_COLORS
+# order, then any other animal found, alphabetically.
+ANIMAL_DIR = 'Animal'
 
 # --- Theta-modulation criteria plotted per group: (column, label, bar hatch). Only the last one
 # (Rayleigh+ AND TMI+, the theta-modulation criterion) is tested across groups. ---
@@ -344,10 +366,13 @@ def load_ncs(path: Path):
 
     Returns (samples_uV, start_s, fs_hz, records): sample i is at start_s + i / fs_hz; records holds
     each record's first grid index ('start') and NumValidSamples ('nvalid'), for the short-record
-    check of acg_theta_epochs.
+    check of acg_theta_epochs, this file's header values 'ad_bit_volts' (V/count) and
+    'input_range_uv' (uV, None if absent), and 'saturated', the clipped-sample mask of the raw
+    native-rate trace (saturated_samples), for the saturation check of acg_theta_epochs.
     """
     header_text = _read_header_text(path)
     adbitvolts = _header_field(header_text, 'ADBitVolts', default=DEFAULT_ADBITVOLTS)
+    input_range_uv = _header_field(header_text, 'InputRange', default=None)
     samples_uV, start_us = load_repaired_uv(path, adbitvolts)
 
     ncs_dtype = np.dtype([
@@ -360,8 +385,47 @@ def load_ncs(path: Path):
     data = np.memmap(path, dtype=ncs_dtype, mode='r', offset=HEADER_BYTES)
     start = np.round((np.asarray(data['TimeStamp']).astype(np.int64) - start_us)
                      * NCS_NATIVE_FS / 1e6).astype(np.int64)
-    records = {'start': start, 'nvalid': record_lengths(data['NumValidSamples'])}
+    records = {'start': start, 'nvalid': record_lengths(data['NumValidSamples']),
+               'ad_bit_volts': adbitvolts, 'input_range_uv': input_range_uv,
+               'saturated': saturated_samples(samples_uV, input_range_uv, adbitvolts)}
     return samples_uV, start_us / 1e6, float(NCS_NATIVE_FS), records
+
+
+def saturated_samples(lfp_uv, input_range_uv, ad_bit_volts, tol_steps=SATURATION_TOL_STEPS):
+    """Boolean mask of clipped samples of the raw, native-rate trace (uV): those within
+    `tol_steps` ADC steps of +/-`input_range_uv` (saturated_samples of
+    Figc_ACG_ScalingCorrected_v11_SaturationReject.py). All False if the file has no InputRange."""
+    if input_range_uv is None:
+        return np.zeros(len(lfp_uv), dtype=bool)
+    rail_uv = input_range_uv - tol_steps * ad_bit_volts * 1e6
+    return np.abs(lfp_uv) >= rail_uv
+
+
+def epoch_saturation(sat_native, n_total, nperseg, fs_hz, margin_s=SATURATION_MARGIN_S):
+    """Clipped-sample count and near-clipping flag of each (fs_hz) epoch (epoch_saturation of
+    Figc_ACG_ScalingCorrected_v11_SaturationReject.py). `sat_native` = saturated_samples() of the
+    native-rate trace. Epoch i covers native samples first..last, mapped as in acg_theta_epochs'
+    short-record check; each clipped run is widened by `margin_s` on both sides, and an epoch is
+    near clipping if it overlaps any widened run.
+    Returns (n_clipped, near_clip)."""
+    step = NCS_NATIVE_FS / fs_hz
+    i = np.arange(n_total)
+    first = np.round(i * nperseg * step).astype(np.int64)
+    last = np.minimum(np.round(((i + 1) * nperseg - 1) * step).astype(np.int64), len(sat_native) - 1)
+    sat_cum = np.concatenate(([0], np.cumsum(sat_native, dtype=np.int64)))
+    n_clipped = sat_cum[last + 1] - sat_cum[first]
+
+    # widened runs [run_lo, run_hi] (sorted by start); an epoch overlaps one if the last run starting
+    # at or before its end reaches (running max of ends) its start
+    run_starts, run_lengths = find_runs(sat_native)
+    margin = int(round(margin_s * NCS_NATIVE_FS))
+    near_clip = np.zeros(n_total, dtype=bool)
+    if len(run_starts):
+        run_lo = run_starts - margin
+        run_hi_max = np.maximum.accumulate(run_starts + run_lengths - 1 + margin)
+        j = np.searchsorted(run_lo, last, side='right') - 1
+        near_clip = (j >= 0) & (run_hi_max[np.maximum(j, 0)] >= first)
+    return n_clipped, near_clip
 
 
 def load_ntt_spike_times(path: Path):
@@ -1068,12 +1132,14 @@ def acg_theta_epochs(lfp_clean, records=None):
 
     Epoch i is the i-th block of ACG_EPOCH_SEC * ACG_FS consecutive samples; use
     times_in_ok_epochs to match absolute times to epochs by the samples' timestamps.
-    `records` (from load_ncs) is only needed with ACG_REJECT_PARTIAL_RECORD_EPOCHS.
+    `records` (from load_ncs) is needed for ACG_REJECT_PARTIAL_RECORD_EPOCHS and
+    ACG_REJECT_SATURATED_EPOCHS.
 
     Returns a dict of per-epoch arrays:
       ok             True for theta epochs (status 'accepted')
       status         'accepted', or the first rejection: 'rejected_partial' (short .ncs record),
-                     'rejected_deltatheta' (delta power > theta power), 'rejected_artifact'
+                     'rejected_saturated' (clipped at +/-InputRange, or within SATURATION_MARGIN_S
+                     of clipping), 'rejected_deltatheta' (delta power > theta power), 'rejected_artifact'
                      (peak-to-peak MAD outlier), 'rejected_flat' (no autocorrelogram), or
                      'rejected_outofband' (freq_est outside ACG_FREQ_RANGE: non-theta)
       ED_min         normalised distance to the closest reference sinusoid (NaN if not fitted)
@@ -1081,15 +1147,17 @@ def acg_theta_epochs(lfp_clean, records=None):
       peakrangenorm  autocorrelogram peak range normalised by the matched reference's own peak
                      range (1 = clean sinusoid, 0 = flat; NaN if the matched reference is too slow
                      to have one) -- QC plot only, it does not decide anything
+      n_clipped      number of clipped native-rate samples in the epoch (0 without a saturation check)
     """
     x = lfp_clean
     nperseg = int(round(ACG_FS * ACG_EPOCH_SEC))
     n_total = len(x) // nperseg
     status = np.full(n_total, 'accepted', dtype=object)
     ed_min, freq_est, peakrangenorm = (np.full(n_total, np.nan) for _ in range(3))
+    n_clipped = np.zeros(n_total, dtype=np.int64)
     if n_total == 0:
         return dict(ok=np.zeros(0, dtype=bool), status=status, ED_min=ed_min, freq_est=freq_est,
-                    peakrangenorm=peakrangenorm)
+                    peakrangenorm=peakrangenorm, n_clipped=n_clipped)
     epochs = x[:n_total * nperseg].reshape(n_total, nperseg)
 
     keep = np.ones(n_total, dtype=bool)
@@ -1105,6 +1173,17 @@ def acg_theta_epochs(lfp_clean, records=None):
         partial = (short_cum[r1 + 1] - short_cum[r0]) > 0
         status[partial] = 'rejected_partial'
         keep &= ~partial
+    if records is not None and records.get('input_range_uv') is not None:
+        n_clipped, near_clip = epoch_saturation(records['saturated'], n_total, nperseg, ACG_FS)
+        is_sat = n_clipped > 0
+        print(f'  saturation (InputRange {records["input_range_uv"]:g} uV): {int(is_sat.sum())}/{n_total} '
+              f'epochs contain clipped samples, {int((near_clip & ~is_sat).sum())} more within '
+              f'{SATURATION_MARGIN_S:g} s of clipping; {100 * records["saturated"].mean():.3f}% of samples clipped')
+        if ACG_REJECT_SATURATED_EPOCHS:
+            status[keep & near_clip] = 'rejected_saturated'
+            keep &= ~near_clip
+    elif records is not None:
+        print('  saturation: no -InputRange in header -- check skipped')
     if ACG_REJECT_DELTA_OVER_THETA:
         win = signal.get_window('hann', nperseg)
         for i in np.flatnonzero(keep):
@@ -1147,7 +1226,7 @@ def acg_theta_epochs(lfp_clean, records=None):
             peakrangenorm[i] = (pk - (tr1 + tr2) / 2) / refRange[mi]
 
     return dict(ok=status == 'accepted', status=status, ED_min=ed_min, freq_est=freq_est,
-                peakrangenorm=peakrangenorm)
+                peakrangenorm=peakrangenorm, n_clipped=n_clipped)
 
 
 def times_in_ok_epochs(t_s, lfp_ts, lfp_fs, epoch_ok):
@@ -1915,7 +1994,9 @@ SESSION_COLORS = {
     'NoRot': {'face': PAL_MAGENTA, 'edge': PAL_BLACK},
     'Rot': {'face': '#C000C0', 'edge': PAL_BLACK},
 }
-GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS}
+# Per-animal comparison (ANIMAL_DIR): the animals' ANIMAL_COLORS
+ANIMAL_GROUP_COLORS = {a: {'face': c, 'edge': PAL_BLACK} for a, c in ANIMAL_COLORS.items()}
+GROUP_COLORS = {**ARENA_COLORS, **SESSION_COLORS, **ANIMAL_GROUP_COLORS}
 _DEFAULT_COLOR = {'face': '#BFBFBF', 'edge': PAL_BLACK}
 # Pooled 'All units' plots: theta-modulated (Rayleigh+ & TMI+) units in viridis lime green, the rest gray
 _ALL_UNITS_GROUP = 'All units'
@@ -1931,6 +2012,7 @@ def _face(g, tm: bool = False) -> str:
 # Grouping column -> names of the omnibus tables' group-count / n-per-group columns
 GROUP_COUNT_COLUMNS = {'Arena': ('N_arenas', 'N_per_arena'),
                        'SessionType': ('N_session_types', 'N_per_session_type'),
+                       'Animal': ('N_animals', 'N_per_animal'),
                        'All': ('N_groups', 'N_per_group')}
 _TEST_STAT_NAMES = {'Mardia-Watson-Wheeler': 'W', 'Watson-Williams': 'F',
                     'Chi-square': 'χ²', 'Pairwise chi-square': 'χ²', 'Pairwise chi-square (Yates)': 'χ²',
@@ -2170,7 +2252,7 @@ def compare_proportion(counts_df: pd.DataFrame, col: str, metric: str, group_col
 def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
                               out_path: Path, group_col: str, title_prefix: str = '', pooled: str = ''):
     """% of all units that are Rayleigh+, TMI+ and Rayleigh+ & TMI+ per group, three bars side by
-    side in the group colour (hatch = criterion), 'n units' above each bar; stars over pairs of
+    side in the group colour (hatch = criterion), '%' and 'n units' above each bar; stars over pairs of
     Rayleigh+ & TMI+ bars whose Holm-corrected pairwise chi-square p < ALPHA. Counts and tests in a
     panel underneath."""
     groups = counts_df[group_col].tolist()
@@ -2203,10 +2285,10 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
         ax.bar(positions + off, pct, width=0.92 * width, color=faces, edgecolor=PAL_BLACK, hatch=hatch,
                linewidth=FIG_BOX_LW, zorder=2)
         for x, p_, n_k in zip(positions + off, pct, counts_df[f'n_{col}']):
-            ax.text(x, p_ + 1.5, str(n_k), ha='center', va='bottom', fontsize=FS_TICK - 3)
+            ax.text(x, p_ + 1.5, f'{p_:.1f}%\n{n_k}', ha='center', va='bottom', fontsize=FS_TICK - 3)
     top = _draw_sig_brackets(ax, dict(zip(groups, positions + offsets[-1])), pairwise_df,
-                             y_base=pct_max + 10, y_step=8, y_text=3, group_col=group_col)
-    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 6) + 8))
+                             y_base=pct_max + 15, y_step=8, y_text=3, group_col=group_col)
+    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 11) + 8))
     ax.set_yticks(np.arange(0, 101, 20))
     ax.set_xticks(positions)
     ax.set_xticklabels([f'{_label(g)}\n(n={n})' for g, n in zip(groups, n_all)])
@@ -2228,7 +2310,7 @@ def plot_theta_mod_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame,
 def plot_theta_mod_tested_proportion(counts_df: pd.DataFrame, omnibus_df: pd.DataFrame, pairwise_df: pd.DataFrame,
                                      out_path: Path, group_col: str, title_prefix: str = '', pooled: str = ''):
     """% of TESTED units (>= MIN_SPIKES_FOR_TMI theta-epoch spikes) that are Rayleigh+ & TMI+ per
-    group, one bar per group in the group colour, 'k/n' above each bar; stars over pairs whose
+    group, one bar per group in the group colour, '%' and 'k/n' above each bar; stars over pairs whose
     Holm-corrected pairwise chi-square p < ALPHA. Counts and tests in a panel underneath.
     `counts_df` holds only groups with >= 1 tested unit."""
     test_col, test_name = THETA_MOD_CRITERIA[-1][0], THETA_MOD_CRITERIA[-1][1]
@@ -2252,11 +2334,11 @@ def plot_theta_mod_tested_proportion(counts_df: pd.DataFrame, omnibus_df: pd.Dat
     ax.bar(positions, pct, width=0.55, color=[_face(g, tm=True) for g in groups],
            edgecolor=PAL_BLACK, linewidth=FIG_BOX_LW, zorder=2)
     for x, p_, k, n in zip(positions, pct, n_yes, n_tested):
-        ax.text(x, p_ + 1.5, f'{k}/{n}', ha='center', va='bottom', fontsize=FS_TICK - 3)
+        ax.text(x, p_ + 1.5, f'{p_:.1f}%\n{k}/{n}', ha='center', va='bottom', fontsize=FS_TICK - 3)
     pct_max = float(pct.max())
     top = _draw_sig_brackets(ax, dict(zip(groups, positions)), pairwise_df,
-                             y_base=pct_max + 10, y_step=8, y_text=3, group_col=group_col)
-    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 6) + 8))
+                             y_base=pct_max + 15, y_step=8, y_text=3, group_col=group_col)
+    ax.set_ylim(0, max(100.0, (top if top is not None else pct_max + 11) + 8))
     ax.set_yticks(np.arange(0, 101, 20))
     ax.set_xticks(positions)
     ax.set_xticklabels([f'{_label(g)}\n(n={n})' for g, n in zip(groups, n_tested)])
@@ -2916,28 +2998,31 @@ def run_animal_controlled(df: pd.DataFrame, out_dir: Path) -> dict[str, pd.DataF
     all_tables = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
         src_dirs = []
-        for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
-            order = [a for a in ARENA_LABELS if a in arenas]
-            wanted = {a.lower() for a in animals}
-            sel = df[df['Animal'].astype(str).str.lower().isin(wanted) & df['Arena'].isin(order)]
-            print(f'\n=== Animal-controlled {name}: units per animal and arena ===')
-            if sel.empty:
-                print('No units; skipped.')
-                continue
-            print(pd.crosstab(sel['Animal'], sel['Arena'], margins=True))
-            for arena in order:
-                missing = [a for a in animals if not ((sel['Animal'].astype(str).str.lower() == a.lower())
-                                                      & (sel['Arena'] == arena)).any()]
-                if missing:
-                    print(f'WARNING: no units of {missing} in the {arena} arena.')
-            src = Path(tmp_dir) / name
-            src_dirs.append(src)
-            tables = run_group_comparisons(sel, 'Arena', order, src, 'AnimalControlled', 'arena',
-                                           title_prefix=f'{" + ".join(animals)} only: ')
-            tag = 'AC' + ''.join(order)
-            for key, table in tables.items():
-                table.insert(0, 'Animals', ', '.join(animals))
-                all_tables[f'{tag}_{key}'] = table
+        # Same y-range for the versions of every plot (plu.shared_y_axes): the lowest lower and
+        # highest upper limit of the comparisons.
+        with plu.shared_y_axes([Path(tmp_dir) / n for n in ANIMAL_CONTROLLED_COMPARISONS]):
+            for name, (animals, arenas) in ANIMAL_CONTROLLED_COMPARISONS.items():
+                order = [a for a in ARENA_LABELS if a in arenas]
+                wanted = {a.lower() for a in animals}
+                sel = df[df['Animal'].astype(str).str.lower().isin(wanted) & df['Arena'].isin(order)]
+                print(f'\n=== Animal-controlled {name}: units per animal and arena ===')
+                if sel.empty:
+                    print('No units; skipped.')
+                    continue
+                print(pd.crosstab(sel['Animal'], sel['Arena'], margins=True))
+                for arena in order:
+                    missing = [a for a in animals if not ((sel['Animal'].astype(str).str.lower() == a.lower())
+                                                          & (sel['Arena'] == arena)).any()]
+                    if missing:
+                        print(f'WARNING: no units of {missing} in the {arena} arena.')
+                src = Path(tmp_dir) / name
+                src_dirs.append(src)
+                tables = run_group_comparisons(sel, 'Arena', order, src, 'AnimalControlled', 'arena',
+                                               title_prefix=f'{" + ".join(animals)} only: ')
+                tag = 'AC' + ''.join(order)
+                for key, table in tables.items():
+                    table.insert(0, 'Animals', ', '.join(animals))
+                    all_tables[f'{tag}_{key}'] = table
         if src_dirs:
             _combine_side_by_side(src_dirs, out_dir)
     return all_tables
@@ -2973,13 +3058,16 @@ def plot_acg_epochs(acg_df: pd.DataFrame, out_path: Path):
         n = len(sub)
         n_acc = int((sub['Status'] == 'accepted').sum())
         n_oob = int((sub['Status'] == 'rejected_outofband').sum())
-        n_noise = n - n_acc - n_oob
+        n_sat = int((sub['Status'] == 'rejected_saturated').sum())
+        n_noise = n - n_acc - n_oob - n_sat
         return (f'{label}: theta {100 * n_acc / n:.1f}% ({n_acc}/{n}) | '
                 f'non-theta {100 * n_oob / n:.1f}% ({n_oob}/{n}) | '
+                f'saturated {100 * n_sat / n:.1f}% ({n_sat}/{n}) | '
                 f'noise {100 * n_noise / n:.1f}% ({n_noise}/{n})')
 
     stats_lines = [f'All epochs. Theta = freq_est (bank {ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz) in {band}; '
-                   f'noise = delta > theta power or peak-to-peak MAD outlier']
+                   f'saturated = clipped at +/-InputRange or within {SATURATION_MARGIN_S:g} s of clipping; '
+                   f'noise = delta > theta power, peak-to-peak MAD outlier or other rejection']
     stats_lines += [_status_line(a, acg_df[acg_df['Animal'] == a]) for a in animals]
     if len(animals) > 1:
         stats_lines.append(_status_line('All animals', acg_df))
@@ -3104,7 +3192,8 @@ def process_session(data_folder: Path, rng, acg_records: list | None = None) -> 
                         dict(Animal=animal_id, Session=session_label, FolderPath=str(data_folder),
                              lfp_file=theta_ncs.name, epoch_index=i, ED_min=acg['ED_min'][i],
                              freq_est=acg['freq_est'][i], peakrangenorm=acg['peakrangenorm'][i],
-                             Status=acg['status'][i])
+                             Status=acg['status'][i], n_clipped=int(acg['n_clipped'][i]),
+                             InputRange_uV=ncs_records['input_range_uv'])
                         for i in range(len(acg_epoch_ok)))
 
             lfp_cache[theta_ncs] = dict(lfp_ts=lfp_ts, lfp_fs=lfp_fs, lfp_phase_unwrapped=lfp_phase_unwrapped,
@@ -3314,6 +3403,11 @@ def save_metadata_csv(csv_path: Path) -> Path:
                                       'value threshold'),
         ('NCS_LOADER', 'ncs_repair.load_repaired_uv: valid samples on a timestamp-anchored grid, gaps up to 1 s '
                        'interpolated, files with a longer gap skipped'),
+        ('ADBitVolts', 'per-file, from .ncs header (-ADBitVolts); DEFAULT_ADBITVOLTS only if absent'),
+        ('InputRange', 'per-file, from .ncs header (-InputRange, uV); no saturation check if absent'),
+        ('SATURATION_DETECTION', 'raw repaired native-rate trace, before filtering; |uV| >= InputRange - '
+                                 'SATURATION_TOL_STEPS * ADBitVolts; each clipped run widened by SATURATION_MARGIN_S '
+                                 'both sides; epoch rejected if it overlaps a widened run (before delta/theta + MAD)'),
         ('THETA_MODULATED_CRITERION', 'Rayleigh p < ALPHA AND TMI burst-preserving shuffle p < ALPHA'),
         ('PROPORTION_TESTS', 'chi-square test of independence + pairwise chi-square (Yates for 2 x 2), Holm'),
         ('PHASE_TESTS', 'Mardia-Watson-Wheeler (permutation p) + Watson-Williams, Holm'),
@@ -3330,7 +3424,9 @@ def save_metadata_csv(csv_path: Path) -> Path:
 README_NOTES = [
     'Units sheet: ONE ROW PER UNIT (one .ntt cluster in one session). Theta phase = Hilbert phase of the cleaned, '
     f'{LFP_FILTER_BAND[0]:g}-{LFP_FILTER_BAND[1]:g} Hz filtered LFP, 0 deg = theta peak, 180 deg = trough; only spikes in '
-    f'ACG theta epochs enter any phase: {ACG_EPOCH_SEC:g} s epochs that pass the noise rejection (delta > theta power, '
+    f'ACG theta epochs enter any phase: {ACG_EPOCH_SEC:g} s epochs not within {SATURATION_MARGIN_S:g} s of ADC clipping '
+    f'(|uV| >= the file\'s -InputRange minus {SATURATION_TOL_STEPS:g} ADC steps; reject: {ACG_REJECT_SATURATED_EPOCHS}) '
+    'that pass the noise rejection (delta > theta power, '
     f'peak-to-peak MAD outlier) and whose closest reference sinusoid ({ACG_REF_BANK[0]:g}-{ACG_REF_BANK[1]:g} Hz bank) lies '
     f'in {ACG_FREQ_RANGE[0]:g}-{ACG_FREQ_RANGE[1]:g} Hz (Figc_ACG_ScalingCorrected_v8_NoiseCleaning.py; no ED_min threshold). '
     'n_spikes_ACGtheta / ACGtheta_epoch_frac: the unit\'s spikes in theta epochs / fraction of its LFP\'s epochs that are theta.',
@@ -3355,7 +3451,8 @@ README_NOTES = [
     f'Laps = traversals of the main field (v30 field_traversals); laps with >= {MIN_SPIKES_PER_LAP} analysed spikes are kept. '
     'Onset_* / Offset_* = circular mean / MRL over kept laps of the first / last analysed spike of each lap. *_range = theta '
     f'trough range ({THETA_TROUGH_RANGE_DEG[0]:g}-{THETA_TROUGH_RANGE_DEG[1]:g} deg) or theta peak range.',
-    'Statistics sheets: All_* = every unit pooled; Ses<arena>_* = session types within an arena; Arena_* = arena types, session '
+    'Statistics sheets: All_* = every unit pooled; Animal_ThetaMod_* / Animal_TMTested_* = the theta-modulated '
+    'proportions compared across animals, arenas and session types pooled within each animal; Ses<arena>_*= session types within an arena; Arena_* = arena types, session '
     'types pooled; AC<arenas>_* = arena types, only the animals in the Animals column. ThetaMod_Counts: n / % of all units '
     'Rayleigh+, TMI+, both; ThetaMod_Omni / _Pair: chi-square + pairwise chi-square (Yates), Holm, on Rayleigh+ & TMI+ only. '
     f'TMTested_Omni / _Pair: the same tests on the % of TESTED units (>= {MIN_SPIKES_FOR_TMI} theta-epoch spikes) that are '
@@ -3390,6 +3487,20 @@ def finish_population(df: pd.DataFrame, excel_path: Path):
     tables.update(run_tm_vs_non(df_all, 'All', ['All units'], excel_path.parent, 'AllUnits', pooled_all))
     tables.update(run_peakbin_span(df_all, 'All', ['All units'], excel_path.parent, 'AllUnits', pooled_all))
     all_tables.update({f'All_{k}': t for k, t in tables.items()})
+
+    # ---- Animals: % theta-modulated units per animal, arenas and session types pooled ----
+    print('\n=== Animal comparison (all arenas and session types pooled within each animal) ===')
+    df_animal = df.loc[df['Animal'].notna()]
+    present = set(df_animal['Animal'])
+    animal_order = ([a for a in ANIMAL_COLORS if a in present]
+                    + sorted(present - set(ANIMAL_COLORS), key=str))
+    animal_dir = excel_path.parent / ANIMAL_DIR
+    animal_dir.mkdir(parents=True, exist_ok=True)
+    print(pd.crosstab(df_animal['Animal'], df_animal['Arena'], margins=True))
+    tables = run_theta_mod_proportion(df_animal, 'Animal', animal_order,
+                                      animal_dir / 'Animal_ThetaModProportion.png',
+                                      'arenas and session types pooled within each animal')
+    all_tables.update({f'Animal_{k}': t for k, t in tables.items()})
 
     # ---- 1) Session types within each arena ----
     for arena in ARENA_LABELS:

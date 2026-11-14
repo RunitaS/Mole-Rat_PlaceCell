@@ -14,7 +14,7 @@ https://github.com/slsdunn/theta-paper-code), binned against running speed
 computed from the cleaned tracking position.
 
 Before the mixed-model statistics, the per-time-bin (BINSIZE) Frequency/Power
-values are further aggregated into 2 cm/s-wide speed bins per session
+values are further aggregated into 4 cm/s-wide speed bins per session
 (representative Frequency/Power per bin -- see aggregate_by_speed_bin), and
 the random-intercept LMM is fit with each bin's center speed as the predictor,
 i.e. one value per speed bin actually visited per session rather than
@@ -43,12 +43,38 @@ except:
     old window lies mostly below the 4 cm/s cut).
   * Dunn Fig. 3 per-session OLS: speeds < 4 cm/s are dropped first, then the
     per-session 90th-percentile cut is taken on the remaining (mobile) speeds.
-    The 5 cm/s bins stay anchored at 0, so the first bin holds 4-5 cm/s only.
+  * Speed bins are SPEED_BIN_WIDTH_CMS = 4 cm/s wide in every analysis (mixed
+    model, Dunn Fig. 3 per-session OLS, individual-file plots), anchored at 0:
+    [0,4) is immobility and the first mobile bin is a full [4,8) cm/s.
+    (Before: 2 cm/s for the mixed model and 5 cm/s for Fig. 3, whose first
+    mobile bin held only 4-5 cm/s.)
   * Relative power denominator unchanged: whole-session 1-100 Hz power.
   * Copied .ncs files dropped (DROP_DUPLICATE_LFP): within a recording folder,
     files with identical record timestamps / valid-sample counts / samples are
     copies of one signal; only the first in natural name order is analysed.
-  * Results are written to Results/ThetaVsSpeed/Mobility.
+  * Results are written to Results/ThetaVsSpeed/Mobility_v3 (v2 = 2 / 5 cm/s
+    speed bins, PowerdB in the individual-file plots).
+  * Individual-file correlations (run_individual_correlations): the Dunn
+    Fig. 3 per-session OLS is drawn for every analysed .ncs file on its own
+    (Frequency and PowerRel -- relative power -- vs speed)
+    -> IndivdualCorrel/<session>.png. Each
+    file's slope is classed as significantly positive / n.s. positive / n.s.
+    negative / significantly negative (Benjamini-Hochberg FDR across files,
+    per measure) or not fitted, and the % of all files in each class is
+    plotted overall and per animal (IndividualCorrel_PercentPositive.png).
+    The individual fits drop no upper tail of speeds (the group per-session
+    OLS keeps the 90th-percentile cut); instead a speed bin is kept only with
+    >= INDIV_MIN_TIME_PER_BIN_S (5 s) of data.
+  * ADC saturation removed (REJECT_SATURATED_BINS), as in
+    Figc_ACG_ScalingCorrected_v11_SaturationReject.py: the amplifier clips at
+    +/-InputRange, read from each file's own .ncs header (1500 or 1000 uV).
+    Clipped samples are found on the raw, repaired native-rate trace, before
+    any filtering, and every clipped run is widened by SATURATION_MARGIN_S
+    (0.2 s) on both sides, because filtering spreads the clip edges. Every
+    0.25 s time bin (BINSIZE) that overlaps a widened run is removed (its
+    Frequency/Power are set to NaN and the row is dropped with the other NaN
+    bins), and the widened-run samples are left out of the relative-power
+    denominator (TotalPower). Per-file counts -> Saturation_summary.xlsx.
 """
 
 import os
@@ -63,6 +89,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.stats import norm, linregress, ttest_1samp, wilcoxon
 import matplotlib.pyplot as plt
 import statsmodels.formula.api as smf
+from statsmodels.stats.multitest import multipletests
 import openpyxl
 
 # ---- Timestamp-anchored .ncs loading ----
@@ -73,7 +100,7 @@ import sys
 NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCorr'
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
-from ncs_repair import load_repaired_uv, open_ncs
+from ncs_repair import load_repaired_uv, open_ncs, find_runs
 
 
 # %% ==================== Configuration ===========================================
@@ -84,7 +111,7 @@ from ncs_repair import load_repaired_uv, open_ncs
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
 # Speed vs. theta stats (mixed-model plots + summary) are written here.
-OUTPUT_DIR = Path(ROOT_DIR) / 'Results' / 'ThetaVsSpeed' / 'Mobility'
+OUTPUT_DIR = Path(ROOT_DIR) / 'Results' / 'ThetaVsSpeed' / 'Mobility_v3'
 
 # Per-time-bin rows of every analysed file (all speeds; Mobile flags the rows
 # used in the fits).
@@ -121,6 +148,18 @@ ncs_dtype = np.dtype([
     ('params'     , '<u4'),
     ('samples'    , '<i2', (512,)),
 ])
+
+# ---- ADC saturation (as in Figc_ACG_ScalingCorrected_v11_SaturationReject.py) ----
+# The clipping level is each file's own -InputRange header value (uV), never a
+# fixed number: 1500 uV for some recordings, 1000 uV for others. Clipped samples
+# are stored at ADMaxValue = 32767 counts, so a sample counts as clipped if
+# |value| >= InputRange - SATURATION_TOL_STEPS ADC steps (one step = ADBitVolts);
+# 1.5 steps flags exactly the +/-32767 rail and is safe against rounding.
+REJECT_SATURATED_BINS = True     # True: drop every time bin within SATURATION_MARGIN_S of clipping
+SATURATION_TOL_STEPS  = 1.5      # ADC steps below +/-InputRange that still count as clipped
+# Each clipped run is widened by this much on both sides before time bins are
+# rejected, since filtering spreads the sharp clip edges into neighbouring samples.
+SATURATION_MARGIN_S   = 0.2      # s, either side of each clipped run
 
 # ---- 50 Hz line-noise cleaning (European mains) ----
 LINE_HARMONICS = [50.0, 100.0, 150.0, 200.0]
@@ -162,11 +201,12 @@ BIN_AGG_METHOD = 'median'
 # with BINSIZE=0.25 s time bins, a session contributes thousands of
 # Frequency/Power/Speed points, which are not independent samples of the
 # speed relationship and inflate the mixed model's apparent significance.
-# Grouping by SPEED_BIN_WIDTH_CMS-wide speed bins ([0,2), [2,4), ... cm/s) and
+# Grouping by SPEED_BIN_WIDTH_CMS-wide speed bins ([0,4), [4,8), ... cm/s) and
 # taking the median Frequency/Power within each (session, bin) group gives one
 # value per speed bin visited per session; the mixed model's predictor is the
-# bin center (1, 3, 5, ... cm/s).
-SPEED_BIN_WIDTH_CMS = 2.0
+# bin center (2, 6, 10, ... cm/s). The same width is used by the Fig. 3
+# per-session OLS and the individual-file plots (FIG3_SPEED_BIN_WIDTH_CMS).
+SPEED_BIN_WIDTH_CMS = 4.0
 
 # ---- Theta-power normalization (see add_normalized_power) ----
 # dB baseline: each session's baseline B is the BIN_AGG_METHOD power of its
@@ -243,6 +283,47 @@ def read_ncs_adbitvolts(fpath):
     return float(m.group(1))
 
 
+def read_ncs_input_range(fpath):
+    """Amplifier input range (uV) from the '-InputRange' line of the .ncs header,
+    i.e. the level at which the recorded signal clips. None if the header has no
+    InputRange (simulated files), in which case no saturation check is possible."""
+    with open(fpath, 'rb') as f:
+        header = f.read(16 * 1024).decode('latin-1')
+    m = re.search(r'^-InputRange[ \t]+(\S+)', header, flags=re.MULTILINE)
+    return float(m.group(1)) if m else None
+
+
+def saturated_samples(lfp_uv, input_range_uv, ad_bit_volts, tol_steps=SATURATION_TOL_STEPS):
+    """Boolean mask of clipped samples of the raw, native-rate trace (uV): those
+    within `tol_steps` ADC steps of +/-`input_range_uv`. All False if the file
+    has no InputRange."""
+    if input_range_uv is None:
+        return np.zeros(len(lfp_uv), dtype=bool)
+    rail_uv = input_range_uv - tol_steps * ad_bit_volts * 1e6
+    return np.abs(lfp_uv) >= rail_uv
+
+
+def near_clip_mask(sat_native, n_out, fs_native=NATIVE_FS, fs_out=FS_LFP,
+                   margin_s=SATURATION_MARGIN_S):
+    """`sat_native` (native-rate clipped-sample mask) mapped onto the first
+    `n_out` samples of the fs_out trace that clean_lfp returns (an fs_out sample
+    is clipped if any of the native samples it covers is), then every clipped
+    run widened by `margin_s` on both sides."""
+    step = int(round(fs_native / fs_out))
+    n_full = -(-len(sat_native) // step) * step
+    padded = np.zeros(n_full, dtype=bool)
+    padded[:len(sat_native)] = sat_native
+    sat = padded.reshape(-1, step).any(axis=1)
+    sat = np.pad(sat, (0, max(0, n_out - len(sat))))[:n_out]
+
+    starts, lengths = find_runs(sat)
+    margin = int(round(margin_s * fs_out))
+    edges = np.zeros(n_out + 1, dtype=np.int64)
+    np.add.at(edges, np.clip(starts - margin, 0, n_out), 1)
+    np.add.at(edges, np.clip(starts + lengths + margin, 0, n_out), -1)
+    return np.cumsum(edges[:-1]) > 0
+
+
 def load_ncs(fpath):
     """Read a Neuralynx .ncs file.
 
@@ -252,8 +333,11 @@ def load_ncs(fpath):
                                 NATIVE_FS grid (see ncs_repair.py)
     start_timestamp : int      UNIX timestamp (us) of the first sample -- same
                                 clock as the tracking .csv.
+    ad_bit_volts    : float    V per ADC count (this file's -ADBitVolts)
     """
-    return load_repaired_uv(fpath, read_ncs_adbitvolts(fpath))
+    ad_bit_volts = read_ncs_adbitvolts(fpath)
+    lfp, start_us = load_repaired_uv(fpath, ad_bit_volts)
+    return lfp, start_us, ad_bit_volts
 
 
 def notch_filter(x, fs_hz, freqs, Q=30.0):
@@ -626,6 +710,15 @@ def bin_data(data, ts, bins, agg_method=BIN_AGG_METHOD):
     return data_binned, bin_centers
 
 
+def bin_any(mask, ts, bins):
+    """Per bin of `bins` (same [start, stop] inclusive edges as bin_data):
+    True if any sample of `mask` with time `ts` (sorted) falls in it."""
+    cum = np.concatenate(([0], np.cumsum(mask, dtype=np.int64)))
+    lo = np.searchsorted(ts, bins[:-1], side='left')
+    hi = np.searchsorted(ts, bins[1:], side='right')
+    return (cum[hi] - cum[lo]) > 0
+
+
 def drop_nan(inst_freq_binned, inst_power_binned, inst_speed_binned, bin_centers):
     idx_nan = np.where(np.isnan(inst_speed_binned))
     inst_freq_binned = np.delete(inst_freq_binned, idx_nan)
@@ -649,9 +742,20 @@ def process_ncs_session(fpath):
     LFP (resample -> notch -> detrend -> low-pass -> theta band-pass), and
     return a DataFrame of binned instantaneous theta frequency/power vs.
     running speed for that session.
+
+    With REJECT_SATURATED_BINS, time bins within SATURATION_MARGIN_S of an ADC
+    clipped sample are removed (see module header).
+
+    Returns (per-time-bin DataFrame, saturation summary dict).
     """
-    raw_lfp, lfp_start_us = load_ncs(fpath)
+    raw_lfp, lfp_start_us, ad_bit_volts = load_ncs(fpath)
+    # clipped samples are found on the raw native-rate trace, before any filtering
+    input_range_uv = read_ncs_input_range(fpath)
+    sat_native = saturated_samples(raw_lfp, input_range_uv, ad_bit_volts)
     lfp = clean_lfp(raw_lfp)
+    near_clip = near_clip_mask(sat_native, len(lfp))
+    if not REJECT_SATURATED_BINS:
+        near_clip = np.zeros(len(lfp), dtype=bool)
     theta = filter_signal(lfp, FS_LFP, BANDPASS_CUTOFF, FILTER_ORDER)
     broadband = filter_signal(lfp, FS_LFP, REL_POWER_BAND, REL_POWER_FILTER_ORDER)
 
@@ -659,9 +763,12 @@ def process_ncs_session(fpath):
 
     theta = trim_signal(theta, FS_LFP, TRIM_DUR)
     lfp_ts = trim_signal(lfp_ts, FS_LFP, TRIM_DUR)
+    near_clip = trim_signal(near_clip, FS_LFP, TRIM_DUR)
     # session's total REL_POWER_BAND power (uV^2): by Parseval, the mean square
-    # of the band-passed trace equals the integral of its PSD over that band
-    total_power = np.mean(trim_signal(broadband, FS_LFP, TRIM_DUR) ** 2)
+    # of the band-passed trace equals the integral of its PSD over that band.
+    # Samples within SATURATION_MARGIN_S of clipping are left out.
+    broadband = trim_signal(broadband, FS_LFP, TRIM_DUR)
+    total_power = np.mean(broadband[~near_clip] ** 2) if (~near_clip).any() else np.nan
 
     pos_path = find_position_file(fpath)
     if pos_path is None:
@@ -684,10 +791,31 @@ def process_ncs_session(fpath):
     inst_speed_binned, _ = bin_data(inst_speed, speed_ts, bins)
     inst_freq_binned, _ = bin_data(inst_freq, lfp_ts, bins)
     inst_power_binned, bin_centers = bin_data(inst_power, lfp_ts, bins)
+    inst_freq_binned = np.asarray(inst_freq_binned)
+    inst_power_binned = np.asarray(inst_power_binned)
+    inst_speed_binned = np.asarray(inst_speed_binned)
+
+    # remove time bins within SATURATION_MARGIN_S of clipping: NaN here, then
+    # dropped by drop_nan with the other NaN bins
+    bin_sat = bin_any(near_clip, lfp_ts, bins)
+    n_valid_before = int((np.isfinite(inst_power_binned) & np.isfinite(inst_speed_binned)).sum())
+    inst_freq_binned[bin_sat] = np.nan
+    inst_power_binned[bin_sat] = np.nan
 
     inst_freq_binned, inst_power_binned, inst_speed_binned, bin_centers = drop_nan(
-        np.asarray(inst_freq_binned), np.asarray(inst_power_binned),
-        np.asarray(inst_speed_binned), np.asarray(bin_centers))
+        inst_freq_binned, inst_power_binned, inst_speed_binned, np.asarray(bin_centers))
+
+    n_clipped = int(sat_native.sum())
+    sat_info = {
+        "InputRange_uV": input_range_uv,
+        "n_clipped_samples": n_clipped,
+        "pct_samples_clipped": 100 * n_clipped / len(sat_native) if len(sat_native) else np.nan,
+        "n_clipped_runs": len(find_runs(sat_native)[0]),
+        "pct_time_near_clip": 100 * near_clip.mean() if len(near_clip) else np.nan,
+        "n_bins_before": n_valid_before,
+        "n_bins_removed_saturation": n_valid_before - len(bin_centers),
+        "n_bins_kept": len(bin_centers),
+    }
 
     return pd.DataFrame({
         "Power": inst_power_binned,
@@ -695,7 +823,7 @@ def process_ncs_session(fpath):
         "Speed": inst_speed_binned,
         "Time": bin_centers,
         "TotalPower": total_power,
-    })
+    }), sat_info
 
 
 def _natural_key(path):
@@ -762,24 +890,42 @@ def process_root_directory(root_dir):
         ncs_files, dups = find_duplicate_ncs(ncs_files, root_dir)
         dups.to_excel(OUTPUT_DIR / 'Dropped_duplicate_ncs.xlsx', index=False)
 
-    all_results = []
+    all_results, sat_rows = [], []
     for fpath in ncs_files:
         rel = os.path.relpath(fpath, root_dir)
         ses_id = os.path.splitext(rel)[0].replace(os.sep, '_')
         rel_dir = os.path.dirname(rel)
         try:
-            df_session = process_ncs_session(fpath)
+            df_session, sat = process_ncs_session(fpath)
             df_session['Session'] = ses_id
             df_session['Recording'] = rel_dir.replace(os.sep, '/')
             df_session['Animal'] = rel_dir.split(os.sep)[0]
-            print(f'  OK: {rel}  [{len(df_session)} bins]')
+            if sat['InputRange_uV'] is None:
+                sat_msg = 'no -InputRange in header, saturation check skipped'
+            else:
+                sat_msg = (f'InputRange {sat["InputRange_uV"]:g} uV, '
+                           f'{sat["pct_samples_clipped"]:.3f}% samples clipped, '
+                           f'{sat["n_bins_removed_saturation"]}/{sat["n_bins_before"]} bins removed '
+                           f'within {SATURATION_MARGIN_S:g} s of clipping')
+            print(f'  OK: {rel}  [{len(df_session)} bins; {sat_msg}]')
             all_results.append(df_session)
+            sat_rows.append({'Session': ses_id, 'Animal': rel_dir.split(os.sep)[0],
+                             'Recording': rel_dir.replace(os.sep, '/'),
+                             'file_name': os.path.basename(fpath), **sat})
         except Exception as e:
             print(f'  SKIP: {rel} -- {e}')
 
     print(f'-> {len(all_results)} files processed\n')
     if not all_results:
         raise ValueError(f'No files processed successfully under {root_dir}')
+
+    sat_df = pd.DataFrame(sat_rows)
+    sat_df.to_excel(OUTPUT_DIR / 'Saturation_summary.xlsx', index=False)
+    n_before, n_removed = sat_df['n_bins_before'].sum(), sat_df['n_bins_removed_saturation'].sum()
+    print(f'ADC saturation: {int((sat_df["n_clipped_samples"] > 0).sum())}/{len(sat_df)} files contain '
+          f'clipped samples; {n_removed}/{n_before} time bins ({100 * n_removed / max(n_before, 1):.2f}%) '
+          f'removed within {SATURATION_MARGIN_S:g} s of clipping'
+          + ('' if REJECT_SATURATED_BINS else ' [REJECT_SATURATED_BINS = False: nothing removed]'))
     return pd.concat(all_results, ignore_index=True)
 
 
@@ -981,7 +1127,7 @@ def run_speed_vs_theta_stats(df):
     than the raw per-time-bin rows (see aggregate_by_speed_bin)."""
     df_clean = df.dropna(subset=["Frequency", "Power", "Speed"])
     # mobile and immobile time bins are aggregated separately, so a speed bin
-    # that straddles MIN_SPEED_CMS can't mix the two (with 2 cm/s bins and a
+    # that straddles MIN_SPEED_CMS can't mix the two (with 4 cm/s bins and a
     # 4 cm/s cut none does); only the mobile rows enter the fits
     parts = []
     for mobile, d in df_clean.groupby("Mobile"):
@@ -1052,8 +1198,41 @@ def run_speed_vs_theta_stats(df):
 # shared slope -- a different, not wrong, question from the paper's per-session
 # slope distribution).
 
-FIG3_SPEED_BIN_WIDTH_CMS = 5.0  # matches the paper's Fig. 3 speed binning ("5 cms-1 bins")
+# The paper's Fig. 3 used 5 cm/s bins ("5 cms-1 bins"); here the same 4 cm/s
+# width as the mixed model is used, so the first mobile bin is a full [4,8).
+FIG3_SPEED_BIN_WIDTH_CMS = SPEED_BIN_WIDTH_CMS
 FIG3_SPEED_UPPER_PCTILE = 90.0  # paper excluded speeds above the 90th percentile per session
+
+
+def fig3_trim_and_bin(df, upper_pctile=FIG3_SPEED_UPPER_PCTILE, min_bin_s=0.0):
+    """The per-session OLS input: mobile time bins (>= MIN_SPEED_CMS) of each
+    session, and their FIG3_SPEED_BIN_WIDTH_CMS speed-bin medians.
+
+    upper_pctile : speeds above this per-session percentile (of the mobile
+                   speeds) are dropped first; None = no percentile cut.
+    min_bin_s    : speed bins (per session) with less than this much data
+                   (n time bins * BINSIZE seconds) are dropped, together
+                   with their time bins; 0 = keep every visited bin.
+    Returns (kept time-bin rows, speed-bin rows)."""
+    df_clean = df.dropna(subset=["Frequency", "Power", "Speed"]).copy()
+    # immobility (< MIN_SPEED_CMS) is dropped first, so the percentile cut
+    # below is taken on each session's mobile speeds; bins stay anchored at
+    # 0, so with 4 cm/s bins the first mobile bin is [4, 8) cm/s
+    df_clean = df_clean[df_clean["Mobile"]]
+
+    if upper_pctile is not None:
+        def _trim_top_pctile(g):
+            thresh = np.percentile(g["Speed"], upper_pctile)
+            return g[g["Speed"] <= thresh]
+        df_clean = df_clean.groupby("Session", group_keys=False).apply(_trim_top_pctile)
+
+    if min_bin_s > 0:
+        speed_bin = np.floor(df_clean["Speed"] / FIG3_SPEED_BIN_WIDTH_CMS)
+        n_in_bin = df_clean.groupby([df_clean["Session"], speed_bin])["Speed"].transform("size")
+        df_clean = df_clean[n_in_bin * BINSIZE >= min_bin_s]
+
+    df_binned = aggregate_by_speed_bin(df_clean, speed_bin_width=FIG3_SPEED_BIN_WIDTH_CMS)
+    return df_clean, df_binned
 
 
 def fit_per_session_ols(df, response, predictor="Speed", group="Session"):
@@ -1067,11 +1246,13 @@ def fit_per_session_ols(df, response, predictor="Speed", group="Session"):
         g = g.dropna(subset=[predictor, response])
         if len(g) < 3:
             continue
-        slope, intercept, r_value, p_value, _std_err = linregress(g[predictor], g[response])
+        slope, intercept, r_value, p_value, std_err = linregress(g[predictor], g[response])
         rows.append({
             group: ses_id,
             "beta1": slope,
+            "beta1_se": std_err,
             "intercept": intercept,
+            "r": r_value,
             "r2": r_value ** 2,
             "pvalue": p_value,
             "n_bins": len(g),
@@ -1168,18 +1349,7 @@ def run_speed_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
     count -- leave this at 1 if you're not correcting across multiple
     simultaneously-recorded channels per session).
     """
-    df_clean = df.dropna(subset=["Frequency", "Power", "Speed"]).copy()
-    # immobility (< MIN_SPEED_CMS) is dropped first, so the 90th-percentile
-    # cut below is taken on each session's mobile speeds; bins stay anchored
-    # at 0, so the first 5 cm/s bin holds only MIN_SPEED_CMS-5 cm/s
-    df_clean = df_clean[df_clean["Mobile"]]
-
-    def _trim_top_pctile(g):
-        thresh = np.percentile(g["Speed"], FIG3_SPEED_UPPER_PCTILE)
-        return g[g["Speed"] <= thresh]
-    df_clean = df_clean.groupby("Session", group_keys=False).apply(_trim_top_pctile)
-
-    df_binned = aggregate_by_speed_bin(df_clean, speed_bin_width=FIG3_SPEED_BIN_WIDTH_CMS)
+    _df_clean, df_binned = fig3_trim_and_bin(df)
     df_binned.to_excel(OUTPUT_DIR / "Fig3_speed_binned_medians.xlsx", index=False)
 
     alpha_bonf = 0.05 / n_channels_for_bonferroni
@@ -1229,6 +1399,278 @@ def run_speed_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
     return df_binned
 
 
+# %% ==================== Individual-file correlations (per-file OLS plots + % positive) ====
+#
+# Every analysed .ncs file (one Session) is fit on its own with the per-session
+# OLS above (fig3_trim_and_bin -> fit_per_session_ols), but with its own
+# speed-bin inclusion rule (INDIV_SPEED_UPPER_PCTILE / INDIV_MIN_TIME_PER_BIN_S),
+# so slopes differ from Fig3_persession_OLS_<measure>.xlsx. Per measure, the p-values
+# of all fitted files are Benjamini-Hochberg FDR-corrected, and each file is
+# put in one CORREL_CATEGORIES class. The % summary uses every analysed file
+# as the denominator: files without a fit (< 3 speed bins, or no finite
+# value of the measure) are counted as "Not fitted". Power is the relative
+# (normalized) power PowerRel, not PowerdB.
+
+INDIV_DIR = OUTPUT_DIR / 'IndivdualCorrel'
+# (column, panel title, y-axis label)
+INDIV_MEASURES = [
+    ("Frequency", "Theta frequency", "Theta Frequency [Hz]"),
+    ("PowerRel", "Theta power (relative)", POWER_MEASURES[2][2]),
+]
+INDIV_FDR_Q = 0.05
+# Speed-bin inclusion for the individual fits only (the group per-session OLS
+# above keeps the Dunn 90th-percentile cut): no per-file percentile cut, and a
+# speed bin is kept only with >= INDIV_MIN_TIME_PER_BIN_S of data (5 s = 20
+# time bins of BINSIZE), which drops thinly sampled bins (e.g. rare fast
+# running or tracking artifacts) instead of the whole upper 10% of speeds.
+INDIV_SPEED_UPPER_PCTILE = None
+INDIV_MIN_TIME_PER_BIN_S = 5.0
+# (class, colour), in bar-stacking order from the baseline up
+CORREL_CATEGORIES = [
+    ("Positive, significant", "#c43c3b"),
+    ("Positive, n.s.",        "#f2b0ae"),
+    ("Negative, n.s.",        "#9ec5f4"),
+    ("Negative, significant", "#1c5cab"),
+    ("Not fitted",            "#d9d8d4"),
+]
+_DARK_CATEGORIES = {"Positive, significant", "Negative, significant"}
+# Epoch cloud behind the speed-bin medians (individual plots only): every
+# 0.25 s time bin that went into the fit, drawn as a small borderless gray dot
+# with low opacity, so the gray gets darker where epochs overlap (denser).
+INDIV_EPOCH_COLOR = '0.35'      # darkest gray reached where many dots stack
+# opacity of a single epoch dot = INDIV_EPOCH_ALPHA_K / sqrt(n epochs), clipped
+# to INDIV_EPOCH_ALPHA_RANGE: files with few epochs still show each dot, files
+# with thousands don't turn into a solid block
+INDIV_EPOCH_ALPHA_K = 4.0
+INDIV_EPOCH_ALPHA_RANGE = (0.04, 0.35)
+INDIV_EPOCH_SIZE = 9            # marker area (pt^2)
+# y-axis limited to this percentile range of the epochs (plus the medians,
+# whiskers and fit), so a few extreme epochs can't flatten the plot; the
+# number of epochs outside the axis is given in the panel text.
+INDIV_EPOCH_YLIM_PCTILE = (1.0, 99.0)
+
+
+def classify_individual_fits(fits, sessions, q_thresh=INDIV_FDR_Q):
+    """`fits` (fit_per_session_ols output) re-indexed onto every session in
+    `sessions`, with the BH-FDR q-value (over the fitted files) and the class."""
+    out = pd.DataFrame({"Session": list(sessions)}).merge(fits, on="Session", how="left")
+    out["qvalue"] = np.nan
+    fitted = out["pvalue"].notna()
+    if fitted.any():
+        out.loc[fitted, "qvalue"] = multipletests(out.loc[fitted, "pvalue"], method="fdr_bh")[1]
+
+    def _cls(r):
+        if np.isnan(r["beta1"]):
+            return "Not fitted"
+        sig = r["qvalue"] < q_thresh
+        if r["beta1"] > 0:
+            return "Positive, significant" if sig else "Positive, n.s."
+        return "Negative, significant" if sig else "Negative, n.s."
+    out["Category"] = out.apply(_cls, axis=1)
+    return out
+
+
+def plot_individual_correlation(ses_id, raw, binned, cls_rows, out_path):
+    """One file: per measure, its FIG3_SPEED_BIN_WIDTH_CMS speed-bin medians (whiskers = IQR of
+    the 0.25 s time bins in that speed bin) against the bin's median speed,
+    with the file's own OLS line (solid if FDR-significant, dashed if not).
+    Behind them, every 0.25 s time bin (epoch) used in the fit is drawn at its
+    own speed as a faint gray dot; overlapping dots add up, so denser regions
+    are darker (INDIV_EPOCH_*)."""
+    fig, axes = plt.subplots(1, len(INDIV_MEASURES), figsize=(5.5 * len(INDIV_MEASURES), 4.6))
+    axes = np.atleast_1d(axes)
+    for ax, (col, panel_title, ylabel) in zip(axes, INDIV_MEASURES):
+        b = binned.dropna(subset=[col]).sort_values("Speed")
+        r = raw.dropna(subset=[col])
+        fit = cls_rows[col]
+        animal = fit["Animal"]
+        y_keep = []  # values the y-axis must show
+
+        if len(r):
+            alpha = float(np.clip(INDIV_EPOCH_ALPHA_K / np.sqrt(len(r)), *INDIV_EPOCH_ALPHA_RANGE))
+            ax.scatter(r["Speed"], r[col], s=INDIV_EPOCH_SIZE, color=INDIV_EPOCH_COLOR,
+                       alpha=alpha, linewidths=0, zorder=1, rasterized=True)
+            y_keep += list(np.percentile(r[col], INDIV_EPOCH_YLIM_PCTILE))
+
+        if len(b):
+            q = (r.assign(SpeedBin=np.floor(r["Speed"] / FIG3_SPEED_BIN_WIDTH_CMS))
+                  .groupby("SpeedBin")[col].quantile([0.25, 0.75]).unstack())
+            sb = np.floor(b["Speed"] / FIG3_SPEED_BIN_WIDTH_CMS)
+            lo = q.reindex(sb)[0.25].to_numpy()
+            hi = q.reindex(sb)[0.75].to_numpy()
+            y = b[col].to_numpy()
+            ax.errorbar(b["Speed"], y, yerr=[np.maximum(y - lo, 0), np.maximum(hi - y, 0)],
+                        fmt='none', ecolor='0.2', elinewidth=1, capsize=3, zorder=2)
+            ax.scatter(b["Speed"], y, s=55, color=animal_color(animal), edgecolor='k',
+                       linewidth=0.7, zorder=3)
+            y_keep += [np.nanmin(lo), np.nanmax(hi), y.min(), y.max()]
+
+        if fit["Category"] != "Not fitted":
+            x = np.linspace(b["Speed"].min(), b["Speed"].max(), 50)
+            y_fit = fit["intercept"] + fit["beta1"] * x
+            ax.plot(x, y_fit, color='black', lw=2,
+                    ls='-' if fit["qvalue"] < INDIV_FDR_Q else '--', zorder=4)
+            y_keep += [y_fit.min(), y_fit.max()]
+            details = [
+                f"β₁ = {fit['beta1']:.4g} ± {fit['beta1_se']:.2g} SE per cm/s",
+                f"r = {fit['r']:.3f},  R² = {fit['r2']:.3f}",
+                f"p = {fit['pvalue']:.3g},  q (BH-FDR) = {fit['qvalue']:.3g}",
+                f"n = {int(fit['n_bins'])} speed bins ({len(r)} time bins)",
+                f"Class: {fit['Category']}",
+            ]
+        else:
+            why = (f"no finite {col} values" if r.empty and not raw.empty
+                   else f"{len(b)} speed bins (< 3)")
+            details = [f"Not fitted: {why}"]
+
+        y_keep = np.asarray(y_keep, dtype=float)
+        y_keep = y_keep[np.isfinite(y_keep)]
+        if len(y_keep):
+            y0, y1 = y_keep.min(), y_keep.max()
+            pad = 0.05 * (y1 - y0) if y1 > y0 else 1.0
+            ax.set_ylim(y0 - pad, y1 + pad)
+            n_out = int(((r[col] < y0 - pad) | (r[col] > y1 + pad)).sum())
+            details.append(f"Gray: {len(r)} epochs ({BINSIZE:g} s), darker = denser"
+                           + (f"; {n_out} outside y-axis" if n_out else ""))
+        details = "\n".join(details)
+        ax.set_title(panel_title, fontsize=12, weight='bold')
+        ax.set_xlabel(f"Speed (cm/s); points = median per {FIG3_SPEED_BIN_WIDTH_CMS:g} cm/s bin",
+                      fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.grid(True, linestyle='--', alpha=0.4)
+        add_details_below(fig, ax, details)
+    fig.suptitle(ses_id, fontsize=11)
+    fig.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig)
+
+
+def _stacked_percent_bars(ax, groups):
+    """`groups`: list of (x label, Series of class counts). One 100% bar each."""
+    cats = [c for c, _ in CORREL_CATEGORIES]
+    for i, (_label, counts) in enumerate(groups):
+        counts = counts.reindex(cats, fill_value=0)
+        total = counts.sum()
+        bottom = 0.0
+        for cat, color in CORREL_CATEGORIES:
+            pct = 100 * counts[cat] / total if total else 0
+            if pct > 0:
+                ax.bar(i, pct, bottom=bottom, width=0.7, color=color,
+                       edgecolor='white', linewidth=1.5)
+                if pct >= 4:  # count on a second line only where the segment has room
+                    label = f"{pct:.0f}%\n({counts[cat]})" if pct >= 9 else f"{pct:.0f}% ({counts[cat]})"
+                    ax.text(i, bottom + pct / 2, label, ha='center',
+                            va='center', fontsize=8,
+                            color='white' if cat in _DARK_CATEGORIES else '0.15')
+                else:     # too thin for text inside: the % just right of the segment
+                    ax.text(i + 0.37, bottom + pct / 2, f"{pct:.1f}%", ha='left',
+                            va='center', fontsize=6.5, color='0.15')
+            bottom += pct
+        ax.text(i, 101.5, f"n = {total}", ha='center', va='bottom', fontsize=8, color='0.3')
+    ax.set_xticks(range(len(groups)))
+    ax.set_xticklabels([g[0] for g in groups], fontsize=9)
+    ax.set_xlim(-0.6, len(groups) - 0.4)
+    ax.set_ylim(0, 108)
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def plot_percent_positive(cls_long, out_path):
+    """% of all analysed files in each class: one bar per measure (all files),
+    then one bar per animal for each measure."""
+    animals = ordered_animals(cls_long["Animal"])
+    n_panels = 1 + len(INDIV_MEASURES)
+    fig = plt.figure(figsize=(3 + 2.2 * len(animals) * len(INDIV_MEASURES), 7.2))
+    gs = fig.add_gridspec(2, n_panels, height_ratios=[4, 1.25],
+                          width_ratios=[len(INDIV_MEASURES)] + [len(animals)] * len(INDIV_MEASURES))
+    ax0 = fig.add_subplot(gs[0, 0])
+    _stacked_percent_bars(ax0, [(title, cls_long.loc[cls_long["Measure"] == col, "Category"].value_counts())
+                                for col, title, _ in INDIV_MEASURES])
+    ax0.set_ylabel("% of LFP files", fontsize=11)
+    ax0.set_title("All files", fontsize=12, weight='bold')
+    for k, (col, title, _) in enumerate(INDIV_MEASURES, start=1):
+        ax = fig.add_subplot(gs[0, k], sharey=ax0)
+        sub = cls_long[cls_long["Measure"] == col]
+        _stacked_percent_bars(ax, [(a, sub.loc[sub["Animal"] == a, "Category"].value_counts())
+                                   for a in animals])
+        ax.set_title(f"{title}, by animal", fontsize=12, weight='bold')
+        ax.tick_params(labelleft=False)
+
+    lines = []
+    for col, title, _ in INDIV_MEASURES:
+        c = cls_long.loc[cls_long["Measure"] == col, "Category"].value_counts()
+        n = int(c.sum())
+        n_pos = int(c.get("Positive, significant", 0) + c.get("Positive, n.s.", 0))
+        n_fit = n - int(c.get("Not fitted", 0))
+        lines.append(f"{title}: slope > 0 in {n_pos}/{n} files ({100 * n_pos / n:.1f}%); "
+                     f"significantly positive in {c.get('Positive, significant', 0)}/{n} "
+                     f"({100 * c.get('Positive, significant', 0) / n:.1f}%); "
+                     f"significantly negative in {c.get('Negative, significant', 0)}/{n}; "
+                     f"not fitted {c.get('Not fitted', 0)}/{n}  (BH-FDR over {n_fit} fitted files)")
+    trim_txt = ("no upper speed cut" if INDIV_SPEED_UPPER_PCTILE is None
+                else f"top {100 - INDIV_SPEED_UPPER_PCTILE:g}% of each file's speeds dropped")
+    lines.append(f"Per-file OLS of {FIG3_SPEED_BIN_WIDTH_CMS:g} cm/s speed-bin medians (speeds ≥ "
+                 f"{MIN_SPEED_CMS:g} cm/s, {trim_txt}, speed bins with ≥ {INDIV_MIN_TIME_PER_BIN_S:g} s "
+                 f"of data); significant = Benjamini-Hochberg q < {INDIV_FDR_Q:g}, per measure.")
+    axl = fig.add_subplot(gs[1, :])
+    axl.axis('off')
+    handles = [plt.Rectangle((0, 0), 1, 1, color=color) for _, color in CORREL_CATEGORIES]
+    axl.legend(handles, [c for c, _ in CORREL_CATEGORIES], loc='upper center',
+               ncol=len(CORREL_CATEGORIES), frameon=False, fontsize=9)
+    axl.text(0.5, 0.55, "\n".join(lines), transform=axl.transAxes, ha='center', va='top',
+             fontsize=9, linespacing=1.5)
+    fig.suptitle("Theta vs. running speed: individual-file correlations", fontsize=13, weight='bold')
+    fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig)
+
+
+def run_individual_correlations(df):
+    """Per-file OLS fits, FDR classes, one PNG per file in INDIV_DIR, the
+    % summary figure and IndividualCorrel_per_file.xlsx."""
+    INDIV_DIR.mkdir(parents=True, exist_ok=True)
+    df_clean, df_binned = fig3_trim_and_bin(df, upper_pctile=INDIV_SPEED_UPPER_PCTILE,
+                                            min_bin_s=INDIV_MIN_TIME_PER_BIN_S)
+    meta = (df[["Session", "Recording", "Animal"]].drop_duplicates("Session")
+              .sort_values("Session").reset_index(drop=True))
+    sessions = meta["Session"].tolist()
+
+    per_measure = {}
+    for col, _title, _ylabel in INDIV_MEASURES:
+        cls = classify_individual_fits(fit_per_session_ols(df_binned, col), sessions)
+        per_measure[col] = cls.merge(meta, on="Session", how="left").assign(Measure=col)
+    cls_long = pd.concat(per_measure.values(), ignore_index=True)
+
+    raw_by_ses = dict(tuple(df_clean.groupby("Session")))
+    bin_by_ses = dict(tuple(df_binned.groupby("Session")))
+    empty_raw, empty_bin = df_clean.iloc[:0], df_binned.iloc[:0]
+    for i, ses_id in enumerate(sessions, start=1):
+        rows = {col: per_measure[col].set_index("Session").loc[ses_id] for col in per_measure}
+        fname = re.sub(r'[^\w.-]', '_', ses_id) + '.png'
+        plot_individual_correlation(ses_id, raw_by_ses.get(ses_id, empty_raw),
+                                    bin_by_ses.get(ses_id, empty_bin), rows, INDIV_DIR / fname)
+        if i % 25 == 0 or i == len(sessions):
+            print(f'  individual correlation plots: {i}/{len(sessions)}')
+
+    plot_percent_positive(cls_long, OUTPUT_DIR / "IndividualCorrel_PercentPositive.png")
+
+    cats = [c for c, _ in CORREL_CATEGORIES]
+    overall = (cls_long.groupby("Measure")["Category"].value_counts().unstack(fill_value=0)
+                       .reindex(columns=cats, fill_value=0))
+    by_animal = (cls_long.groupby(["Measure", "Animal"])["Category"].value_counts()
+                         .unstack(fill_value=0).reindex(columns=cats, fill_value=0))
+    for t in (overall, by_animal):
+        t["n_files"] = t[cats].sum(axis=1)
+        t["pct_slope_positive"] = 100 * (t["Positive, significant"] + t["Positive, n.s."]) / t["n_files"]
+        t["pct_sig_positive"] = 100 * t["Positive, significant"] / t["n_files"]
+        t["pct_sig_negative"] = 100 * t["Negative, significant"] / t["n_files"]
+    cols = ["Measure", "Session", "Animal", "Recording", "beta1", "beta1_se", "intercept",
+            "r", "r2", "pvalue", "qvalue", "n_bins", "Category"]
+    with pd.ExcelWriter(OUTPUT_DIR / "IndividualCorrel_per_file.xlsx") as xw:
+        cls_long[cols].to_excel(xw, sheet_name="per_file", index=False)
+        overall.reset_index().to_excel(xw, sheet_name="counts_all_files", index=False)
+        by_animal.reset_index().to_excel(xw, sheet_name="counts_by_animal", index=False)
+    print(overall.to_string())
+    return cls_long
+
+
 # %% ==================== Run metadata ===============================================
 
 def _script_path():
@@ -1265,13 +1707,23 @@ def save_run_metadata(meta_dir=META_DIR):
                                     'per recording folder; first in natural name order kept',
         'fig3_order':               'drop < MIN_SPEED_CMS, then per-session 90th percentile of '
                                     'mobile speeds; bins anchored at 0',
-        'rel_power_denominator':    'whole session (all speeds)',
+        'rel_power_denominator':    'whole session (all speeds), samples near clipping excluded',
         # ---- acquisition ----
         'NATIVE_FS':                NATIVE_FS,
         'ADBitVolts':               'read per file from the .ncs header (-ADBitVolts)',
         'ncs_dtype':                str(ncs_dtype),
         'ncs_samples_used':         'valid samples on a timestamp-anchored grid, gaps up to '
                                     '1 s interpolated (ncs_repair.py)',
+        # ---- ADC saturation ----
+        'InputRange':               'per-file, from .ncs header (-InputRange, uV)',
+        'REJECT_SATURATED_BINS':    REJECT_SATURATED_BINS,
+        'SATURATION_TOL_STEPS':     SATURATION_TOL_STEPS,
+        'SATURATION_MARGIN_S':      SATURATION_MARGIN_S,
+        'saturation_detection':     'raw repaired native-rate trace, before filtering; '
+                                    '|uV| >= InputRange - SATURATION_TOL_STEPS * ADBitVolts; '
+                                    'mapped to FS_LFP, each clipped run widened by '
+                                    'SATURATION_MARGIN_S both sides; time bins overlapping a '
+                                    'widened run removed; widened-run samples excluded from TotalPower',
         # ---- LFP cleaning (resample -> notch -> detrend -> low-pass) ----
         'FS_LFP':                   FS_LFP,
         'LINE_HARMONICS':           LINE_HARMONICS,
@@ -1303,6 +1755,12 @@ def save_run_metadata(meta_dir=META_DIR):
         'FIG3_SPEED_UPPER_PCTILE':  FIG3_SPEED_UPPER_PCTILE,
         'n_channels_for_bonferroni': 1,
         'ols_min_speed_bins':       3,
+        'INDIV_SPEED_UPPER_PCTILE': INDIV_SPEED_UPPER_PCTILE,
+        'INDIV_MIN_TIME_PER_BIN_S': f'{INDIV_MIN_TIME_PER_BIN_S} (speed bins with less data '
+                                    'dropped from the individual fits)',
+        'individual_correl':        f'per-file OLS of {[m[0] for m in INDIV_MEASURES]}, '
+                                    f'Benjamini-Hochberg FDR q < {INDIV_FDR_Q} across fitted files '
+                                    'per measure; % denominator = all analysed files',
         # ---- plots ----
         'ANIMAL_COLORS':            ANIMAL_COLORS,
         'figure_dpi':               200,
@@ -1338,5 +1796,6 @@ if __name__ == "__main__":
     if df["Session"].nunique() > 0:
         run_speed_vs_theta_stats(df)                    # mixed model (session as random intercept)
         run_speed_vs_theta_persession_stats(df)          # Dunn et al. Fig. 3's per-session OLS
+        run_individual_correlations(df)                  # one OLS plot per file + % positive
     else:
         print('No sessions processed successfully -- skipping speed vs. theta statistics.')
