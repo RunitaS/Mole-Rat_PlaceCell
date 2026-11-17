@@ -27,7 +27,13 @@ Widths are given in bins and in cm (bins x bin side, bin side =
 sqrt(area_cm2 / n_bins)).
 
 Circular-track fields ('bin_coords' are 1-D angular bins, e.g. '25;26;27')
-have no 2-D shape; their shape columns are left blank (NaN).
+have no 2-D shape themselves; their shape columns are left blank (NaN) unless
+2-D bins are passed to add_field_shape (`shape_coords`). The caller
+(ArenaSessionType_StatsComparison_v21) gets those from a linearized 2-D map of
+the ring: column = angular bin counted from a cut (linearization_cut: the
+theta = 0 seam, moved one bin at a time until it does not pass through a
+field), row = radial bin, so each field becomes one 2-D bin set in the same
+'x-y' form as the other arenas.
 
 field_width_lines gives the two widths as line segments for plotting: the max
 width between the two farthest bin centres, the min width between the two
@@ -172,12 +178,48 @@ def field_width_lines(bin_coords) -> dict | None:
             'min_calipers': np.array([[t_lo * t + p * n, t_hi * t + p * n] for p in (p_lo, p_hi)])}
 
 
-def add_field_shape(fields: pd.DataFrame) -> pd.DataFrame:
-    """Copy of the 'PlaceFields' dataframe with the SHAPE_COLUMNS added."""
+def linearization_cut(field_bins, n_theta: int, start: int = 0) -> int:
+    """Where to cut a ring of `n_theta` angular bins to unroll it into a line:
+    the bin the line starts at. The cut lies between bins c - 1 and c; it
+    starts at `start` (0 = the theta = 0 seam) and moves one bin forward
+    until no field holds both c - 1 and c, so no field is split between the
+    two ends of the line. `field_bins`: one list of angular bin indices per
+    field. ValueError if every possible cut passes through a field (a single
+    field around the whole ring)."""
+    inside = [set(int(b) % n_theta for b in bins) for bins in field_bins]
+    for step in range(n_theta):
+        c = (start + step) % n_theta
+        if not any((c - 1) % n_theta in s and c in s for s in inside):
+            return c
+    raise ValueError('every cut of the ring passes through a place field')
+
+
+def linearized_column(bins, cut: int, n_theta: int) -> np.ndarray:
+    """Column on the unrolled ring (0 .. n_theta - 1) of angular bins `bins`,
+    for a cut at bin `cut` (linearization_cut)."""
+    return (np.asarray(bins, dtype=int) - cut) % n_theta
+
+
+def add_field_shape(fields: pd.DataFrame, shape_coords: pd.Series = None,
+                    shape_bin_cm: pd.Series = None) -> pd.DataFrame:
+    """Copy of the 'PlaceFields' dataframe with the SHAPE_COLUMNS added.
+
+    `shape_coords` (optional, same index as `fields`): 2-D 'x-y;...' bins that
+    replace 'bin_coords' for the shape wherever they are not NaN (Circle
+    fields on the linearized map); `shape_bin_cm`: the bin side (cm) of those
+    rows, replacing sqrt(area_cm2 / n_bins), which for a Circle field is the
+    area of an angular bin, not of a 2-D bin."""
     fields = fields.copy()
-    shp = pd.DataFrame([field_shape(b) for b in fields['bin_coords']], index=fields.index)
+    coords = fields['bin_coords']
+    if shape_coords is not None:
+        shape_coords = shape_coords.reindex(fields.index)
+        coords = shape_coords.where(shape_coords.notna(), coords)
+    shp = pd.DataFrame([field_shape(b) for b in coords], index=fields.index)
     bin_cm = np.sqrt(pd.to_numeric(fields['area_cm2'], errors='coerce')
                      / pd.to_numeric(fields['n_bins'], errors='coerce'))
+    if shape_bin_cm is not None:
+        shape_bin_cm = pd.to_numeric(shape_bin_cm.reindex(fields.index), errors='coerce')
+        bin_cm = shape_bin_cm.where(shape_bin_cm.notna(), bin_cm)
 
     fields['fld_max_width_bins']  = shp['max_width']
     fields['fld_min_width_bins']  = shp['min_width']
@@ -192,13 +234,26 @@ def add_field_shape(fields: pd.DataFrame) -> pd.DataFrame:
     return fields
 
 
+def _cell_value(v):
+    """Workbook value of one dataframe cell: None for NaN / None, numbers
+    rounded to 4 decimals, booleans and text unchanged."""
+    if v is None or (isinstance(v, float) and np.isnan(v)) or v is pd.NA:
+        return None
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return round(float(v), 4)
+    return str(v)
+
+
 def save_shape_columns(in_path: str, out_path: str, fields: pd.DataFrame,
-                       sheet: str = 'PlaceFields'):
-    """Write a copy of workbook `in_path` to `out_path` with the SHAPE_COLUMNS
-    of `fields` (same rows, same order as `sheet`) written into `sheet` --
-    into the first empty columns after the existing ones, or over columns of
-    the same name if they already exist. Other sheets are copied unchanged.
-    `in_path` itself is not modified."""
+                       sheet: str = 'PlaceFields', columns: list = None):
+    """Write a copy of workbook `in_path` to `out_path` with the `columns`
+    (default SHAPE_COLUMNS) of `fields` (same rows, same order as `sheet`)
+    written into `sheet` -- into the first empty columns after the existing
+    ones, or over columns of the same name if they already exist. Other
+    sheets are copied unchanged. `in_path` itself is not modified."""
+    columns = SHAPE_COLUMNS if columns is None else columns
     wb = openpyxl.load_workbook(in_path)
     ws = wb[sheet]
     if ws.max_row - 1 != len(fields):
@@ -210,13 +265,13 @@ def save_shape_columns(in_path: str, out_path: str, fields: pd.DataFrame,
         header.pop()
     col_of = {name: i + 1 for i, name in enumerate(header) if name is not None}
     next_col = len(header) + 1
-    for name in SHAPE_COLUMNS:
+    for name in columns:
         if name not in col_of:
             col_of[name] = next_col
             next_col += 1
         col = col_of[name]
         head = ws.cell(row=1, column=col, value=name)
         head.font = copy(ws.cell(row=1, column=1).font)
-        for r, v in enumerate(fields[name].to_numpy(dtype=float), start=2):
-            ws.cell(row=r, column=col, value=None if np.isnan(v) else round(float(v), 4))
+        for r, v in enumerate(fields[name].tolist(), start=2):
+            ws.cell(row=r, column=col, value=_cell_value(v))
     wb.save(out_path)

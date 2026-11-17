@@ -112,12 +112,14 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
+from Codes.ManageFiles.batch_occupancy_maps_v1 import OUTPUT_DIR
+
 # ============================================================================
 # Configuration -- EDIT THESE
 # ============================================================================
 
 ROOT_FOLDER = Path(r"X:/NMR_group_data/Runita/Analysis/Mean_KDE_Open_PascalOldenburg/LinearTrack_GeoMagVsZero/Data")
-OUTPUT_SUBFOLDER = 'ThetaPhaseReversals'           # created inside each session folder
+OUTPUT_SUBFOLDER = os.path.join(OUTPUT_DIR, 'Results', 'ThetaPhaseReversals')  # created inside each session folder
 SUMMARY_EXCEL_NAME = 'ThetaPhaseReversal_Summary.xlsx'   # written to ROOT_FOLDER
 
 MANUAL_REVIEW = False    # True: after detecting all files, open the GUI to accept/reject each reversal

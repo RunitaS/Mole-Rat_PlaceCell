@@ -65,6 +65,11 @@ except:
     The individual fits drop no upper tail of speeds (the group per-session
     OLS keeps the 90th-percentile cut); instead a speed bin is kept only with
     >= INDIV_MIN_TIME_PER_BIN_S (5 s) of data.
+    Files significant for BOTH Frequency and PowerRel are counted by the
+    signs of their two slopes (both positive = red, both negative = blue,
+    opposite = violet, the RGB mix of the two), overall and per animal
+    -> IndividualCorrel_BothSignificant.png/.xlsx. Re-plot this figure alone
+    from the saved per-file workbook with IndividualCorrel_BothSignificant.py.
   * ADC saturation removed (REJECT_SATURATED_BINS), as in
     Figc_ACG_ScalingCorrected_v11_SaturationReject.py: the amplifier clips at
     +/-InputRange, read from each file's own .ncs header (1500 or 1000 uV).
@@ -1622,6 +1627,136 @@ def plot_percent_positive(cls_long, out_path):
     plt.close(fig)
 
 
+# ---- Files significant for both measures (frequency AND relative power) ----
+# Only files whose slope is FDR-significant (CORREL_CATEGORIES "... significant")
+# for every measure in INDIV_MEASURES are kept; each is put in one class by the
+# signs of its two slopes. Colours: the significant-positive red and
+# significant-negative blue of CORREL_CATEGORIES, and their exact 50/50 RGB
+# mixture (violet) for opposite signs.
+def _mix_hex(c1, c2):
+    """Per-channel RGB average of two '#rrggbb' colours."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return '#' + ''.join(f'{round((x + y) / 2):02x}' for x, y in zip(a, b))
+
+
+_CORREL_COLOR = dict(CORREL_CATEGORIES)
+BOTH_SIG_CATEGORIES = [
+    ("Both positive",  _CORREL_COLOR["Positive, significant"]),
+    ("Opposite signs", _mix_hex(_CORREL_COLOR["Positive, significant"],
+                                _CORREL_COLOR["Negative, significant"])),
+    ("Both negative",  _CORREL_COLOR["Negative, significant"]),
+]
+_SIG_SIGN = {"Positive, significant": 1, "Negative, significant": -1}
+
+
+def both_significant_table(cls_long):
+    """One row per file: each measure's slope, q-value and class, whether the
+    file is significant for all INDIV_MEASURES, and its sign combination
+    (BOTH_SIG_CATEGORIES; empty if not significant for both)."""
+    cols = [m[0] for m in INDIV_MEASURES]
+    meta = cls_long.drop_duplicates("Session").set_index("Session")[["Animal", "Recording"]]
+    wide = cls_long.pivot(index="Session", columns="Measure", values=["beta1", "qvalue", "Category"])
+    out = meta.copy()
+    for col in cols:
+        for v in ("beta1", "qvalue", "Category"):
+            out[f"{v}_{col}"] = wide[(v, col)]
+    signs = pd.DataFrame({col: out[f"Category_{col}"].map(_SIG_SIGN) for col in cols})
+    both = signs.notna().all(axis=1)
+    out["BothSignificant"] = both
+    out["Combination"] = ""
+    out.loc[both & (signs > 0).all(axis=1), "Combination"] = "Both positive"
+    out.loc[both & (signs < 0).all(axis=1), "Combination"] = "Both negative"
+    opp = both & (out["Combination"] == "")
+    out.loc[opp, "Combination"] = "Opposite signs"
+    out["Direction"] = ""
+    out.loc[opp, "Direction"] = signs[opp].apply(
+        lambda r: ", ".join(f"{c} {'+' if r[c] > 0 else '−'}" for c in cols), axis=1)
+    return out.reset_index()
+
+
+def plot_both_significant(both_tbl, out_path):
+    """Number of files significant for both measures, per sign combination:
+    all files (left) and by animal (right)."""
+    sig = both_tbl[both_tbl["BothSignificant"]]
+    cats = [c for c, _ in BOTH_SIG_CATEGORIES]
+    animals = ordered_animals(both_tbl["Animal"])
+    n_all = int(len(both_tbl))
+    counts_all = sig["Combination"].value_counts().reindex(cats, fill_value=0)
+    counts_an = (sig.groupby("Animal")["Combination"].value_counts().unstack(fill_value=0)
+                    .reindex(index=animals, columns=cats, fill_value=0))
+    ymax = max(1, int(counts_all.max()))
+
+    fig = plt.figure(figsize=(4 + 1.6 * len(animals), 6.4))
+    gs = fig.add_gridspec(2, 2, height_ratios=[4, 1.1], width_ratios=[1.3, len(animals)])
+    ax0 = fig.add_subplot(gs[0, 0])
+    for i, (cat, color) in enumerate(BOTH_SIG_CATEGORIES):
+        ax0.bar(i, counts_all[cat], width=0.7, color=color, edgecolor='k', linewidth=0.6)
+        ax0.text(i, counts_all[cat] + 0.02 * ymax, str(counts_all[cat]),
+                 ha='center', va='bottom', fontsize=10)
+    ax0.set_xticks(range(len(cats)))
+    ax0.set_xticklabels(cats, rotation=30, ha='right', fontsize=9)
+    ax0.set_ylabel("Number of LFP files", fontsize=11)
+    ax0.set_title(f"All files\n({len(sig)} of {n_all} significant for both)", fontsize=11, weight='bold')
+
+    ax1 = fig.add_subplot(gs[0, 1], sharey=ax0)
+    w = 0.8 / len(cats)
+    for j, (cat, color) in enumerate(BOTH_SIG_CATEGORIES):
+        x = np.arange(len(animals)) + (j - (len(cats) - 1) / 2) * w
+        ax1.bar(x, counts_an[cat], width=w, color=color, edgecolor='k', linewidth=0.6)
+        for xi, n in zip(x, counts_an[cat]):
+            ax1.text(xi, n + 0.02 * ymax, str(n), ha='center', va='bottom', fontsize=9)
+    n_files_an = both_tbl.groupby("Animal").size().reindex(animals, fill_value=0)
+    ax1.set_xticks(range(len(animals)))
+    ax1.set_xticklabels([f"{a}\n({int(counts_an.loc[a].sum())} of {n_files_an[a]})" for a in animals],
+                        fontsize=9)
+    ax1.set_title("By animal", fontsize=11, weight='bold')
+    ax1.tick_params(labelleft=False)
+    for ax in (ax0, ax1):
+        ax.set_ylim(0, ymax * 1.15 + 0.5)
+        ax.yaxis.get_major_locator().set_params(integer=True)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    titles = {col: title for col, title, _ in INDIV_MEASURES}
+    opp = sig.loc[sig["Combination"] == "Opposite signs", "Direction"].value_counts()
+    opp_txt = "; ".join(f"{d}: {n}" for d, n in opp.items()) if len(opp) else "none"
+    lines = [
+        f"Kept: files whose slope is significant (BH-FDR q < {INDIV_FDR_Q:g}, per measure) for both "
+        + " and ".join(titles.values()) + f" ({len(sig)} of {n_all} analysed files).",
+        f"Opposite signs split: {opp_txt}.",
+    ]
+    axl = fig.add_subplot(gs[1, :])
+    axl.axis('off')
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=c, edgecolor='k', linewidth=0.6)
+               for _, c in BOTH_SIG_CATEGORIES]
+    axl.legend(handles, cats, loc='upper center', ncol=len(cats), frameon=False, fontsize=9)
+    axl.text(0.5, 0.5, "\n".join(lines), transform=axl.transAxes, ha='center', va='top',
+             fontsize=9, linespacing=1.5)
+    fig.suptitle("Theta frequency and power both modulated by speed: direction",
+                 fontsize=12, weight='bold')
+    fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig)
+
+
+def save_both_significant(cls_long, out_dir=OUTPUT_DIR):
+    """IndividualCorrel_BothSignificant.png + .xlsx (per-file table and counts)."""
+    tbl = both_significant_table(cls_long)
+    plot_both_significant(tbl, Path(out_dir) / "IndividualCorrel_BothSignificant.png")
+    cats = [c for c, _ in BOTH_SIG_CATEGORIES]
+    sig = tbl[tbl["BothSignificant"]]
+    counts = (sig.groupby("Animal")["Combination"].value_counts().unstack(fill_value=0)
+                 .reindex(index=ordered_animals(tbl["Animal"]), columns=cats, fill_value=0))
+    counts.loc["All files"] = counts.sum()
+    n_files = tbl.groupby("Animal").size()
+    counts["n_both_significant"] = counts[cats].sum(axis=1)
+    counts["n_files"] = [n_files.get(a, 0) for a in counts.index[:-1]] + [len(tbl)]
+    with pd.ExcelWriter(Path(out_dir) / "IndividualCorrel_BothSignificant.xlsx") as xw:
+        tbl.to_excel(xw, sheet_name="per_file", index=False)
+        counts.rename_axis("Animal").reset_index().to_excel(xw, sheet_name="counts", index=False)
+    print(counts.to_string())
+    return tbl
+
+
 def run_individual_correlations(df):
     """Per-file OLS fits, FDR classes, one PNG per file in INDIV_DIR, the
     % summary figure and IndividualCorrel_per_file.xlsx."""
@@ -1650,6 +1785,7 @@ def run_individual_correlations(df):
             print(f'  individual correlation plots: {i}/{len(sessions)}')
 
     plot_percent_positive(cls_long, OUTPUT_DIR / "IndividualCorrel_PercentPositive.png")
+    save_both_significant(cls_long, OUTPUT_DIR)   # files significant for both measures
 
     cats = [c for c, _ in CORREL_CATEGORIES]
     overall = (cls_long.groupby("Measure")["Category"].value_counts().unstack(fill_value=0)
