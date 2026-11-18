@@ -9,11 +9,18 @@ PlaceCell_Main_v21 workbook (place_cell == True rows only):
   Mean    3 cells whose SIR is closest to that arena's MEDIAN SIR (SIR is
           right-skewed, so the median is the typical cell); cells already
           picked as Best / Worst are excluded
-and draws each cell as one row of four panels, left to right:
+and draws each cell as one row of five panels, left to right:
   1. trajectory (gray) with spike locations (red)
   2. Gaussian-smoothed ratemap, full session
   3. Gaussian-smoothed ratemap, first half of the session
   4. Gaussian-smoothed ratemap, second half of the session
+  5. the cell's scores, read from its row in the workbook (the values the
+     PlaceCell_Main_v21 run wrote, not recomputed here): peak and mean firing
+     rate, spatial information (SIR, bits/spike), coherence, sparsity and the
+     split-half stability score with its p value. Stability is coloured
+       green      p < 0.05 and r > 0
+       red        p < 0.05 and r < 0
+       dark grey  p >= 0.05 (or not computed)
 Every ratemap panel is scaled to ITS OWN peak (colour scale 0 .. that map's
 max, peak given in the panel title); no panel shares a colour scale.
 
@@ -75,7 +82,7 @@ root_folder = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\S
 input_excel = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\All_TT_PlaceChar_SiSkaggsAdptBin_Final_OnlyPC.xlsx'
 
 # Figures go here, one subfolder per arena.
-FIGURES_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\BestWorstMedian_SIR'
+FIGURES_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\Results\BestWorstMedian_SIR\Vals'
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -90,6 +97,13 @@ pc.COHERENCE_STABILITY_RATEMAP_TYPE = 'gaussian_smooth'
 CMAP        = 'jet'
 TRAJ_COLOR  = '0.6'
 SPIKE_COLOR = 'red'
+
+# Scores panel: workbook columns written by PlaceCell_Main_v21.
+STABILITY_ALPHA      = 0.05
+STAB_POS_SIG_COLOR   = 'green'      # p < alpha, r > 0
+STAB_NEG_SIG_COLOR   = 'red'        # p < alpha, r < 0
+STAB_NOT_SIG_COLOR   = 'dimgray'    # p >= alpha or not computed
+METRIC_TEXT_COLOR    = 'black'
 
 
 # ── Cell selection ────────────────────────────────────────────────────────────
@@ -183,8 +197,8 @@ def _cell_maps(ctx: dict) -> dict:
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
 def _draw_row(fig, axes, cell: pd.Series, maps: dict) -> None:
-    """One cell: trajectory + spikes, then the three ratemaps, each scaled to
-    its own peak."""
+    """One cell: trajectory + spikes, the three ratemaps (each scaled to its
+    own peak), then the scores panel."""
     ax_traj = axes[0]
     ax_traj.plot(maps['x_all'], maps['y_all'], color=TRAJ_COLOR, linewidth=0.5)
     ax_traj.plot(maps['x_spk'], maps['y_spk'], '.', color=SPIKE_COLOR, markersize=3)
@@ -194,8 +208,7 @@ def _draw_row(fig, axes, cell: pd.Series, maps: dict) -> None:
     ax_traj.set_title(f'Trajectory + spikes (n = {len(maps["x_spk"])})', fontsize=9)
     ax_traj.set_xlabel('x (cm)')
     ax_traj.set_ylabel(f'{cell["group"]} {cell["rank"]}\n'
-                       f'{cell["session"]}\n{cell["unit"]}\n'
-                       f'SIR = {cell[SIR_COLUMN]:.3f}\n\ny (cm)', fontsize=8)
+                       f'{cell["session"]}\n{cell["unit"]}\n\ny (cm)', fontsize=8)
 
     for ax, (title, rate) in zip(axes[1:], maps['maps']):
         peak = float(rate.max()) if rate.count() else 0.0
@@ -206,17 +219,62 @@ def _draw_row(fig, axes, cell: pd.Series, maps: dict) -> None:
         ax.set_ylabel('y (cm)')
         fig.colorbar(im, ax=ax, label='firing rate (Hz)', shrink=0.8)
 
+    _draw_scores(axes[4], cell)
+
+
+def _num(value) -> float:
+    """Workbook value as float (NaN when missing or not numeric)."""
+    v = pd.to_numeric(value, errors='coerce')
+    return float(v) if pd.notna(v) else float('nan')
+
+
+def _fmt(value: float, fmt: str, unit: str = '') -> str:
+    return 'n/a' if np.isnan(value) else f'{value:{fmt}}{unit}'
+
+
+def _stability_color(r: float, p: float) -> str:
+    if np.isnan(r) or np.isnan(p) or p >= STABILITY_ALPHA:
+        return STAB_NOT_SIG_COLOR
+    if r > 0:
+        return STAB_POS_SIG_COLOR
+    if r < 0:
+        return STAB_NEG_SIG_COLOR
+    return STAB_NOT_SIG_COLOR
+
+
+def _draw_scores(ax, cell: pd.Series) -> None:
+    """Text panel with the cell's workbook scores; stability coloured by its
+    sign and significance."""
+    ax.axis('off')
+    r = _num(cell.get('stability_score'))
+    p = _num(cell.get('stability_p_value'))
+    lines = [
+        (f'Peak FR = {_fmt(_num(cell.get("peak_fr")), ".2f", " Hz")}',            METRIC_TEXT_COLOR),
+        (f'Mean FR = {_fmt(_num(cell.get("mean_fr")), ".2f", " Hz")}',            METRIC_TEXT_COLOR),
+        (f'SI = {_fmt(_num(cell.get(SIR_COLUMN)), ".3f", " bits/spike")}',        METRIC_TEXT_COLOR),
+        (f'Coherence = {_fmt(_num(cell.get("coherence")), ".3f")}',               METRIC_TEXT_COLOR),
+        (f'Sparsity = {_fmt(_num(cell.get("sparsity")), ".3f")}',                 METRIC_TEXT_COLOR),
+        (f'Stability r = {_fmt(r, ".3f")}',                                       _stability_color(r, p)),
+        (f'   (p = {_fmt(p, ".3g")})',                                            _stability_color(r, p)),
+    ]
+    # Fixed point spacing from the top of the panel, so short (horizontal
+    # Linear) rows do not squeeze the lines together.
+    for i, (text, color) in enumerate(lines):
+        ax.annotate(text, xy=(0.0, 1.0), xycoords='axes fraction',
+                    xytext=(0, -13 * i), textcoords='offset points',
+                    fontsize=9, color=color, va='top', ha='left')
+
 
 def _save_figure(cells: list[tuple[pd.Series, dict]], title: str, save_path: str) -> None:
     # One subfigure per cell, its height following the map's y/x aspect, so
     # horizontal Linear tracks (0 / 180) are not squashed into the row height
     # of vertical ones (90 / 270) or of the Open / Circle arenas.
     heights = [float(np.clip(m['extent'][3] / m['extent'][1], 0.35, 1.0)) for _, m in cells]
-    fig = Figure(figsize=(18, 4.4 * sum(heights) + 0.5), layout='constrained')
+    fig = Figure(figsize=(21, 4.4 * sum(heights) + 0.5), layout='constrained')
     FigureCanvasAgg(fig)
     subfigs = fig.subfigures(len(cells), 1, height_ratios=heights, squeeze=False)[:, 0]
     for subfig, (cell, maps) in zip(subfigs, cells):
-        _draw_row(subfig, subfig.subplots(1, 4), cell, maps)
+        _draw_row(subfig, subfig.subplots(1, 5, width_ratios=[1, 1, 1, 1, 0.6]), cell, maps)
     fig.suptitle(title, fontsize=11)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, dpi=150)
