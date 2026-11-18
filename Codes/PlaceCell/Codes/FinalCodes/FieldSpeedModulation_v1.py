@@ -2,7 +2,7 @@
 """
 Speed modulation of the firing INSIDE each place field, one test per field,
 and the proportion of place fields that are speed-modulated compared across
-the conditions of ArenaSessionType_StatsComparison_v20.py.
+the conditions of ArenaSessionType_StatsComparison_v21.py.
 
 Per field (the analysis of PlaceCell_Main_v21._compute_speed_modulation,
 restricted to the time the animal spends inside the field):
@@ -52,11 +52,11 @@ restricted to the time the animal spends inside the field):
   highlighted): <session>\\FIELD_SPEED_SUBDIR\\<unit>_F<n>_field_speed_modulation.png
   under PLACE_CELL_FOLDER.
 
-Speed class of a field (as v20's add_speed_class): p-type if speed_cell is True
+Speed class of a field (as v21's add_speed_class): p-type if speed_cell is True
 and final_speed_score > 0, n-type if < 0, non-modulated otherwise (speed_cell
 False or 'not tested'); fields with no final_speed_score have no class.
 
-Statistics (functions of ArenaSessionType_StatsComparison_v20, imported as asc),
+Statistics (functions of ArenaSessionType_StatsComparison_v21, imported as asc),
 one folder per level in OUTPUT_DIR:
   SessionType\\<arena>\\       level 1, session types within each arena
   ArenaType\\                  level 2, Circle / Linear / Open
@@ -76,7 +76,7 @@ Each folder:
                                           cell's whole-session class (workbook
                                           'Full': speed_cell + final_speed_score);
                                           chi-square of independence per group
-Fields of one cell are treated as independent rows (as v20 treats its
+Fields of one cell are treated as independent rows (as v21 treats its
 per-field multi-peak metrics).
 
 Outputs:
@@ -110,11 +110,11 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # CellClusteredStats_Utils.py lives one folder up (appended, so this folder's
-# PlaceCell_Main_v21.py and ArenaSessionType_StatsComparison_v20.py come first).
+# PlaceCell_Main_v21.py and ArenaSessionType_StatsComparison_v21.py come first).
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import PlaceCell_Main_v21 as pc
-import ArenaSessionType_StatsComparison_v20 as asc   # statistics + plot style
+import ArenaSessionType_StatsComparison_v21 as asc   # statistics + plot style
 import CellClusteredStats_Utils as ccs
 import PlaceFieldShape_Utils as pfs
 

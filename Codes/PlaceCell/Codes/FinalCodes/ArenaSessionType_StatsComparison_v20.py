@@ -141,7 +141,13 @@ Metrics compared (all restricted to place_cell == True):
 
   Proportions: place-cell yield, theta modulation, coherence shuffle
   significance, split-half stability significance, speed cells, and the
-  p-Speed / n-Speed / non-speed classification.
+  p-Speed / n-Speed / non-speed classification. Split-half stability
+  significance is also split by the sign of the score: 'stability_sig_pos'
+  (% of place cells with p <= 0.05 and score > 0) and 'stability_sig_neg'
+  (p <= 0.05 and score < 0), both out of ALL place cells with a stability
+  type, so the two add up to the % significant
+  (Categorical_stability_sig_pos.png / Categorical_stability_sig_neg.png at
+  every level; standalone: StabilitySignSig_Comparison_v1.py).
 
   Temporal stability (V15, merged from TemporalStabilityMap_v6_MapPassStability.py;
   one value per cell, TEMPORAL_STABILITY_METRICS, box plots / histograms
@@ -864,6 +870,8 @@ CATEGORICAL_METRICS_PLACE_CELLS = {
     'theta_modulated':          'Theta modulation (% of place cells)',
     'coherence_bootstrap_sig':  'Coherence shuffle significance (% of place cells)',
     'stability_significant':    'Split-half stability significance, p <= 0.05 (% of place cells)',
+    'stability_sig_pos':        'Significant POSITIVE split-half stability, p <= 0.05 and score > 0 (% of place cells)',
+    'stability_sig_neg':        'Significant NEGATIVE split-half stability, p <= 0.05 and score < 0 (% of place cells)',
     'speed_cell_final':         'Speed cells (% of place cells)',
 }
 
@@ -1115,6 +1123,10 @@ def build_full_metrics_df(full: pd.DataFrame) -> pd.DataFrame:
     df['stability_significant'] = df['stability_p_value'].apply(_stability_sig)
     df['stability_type'] = [_stability_type(s, p) for s, p in
                             zip(df['stability_score'], df['stability_p_value'])]
+    # % of ALL place cells with significant positive / negative stability: True for
+    # that type, False for the other two, None if the cell has no stability type.
+    for col, key in (('stability_sig_pos', 'SigPos'), ('stability_sig_neg', 'SigNeg')):
+        df[col] = df['stability_type'].map(lambda t, key=key: None if t is None or pd.isna(t) else t == key)
     return df
 
 

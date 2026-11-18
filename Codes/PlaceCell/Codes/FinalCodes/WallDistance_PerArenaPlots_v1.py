@@ -2,7 +2,7 @@
 WallDistance_PerArenaPlots_v1.py
 
 Standalone re-plot of the ArenaType wall-distance figures, one arena at a time,
-without re-running ArenaSessionType_StatsComparison_v20.py.
+without re-running ArenaSessionType_StatsComparison_v21.py.
 
 The ArenaType\\WallDistance\\WallDist_*.png plots put Circle, Linear and Open on
 one y-axis; the Circle values stretch it so far that trends in the other arenas
@@ -19,21 +19,21 @@ text: that arena's trend with wall distance and its across-distance test, the
 same tests as in the combined plots (no pooled / interaction / matched-distance
 lines, which compare arenas). The combined plots are left untouched.
 
-Everything comes from v20 (settings, data building, tests, plot code, imported
-from ArenaSessionType_StatsComparison_v20.py). To be fast it reuses the outputs
-of the last v20 run instead of recomputing them:
-  * wall distance of every unit: sheet 'WD_Cells' of v20's STATS_XLSX
+Everything comes from v21 (settings, data building, tests, plot code, imported
+from ArenaSessionType_StatsComparison_v21.py). To be fast it reuses the outputs
+of the last v21 run instead of recomputing them:
+  * wall distance of every unit: sheet 'WD_Cells' of v21's STATS_XLSX
     (re-scans WD_PLACE_CELL_DIR only if that sheet is missing),
   * temporal stability: sheet 'PerCell' of OUTPUT_DIR\\TS_RESULTS_XLSX
     (re-runs the maps only if missing),
   * multi-peak fields: MULTIPEAK_EXCEL (re-runs the KDE only if missing),
   * within-field rate: INPUT_EXCEL column if present, else sheet 'PerCell' of
     OUTPUT_DIR\\IFR_RESULTS_XLSX (rebuilt, and that file written, only if missing).
-INPUT_EXCEL's 'Full' / 'PlaceFields' are read directly (FIELD_SHAPE_EXCEL is not
-rewritten). Apart from the plots (and IFR_RESULTS_XLSX when it has to be
+INPUT_EXCEL's 'Full' / 'PlaceFields' are read directly; the Circle field shapes
+(linearized, V21) come from FIELD_SHAPE_EXCEL, which is only read, not rewritten. Apart from the plots (and IFR_RESULTS_XLSX when it has to be
 rebuilt), nothing in OUTPUT_DIR is written.
 
-The same per-arena plots are made by v20 itself when WD_PER_ARENA_PLOTS = True.
+The same per-arena plots are made by v21 itself when WD_PER_ARENA_PLOTS = True.
 """
 
 import os
@@ -43,14 +43,42 @@ from dataclasses import replace
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import ArenaSessionType_StatsComparison_v20 as v  # noqa: E402
+import ArenaSessionType_StatsComparison_v21 as v  # noqa: E402
 
 
 def load_inputs():
-    """full, fields of INPUT_EXCEL (with the field-shape columns, nothing saved)."""
+    """full, fields of INPUT_EXCEL with the field-shape columns (nothing saved).
+    2-D arenas: from 'bin_coords'. Circle fields (V21, linearized 2-D map): the
+    shape and CIRCLE_LIN_COLUMNS of the last v21 run, from FIELD_SHAPE_EXCEL's
+    'PlaceFields'; rebuilt (v.add_all_field_shapes, slow) only if that workbook
+    has no linearization columns or CIRCLE_LIN_FIELD_SHAPE = False."""
     print(f'Loading {v.INPUT_EXCEL} ...')
     full = pd.read_excel(v.INPUT_EXCEL, sheet_name='Full')
-    fields = v.pfs.add_field_shape(pd.read_excel(v.INPUT_EXCEL, sheet_name='PlaceFields'))
+    fields = pd.read_excel(v.INPUT_EXCEL, sheet_name='PlaceFields')
+    if not v.CIRCLE_LIN_FIELD_SHAPE:
+        return full, v.pfs.add_field_shape(fields)
+
+    keys = ['session', 'unit', 'field_number']
+    shp = None
+    if os.path.isfile(v.FIELD_SHAPE_EXCEL):
+        shp = pd.read_excel(v.FIELD_SHAPE_EXCEL, sheet_name='PlaceFields')
+        if 'fld_lin_status' not in shp.columns:
+            shp = None
+    if shp is None:
+        print(f'No Circle linearization columns in {v.FIELD_SHAPE_EXCEL}; rebuilding them.')
+        return full, v.add_all_field_shapes(full, fields)
+
+    print(f'Field shapes (Circle: linearized, last v21 run): {v.FIELD_SHAPE_EXCEL}')
+    cols = v.pfs.SHAPE_COLUMNS + v.CIRCLE_LIN_COLUMNS
+    shp = shp[keys + cols].drop_duplicates(keys)
+    m = fields[keys].merge(shp, on=keys, how='left')
+    m.index = fields.index
+    fields = v.pfs.add_field_shape(fields)        # 2-D arenas from bin_coords
+    is_circle = fields['arena_type'].astype(str) == 'Circle'
+    for c in v.pfs.SHAPE_COLUMNS:
+        fields.loc[is_circle, c] = m.loc[is_circle, c]
+    for c in v.CIRCLE_LIN_COLUMNS:
+        fields[c] = m[c]
     return full, fields
 
 

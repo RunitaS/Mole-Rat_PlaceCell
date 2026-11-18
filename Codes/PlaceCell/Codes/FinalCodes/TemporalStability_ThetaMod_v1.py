@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Temporal stability of theta-modulated vs non-theta-modulated place cells,
-compared within every condition of ArenaSessionType_StatsComparison_v20.py.
+compared within every condition of ArenaSessionType_StatsComparison_v21.py.
 
 Nothing is recomputed from .ntt / tracking files: every value is read from
 workbooks that already exist.
 
 Inputs
-  TS_XLSX        TemporalStability.xlsx written by ArenaSessionType_StatsComparison_v20
+  TS_XLSX        TemporalStability.xlsx written by ArenaSessionType_StatsComparison_v21
                  (OUTPUT_DIR of that run), sheets 'PerCell' and 'PerField'.
   THETAMOD_XLSX  ThetaMod_Pure_v3.xlsx, sheet 'Units' (one row per unit and session).
 
@@ -23,14 +23,14 @@ Theta-modulation label (ThetaMod_Pure_v3, 'ThetaModulated' = Rayleigh+ & TMI+)
 Metrics (one value per cell, within its place fields)
   occ_wmean_pct_across_bins     bin-wise: mean over the cell's field bins of
                                 % visits with >= 1 spike, each bin weighted by its
-                                dwell (PerCell, as computed by v20)
+                                dwell (PerCell, as computed by v21)
   lap_occ_wmean_across_fields   lap-wise: mean over the cell's fields of
                                 lap_stability_score (fraction of passes with
                                 >= MIN_SPIKES_PER_PASS spikes), each field weighted
                                 by its dwell occupancy_s_field_bins (from PerField;
                                 fields with no pass are left out)
 
-Conditions (one folder each, same groups as v20)
+Conditions (one folder each, same groups as v21)
   SessionType\\<arena>\\        level 1: session types within each arena
   ArenaType\\                   level 2: Circle / Linear / Open
   AnimalControlledArenaType\\   level 3: ANIMAL_CONTROLLED_COMPARISONS side by side
@@ -62,8 +62,8 @@ from scipy import stats
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-import ArenaSessionType_StatsComparison_v20 as asc   # groups, colours, plot style
-from ArenaSessionType_StatsComparison_v20 import ccs, plu, plt
+import ArenaSessionType_StatsComparison_v21 as asc   # groups, colours, plot style
+from ArenaSessionType_StatsComparison_v21 import ccs, plu, plt
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -118,7 +118,7 @@ def lap_occ_weighted(per_field: pd.DataFrame) -> pd.DataFrame:
 
 def load_cells() -> pd.DataFrame:
     """PerCell temporal stability + lap-wise weighted value + theta class, tagged with
-    arena / session type / animal / cell_id like v20. Only TM / nonTM rows are kept."""
+    arena / session type / animal / cell_id like v21. Only TM / nonTM rows are kept."""
     print(f'Loading {TS_XLSX}')
     per_cell = pd.read_excel(TS_XLSX, sheet_name='PerCell')
     per_field = pd.read_excel(TS_XLSX, sheet_name='PerField')
@@ -411,8 +411,8 @@ def main():
         ('run_timestamp', datetime.now().isoformat(timespec='seconds')),
         ('script', os.path.abspath(__file__)), ('TS_XLSX', TS_XLSX),
         ('THETAMOD_XLSX', THETAMOD_XLSX), ('TESTED_ONLY', TESTED_ONLY),
-        ('MIN_SPIKES_PER_PASS (lap stability, from v20)', asc.MIN_SPIKES_PER_PASS),
-        ('ALPHA', ALPHA), ('LINK_CELLS_ACROSS_ARENAS (cell_id, from v20)',
+        ('MIN_SPIKES_PER_PASS (lap stability, from v21)', asc.MIN_SPIKES_PER_PASS),
+        ('ALPHA', ALPHA), ('LINK_CELLS_ACROSS_ARENAS (cell_id, from v21)',
                            asc.LINK_CELLS_ACROSS_ARENAS)], columns=['item', 'value'])
     xlsx = os.path.join(OUTPUT_DIR, 'TS_ThetaMod_AllStats.xlsx')
     with pd.ExcelWriter(xlsx, engine='openpyxl') as w:

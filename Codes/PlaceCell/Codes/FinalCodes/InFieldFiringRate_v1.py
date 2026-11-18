@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Within-field mean firing rate of every place cell, compared across the
-conditions of ArenaSessionType_StatsComparison_v20.py -- standalone, so it can
-run without re-running PlaceCell_Main_v22 or the whole v20 analysis.
+conditions of ArenaSessionType_StatsComparison_v21.py -- standalone, so it can
+run without re-running PlaceCell_Main_v22 or the whole v21 analysis.
 
 Within-field mean firing rate (one value per place cell):
     spikes while the animal was inside any of the cell's place fields
@@ -11,9 +11,9 @@ pooled over all of the cell's fields, moving frames only (speed >=
 pc.IMMOBILITY_SPEED_CMS, and the spikes assigned to those frames: the data behind
 mean_fr, the ratemaps and field_n_spikes). Equal to the occupancy-weighted mean
 of the raw rate over all field bins. Same computation as PlaceCell_Main_v22
-(pc._infield_firing_rate) and v20 (asc.run_infield_rate, used here):
+(pc._infield_firing_rate) and v21 (asc.run_infield_rate, used here):
   1. Place cells (place_cell True) and their fields (bin_coords) from INPUT_EXCEL
-     ('Full', 'PlaceFields'), the workbook of the v20 statistics.
+     ('Full', 'PlaceFields'), the workbook of the v21 statistics.
   2. Each cell's moving-only spike-count and occupancy maps are rebuilt with
      PlaceCell_Main_v22.compute_metrics from its .ntt + tracking file in
      PLACE_CELL_FOLDER (2-D grid; Circle track: the angular maps of
@@ -27,7 +27,7 @@ of the raw rate over all field bins. Same computation as PlaceCell_Main_v22
   INPUT_EXCEL field_n_spikes. EXCLUDE_RATEMAP_MISMATCH = True leaves cells that
   fail ratemap_check out of the statistics.
 
-Statistics and plots (functions of ArenaSessionType_StatsComparison_v20,
+Statistics and plots (functions of ArenaSessionType_StatsComparison_v21,
 imported as asc; same tests, colours, point shading by SIR, Holm correction),
 one folder per level in OUTPUT_DIR:
   SessionType\\<arena>\\       level 1, session types within each arena
@@ -41,7 +41,7 @@ Each folder:
                                            (Kruskal-Wallis + pairwise Mann-Whitney U,
                                            Holm-Bonferroni; rows = unit x session)
   Histograms\\Hist_Full_infield_mean_fr.png one histogram per group
-The wall-distance analysis of v20 is not repeated here.
+The wall-distance analysis of v21 is not repeated here.
 
 Outputs:
   OUTPUT_DIR\\InFieldFiringRate.xlsx    PerCell, PerField (written by asc.run_infield_rate)
@@ -66,16 +66,16 @@ import matplotlib
 matplotlib.use('Agg')
 
 # CellClusteredStats_Utils.py lives one folder up (appended, so this folder's
-# PlaceCell_Main_v22.py and ArenaSessionType_StatsComparison_v20.py come first).
+# PlaceCell_Main_v22.py and ArenaSessionType_StatsComparison_v21.py come first).
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import PlaceCell_Main_v22 as pc
-import ArenaSessionType_StatsComparison_v20 as asc   # rate rebuild, statistics, plot style
+import ArenaSessionType_StatsComparison_v21 as asc   # rate rebuild, statistics, plot style
 import CellClusteredStats_Utils as ccs
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
-# Place cells ('Full') and their fields ('PlaceFields', bin_coords): v20's INPUT_EXCEL.
+# Place cells ('Full') and their fields ('PlaceFields', bin_coords): v21's INPUT_EXCEL.
 INPUT_EXCEL = asc.INPUT_EXCEL
 
 # .ntt + tracking files of those place cells (one folder per session).
@@ -98,7 +98,7 @@ RUN_SNAPSHOT_SUBDIR = 'RunSnapshots'
 METRICS = {asc.INFIELD_RATE_COL: asc.INFIELD_RATE_LABEL}
 PLOT_PREFIX = 'Full'
 
-# Rate-rebuild settings of v20 / PlaceCell_Main_v22 (listed so the run snapshot records them).
+# Rate-rebuild settings of v21 / PlaceCell_Main_v22 (listed so the run snapshot records them).
 RATEMAP_CHECK_TOL_HZ = asc.IFR_RATEMAP_CHECK_TOL_HZ
 MAX_WORKERS          = asc.IFR_MAX_WORKERS
 IMMOBILITY_SPEED_CMS = pc.IMMOBILITY_SPEED_CMS
@@ -120,7 +120,7 @@ def run_rate_comparison(grp, df: pd.DataFrame, plots_dir: str) -> dict:
         print('No values; skipping.')
         return {}
     os.makedirs(plots_dir, exist_ok=True)
-    # Point shade: the cell's SIR rank among this comparison's place cells (as v20).
+    # Point shade: the cell's SIR rank among this comparison's place cells (as v21).
     grp = replace(grp, shade=asc.cell_shades(df))
 
     desc, omni, post = asc.run_all_comparisons(df, METRICS, PLOT_PREFIX, grp, plots_dir)
@@ -169,7 +169,7 @@ def _module_settings() -> dict:
 
 def save_run_snapshot() -> str:
     """This script + the local modules it uses, and RunMetadata.xlsx (run info +
-    every setting of this script, v20 and PlaceCell_Main_v22), in
+    every setting of this script, v21 and PlaceCell_Main_v22), in
     OUTPUT_DIR\\RUN_SNAPSHOT_SUBDIR\\<timestamp>."""
     now = datetime.now()
     snap = os.path.join(OUTPUT_DIR, RUN_SNAPSHOT_SUBDIR, now.strftime('%Y%m%d_%H%M%S'))

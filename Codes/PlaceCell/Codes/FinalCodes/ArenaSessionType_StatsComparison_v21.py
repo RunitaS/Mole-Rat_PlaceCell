@@ -149,7 +149,13 @@ Metrics compared (all restricted to place_cell == True):
 
   Proportions: place-cell yield, theta modulation, coherence shuffle
   significance, split-half stability significance, speed cells, and the
-  p-Speed / n-Speed / non-speed classification.
+  p-Speed / n-Speed / non-speed classification. Split-half stability
+  significance is also split by the sign of the score: 'stability_sig_pos'
+  (% of place cells with p <= 0.05 and score > 0) and 'stability_sig_neg'
+  (p <= 0.05 and score < 0), both out of ALL place cells with a stability
+  type, so the two add up to the % significant
+  (Categorical_stability_sig_pos.png / Categorical_stability_sig_neg.png at
+  every level; standalone: StabilitySignSig_Comparison_v1.py).
 
   Temporal stability (V15, merged from TemporalStabilityMap_v6_MapPassStability.py;
   one value per cell, TEMPORAL_STABILITY_METRICS, box plots / histograms
@@ -333,6 +339,12 @@ Metrics compared (all restricted to place_cell == True):
     distance, or % yes with Wilson 95 % CI per distance; the groups side by side
     at each distance, the tests underneath. No plots for comparisons with a
     single distance level (SessionType\\Circle).
+    Per-arena plots (WD_PER_ARENA_PLOTS; ArenaType comparison only): every
+    'WallDist_*.png' again with one arena alone, in ArenaType\\WallDistance\\<arena>\\
+    (Circle, Linear, Open); y-axis scaled to that arena's values only (yes/no
+    metrics: to that arena's % and CI range instead of 0-100 %), x-axis to its own
+    distance levels; stats text = that arena's trend + across-distance test.
+    Standalone re-plot: WallDistance_PerArenaPlots_v1.py.
 
 Place-field dimension figures (V19; switched off with
 INCLUDE_FIELD_DIMENSION_MAPS = False). One figure per place cell of
@@ -739,6 +751,10 @@ LINEAR_ENDS_ARE_WALLS = True
 WD_DIST_W       = 0.6
 WD_GROUP_OFFSET = 0.22
 
+# ArenaType comparison: also save every WallDist_*.png per arena, alone and on its own
+# y-scale, to ArenaType\WallDistance\<arena>\ (Circle, Linear, Open).
+WD_PER_ARENA_PLOTS = True
+
 # Arena geometry
 WD_BIN_CM                   = 2.0
 WD_OPEN_DIAMETER_CM         = 60.0
@@ -896,6 +912,8 @@ CATEGORICAL_METRICS_PLACE_CELLS = {
     'theta_modulated':          'Theta modulation (% of place cells)',
     'coherence_bootstrap_sig':  'Coherence shuffle significance (% of place cells)',
     'stability_significant':    'Split-half stability significance, p <= 0.05 (% of place cells)',
+    'stability_sig_pos':        'Significant POSITIVE split-half stability, p <= 0.05 and score > 0 (% of place cells)',
+    'stability_sig_neg':        'Significant NEGATIVE split-half stability, p <= 0.05 and score < 0 (% of place cells)',
     'speed_cell_final':         'Speed cells (% of place cells)',
 }
 
@@ -945,16 +963,20 @@ class Grouping:
     optional prefix for plot titles (e.g. 'Linear arena'). `shade` is the
     per-cell shading of this comparison, {(session, unit): t} (cell_shades),
     set by run_comparison. tests=False (a single group, level 5): no test
-    results in the plots' stats text and no significance printout."""
+    results in the plots' stats text and no significance printout.
+    wd_split=True: the wall-distance plots are also saved per group, alone
+    (WallDistance\\<group>\\)."""
     col: str
     order: list
     noun: str
     title: str = ''
     shade: dict = None
     tests: bool = True
+    wd_split: bool = False
 
 
-ARENA_GROUPING = Grouping('arena_type', ARENA_TYPES, 'arena types')
+ARENA_GROUPING = Grouping('arena_type', ARENA_TYPES, 'arena types',
+                          wd_split=WD_PER_ARENA_PLOTS)
 
 # Level 5: one group holding every cell ('all_cells' column, _tag_groups).
 ALL_CELLS_GROUPING = Grouping('all_cells', [ALL_CELLS_LABEL], 'cells', tests=False)
@@ -1146,6 +1168,11 @@ def build_full_metrics_df(full: pd.DataFrame) -> pd.DataFrame:
     df['stability_significant'] = df['stability_p_value'].apply(_stability_sig)
     df['stability_type'] = [_stability_type(s, p) for s, p in
                             zip(df['stability_score'], df['stability_p_value'])]
+    # % of ALL place cells with significant positive / negative stability: True for
+    # that type, False for the other two, None if the cell has no stability type.
+    for col, key in (('stability_sig_pos', 'SigPos'), ('stability_sig_neg', 'SigNeg')):
+        df[col] = df['stability_type'].map(
+            lambda t, key=key: None if t is None or pd.isna(t) else t == key)
     return df
 
 
@@ -5613,8 +5640,9 @@ def plot_wd_continuous(m: WDMetric, res: dict, grp: Grouping, out_path: str):
                _titled(f'{m.label} vs wall distance', grp), out_path)
 
 
-def plot_wd_binary(m: WDMetric, res: dict, grp: Grouping, out_path: str):
-    """% yes of each group at each wall distance, Wilson 95 % CI."""
+def plot_wd_binary(m: WDMetric, res: dict, grp: Grouping, out_path: str, y_auto: bool = False):
+    """% yes of each group at each wall distance, Wilson 95 % CI. y_auto=True: y-axis from the
+    plotted % and CI range (padded, within 0-105 %) instead of the full 0-100 %."""
     subs = res['subs']
     if not subs:
         return
@@ -5622,6 +5650,7 @@ def plot_wd_binary(m: WDMetric, res: dict, grp: Grouping, out_path: str):
     handles = [_wd_group_handle(g, len(s), res['trend'][g]) for g, s in subs.items()]
     fig, ax, ax_info, ncol = _wd_fig(_wd_stats_lines(res, grp) + ['Error bars: Wilson 95 % CI.'],
                                      len(handles), False, max_d)
+    y_lo, y_hi = [], []
     for (g, sub), off in zip(subs.items(), _wd_offsets(len(subs))):
         c = _color(g)
         lv, pct, lo, hi = [], [], [], []
@@ -5638,8 +5667,16 @@ def plot_wd_binary(m: WDMetric, res: dict, grp: Grouping, out_path: str):
                     color=c['dark'], markerfacecolor=c['face'], markersize=6,
                     markeredgecolor=PAL_BLACK, markeredgewidth=0.6, linewidth=1.5,
                     elinewidth=1.2, capsize=3, zorder=4)
-    ax.set_ylim(0, 105)
-    ax.set_yticks(np.arange(0, 101, 20))
+        y_lo.append(np.min(pct - yerr[0]))
+        y_hi.append(np.max(pct + yerr[1]))
+    if y_auto and y_lo:
+        lo_, hi_ = min(y_lo), max(y_hi)
+        pad = max(2.0, 0.08 * (hi_ - lo_))
+        ax.set_ylim(max(0.0, lo_ - pad), min(105.0, hi_ + pad))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+    else:
+        ax.set_ylim(0, 105)
+        ax.set_yticks(np.arange(0, 101, 20))
     _wd_finish(fig, ax, ax_info, handles, ncol, max_d, '% of cells',
                _titled(f'{m.label} vs wall distance', grp), out_path)
 
@@ -5707,6 +5744,38 @@ def plot_peak_distribution(full_df: pd.DataFrame, sessions_df: pd.DataFrame, uni
     _save(fig, out_path)
     print(f'Peak-distance distribution saved to {out_path}')
     return pd.DataFrame(rows)
+
+
+def plot_wd_per_group(metrics: list, results: dict, grp: Grouping, plots_dir: str):
+    """Every WallDist_<metric>.png again for each group of `grp` alone, in plots_dir\\<group>\\
+    (V20, WD_PER_ARENA_PLOTS): y-axis scaled to that group's values only, x-axis to its own
+    distance levels; stats text = the group's trend and across-distance test (no pooled /
+    interaction / matched-distance lines, which compare groups). `results`: {metric stem:
+    res} as built in run_wall_distance (only 'subs', 'trend' and 'across' are used)."""
+    for g in grp.order:
+        g_grp = replace(grp, order=[g], title=f'{_label(g)} arena' if grp.col == 'arena_type'
+                        else _label(g))
+        g_dir = os.path.join(plots_dir, str(g))
+        n_saved = 0
+        for m in metrics:
+            res = results.get(m.stem)
+            if res is None or g not in res['subs'] or m.kind not in ('box', 'cat'):
+                continue
+            g_res = dict(subs={g: res['subs'][g]},
+                         trend={g: res['trend'][g]} if g in res['trend'] else {},
+                         across={g: res['across'][g]} if g in res['across'] else {},
+                         pooled=None, interaction=None, matched=[])
+            if g not in g_res['trend']:
+                continue
+            os.makedirs(g_dir, exist_ok=True)
+            out_path = os.path.join(g_dir, f'WallDist_{m.stem}.png')
+            if m.kind == 'box':
+                plot_wd_continuous(m, g_res, g_grp, out_path)
+            else:
+                plot_wd_binary(m, g_res, g_grp, out_path, y_auto=True)
+            n_saved += 1
+        if n_saved:
+            print(f'  {n_saved} per-group wall-distance plot(s) saved to {g_dir}')
 
 
 WD_ARENA_SIZE_NOTES = {
@@ -5905,6 +5974,8 @@ def run_wall_distance(grp: Grouping, wd_dfs: dict, plots_dir: str,
             elif m.kind == 'cat':
                 plot_wd_binary(m, results[m.stem], grp, out_path)
         print(f'  Wall-distance plots saved to {plots_dir}')
+        if grp.wd_split:
+            plot_wd_per_group(metrics, results, grp, plots_dir)
     else:
         print('  Every group has a single distance level; no plots.')
 
