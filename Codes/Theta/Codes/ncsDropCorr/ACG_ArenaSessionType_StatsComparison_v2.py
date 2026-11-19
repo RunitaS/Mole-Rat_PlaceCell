@@ -950,6 +950,10 @@ MOVEMENT_FILL_ALPHA = 0.45
 MOVEMENT_FILL = {m: tuple(MOVEMENT_FILL_ALPHA * np.array(c[:3]) + (1 - MOVEMENT_FILL_ALPHA))
                  for m, c in MOVEMENT_FACE.items()}
 CENTROID_FACE = {'immobile': '#FF1493', 'moving': matplotlib.colormaps['viridis'](0.8)}
+# Pooled-level NonTheta_Rejected_Overall: rejected share grey, accepted-as-theta share
+# the exact 50/50 mix of the magma pink and viridis green bar fills above.
+REJECTED_FILL = GROUP_FACE[POOLED_GROUP]
+THETA_ACCEPTED_FILL = tuple((np.array(MOVEMENT_FILL['immobile']) + np.array(MOVEMENT_FILL['moving'])) / 2)
 # Per-animal colours of the ACG script (Pastel1) + one marker per animal.
 ANIMAL_COLORS = {'Fa8477': '#FBB4AE', 'Fa1059': '#B3CDE3', 'Fa23BD': '#CCEBC5', 'Fa5834': '#DECBE4'}
 ANIMAL_MARKERS = {'Fa8477': 'o', 'Fa1059': 's', 'Fa23BD': '^', 'Fa5834': 'v'}
@@ -1109,12 +1113,22 @@ def draw_overall(ax, grp, res):
         return [], ['No epochs']
     groups, x = list(desc['group']), np.arange(len(desc))
     pct = desc['pct_epochs'].to_numpy(float)
-    bars = ax.bar(x, pct, width=BAR_WIDTH, color=[GROUP_FACE.get(g, '#BFBFBF') for g in groups],
-                  edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
-    plu.label_bars(ax, bars, fontsize=BAR_PCT_FS)
-    top = max(np.nanmax(pct), _rec_dots(ax, res['rec'], grp.col, groups, x, 'pct_overall'))
-    _fit_ylim(ax, 0, top if top > 0 else 1, _posthoc_pairs(pr['epoch'][1], dict(zip(groups, x))),
-              pct=True)
+    if _single(grp):
+        # Pooled level: stacked bar, rejected (grey) below, accepted as theta (colour) above.
+        for bars in (ax.bar(x, pct, width=BAR_WIDTH, color=REJECTED_FILL, edgecolor=BAR_EDGE,
+                            linewidth=BAR_EDGE_LW, zorder=2),
+                     ax.bar(x, 100 - pct, bottom=pct, width=BAR_WIDTH, color=THETA_ACCEPTED_FILL,
+                            edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)):
+            plu.label_bars(ax, bars, inside=True, fontsize=BAR_PCT_FS)
+        _rec_dots(ax, res['rec'], grp.col, groups, x, 'pct_overall')
+        _fit_ylim(ax, 0, 100, [], pct=True)
+    else:
+        bars = ax.bar(x, pct, width=BAR_WIDTH, color=[GROUP_FACE.get(g, '#BFBFBF') for g in groups],
+                      edgecolor=BAR_EDGE, linewidth=BAR_EDGE_LW, zorder=2)
+        plu.label_bars(ax, bars, fontsize=BAR_PCT_FS)
+        top = max(np.nanmax(pct), _rec_dots(ax, res['rec'], grp.col, groups, x, 'pct_overall'))
+        _fit_ylim(ax, 0, top if top > 0 else 1, _posthoc_pairs(pr['epoch'][1], dict(zip(groups, x))),
+                  pct=True)
     ax.set_xticks(x)
     ax.set_xticklabels([f'{_label(g)}\n{p:.1f}%\n({k}/{n})\n{r} rec' for g, p, k, n, r in
                         zip(groups, pct, desc['n_rejected'], desc['n_epochs'], desc['n_recordings'])])
@@ -1124,8 +1138,11 @@ def draw_overall(ax, grp, res):
 
     if _single(grp):
         lines = ['Descriptive only (one group, no comparison).'] + _pooled_desc_lines(desc, 'recording')
-        lines.append('Bar: epochs pooled; dots: one recording each (animal colour)')
-        return _animal_handles(res['rec']['animal'].dropna().unique()), lines
+        lines.append('Bar: epochs pooled, rejected as non-theta (grey) and accepted as theta '
+                     '(colour); dots: % rejected of one recording each (animal colour)')
+        handles = [Patch(facecolor=REJECTED_FILL, edgecolor=BAR_EDGE, label='Rejected (non-theta)'),
+                   Patch(facecolor=THETA_ACCEPTED_FILL, edgecolor=BAR_EDGE, label='Accepted as theta')]
+        return handles + _animal_handles(res['rec']['animal'].dropna().unique()), lines
     lines = ['Epoch level (all epochs of a group pooled):'] + _test_lines(*pr['epoch'])
     lines += _note_line(pr['epoch'][0])
     lines += ['Recording level (one % per recording):'] + _test_lines(*pr['recording'])
