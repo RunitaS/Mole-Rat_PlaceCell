@@ -24,10 +24,10 @@ ArenaSessionType_StatsComparison_v18.py:
 Copied LFP files (DROP_DUPLICATE_LFP): some session folders hold copies of one
 LFP signal under several .ncs names (placed there so that every tetrode had a
 matched LFP file for another analysis; e.g. CSC1 = CSC4, CSC2 = CSC3,
-CSC5 = CSC6 = CSC7 = CSC8). Within a session, files whose epoch results are
-identical (DUP_SIGNATURE_COLS of every epoch) are copies; only the first of
-each set (natural file-name order) is analysed. The dropped copies are listed
-in the 'LFP_Duplicates_Dropped' sheet.
+CSC5 = CSC6 = CSC7 = CSC8). Only the files in NCS_FILE_LIST_CSV -- the list
+made once by Make_NcsFileList.py, holding the first of each set of copies
+(natural file-name order) -- are analysed. The dropped copies are listed in
+the 'LFP_Duplicates_Dropped' sheet.
 
 Arena and session type are parsed from each epoch's session folder exactly as
 in ArenaSessionType_StatsComparison_v18.py (extract_arena_type /
@@ -134,7 +134,6 @@ INPUT_CSV is only read, not modified.
 import os
 import re
 import sys
-import hashlib
 import shutil
 import platform
 import subprocess
@@ -160,6 +159,12 @@ if PLACECELL_CODES_DIR not in sys.path:
     sys.path.append(PLACECELL_CODES_DIR)
 import CellClusteredStats_Utils as ccs
 import PlotLayout_Utils as plu    # shared y-range of side-by-side panels, % labels on bars
+# NcsFileList_Utils.py (the .ncs file list of Make_NcsFileList.py) sits in this
+# script's folder; the absolute path also finds it from another working directory.
+NCS_UTILS_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCorr'
+if NCS_UTILS_DIR not in sys.path:
+    sys.path.insert(0, NCS_UTILS_DIR)
+from NcsFileList_Utils import split_by_list  # noqa: E402
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -220,12 +225,12 @@ CENTROID_UNIT = 'recording'
 # 'recording' only: recording centroids from fewer accepted epochs are left out (1 = keep all).
 MIN_EPOCHS_PER_CENTROID = 1
 
-# Copied LFP files: within a session, .ncs files with identical epoch results
-# (these columns, every epoch) are copies of one signal -- only the first file
-# (natural name order, e.g. CSC1 of CSC1 = CSC4) is analysed. False: keep all.
+# Copied LFP files: only the .ncs files in NCS_FILE_LIST_CSV (made once by
+# Make_NcsFileList.py: within a session folder, files with identical records
+# are copies of one signal and only the first, in natural name order -- e.g.
+# CSC1 of CSC1 = CSC4 -- is listed) are analysed. False: keep all.
 DROP_DUPLICATE_LFP = True
-DUP_SIGNATURE_COLS = ['epoch_index', 'epoch_start_us', 'movement', 'ED_min', 'freq',
-                      'peakrangenorm', 'skipped']
+NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\NcsFileList\Ncs_files_to_analyse.csv'
 
 # Immobility vs mobility within a group is a PAIRED comparison (Wilcoxon
 # signed-rank) for the % of metrics 2 and 4 and the centroids of metric 3; one
@@ -438,40 +443,23 @@ def load_epochs() -> pd.DataFrame:
     return ep, dups
 
 
-def _natural_key(path) -> tuple:
-    """'CSC10ch2.ncs' after 'CSC2ch2.ncs' (numbers compared as numbers)."""
-    return tuple((0, int(t), '') if t.isdigit() else (1, 0, t.lower())
-                 for t in re.split(r'(\d+)', os.path.basename(str(path))) if t)
-
-
 def drop_duplicate_recordings(ep: pd.DataFrame):
-    """Copied LFP files: within a session folder, .ncs files whose epoch results
-    (DUP_SIGNATURE_COLS of every epoch) are identical are copies of one signal
-    (placed there so that every tetrode had a matched LFP file). Only the first
-    file of each set of copies (natural file-name order) is kept. Returns
-    (epochs, table of the dropped copies). DROP_DUPLICATE_LFP = False keeps all."""
+    """Copied LFP files (placed so that every tetrode had a matched LFP file):
+    keep only the epochs of .ncs files listed in NCS_FILE_LIST_CSV, the first
+    file of each set of copies (Make_NcsFileList.py). Raises if the ACG run
+    holds a file the list does not know (list made for another data tree, or
+    out of date). Returns (epochs, table of the dropped copies).
+    DROP_DUPLICATE_LFP = False keeps all."""
     if not DROP_DUPLICATE_LFP:
         return ep, pd.DataFrame()
-    cols = [c for c in DUP_SIGNATURE_COLS if c in ep.columns]
-    rows = []
-    for (sess, f), d in ep.groupby(['session_folder', 'file'], sort=False):
-        s = d.sort_values(['epoch_start_us', 'epoch_index'])[cols].copy()
-        num = s.select_dtypes('number').columns
-        s[num] = s[num].round(9)
-        sig = hashlib.sha1(pd.util.hash_pandas_object(s, index=False).to_numpy().tobytes())
-        rows.append((sess, f, sig.hexdigest(), len(d)))
-    files = pd.DataFrame(rows, columns=['session_folder', 'file', 'signature', 'n_epochs'])
-    files = files.iloc[sorted(range(len(files)), key=lambda i: (files['session_folder'].iat[i],
-                                                                _natural_key(files['file'].iat[i])))]
-    files['kept_file'] = files.groupby(['session_folder', 'signature'])['file'].transform('first')
-    dups = files[files['file'] != files['kept_file']].drop(columns='signature')
-    n_sets = files.groupby(['session_folder', 'signature']).ngroups
-    print(f'Duplicate LFP files: {len(files)} files, {n_sets} distinct signals; '
-          f'{len(dups)} copies in {dups["session_folder"].nunique()} sessions dropped '
-          f'(first file of each set kept).')
-    dups = dups.assign(file_name=dups['file'].map(lambda p: os.path.basename(str(p))),
-                       copy_of=dups['kept_file'].map(lambda p: os.path.basename(str(p))))
-    return ep[~ep['file'].isin(set(dups['file']))].copy(), dups.reset_index(drop=True)
+    keep, dups = split_by_list(ep['file'].unique(), NCS_FILE_LIST_CSV)
+    n_ep = ep.groupby('file').size()
+    sess = ep.drop_duplicates('file').set_index('file')['session_folder']
+    dups.insert(0, 'session_folder', dups['file'].map(sess))
+    dups.insert(2, 'n_epochs', dups['file'].map(n_ep))
+    print(f'Copied LFP files (list {NCS_FILE_LIST_CSV}): {ep["file"].nunique()} files in the ACG run, '
+          f'{len(keep)} kept; {len(dups)} copies in {dups["session_folder"].nunique()} sessions dropped.')
+    return ep[ep['file'].isin(keep)].copy(), dups
 
 
 def recording_table(ep: pd.DataFrame) -> pd.DataFrame:

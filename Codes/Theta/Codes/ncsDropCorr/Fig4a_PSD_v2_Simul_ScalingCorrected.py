@@ -44,6 +44,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv
+from NcsFileList_Utils import listed_ncs_files
 
 
 # %% ==================== Configuration (from reference code) ====================
@@ -51,6 +52,12 @@ from ncs_repair import load_repaired_uv
 # Root folder holding one subfolder per animal, named exactly with that
 # animal's ID (e.g. ROOT_DIR/1059Test/...).
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2'
+
+# .ncs files to analyse: the list made once by Make_NcsFileList.py for
+# ROOT_DIR (copied LFP files left out -- only the first of each set of copies,
+# e.g. CSC1 of CSC1 = CSC4). It must be the list of THIS ROOT_DIR's tree.
+# None: every .ncs under each animal folder, copies included.
+NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2\NcsFileList\Ncs_files_to_analyse.csv'
 
 # Common output folder: every CSV/XLSX/PKL/TXT result and all figures
 # (band-by-band, theta range, aperiodic properties) are saved under here.
@@ -451,12 +458,15 @@ def process_animal(label, folder):
     -------
     freq_vec, mean_psd, sem_psd, n_files, psds_norm, file_names
     """
-    ncs_files = []
-    for root, _dirs, files in os.walk(folder):
-        for fname in files:
-            if fname.endswith('.ncs'):
-                ncs_files.append(os.path.join(root, fname))
-    print(f'Found {len(ncs_files)} .ncs files in {folder}')
+    if NCS_FILE_LIST_CSV:
+        ncs_files = listed_ncs_files(NCS_FILE_LIST_CSV, under=folder)
+    else:
+        ncs_files = []
+        for root, _dirs, files in os.walk(folder):
+            for fname in files:
+                if fname.endswith('.ncs'):
+                    ncs_files.append(os.path.join(root, fname))
+        print(f'Found {len(ncs_files)} .ncs files in {folder}')
 
     psds       = []
     file_names = []
@@ -1740,6 +1750,7 @@ def _analysis_settings():
     return {
         'paths / animals': {
             'ROOT_DIR':               ROOT_DIR,
+            'NCS_FILE_LIST_CSV':      NCS_FILE_LIST_CSV,
             'OUTPUT_DIR':             OUTPUT_DIR,
             'FIGURE_DIR':             FIGURE_DIR,
             'ANIMALS_TO_INCLUDE':     ANIMALS_TO_INCLUDE,

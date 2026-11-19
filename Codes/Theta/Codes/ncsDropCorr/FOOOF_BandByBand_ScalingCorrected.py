@@ -34,6 +34,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv
+from NcsFileList_Utils import listed_ncs_files
 
 
 # %% ==================== Configuration (from reference code) ====================
@@ -47,6 +48,15 @@ ANIMALS = {
     'Fa23BD': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/23BDTest',
     'Fa1059': r'C:/Runita/NMR/analysis/AllSort_Results/LFP/1059Test',
 }
+
+# .ncs files to analyse: the list(s) made once by Make_NcsFileList.py (copied
+# LFP files left out -- only the first of each set of copies, e.g. CSC1 of
+# CSC1 = CSC4). One list per data tree; together they must cover every folder
+# in ANIMALS. None: every .ncs under each animal folder, copies included.
+NCS_FILE_LIST_CSV = [
+    r'C:/Runita/NMR/analysis/AllSort_Results/LFP/23BDTest/NcsFileList/Ncs_files_to_analyse.csv',
+    r'C:/Runita/NMR/analysis/AllSort_Results/LFP/1059Test/NcsFileList/Ncs_files_to_analyse.csv',
+]
 
 
 OUTPUT_DIR = r'C:/Runita/NMR/analysis/AllSort_Results/LFP/BandByBand/v1_NcsDropCorr'  # saved plots go here
@@ -421,12 +431,15 @@ def process_animal(label, folder):
     -------
     freq_vec, mean_psd, sem_psd, n_files, psds_norm, file_names
     """
-    ncs_files = []
-    for root, _dirs, files in os.walk(folder):
-        for fname in files:
-            if fname.endswith('.ncs'):
-                ncs_files.append(os.path.join(root, fname))
-    print(f'Found {len(ncs_files)} .ncs files in {folder}')
+    if NCS_FILE_LIST_CSV:
+        ncs_files = listed_ncs_files(NCS_FILE_LIST_CSV, under=folder)
+    else:
+        ncs_files = []
+        for root, _dirs, files in os.walk(folder):
+            for fname in files:
+                if fname.endswith('.ncs'):
+                    ncs_files.append(os.path.join(root, fname))
+        print(f'Found {len(ncs_files)} .ncs files in {folder}')
 
     psds       = []
     file_names = []

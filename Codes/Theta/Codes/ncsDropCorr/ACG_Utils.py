@@ -73,6 +73,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv
+from NcsFileList_Utils import listed_ncs_files
 import PlotLayout_Utils as plu    # % labels on bars
 
 
@@ -113,6 +114,11 @@ MARKER_EDGE = dict(markeredgecolor='0.25', markeredgewidth=0.5)
 # Root directory to search recursively for .ncs files. Every .ncs found
 # anywhere under this tree (in any subfolder) is processed.
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200'
+
+# .ncs files to analyse: the list made once by Make_NcsFileList.py for
+# ROOT_DIR (copied LFP files left out). None: every .ncs under ROOT_DIR.
+# A caller that changes ROOT_DIR (e.g. ThetaVsSpeed_ACGMethod_*) sets this too.
+NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Alpha200\NcsFileList\Ncs_files_to_analyse.csv'
 
 # Where results/figures are written (default: alongside ROOT_DIR).
 OUTPUT_DIR = os.path.join(ROOT_DIR, 'ACG_theta_continuity_NoiseRemoval_EdgePad_NcsDropCorr')
@@ -891,16 +897,26 @@ def get_epoch_waveform(fpath, epoch_index, epoch_sec=EPOCH_SEC, fs_acg=FS_ACG):
     return epochs[int(epoch_index)]
 
 
-def process_root_directory(root_dir):
-    """Recursively find every .ncs under `root_dir`, run process_ncs_for_acg on
-    each, and concatenate the per-epoch results, tagging each row with
-    path-derived metadata (parse_metadata_from_path)."""
+def list_ncs_files(root_dir):
+    """The .ncs files to analyse under `root_dir`: from NCS_FILE_LIST_CSV
+    (copies left out), or every .ncs found recursively when it is None."""
+    if NCS_FILE_LIST_CSV:
+        return listed_ncs_files(NCS_FILE_LIST_CSV, under=root_dir)
     ncs_files = []
     for root, _dirs, files in os.walk(root_dir):
         for fname in files:
             if fname.endswith('.ncs'):
                 ncs_files.append(os.path.join(root, fname))
     print(f'Found {len(ncs_files)} .ncs files under {root_dir}')
+    return ncs_files
+
+
+def process_root_directory(root_dir):
+    """Run process_ncs_for_acg on every .ncs file to analyse under `root_dir`
+    (NCS_FILE_LIST_CSV; None: every .ncs found recursively), and concatenate
+    the per-epoch results, tagging each row with path-derived metadata
+    (parse_metadata_from_path)."""
+    ncs_files = list_ncs_files(root_dir)
 
     all_results = []
     for fpath in ncs_files:
@@ -1820,6 +1836,7 @@ def save_run_metadata(meta_dir=META_DIR):
         'script_dir':               os.path.dirname(script_path),
         'run_datetime':             datetime.datetime.now().isoformat(timespec='seconds'),
         'data_dir (ROOT_DIR)':      ROOT_DIR,
+        'NCS_FILE_LIST_CSV':        NCS_FILE_LIST_CSV,
         'OUTPUT_DIR':               OUTPUT_DIR,
         'FIGURE_DIR':               FIGURE_DIR,
         # ---- acquisition ----

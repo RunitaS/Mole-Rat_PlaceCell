@@ -52,6 +52,8 @@ except:
   * Copied .ncs files dropped (DROP_DUPLICATE_LFP): within a recording folder,
     files with identical record timestamps / valid-sample counts / samples are
     copies of one signal; only the first in natural name order is analysed.
+    The files are read from the list made once by Make_NcsFileList.py
+    (NCS_FILE_LIST_CSV) -- no directory walk or file comparison per run.
   * Results are written to Results/ThetaVsSpeed/Mobility_v3 (v2 = 2 / 5 cm/s
     speed bins, PowerdB in the individual-file plots).
   * Individual-file correlations (run_individual_correlations): the Dunn
@@ -84,7 +86,6 @@ except:
 
 import os
 import re
-import hashlib
 import warnings
 from pathlib import Path
 import numpy as np
@@ -106,6 +107,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv, open_ncs, find_runs
+from NcsFileList_Utils import listed_ncs_files, listed_copies, natural_key
 
 
 # %% ==================== Configuration ===========================================
@@ -132,8 +134,11 @@ EXCLUDED_COLOR = '#B0B0B0'
 # ---- Copied LFP files ----
 # Some recording folders hold bit-identical copies of one .ncs signal (placed
 # so every tetrode had a matched LFP file). True: analyse only the first file
-# of each set of copies (natural name order, e.g. CSC1 of CSC1 = CSC4).
+# of each set of copies (natural name order, e.g. CSC1 of CSC1 = CSC4), as
+# listed in NCS_FILE_LIST_CSV (made by Make_NcsFileList.py for ROOT_DIR).
+# False: every .ncs file under ROOT_DIR (directory walk, copies included).
 DROP_DUPLICATE_LFP = True
+NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\NcsFileList\Ncs_files_to_analyse.csv'
 # Run metadata (all settings, data/script paths) + a copy of this script
 # are written here -- see save_run_metadata.
 META_DIR = OUTPUT_DIR / 'meta'
@@ -831,69 +836,31 @@ def process_ncs_session(fpath):
     }), sat_info
 
 
-def _natural_key(path):
-    """'CSC10.ncs' after 'CSC2.ncs' (numbers compared as numbers)."""
-    return tuple((0, int(t), '') if t.isdigit() else (1, 0, t.lower())
-                 for t in re.split(r'(\d+)', os.path.basename(str(path))) if t)
-
-
-def ncs_signal_signature(fpath):
-    """SHA-1 of the file's ADBitVolts and every record's timestamp, valid-sample
-    count and samples -- the header text and the channel-number field are left
-    out, so a copy of a signal saved under another channel name still matches."""
-    rec = open_ncs(fpath)
-    h = hashlib.sha1()
-    h.update(repr(read_ncs_adbitvolts(fpath)).encode())
-    for field in ('timestamp', 'n_valid', 'samples'):
-        h.update(np.ascontiguousarray(rec[field]).tobytes())
-    del rec
-    return h.hexdigest()
-
-
-def find_duplicate_ncs(ncs_files, root_dir):
-    """Within each recording folder, group .ncs files with identical
-    ncs_signal_signature; the first of each group (natural name order) is kept.
-    Returns (files to analyse, table of the dropped copies)."""
-    rows = []
-    for fpath in ncs_files:
-        rows.append({'folder': os.path.dirname(fpath), 'file': fpath,
-                     'signature': ncs_signal_signature(fpath)})
-    files = pd.DataFrame(rows)
-    files['kept_file'] = files.groupby(['folder', 'signature'])['file'].transform('first')
-    dups = files[files['file'] != files['kept_file']].copy()
-    n_sets = files.groupby(['folder', 'signature']).ngroups
-    print(f'Duplicate LFP files: {len(files)} files, {n_sets} distinct signals; '
-          f'{len(dups)} copies in {dups["folder"].nunique()} folders dropped '
-          f'(first file of each set kept).')
-    dups = pd.DataFrame({
-        'Recording': dups['folder'].map(lambda p: os.path.relpath(p, root_dir).replace(os.sep, '/')),
-        'file_name': dups['file'].map(os.path.basename),
-        'copy_of':   dups['kept_file'].map(os.path.basename),
-    }).reset_index(drop=True)
-    kept = files.loc[files['file'] == files['kept_file'], 'file'].tolist()
-    return kept, dups
-
-
 def process_root_directory(root_dir):
-    """Recursively find every .ncs under `root_dir`, run process_ncs_session
-    on each, and concatenate the per-bin results, tagging each row with a
+    """Run process_ncs_session on every .ncs file to analyse under `root_dir`,
+    and concatenate the per-bin results, tagging each row with a
     session id derived from the file's path (relative to `root_dir`), plus the
     recording folder it came from (channels in the same folder were recorded
     simultaneously) and the animal (first path component).
 
-    With DROP_DUPLICATE_LFP, copied files are found first (find_duplicate_ncs)
-    and skipped; the dropped copies are written to OUTPUT_DIR."""
-    ncs_files = []
-    for root, _dirs, files in os.walk(root_dir):
-        for fname in files:
-            if fname.endswith('.ncs'):
-                ncs_files.append(os.path.join(root, fname))
-    ncs_files.sort(key=lambda p: (os.path.dirname(p), _natural_key(p)))
-    print(f'Found {len(ncs_files)} .ncs files under {root_dir}')
-
+    With DROP_DUPLICATE_LFP, the files come from NCS_FILE_LIST_CSV (copies
+    left out, see Make_NcsFileList.py); the left-out copies are written to
+    OUTPUT_DIR. Without it, every .ncs under `root_dir` is used."""
     if DROP_DUPLICATE_LFP:
-        ncs_files, dups = find_duplicate_ncs(ncs_files, root_dir)
-        dups.to_excel(OUTPUT_DIR / 'Dropped_duplicate_ncs.xlsx', index=False)
+        ncs_files = listed_ncs_files(NCS_FILE_LIST_CSV, under=root_dir)
+        dups = listed_copies(NCS_FILE_LIST_CSV, under=root_dir)
+        dups['Recording'] = dups['abs_path'].map(
+            lambda p: os.path.relpath(os.path.dirname(p), root_dir).replace(os.sep, '/'))
+        dups[['Recording', 'file_name', 'copy_of']].to_excel(
+            OUTPUT_DIR / 'Dropped_duplicate_ncs.xlsx', index=False)
+    else:
+        ncs_files = []
+        for root, _dirs, files in os.walk(root_dir):
+            for fname in files:
+                if fname.endswith('.ncs'):
+                    ncs_files.append(os.path.join(root, fname))
+        ncs_files.sort(key=lambda p: (os.path.dirname(p), natural_key(p)))
+        print(f'Found {len(ncs_files)} .ncs files under {root_dir}')
 
     all_results, sat_rows = [], []
     for fpath in ncs_files:
@@ -1839,6 +1806,7 @@ def save_run_metadata(meta_dir=META_DIR):
         'MIN_SPEED_CMS':            f'{MIN_SPEED_CMS} (time bins below are excluded from all fits, '
                                     'drawn gray on the mixed-model figures)',
         'DROP_DUPLICATE_LFP':       DROP_DUPLICATE_LFP,
+        'NCS_FILE_LIST_CSV':        NCS_FILE_LIST_CSV,
         'duplicate_signature':      'SHA-1 of ADBitVolts + record timestamp/n_valid/samples, '
                                     'per recording folder; first in natural name order kept',
         'fig3_order':               'drop < MIN_SPEED_CMS, then per-session 90th percentile of '

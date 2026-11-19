@@ -60,6 +60,7 @@ NCS_REPAIR_DIR = r'C:\Runita\NMR\Mole-Rat_PlaceCell\Codes\Theta\Codes\ncsDropCor
 if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv
+from NcsFileList_Utils import listed_ncs_files
 
 
 # %% ==================== Configuration ==========================================
@@ -67,6 +68,11 @@ from ncs_repair import load_repaired_uv
 # Root folder holding one subfolder per animal, named exactly with that
 # animal's ID (e.g. ROOT_DIR/1059Test/...).
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
+
+# .ncs files to analyse: the list made once by Make_NcsFileList.py for
+# ROOT_DIR (copied LFP files left out -- only the first of each set of copies,
+# e.g. CSC1 of CSC1 = CSC4). None: every .ncs under ROOT_DIR, copies included.
+NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\NcsFileList\Ncs_files_to_analyse.csv'
 
 # Each figure goes in this subfolder of its .ncs file's own folder.
 FIGURE_SUBFOLDER = 'LFP_Speed_Spectrogram'
@@ -442,10 +448,13 @@ def evaluate_file(fpath, velocity_cache, snippet_start=None):
 def process_animal(label, folder):
     """One figure per .ncs file under `folder`, saved next to that file. A file that
     fails is logged as SKIP and the run carries on."""
-    ncs_files = sorted(os.path.join(root, fname)
-                       for root, _dirs, files in os.walk(folder)
-                       for fname in files if fname.endswith('.ncs'))
-    print(f'Found {len(ncs_files)} .ncs files in {folder}')
+    if NCS_FILE_LIST_CSV:
+        ncs_files = listed_ncs_files(NCS_FILE_LIST_CSV, under=folder)
+    else:
+        ncs_files = sorted(os.path.join(root, fname)
+                           for root, _dirs, files in os.walk(folder)
+                           for fname in files if fname.endswith('.ncs'))
+        print(f'Found {len(ncs_files)} .ncs files in {folder}')
 
     only_files = {os.path.normpath(p) for p in ONLY_FILES}
     snippet_starts = {os.path.normpath(p): s for p, s in SNIPPET_START.items()}
@@ -690,7 +699,7 @@ def capture_code_provenance(run_start, snapshot_dir=None):
 
 def _analysis_settings():
     """{parameter: value} -- every analysis setting in the config block."""
-    names = ['ROOT_DIR', 'OUTPUT_DIR', 'FIGURE_SUBFOLDER', 'ANIMALS_TO_INCLUDE', 'ONLY_FILES',
+    names = ['ROOT_DIR', 'NCS_FILE_LIST_CSV', 'OUTPUT_DIR', 'FIGURE_SUBFOLDER', 'ANIMALS_TO_INCLUDE', 'ONLY_FILES',
              'SNIPPET_START', 'SNIPPET_DUR_S', 'SNIPPET_STEP_S', 'SNIPPET_MIN_SPEED_CMS',
              'SATURATION_FRAC', 'SPEED_SPAN', 'SPEED_PLOT_SIGMA_S', 'fs', 'fs_down',
              'nperseg', 'ADBITVOLTS_NO_HEADER', 'NORM_BAND', 'THETA_BAND',

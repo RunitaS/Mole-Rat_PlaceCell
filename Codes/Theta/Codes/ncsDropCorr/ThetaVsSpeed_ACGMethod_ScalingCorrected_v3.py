@@ -75,6 +75,11 @@ acg = importlib.reload(acg)
 # anywhere under this tree (in any subfolder) is processed.
 ROOT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final'
 
+# .ncs files to analyse: the list made once by Make_NcsFileList.py for
+# ROOT_DIR (copied LFP files left out -- only the first of each set of copies,
+# e.g. CSC1 of CSC1 = CSC4). None: every .ncs under ROOT_DIR, copies included.
+NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_Final\NcsFileList\Ncs_files_to_analyse.csv'
+
 # ---- Common-noise (cross-tetrode) epoch rejection ----
 # True:  epochs carrying noise shared by all of a session's .ncs files are
 #        dropped (ACG_Utils.session_common_noise), with per-session diagnostic
@@ -130,6 +135,7 @@ THETA_POWER_FILTER_ORDER = 5    # Butterworth order of the THETA_BAND band-pass 
 # writes during this run (common-noise figures, its run metadata, the
 # run_pipeline outputs) to this script's folders instead.
 acg.ROOT_DIR = ROOT_DIR
+acg.NCS_FILE_LIST_CSV = NCS_FILE_LIST_CSV
 acg.OUTPUT_DIR = OUTPUT_DIR
 acg.FIGURE_DIR = FIGURE_DIR
 acg.META_DIR = ACG_META_DIR
@@ -327,47 +333,45 @@ def run_acg_analysis(root_dir):
 
 
 def build_file_log(root_dir, results_df, file_errors):
-    """One dict per .ncs file under `root_dir` (path, tracking .csv, OK/SKIP
-    status, epoch counts) -- used by save_run_metadata_excel to record
-    exactly which data went into a run."""
+    """One dict per .ncs file analysed under `root_dir` (NCS_FILE_LIST_CSV;
+    path, tracking .csv, OK/SKIP status, epoch counts) -- used by
+    save_run_metadata_excel to record exactly which data went into a run."""
     file_log = []
-    for root, _dirs, files in os.walk(root_dir):
-        for fname in sorted(files):
-            if not fname.endswith('.ncs'):
-                continue
-            fpath = os.path.abspath(os.path.join(root, fname))
-            rel = os.path.relpath(fpath, root_dir)
-            row = {'relative_path': rel,
-                   'ncs_file': fname,
-                   'session_dir': os.path.dirname(fpath),
-                   'abs_path': fpath,
-                   **acg.parse_metadata_from_path(rel)}
-            try:
-                row['tracking_csv'] = acg.find_position_file(fpath)
-                row['ncs_size_bytes'] = os.path.getsize(fpath)
-                row['ncs_modified'] = datetime.fromtimestamp(
-                    os.path.getmtime(fpath)).isoformat(sep=' ', timespec='seconds')
-            except OSError as e:
-                row['tracking_csv'] = f'ERROR: {e}'
+    for fpath in acg.list_ncs_files(root_dir):
+        fname = os.path.basename(fpath)
+        fpath = os.path.abspath(fpath)
+        rel = os.path.relpath(fpath, root_dir)
+        row = {'relative_path': rel,
+               'ncs_file': fname,
+               'session_dir': os.path.dirname(fpath),
+               'abs_path': fpath,
+               **acg.parse_metadata_from_path(rel)}
+        try:
+            row['tracking_csv'] = acg.find_position_file(fpath)
+            row['ncs_size_bytes'] = os.path.getsize(fpath)
+            row['ncs_modified'] = datetime.fromtimestamp(
+                os.path.getmtime(fpath)).isoformat(sep=' ', timespec='seconds')
+        except OSError as e:
+            row['tracking_csv'] = f'ERROR: {e}'
 
-            res = results_df[results_df['file'] == fpath]
-            if len(res):
-                n_edmin = int(res['skipped_edmin'].sum())
-                row.update({'status': 'OK', 'error': '',
-                            'arena_type': res['arena_type'].iloc[0],
-                            'session_type': res['session_type'].iloc[0],
-                            'n_epochs_kept': len(res),
-                            'n_moving': int((res['movement'] == 'moving').sum()),
-                            'n_immobile': int((res['movement'] == 'immobile').sum()),
-                            'n_edmin_rejected': n_edmin,
-                            'pct_edmin_rejected': round(100 * n_edmin / len(res), 2),
-                            'n_outofband_rejected': int(res['skipped_outofband'].sum()),
-                            'n_accepted': int((~res['skipped']).sum())})
-            else:
-                row.update({'status': 'SKIP',
-                            'error': file_errors.get(
-                                fpath, 'not analysed -- .ncs could not be loaded (see console)')})
-            file_log.append(row)
+        res = results_df[results_df['file'] == fpath]
+        if len(res):
+            n_edmin = int(res['skipped_edmin'].sum())
+            row.update({'status': 'OK', 'error': '',
+                        'arena_type': res['arena_type'].iloc[0],
+                        'session_type': res['session_type'].iloc[0],
+                        'n_epochs_kept': len(res),
+                        'n_moving': int((res['movement'] == 'moving').sum()),
+                        'n_immobile': int((res['movement'] == 'immobile').sum()),
+                        'n_edmin_rejected': n_edmin,
+                        'pct_edmin_rejected': round(100 * n_edmin / len(res), 2),
+                        'n_outofband_rejected': int(res['skipped_outofband'].sum()),
+                        'n_accepted': int((~res['skipped']).sum())})
+        else:
+            row.update({'status': 'SKIP',
+                        'error': file_errors.get(
+                            fpath, 'not analysed -- .ncs could not be loaded (see console)')})
+        file_log.append(row)
     return file_log
 
 
@@ -667,7 +671,8 @@ RUN_METADATA_FILENAME = 'run_metadata_ACG_ThetaVsSpeed.xlsx'
 # still recorded (section 'Other'), and every UPPERCASE constant of
 # ACG_Utils.py is recorded under section 'ACG_Utils'.
 CONFIG_SETTINGS = [
-    ('Paths',           'ROOT_DIR',                 'Root directory searched recursively for .ncs files'),
+    ('Paths',           'ROOT_DIR',                 'Root directory of the .ncs files'),
+    ('Paths',           'NCS_FILE_LIST_CSV',        '.ncs files to analyse (Make_NcsFileList.py; copies left out)'),
     ('Paths',           'OUTPUT_DIR',               'Results tables output directory'),
     ('Paths',           'FIGURE_DIR',               'Figure output directory'),
     ('Paths',           'META_DIR',                 'run_metadata.csv + script copy output directory'),
@@ -751,6 +756,7 @@ def save_run_metadata(meta_dir=META_DIR):
         'script_dir':               os.path.dirname(script_path),
         'run_datetime':             datetime.now().isoformat(timespec='seconds'),
         'data_dir (ROOT_DIR)':      ROOT_DIR,
+        'NCS_FILE_LIST_CSV':        NCS_FILE_LIST_CSV,
         'OUTPUT_DIR':               OUTPUT_DIR,
         'FIGURE_DIR':               FIGURE_DIR,
         # ---- ACG analysis ----
@@ -963,6 +969,7 @@ def save_run_metadata_excel(out_path, run_start, run_status, code_snapshots, fil
         ('Run', 'metadata_written', now.isoformat(sep=' ', timespec='seconds')),
         ('Run', 'elapsed_min', round((now - run_start).total_seconds() / 60, 2)),
         ('Run', 'root_dir', ROOT_DIR),
+        ('Run', 'ncs_file_list_csv', NCS_FILE_LIST_CSV),
         ('Run', 'output_dir', OUTPUT_DIR),
         ('Run', 'figure_dir', FIGURE_DIR),
     ]
