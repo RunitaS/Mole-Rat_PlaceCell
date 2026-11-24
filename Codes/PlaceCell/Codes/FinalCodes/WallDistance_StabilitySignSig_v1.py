@@ -2,6 +2,9 @@
 """
 WallDistance_StabilitySignSig_v1.py
 
+SUPERSEDED (20 Nov 2026) by WallDistance_Continuum_v2.py (stability_sig_pos / _neg are among
+its metrics). Do not re-run.
+
 Wall-distance (continuum) analysis of SIGNIFICANT POSITIVE and SIGNIFICANT
 NEGATIVE split-half stability only, without re-running
 ArenaSessionType_StatsComparison_v21.py:

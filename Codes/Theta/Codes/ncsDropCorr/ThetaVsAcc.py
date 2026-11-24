@@ -33,6 +33,11 @@ predictor of every fit is acceleration instead of speed:
   * PowerdB baseline unchanged (4-7 cm/s running SPEED), so Power/PowerdB/
     PowerRel values per time bin are the same as in the speed script.
   * Results are written to Results/ThetaVsAcc.
+  * Acceleration and deceleration analysed separately (run_acc_decel_split):
+    every analysis above is repeated on the time bins with a >= 2 cm/s^2
+    (-> Results/ThetaVsAcc/Acc) and with a < -2 cm/s^2 (-> .../Decel), the
+    near-zero bin [-2, 2) in neither; predictor = |a| in both, so a positive
+    Decel slope means theta rises with harder braking. Tables there are .csv.
 
 Speed-script description (pipeline unchanged):
 
@@ -1025,6 +1030,37 @@ def save_baseline_coverage(df, group="Session"):
     return cov
 
 
+# %% ==================== Analysis labels / table output ===========================
+#
+# Every analysis below runs on the combined data (LAB_ALL, written to OUTPUT_DIR
+# as .xlsx) and again on the acceleration-only and deceleration-only time bins
+# (SPLIT_LABELS, see run_acc_decel_split; written to OUTPUT_DIR/Acc and
+# OUTPUT_DIR/Decel as .csv). A label dict carries the text that differs:
+#   name  : quantity in titles ('Acceleration' / 'Deceleration')
+#   xname : x-axis quantity ('Acceleration' / '|Deceleration|')
+#   short : short model label in the speed-controlled figure
+#   note  : extra line under the figures describing the subset ('' = none)
+#   fmt   : 'xlsx' (one workbook, a sheet per table) or 'csv' (one file per table)
+LAB_ALL = dict(key='All', name='Acceleration', xname='Acceleration', short='Acc', note='', fmt='xlsx')
+
+
+def save_tables(out_dir, stem, sheets, fmt='xlsx'):
+    """Write `sheets` ({sheet name: DataFrame}) as <stem>.xlsx (one sheet each;
+    a single table goes to the default sheet) or, with fmt='csv', as
+    <stem>.csv (single table) / <stem>_<sheet>.csv (several)."""
+    out_dir = Path(out_dir)
+    if fmt == 'csv':
+        for name, t in sheets.items():
+            fname = f'{stem}.csv' if len(sheets) == 1 else f'{stem}_{name}.csv'
+            t.to_csv(out_dir / fname, index=False, encoding='utf-8-sig')
+    elif len(sheets) == 1:
+        next(iter(sheets.values())).to_excel(out_dir / f'{stem}.xlsx', index=False)
+    else:
+        with pd.ExcelWriter(out_dir / f'{stem}.xlsx') as xw:
+            for name, t in sheets.items():
+                t.to_excel(xw, sheet_name=name, index=False)
+
+
 # %% ==================== Acceleration vs. theta statistics (mixed linear model) ==========
 
 def acc_bin_index(acc, width=ACC_BIN_WIDTH):
@@ -1101,7 +1137,7 @@ def add_details_below(fig, ax, text, legend_handles=None, legend_ncol=3, fontsiz
 
 def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, out_path,
                          xlabel=f"Acceleration bin center ({ACC_UNIT})", group="Session",
-                         df_excluded=None):
+                         df_excluded=None, note=''):
     """Scatter the binned data plus the mixed model's fixed-effect fit and its 95% CI band.
     Points are coloured by animal (ANIMAL_COLORS) when `df` has an Animal
     column, otherwise all drawn in `color`. `df_excluded` (acceleration bins
@@ -1163,20 +1199,24 @@ def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, 
         f"only time bins with speed ≥ {MIN_SPEED_CMS:g} cm/s fitted",
         f"Gray: {n_excluded} acceleration bins of immobile time bins (speed < {MIN_SPEED_CMS:g} cm/s), "
         f"shown but excluded from the fit",
+        *([note] if note else []),
     ])
     add_details_below(fig, ax, details, legend_handles=handles, legend_ncol=4 if n_excluded else 3)
     fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
 
 
-def run_acc_vs_theta_stats(df):
+def run_acc_vs_theta_stats(df, out_dir=OUTPUT_DIR, lab=LAB_ALL):
     """Fit and plot mixed linear models of Frequency~Acceleration and, for each
     POWER_MEASURES column, Power~Acceleration (random intercept per Session),
     on ACC_BIN_WIDTH-wide acceleration bins: per (session, bin) the
     representative (BIN_AGG_METHOD) Frequency/Power, against the bin's center
     acceleration -- rather than the raw per-time-bin rows (see
     aggregate_by_acc_bin). Only mobile time bins (speed >= MIN_SPEED_CMS) are
-    fitted. Returns {measure: fitted result}."""
+    fitted. Outputs go to `out_dir`; `lab` sets the labels / table format (see
+    LAB_ALL). Returns {measure: fitted result}."""
+    out_dir = Path(out_dir)
+    name, xlabel = lab['name'], f"{lab['xname']} bin center ({ACC_UNIT})"
     df_clean = df.dropna(subset=["Frequency", "Power", "Speed", "Acceleration"])
     # mobile and immobile time bins are aggregated separately; only the
     # mobile rows enter the fits, the immobile ones are drawn in gray
@@ -1189,7 +1229,7 @@ def run_acc_vs_theta_stats(df):
     df_all = df_all.rename(columns={"Acceleration": "AccWithinBin", "Speed": "SpeedWithinBin",
                                     "AccBinCenter": "Acceleration"})
     df_all = df_all.sort_values(["Session", "InAnalysis", "Acceleration"]).reset_index(drop=True)
-    df_all.to_excel(OUTPUT_DIR / "ThetaVsAcc_binned_medians.xlsx", index=False)
+    save_tables(out_dir, "ThetaVsAcc_binned_medians", {"binned": df_all}, lab['fmt'])
     df_stats = df_all[df_all["InAnalysis"]]
     df_excl = df_all[~df_all["InAnalysis"]]
 
@@ -1200,9 +1240,9 @@ def run_acc_vs_theta_stats(df):
     plot_mixed_model_fit(
         df_stats, freq_result, "Frequency", "Acceleration",
         ylabel="Theta Frequency [Hz]",
-        title="Theta Frequency vs. Acceleration (Mixed Model)",
-        color="red", out_path=OUTPUT_DIR / "ThetaFrequency_vs_Acc_MixedModel.png",
-        df_excluded=df_excl)
+        title=f"Theta Frequency vs. {name} (Mixed Model)",
+        color="red", out_path=out_dir / "ThetaFrequency_vs_Acc_MixedModel.png",
+        xlabel=xlabel, df_excluded=df_excl, note=lab['note'])
 
     for col, suffix, ylabel, title, _unit in POWER_MEASURES:
         d = df_stats.dropna(subset=[col])
@@ -1210,15 +1250,17 @@ def run_acc_vs_theta_stats(df):
         print(results[col].summary())
         plot_mixed_model_fit(
             d, results[col], col, "Acceleration",
-            ylabel=ylabel, title=f"{title}, Mixed Model",
-            color="royalblue", out_path=OUTPUT_DIR / f"ThetaPower{suffix}_vs_Acc_MixedModel.png",
-            df_excluded=df_excl.dropna(subset=[col]))
+            ylabel=ylabel, title=f"{title.replace('Acceleration', name)}, Mixed Model",
+            color="royalblue", out_path=out_dir / f"ThetaPower{suffix}_vs_Acc_MixedModel.png",
+            xlabel=xlabel, df_excluded=df_excl.dropna(subset=[col]), note=lab['note'])
 
-    with open(OUTPUT_DIR / "MixedModel_Stats_Summary.txt", "w", encoding="utf-8") as f:
-        f.write("=== Theta Frequency vs Acceleration ===\n")
+    with open(out_dir / "MixedModel_Stats_Summary.txt", "w", encoding="utf-8") as f:
+        if lab['note']:
+            f.write(lab['note'] + "\n\n")
+        f.write(f"=== Theta Frequency vs {name} ===\n")
         f.write(str(freq_result.summary()))
         for col, _suffix, _ylabel, title, _unit in POWER_MEASURES:
-            f.write(f"\n\n=== {title} [{col}] ===\n")
+            f.write(f"\n\n=== {title.replace('Acceleration', name)} [{col}] ===\n")
             f.write(str(results[col].summary()))
 
     return results
@@ -1263,13 +1305,14 @@ def _coef_row(result, name):
             "z": result.tvalues[name], "pvalue": result.pvalues[name]}
 
 
-def plot_speed_controlled(rows, out_path):
+def plot_speed_controlled(rows, out_path, lab=LAB_ALL):
     """Per measure: the acceleration slope (95% CI) of the acceleration-only
     model and of the Acceleration + Speed model, side by side."""
     measures = rows["Measure"].tolist()
+    short = lab['short']
     fig, axes = plt.subplots(1, len(measures), figsize=(3.6 * len(measures), 3.4), squeeze=False)
     for ax, (_, r) in zip(axes[0], rows.iterrows()):
-        models = [("Acc only", "acc_only"), ("Acc + Speed", "acc_ctrl")]
+        models = [(f"{short} only", "acc_only"), (f"{short} + Speed", "acc_ctrl")]
         for y, (label, key) in enumerate(models):
             b, lo, hi, p = (r[f"{key}_beta"], r[f"{key}_ci_low"], r[f"{key}_ci_high"],
                             r[f"{key}_pvalue"])
@@ -1282,15 +1325,16 @@ def plot_speed_controlled(rows, out_path):
         ax.set_yticklabels([m[0] for m in models], fontsize=9)
         ax.set_ylim(-0.7, len(models) - 0.3)
         ax.set_title(r["Measure"], fontsize=11, weight='bold')
-        ax.set_xlabel(f"Acceleration β ({r['Unit']} per {ACC_UNIT})", fontsize=9)
+        ax.set_xlabel(f"{lab['xname']} β ({r['Unit']} per {ACC_UNIT})", fontsize=9)
         ax.xaxis.set_major_locator(plt.MaxNLocator(4))
         ax.ticklabel_format(axis='x', style='sci', scilimits=(-3, 4), useMathText=True)
         ax.grid(True, axis='x', linestyle='--', alpha=0.4)
-    details = (f"Acc only: response ~ Acceleration + (1 | Session) on {ACC_BIN_WIDTH:g} {ACC_UNIT} "
-               f"acceleration bins.   Acc + Speed: response ~ Acceleration + Speed + (1 | Session) on "
+    details = (f"{short} only: response ~ {lab['xname']} + (1 | Session) on {ACC_BIN_WIDTH:g} {ACC_UNIT} "
+               f"bins.   {short} + Speed: response ~ {lab['xname']} + Speed + (1 | Session) on "
                f"{SPEED_BIN_WIDTH_CMS:g} cm/s × {ACC_BIN_WIDTH:g} {ACC_UNIT} bins per session.\n"
-               f"Speed ≥ {MIN_SPEED_CMS:g} cm/s only; 95% CI; black = p < 0.05.")
-    fig.suptitle("Theta vs. acceleration, with and without controlling for speed",
+               f"Speed ≥ {MIN_SPEED_CMS:g} cm/s only; 95% CI; black = p < 0.05."
+               + (f"\n{lab['note']}" if lab['note'] else ""))
+    fig.suptitle(f"Theta vs. {lab['name'].lower()}, with and without controlling for speed",
                  fontsize=12, weight='bold')
     fig.tight_layout()
     fig.text(0.5, -0.02, details, ha='center', va='top', fontsize=8.5, linespacing=1.4)
@@ -1298,17 +1342,18 @@ def plot_speed_controlled(rows, out_path):
     plt.close(fig)
 
 
-def run_speed_controlled_model(df, acc_only_results):
+def run_speed_controlled_model(df, acc_only_results, out_dir=OUTPUT_DIR, lab=LAB_ALL):
     """Fit response ~ Acceleration + Speed + (1 | Session) on 2-D speed x
     acceleration bins for Frequency and every POWER_MEASURES column; compare
     the acceleration slope with the acceleration-only model
-    (`acc_only_results`, from run_acc_vs_theta_stats)."""
+    (`acc_only_results`, from run_acc_vs_theta_stats). Outputs go to `out_dir`."""
+    out_dir = Path(out_dir)
     d = df.dropna(subset=["Frequency", "Power", "Speed", "Acceleration"])
     d = d[d["Mobile"]]
     r_time = np.corrcoef(d["Acceleration"], d["Speed"])[0, 1]
     df2 = aggregate_by_speed_acc_bin(d)
     df2 = df2.sort_values(["Session", "Speed", "Acceleration"]).reset_index(drop=True)
-    df2.to_excel(OUTPUT_DIR / "SpeedControlled_speed_x_acc_binned_medians.xlsx", index=False)
+    save_tables(out_dir, "SpeedControlled_speed_x_acc_binned_medians", {"binned": df2}, lab['fmt'])
     r_cells = np.corrcoef(df2["Acceleration"], df2["Speed"])[0, 1]
 
     units = {"Frequency": "Hz", **{m[0]: m[4] for m in POWER_MEASURES}}
@@ -1329,16 +1374,18 @@ def run_speed_controlled_model(df, acc_only_results):
         rows.append(row)
     rows = pd.DataFrame(rows)
 
-    with pd.ExcelWriter(OUTPUT_DIR / "SpeedControlled_MixedModel.xlsx") as xw:
-        rows.to_excel(xw, sheet_name="coefficients", index=False)
-        pd.DataFrame([{"r_acc_speed_time_bins": r_time, "n_time_bins": len(d),
-                       "r_acc_speed_bin_cells": r_cells, "n_bin_cells": len(df2)}]
-                     ).to_excel(xw, sheet_name="acc_speed_correlation", index=False)
-    plot_speed_controlled(rows, OUTPUT_DIR / "SpeedControlled_AccSlopes.png")
+    save_tables(out_dir, "SpeedControlled_MixedModel", {
+        "coefficients": rows,
+        "acc_speed_correlation": pd.DataFrame([{"r_acc_speed_time_bins": r_time, "n_time_bins": len(d),
+                                                "r_acc_speed_bin_cells": r_cells, "n_bin_cells": len(df2)}]),
+    }, lab['fmt'])
+    plot_speed_controlled(rows, out_dir / "SpeedControlled_AccSlopes.png", lab)
 
-    header = (f"Acceleration vs speed (mobile time bins): Pearson r = {r_time:.3f} over {len(d)} "
+    header = (f"{lab['xname']} vs speed (mobile time bins): Pearson r = {r_time:.3f} over {len(d)} "
               f"{BINSIZE:g} s time bins; r = {r_cells:.3f} over {len(df2)} speed x acceleration cells.\n")
-    with open(OUTPUT_DIR / "SpeedControlled_MixedModel_Summary.txt", "w", encoding="utf-8") as f:
+    if lab['note']:
+        header = lab['note'] + "\n" + header
+    with open(out_dir / "SpeedControlled_MixedModel_Summary.txt", "w", encoding="utf-8") as f:
         f.write(header)
         for _, r in rows.iterrows():
             f.write(f"{r['Measure']}: acc-only beta = {r['acc_only_beta']:.4g} (p = {r['acc_only_pvalue']:.3g}); "
@@ -1474,7 +1521,7 @@ def summarise_slopes_across_recordings(fits, meta, group="Session"):
     return stats, per_rec, per_animal
 
 
-def plot_recording_slopes(per_rec, grp, ylabel, title, out_path):
+def plot_recording_slopes(per_rec, grp, ylabel, title, out_path, note=''):
     """One dot per recording (its OLS slope, channels averaged), grouped and
     coloured by animal (ANIMAL_COLORS), with each animal's mean as a black bar
     and the group-level test result annotated."""
@@ -1502,13 +1549,14 @@ def plot_recording_slopes(per_rec, grp, ylabel, title, out_path):
         f"{grp['n_positive']}/{grp['n_recordings']} recordings with positive slope",
         f"n = {grp['n_recordings']} recordings, {grp['n_animals']} animals",
         "Black bars: per-animal mean",
+        *([note] if note else []),
     ])
     add_details_below(fig, ax, details)
     fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
 
 
-def run_acc_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
+def run_acc_vs_theta_persession_stats(df, n_channels_for_bonferroni=1, out_dir=OUTPUT_DIR, lab=LAB_ALL):
     """Dunn et al.'s Fig. 3 statistics with acceleration as the predictor: bin
     each session's mobile data into FIG3_ACC_BIN_WIDTH-wide acceleration bins
     (median Frequency/Power per bin; no percentile cut), fit one OLS regression
@@ -1517,34 +1565,34 @@ def run_acc_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
     significant at a Bonferroni-corrected threshold (0.05 /
     n_channels_for_bonferroni).
     """
+    out_dir, name = Path(out_dir), lab['name']
     _df_clean, df_binned = fig3_trim_and_bin(df)
-    df_binned.to_excel(OUTPUT_DIR / "Fig3_acc_binned_medians.xlsx", index=False)
+    save_tables(out_dir, "Fig3_acc_binned_medians", {"binned": df_binned}, lab['fmt'])
 
     alpha_bonf = 0.05 / n_channels_for_bonferroni
 
     meta = df[["Session", "Recording", "Animal"]].drop_duplicates("Session")
 
     units = {"Frequency": "Hz", **{m[0]: m[4] for m in POWER_MEASURES}}
-    summary_lines = []
+    summary_lines = [lab['note']] if lab['note'] else []
     for response in units:
         fits = fit_per_session_ols(df_binned, response)
-        fits.to_excel(OUTPUT_DIR / f"Fig3_persession_OLS_{response}.xlsx", index=False)
+        save_tables(out_dir, f"Fig3_persession_OLS_{response}", {"fits": fits}, lab['fmt'])
 
         n_sig = int((fits["pvalue"] < alpha_bonf).sum())
-        lines = [(f"{response} vs Acceleration (per-session OLS, n={len(fits)} sessions): "
+        lines = [(f"{response} vs {lab['xname']} (per-session OLS, n={len(fits)} sessions): "
                   f"beta1 = {fits['beta1'].mean():.4g} +/- {fits['beta1'].std():.4g} (mean +/- SD), "
                   f"{n_sig}/{len(fits)} sessions significant at Bonferroni p < {alpha_bonf:.4g}")]
 
         # group-level result across all recordings
         grp, per_rec, per_animal = summarise_slopes_across_recordings(fits, meta)
-        with pd.ExcelWriter(OUTPUT_DIR / f"Fig3_group_slopes_{response}.xlsx") as xw:
-            per_rec.to_excel(xw, sheet_name="per_recording", index=False)
-            per_animal.to_excel(xw, sheet_name="per_animal", index=False)
-            pd.DataFrame([grp]).to_excel(xw, sheet_name="group_test", index=False)
+        save_tables(out_dir, f"Fig3_group_slopes_{response}", {
+            "per_recording": per_rec, "per_animal": per_animal, "group_test": pd.DataFrame([grp])},
+            lab['fmt'])
         plot_recording_slopes(
             per_rec, grp, ylabel=f"β₁ ({units[response]} per {ACC_UNIT})",
-            title=f"Theta {response} vs. Acceleration slope",
-            out_path=OUTPUT_DIR / f"Fig3_recording_slopes_{response}.png")
+            title=f"Theta {response} vs. {name} slope",
+            out_path=out_dir / f"Fig3_recording_slopes_{response}.png", note=lab['note'])
 
         lines.append(
             f"  Group level (n={grp['n_recordings']} recordings from {grp['n_animals']} animals, "
@@ -1561,7 +1609,7 @@ def run_acc_vs_theta_persession_stats(df, n_channels_for_bonferroni=1):
             print(line)
         summary_lines.extend(lines)
 
-    with open(OUTPUT_DIR / "Fig3_persession_OLS_summary.txt", "w", encoding="utf-8") as f:
+    with open(out_dir / "Fig3_persession_OLS_summary.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines) + "\n")
 
     return df_binned
@@ -1636,7 +1684,7 @@ def classify_individual_fits(fits, sessions, q_thresh=INDIV_FDR_Q):
     return out
 
 
-def plot_individual_correlation(ses_id, raw, binned, cls_rows, out_path):
+def plot_individual_correlation(ses_id, raw, binned, cls_rows, out_path, lab=LAB_ALL):
     """One file: per measure, its FIG3_ACC_BIN_WIDTH acceleration-bin medians
     (whiskers = IQR of the 0.25 s time bins in that bin) against the bin's
     median acceleration, with the file's own OLS line (solid if FDR-significant,
@@ -1701,12 +1749,12 @@ def plot_individual_correlation(ses_id, raw, binned, cls_rows, out_path):
         details = "\n".join(details)
         ax.set_title(panel_title, fontsize=12, weight='bold')
         ax.axvline(0, color='0.6', linestyle=':', linewidth=1, zorder=0)
-        ax.set_xlabel(f"Acceleration ({ACC_UNIT}); points = median per {FIG3_ACC_BIN_WIDTH:g} {ACC_UNIT} bin",
+        ax.set_xlabel(f"{lab['xname']} ({ACC_UNIT}); points = median per {FIG3_ACC_BIN_WIDTH:g} {ACC_UNIT} bin",
                       fontsize=10)
         ax.set_ylabel(ylabel, fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.4)
         add_details_below(fig, ax, details)
-    fig.suptitle(ses_id, fontsize=11)
+    fig.suptitle(ses_id if lab['key'] == 'All' else f"{ses_id}  [{lab['name']} epochs]", fontsize=11)
     fig.savefig(out_path, dpi=150, bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
 
@@ -1740,7 +1788,7 @@ def _stacked_percent_bars(ax, groups):
     ax.spines[['top', 'right']].set_visible(False)
 
 
-def plot_percent_positive(cls_long, out_path):
+def plot_percent_positive(cls_long, out_path, lab=LAB_ALL):
     """% of all analysed files in each class: one bar per measure (all files),
     then one bar per animal for each measure."""
     animals = ordered_animals(cls_long["Animal"])
@@ -1776,6 +1824,8 @@ def plot_percent_positive(cls_long, out_path):
                  f"{MIN_SPEED_CMS:g} cm/s, no percentile cut, acceleration bins with ≥ "
                  f"{INDIV_MIN_TIME_PER_BIN_S:g} s of data); significant = Benjamini-Hochberg q < "
                  f"{INDIV_FDR_Q:g}, per measure.")
+    if lab['note']:
+        lines.append(lab['note'])
     axl = fig.add_subplot(gs[1, :])
     axl.axis('off')
     handles = [plt.Rectangle((0, 0), 1, 1, color=color) for _, color in CORREL_CATEGORIES]
@@ -1783,7 +1833,7 @@ def plot_percent_positive(cls_long, out_path):
                ncol=len(CORREL_CATEGORIES), frameon=False, fontsize=9)
     axl.text(0.5, 0.55, "\n".join(lines), transform=axl.transAxes, ha='center', va='top',
              fontsize=9, linespacing=1.5)
-    fig.suptitle("Theta vs. acceleration: individual-file correlations", fontsize=13, weight='bold')
+    fig.suptitle(f"Theta vs. {lab['name'].lower()}: individual-file correlations", fontsize=13, weight='bold')
     fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
 
@@ -1836,7 +1886,7 @@ def both_significant_table(cls_long):
     return out.reset_index()
 
 
-def plot_both_significant(both_tbl, out_path):
+def plot_both_significant(both_tbl, out_path, lab=LAB_ALL):
     """Number of files significant for both measures, per sign combination:
     all files (left) and by animal (right)."""
     sig = both_tbl[both_tbl["BothSignificant"]]
@@ -1885,6 +1935,7 @@ def plot_both_significant(both_tbl, out_path):
         f"Kept: files whose slope is significant (BH-FDR q < {INDIV_FDR_Q:g}, per measure) for both "
         + " and ".join(titles.values()) + f" ({len(sig)} of {n_all} analysed files).",
         f"Opposite signs split: {opp_txt}.",
+        *([lab['note']] if lab['note'] else []),
     ]
     axl = fig.add_subplot(gs[1, :])
     axl.axis('off')
@@ -1893,16 +1944,16 @@ def plot_both_significant(both_tbl, out_path):
     axl.legend(handles, cats, loc='upper center', ncol=len(cats), frameon=False, fontsize=9)
     axl.text(0.5, 0.5, "\n".join(lines), transform=axl.transAxes, ha='center', va='top',
              fontsize=9, linespacing=1.5)
-    fig.suptitle("Theta frequency and power both modulated by acceleration: direction",
+    fig.suptitle(f"Theta frequency and power both modulated by {lab['name'].lower()}: direction",
                  fontsize=12, weight='bold')
     fig.savefig(out_path, dpi=200, bbox_inches='tight', pad_inches=0.2)
     plt.close(fig)
 
 
-def save_both_significant(cls_long, out_dir=OUTPUT_DIR):
+def save_both_significant(cls_long, out_dir=OUTPUT_DIR, lab=LAB_ALL):
     """IndividualCorrel_BothSignificant.png + .xlsx (per-file table and counts)."""
     tbl = both_significant_table(cls_long)
-    plot_both_significant(tbl, Path(out_dir) / "IndividualCorrel_BothSignificant.png")
+    plot_both_significant(tbl, Path(out_dir) / "IndividualCorrel_BothSignificant.png", lab)
     cats = [c for c, _ in BOTH_SIG_CATEGORIES]
     sig = tbl[tbl["BothSignificant"]]
     counts = (sig.groupby("Animal")["Combination"].value_counts().unstack(fill_value=0)
@@ -1911,17 +1962,18 @@ def save_both_significant(cls_long, out_dir=OUTPUT_DIR):
     n_files = tbl.groupby("Animal").size()
     counts["n_both_significant"] = counts[cats].sum(axis=1)
     counts["n_files"] = [n_files.get(a, 0) for a in counts.index[:-1]] + [len(tbl)]
-    with pd.ExcelWriter(Path(out_dir) / "IndividualCorrel_BothSignificant.xlsx") as xw:
-        tbl.to_excel(xw, sheet_name="per_file", index=False)
-        counts.rename_axis("Animal").reset_index().to_excel(xw, sheet_name="counts", index=False)
+    save_tables(out_dir, "IndividualCorrel_BothSignificant", {
+        "per_file": tbl, "counts": counts.rename_axis("Animal").reset_index()}, lab['fmt'])
     print(counts.to_string())
     return tbl
 
 
-def run_individual_correlations(df):
-    """Per-file OLS fits, FDR classes, one PNG per file in INDIV_DIR, the
-    % summary figure and IndividualCorrel_per_file.xlsx."""
-    INDIV_DIR.mkdir(parents=True, exist_ok=True)
+def run_individual_correlations(df, out_dir=OUTPUT_DIR, lab=LAB_ALL):
+    """Per-file OLS fits, FDR classes, one PNG per file in <out_dir>/IndivdualCorrel,
+    the % summary figure and IndividualCorrel_per_file.xlsx."""
+    out_dir = Path(out_dir)
+    indiv_dir = out_dir / INDIV_DIR.name
+    indiv_dir.mkdir(parents=True, exist_ok=True)
     df_clean, df_binned = fig3_trim_and_bin(df, min_bin_s=INDIV_MIN_TIME_PER_BIN_S)
     meta = (df[["Session", "Recording", "Animal"]].drop_duplicates("Session")
               .sort_values("Session").reset_index(drop=True))
@@ -1940,12 +1992,12 @@ def run_individual_correlations(df):
         rows = {col: per_measure[col].set_index("Session").loc[ses_id] for col in per_measure}
         fname = re.sub(r'[^\w.-]', '_', ses_id) + '.png'
         plot_individual_correlation(ses_id, raw_by_ses.get(ses_id, empty_raw),
-                                    bin_by_ses.get(ses_id, empty_bin), rows, INDIV_DIR / fname)
+                                    bin_by_ses.get(ses_id, empty_bin), rows, indiv_dir / fname, lab)
         if i % 25 == 0 or i == len(sessions):
             print(f'  individual correlation plots: {i}/{len(sessions)}')
 
-    plot_percent_positive(cls_long, OUTPUT_DIR / "IndividualCorrel_PercentPositive.png")
-    save_both_significant(cls_long, OUTPUT_DIR)   # files significant for both measures
+    plot_percent_positive(cls_long, out_dir / "IndividualCorrel_PercentPositive.png", lab)
+    save_both_significant(cls_long, out_dir, lab)   # files significant for both measures
 
     cats = [c for c, _ in CORREL_CATEGORIES]
     overall = (cls_long.groupby("Measure")["Category"].value_counts().unstack(fill_value=0)
@@ -1959,12 +2011,92 @@ def run_individual_correlations(df):
         t["pct_sig_negative"] = 100 * t["Negative, significant"] / t["n_files"]
     cols = ["Measure", "Session", "Animal", "Recording", "beta1", "beta1_se", "intercept",
             "r", "r2", "pvalue", "qvalue", "n_bins", "Category"]
-    with pd.ExcelWriter(OUTPUT_DIR / "IndividualCorrel_per_file.xlsx") as xw:
-        cls_long[cols].to_excel(xw, sheet_name="per_file", index=False)
-        overall.reset_index().to_excel(xw, sheet_name="counts_all_files", index=False)
-        by_animal.reset_index().to_excel(xw, sheet_name="counts_by_animal", index=False)
+    save_tables(out_dir, "IndividualCorrel_per_file", {
+        "per_file": cls_long[cols], "counts_all_files": overall.reset_index(),
+        "counts_by_animal": by_animal.reset_index()}, lab['fmt'])
     print(overall.to_string())
     return cls_long
+
+
+# %% ==================== Acceleration vs. deceleration epochs, analysed separately ====
+#
+# The time bins are split by the sign of their acceleration and every analysis
+# above (mixed model, speed-controlled model, per-session OLS, individual-file
+# fits) is run on each half on its own:
+#   * Acc   : time bins with a >= ACC_BIN_WIDTH / 2 (acceleration bins centred
+#             4, 8, 12 ... cm/s^2) -> OUTPUT_DIR/Acc
+#   * Decel : time bins with a < -ACC_BIN_WIDTH / 2 (bins centred -4, -8 ...)
+#             -> OUTPUT_DIR/Decel
+# An epoch is one 0.25 s time bin (BINSIZE); no minimum run length. The 0 bin
+# [-ACC_BIN_WIDTH/2, ACC_BIN_WIDTH/2) -- near-constant speed -- is in neither.
+# The predictor is the MAGNITUDE |a| in both halves, so the Decel x-axis runs from
+# 0 to hard braking and a positive slope means theta rises with stronger
+# deceleration (same reading as in Acc). The signed value is kept as
+# AccelerationSigned. Mobility rule, binning, bin-inclusion rules and power
+# measures are those of the combined analyses. Tables are written as .csv.
+
+SPLIT_LABELS = {
+    'Acc': dict(key='Acc', name='Acceleration', xname='Acceleration', short='Acc', fmt='csv',
+                note=f'Acceleration epochs only: {BINSIZE:g} s time bins with a ≥ {ACC_BIN_WIDTH / 2:g} '
+                     f'{ACC_UNIT} (near-zero bin excluded).'),
+    'Decel': dict(key='Decel', name='Deceleration', xname='|Deceleration|', short='|Decel|', fmt='csv',
+                  note=f'Deceleration epochs only: {BINSIZE:g} s time bins with a < −{ACC_BIN_WIDTH / 2:g} '
+                       f'{ACC_UNIT} (near-zero bin excluded); x = |a|, so slope > 0 = theta rises with '
+                       f'harder braking.'),
+}
+
+
+def split_acc_decel(df, key):
+    """Time bins of one direction ('Acc' or 'Decel', see SPLIT_LABELS), with
+    Acceleration replaced by its magnitude and the signed value kept as
+    AccelerationSigned. Uses the same 0-centred bins as everywhere else, so the
+    0 bin is excluded from both."""
+    k = acc_bin_index(df["Acceleration"])
+    d = df[k >= 1 if key == 'Acc' else k <= -1].copy()
+    d["AccelerationSigned"] = d["Acceleration"]
+    d["Acceleration"] = d["Acceleration"].abs()
+    return d
+
+
+def run_acc_decel_split(df, out_root=OUTPUT_DIR, source=''):
+    """Run every acceleration analysis separately on the acceleration and the
+    deceleration time bins (split_acc_decel) -> <out_root>/Acc and
+    <out_root>/Decel. `source` (e.g. the parquet path) is recorded in each
+    folder's Split_settings.csv."""
+    import datetime
+    k_all = acc_bin_index(df["Acceleration"])
+    mobile = df["Mobile"].to_numpy() & np.isfinite(df["Acceleration"].to_numpy())
+    for key, lab in SPLIT_LABELS.items():
+        out_dir = Path(out_root) / key
+        out_dir.mkdir(parents=True, exist_ok=True)
+        d = split_acc_decel(df, key)
+        n_mob = int(d["Mobile"].sum())
+        print(f'\n===== {key}: {len(d)} time bins ({n_mob} mobile = '
+              f'{100 * n_mob / max(mobile.sum(), 1):.1f}% of mobile time bins; '
+              f'{100 * ((k_all == 0) & mobile).sum() / max(mobile.sum(), 1):.1f}% of mobile bins '
+              f'are in the excluded 0 bin) -> {out_dir}')
+
+        settings = {
+            'run_datetime': datetime.datetime.now().isoformat(timespec='seconds'),
+            'input': source or 'in-memory DataFrame (ThetaVsAcc driver)',
+            'subset': lab['note'],
+            'epoch': f'one {BINSIZE:g} s time bin, classed by the sign of its acceleration; no minimum run length',
+            'predictor': '|a| (magnitude) in cm/s^2; signed value kept as AccelerationSigned',
+            'ACC_BIN_WIDTH': ACC_BIN_WIDTH, 'MIN_SPEED_CMS': MIN_SPEED_CMS,
+            'SPEED_BIN_WIDTH_CMS': SPEED_BIN_WIDTH_CMS, 'BIN_AGG_METHOD': BIN_AGG_METHOD,
+            'INDIV_MIN_TIME_PER_BIN_S': INDIV_MIN_TIME_PER_BIN_S, 'INDIV_FDR_Q': INDIV_FDR_Q,
+            'n_time_bins': len(d), 'n_mobile_time_bins': n_mob,
+            'n_sessions': d["Session"].nunique(), 'n_animals': d["Animal"].nunique(),
+            'abs_acc_mobile_p5_p50_p95': ' / '.join(
+                f'{v:.1f}' for v in d.loc[d["Mobile"], "Acceleration"].quantile([0.05, 0.5, 0.95])),
+        }
+        pd.DataFrame({'parameter': list(settings), 'value': [str(v) for v in settings.values()]}
+                     ).to_csv(out_dir / 'Split_settings.csv', index=False, encoding='utf-8-sig')
+
+        res = run_acc_vs_theta_stats(d, out_dir, lab)
+        run_speed_controlled_model(d, res, out_dir, lab)
+        run_acc_vs_theta_persession_stats(d, out_dir=out_dir, lab=lab)
+        run_individual_correlations(d, out_dir, lab)
 
 
 # %% ==================== Run metadata ===============================================
@@ -2067,6 +2199,9 @@ def save_run_metadata(meta_dir=META_DIR):
         'individual_correl':        f'per-file OLS of {[m[0] for m in INDIV_MEASURES]}, '
                                     f'Benjamini-Hochberg FDR q < {INDIV_FDR_Q} across fitted files '
                                     'per measure; % denominator = all analysed files',
+        'acc_decel_split':          'all analyses above repeated on Acc (a >= ACC_BIN_WIDTH/2) and Decel '
+                                    '(a < -ACC_BIN_WIDTH/2) time bins separately, predictor |a|, 0 bin in '
+                                    'neither -> OUTPUT_DIR/Acc, OUTPUT_DIR/Decel (.csv tables)',
         # ---- plots ----
         'ANIMAL_COLORS':            ANIMAL_COLORS,
         'figure_dpi':               200,
@@ -2108,5 +2243,6 @@ if __name__ == "__main__":
         run_speed_controlled_model(df, acc_results)      # Acceleration + Speed, 2-D bins
         run_acc_vs_theta_persession_stats(df)            # Dunn et al. Fig. 3's per-session OLS
         run_individual_correlations(df)                  # one OLS plot per file + % positive
+        run_acc_decel_split(df)                          # all of the above, Acc / Decel separately
     else:
         print('No sessions processed successfully -- skipping acceleration vs. theta statistics.')

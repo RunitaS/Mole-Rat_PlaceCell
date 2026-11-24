@@ -37,6 +37,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt # type: ignore
 from matplotlib.colors import to_hex, ListedColormap, Normalize, TwoSlopeNorm # type: ignore
 from matplotlib.cm import ScalarMappable # type: ignore
+from matplotlib.ticker import MaxNLocator, FixedLocator, FormatStrFormatter # type: ignore
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -112,6 +113,86 @@ def _legend_outside(ax, handles=None, labels=None):
         handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles, labels, frameon=False, fontsize=8, labelcolor=INK_PRIMARY,
               loc='upper left', bbox_to_anchor=(1.0, 1.0))
+
+
+# Axis breaks (used for metrics whose data sit far from a threshold or in one dominant bin)
+BREAK_GAP_FRAC = 0.05   # drawn width of a break, as a fraction of the segment before it
+Y_BREAK_RATIO  = 4.0    # break the y-axis when the tallest bin is > this × the 2nd tallest
+Y_UPPER_FRAC   = 0.18   # share of the axis height kept for the top of the tallest bin
+
+
+def _break_scale(a, b, gap, k=1.0):
+    """Forward / inverse of a piecewise-linear scale: unchanged up to `a`, the empty
+    stretch a → b squeezed to `gap` display units, slope `k` beyond `b`."""
+    s = gap / (b - a)
+
+    def fwd(x):
+        x = np.asarray(x, dtype=float)
+        return np.where(x <= a, x, np.where(x < b, a + (x - a) * s, a + gap + (x - b) * k))
+
+    def inv(y):
+        y = np.asarray(y, dtype=float)
+        return np.where(y <= a, y, np.where(y < a + gap, a + (y - a) / s, b + (y - a - gap) / k))
+    return fwd, inv
+
+
+def _break_mark(ax, pos, axis):
+    """'≈' on the x (bottom) or y (left) spine at data position `pos`."""
+    if axis == 'x':
+        kw = dict(transform=ax.get_xaxis_transform(), rotation=90, x=pos, y=0)
+    else:
+        kw = dict(transform=ax.get_yaxis_transform(), rotation=0, x=0, y=pos)
+    ax.text(s='≈', ha='center', va='center', fontsize=13, color=INK_SECONDARY, zorder=8,
+            clip_on=False, bbox=dict(facecolor=SURFACE, edgecolor='none', pad=0.3), **kw)
+
+
+def _apply_axis_breaks(ax, bin_edges, counts, thresholds):
+    """
+    x: thresholds lying further beyond the data than the data range is wide are kept,
+       but the empty stretch before them is squeezed into a '≈' break.
+    y: when one bin is > Y_BREAK_RATIO × taller than all others, the y-axis is cut
+       between the 2nd-tallest bin and the top of the tallest one.
+    """
+    lo, hi = float(bin_edges[0]), float(bin_edges[-1])
+    xt = MaxNLocator(5).tick_values(lo, hi)
+    a  = float(xt[xt >= hi - 1e-12][0])                 # round end of the data segment
+    far = [t for t in thresholds if t - a > a - lo]
+    if far:
+        pad  = 0.04 * (a - lo)
+        xmin = lo - pad
+        b    = min(far) - pad
+        gap  = BREAK_GAP_FRAC * (a - xmin)
+        ax.set_xscale('function', functions=_break_scale(a, b, gap))
+        ax.set_xlim(xmin, max(far) + pad)
+        ax.xaxis.set_major_locator(FixedLocator(list(xt[(xt >= lo - 1e-12) & (xt <= a + 1e-12)]) + far))
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%g'))
+        ax.xaxis.set_minor_locator(FixedLocator([]))
+        ax.axvspan(a, b, color=SURFACE, linewidth=0, zorder=2.5)
+        _break_mark(ax, (a + b) / 2, 'x')
+
+    counts = np.asarray(counts)
+    srt    = np.sort(counts)
+    top, second = int(srt[-1]), int(srt[-2]) if len(srt) > 1 else 0
+    if second > 0 and top > Y_BREAK_RATIO * second:
+        yt   = MaxNLocator(5, integer=True).tick_values(0, second * 1.15)
+        c1   = float(yt[-1])
+        ytop = top * 1.06                                 # room for the count label
+        c2   = top * 0.92
+        up_t = [float(t) for t in MaxNLocator(2, integer=True).tick_values(c2, top) if c2 <= t <= top]
+        up_t = up_t[-1:] or [float(top)]                  # one tick only: the segment is short
+        gap  = BREAK_GAP_FRAC * c1
+        k    = Y_UPPER_FRAC * (c1 + gap) / (1 - Y_UPPER_FRAC) / (ytop - c2)
+        ax.set_yscale('function', functions=_break_scale(c1, c2, gap, k))
+        ax.set_ylim(0, ytop)
+        ax.yaxis.set_major_locator(FixedLocator([float(t) for t in yt if t >= 0] + up_t))
+        ax.yaxis.set_major_formatter(FormatStrFormatter('%d'))
+        ax.yaxis.set_minor_locator(FixedLocator([]))
+        ax.axhspan(c1, c2, color=SURFACE, linewidth=0, zorder=3.7)   # cuts the tall bar
+        _break_mark(ax, (c1 + c2) / 2, 'y')
+        i_top = int(np.argmax(counts))
+        ax.text(bin_edges[i_top + 1], top, f'{top} units', ha='left', va='top',
+                fontsize=8, color=INK_SECONDARY, zorder=7,
+                bbox=dict(facecolor=SURFACE, edgecolor='none', pad=1.0))
 
 
 def _to_bool(v) -> bool:
@@ -407,13 +488,15 @@ print(f'\nCorrected metrics saved: {CLEAN_EXCEL}')
 # ── Histograms of all quality metrics ─────────────────────────────────────────
 
 def draw_histogram(ax, values, accepted, xlabel, thresholds=(), thr_colors=(), thr_labels=(),
-                   n_bins=30, legend=True, amp=None, amp_norm=None, log_x=False):
+                   n_bins=30, legend=True, amp=None, amp_norm=None, log_x=False, broken=False):
     """
     Stacked histogram (rejected in gray at the bottom, accepted in colour on top).
     If `amp` is given, every accepted unit is drawn as its own unit-height block,
     coloured by its peak amplitude (AMP_CMAP / amp_norm) and stacked low → high
     amplitude within each bin.
     If `log_x`, bins are log-spaced on a log x-axis (values <= 0 are left out).
+    If `broken` (linear x only), empty x-stretches before distant thresholds and the
+    middle of a dominant bin are cut out with '≈' breaks (see _apply_axis_breaks).
     """
     values   = np.asarray(values, dtype=float)
     valid    = ~np.isnan(values)
@@ -471,6 +554,8 @@ def draw_histogram(ax, values, accepted, xlabel, thresholds=(), thr_colors=(), t
                label=f'Median {median_v:.3f}')
     ax.set_xlabel(xlabel, color=INK_PRIMARY)
     ax.set_ylabel('Number of units', color=INK_PRIMARY)
+    if broken and not log_x:
+        _apply_axis_breaks(ax, bin_edges, n_rej + n_acc, thresholds)
     if n_nonpos:
         ax.text(0.99, 0.98, f'{n_nonpos} units with value 0 not shown (log axis)',
                 transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, ha='right', va='top',
@@ -490,6 +575,10 @@ def draw_histogram(ax, values, accepted, xlabel, thresholds=(), thr_colors=(), t
         summary = (f'n = {len(vals)}\n'
                    f'Mean ± SD = {mean_v:.3f} ± {float(np.std(vals)):.3f}\n'
                    f'Median = {median_v:.3f}')
+        if broken:
+            n_zero = int((vals == 0).sum())
+            summary += (f'\nExactly 0 = {n_zero} ({100 * n_zero / len(vals):.1f} %)'
+                        f'\nMax = {float(vals.max()):.3f}')
         ax.text(1.02, 0.0, summary, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY,
                 ha='left', va='bottom')
 
@@ -522,6 +611,7 @@ histogram_specs = [
      (10.0,), (COLOR_THR_BAD,), ('CSI = 10%',)),
 ]
 LOG_X_COLS = {'mean_fr_hz'}      # strongly right-skewed: log-spaced bins on a log axis
+BROKEN_AXIS_COLS = {'isi_violation_pct'}   # data far below the 5 % line, ~96 % of units at 0
 
 accepted_flags = df['accepted'].values
 excel_base     = os.path.splitext(os.path.basename(OUTPUT_EXCEL))[0]
@@ -556,7 +646,7 @@ for suffix, col, title, xlabel, thr, thr_c, thr_l in histogram_specs:
     draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags,
                    xlabel, thr, thr_c, thr_l,
                    amp=peak_amps if color_by_amp else None, amp_norm=amp_norm,
-                   log_x=col in LOG_X_COLS)
+                   log_x=col in LOG_X_COLS, broken=col in BROKEN_AXIS_COLS)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
     if color_by_amp:
         _amp_colorbar(fig.colorbar(ScalarMappable(norm=amp_norm, cmap=AMP_CMAP), ax=ax,
@@ -576,7 +666,7 @@ for ax, (suffix, col, title, xlabel, thr, thr_c, thr_l) in zip(axes, specs_prese
     draw_histogram(ax, pd.to_numeric(df[col], errors='coerce').values, accepted_flags,
                    xlabel, thr, thr_c, thr_l, legend=False,
                    amp=peak_amps if col != 'peak_amp_uV' else None, amp_norm=amp_norm,
-                   log_x=col in LOG_X_COLS)
+                   log_x=col in LOG_X_COLS, broken=col in BROKEN_AXIS_COLS)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc='left')
 for ax in axes[len(specs_present):]:
     ax.set_visible(False)

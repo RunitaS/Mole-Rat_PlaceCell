@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 """
+SUPERSEDED (20 Nov 2026) by FinalCodes\\WallDistance_Continuum_v2.py, which writes
+Results\\WallDistanceContinuum (and the PC_Char\\v4 WallDistance folders) from the latest v21
+inputs with one y-axis per metric. Do not re-run this script into the same OUTPUT_DIR.
+
 Place-cell metrics as a function of DISTANCE FROM THE NEAREST WALL: every place cell is placed at
 the wall distance of the PEAK BIN OF ITS RAW RATE MAP, and every place-cell characterization
 metric is tested for a trend with that distance. Unlike EdgeCentreZone_StatsComparison_v6 (two
@@ -60,6 +64,8 @@ median + IQR per distance (continuous), or % yes with Wilson 95 % CI per distanc
 groups side by side at each distance, the trend / pooled / matched-distance tests underneath.
 \\AnimalControlledArenaType\\<name>\\MatchedRows: one per metric, the two arenas side by side at
 each shared row (and the pooled rows), stars = p_holm_tests.
+The plots of one metric under AnimalControlledArenaType share one y-range across the comparison
+folders (trend plots with trend plots, MatchedRows with MatchedRows; PlotLayout_Utils).
 OUTPUT_DIR\\WallDistanceSchematic_<arena>.png: the bins of each arena shaded by wall_dist.
 
 Outputs (OUTPUT_DIR):
@@ -106,6 +112,10 @@ sys.path[:0] = [_HERE, os.path.join(_HERE, 'OldVer'), _CODES, os.path.join(_CODE
 import EdgeCentreZone_StatsComparison_v6_intmZoneOpen as ez   # noqa: E402
 asc, ccs = ez.asc, ez.ccs
 import matplotlib.pyplot as plt                              # noqa: E402
+# PlotLayout_Utils (shared y-range of the animal-controlled plots) lives in Codes\FinalCodes;
+# appended last so it does not shadow any module found above.
+sys.path.append(os.path.join(_CODES, 'FinalCodes'))
+from PlotLayout_Utils import shared_y_axes                   # noqa: E402
 
 # ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -114,7 +124,7 @@ PLACE_CELL_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFil
 OUTPUT_DIR     = os.path.join(PLACE_CELL_DIR, 'Results', 'WallDistanceContinuum')
 
 # Output of TemporalStabilityMap_v6_MapPassStability.py on PLACE_CELL_DIR.
-TEMPORAL_STABILITY_EXCEL = os.path.join(PLACE_CELL_DIR, 'Results', 'PC_Char' , 'TemporalStability.xlsx')
+TEMPORAL_STABILITY_EXCEL = os.path.join(PLACE_CELL_DIR, 'Results', 'PC_Char', 'v4', 'TemporalStability.xlsx')
 
 # 'Spearman': Spearman correlation per group, linear model on ranks for the pooled tests,
 #             logistic regression -- rows treated as independent (like v6's 'KW').
@@ -1079,19 +1089,25 @@ def main():
                        os.path.join(OUTPUT_DIR, 'SessionType', arena), tables)
 
     # ── 3. Animal-controlled: only the animals recorded in all compared arenas ──
-    for name, (animals, arenas) in asc.ANIMAL_CONTROLLED_COMPARISONS.items():
-        wanted = {a.lower() for a in animals}
+    # The plot of one metric gets the same y-range in every comparison folder (Circle_vs_Open,
+    # Linear_vs_Open), separately for the trend plots and for the MatchedRows plots
+    # (PlotLayout_Utils.shared_y_axes pairs the files by their path within each folder).
+    ac_dirs = [os.path.join(OUTPUT_DIR, asc.ANIMAL_CONTROLLED_DIR, name)
+               for name in asc.ANIMAL_CONTROLLED_COMPARISONS]
+    with shared_y_axes(ac_dirs):
+        for (name, (animals, arenas)), plots_dir in zip(asc.ANIMAL_CONTROLLED_COMPARISONS.items(),
+                                                        ac_dirs):
+            wanted = {a.lower() for a in animals}
 
-        def _of(d):
-            return d['animal'].astype(str).str.lower().isin(wanted)
-        groups = [DistGroup(a, a, _sel(full_df, a, _of), _sel(field_df, a, _of))
-                  for a in asc.ARENA_TYPES if a in arenas]
-        info = dict(level='AnimalControlled', comparison=name, animals=', '.join(animals))
-        plots_dir = os.path.join(OUTPUT_DIR, asc.ANIMAL_CONTROLLED_DIR, name)
-        title = f'Wall distance, {" + ".join(animals)} only'
-        run_comparison(info, groups, metrics, 'arena', title, plots_dir, tables)
-        run_matched_rows(info, groups, common_rows([g.label for g in groups], units), metrics,
-                         title, os.path.join(plots_dir, 'MatchedRows'), tables)
+            def _of(d, wanted=wanted):
+                return d['animal'].astype(str).str.lower().isin(wanted)
+            groups = [DistGroup(a, a, _sel(full_df, a, _of), _sel(field_df, a, _of))
+                      for a in asc.ARENA_TYPES if a in arenas]
+            info = dict(level='AnimalControlled', comparison=name, animals=', '.join(animals))
+            title = f'Wall distance, {" + ".join(animals)} only'
+            run_comparison(info, groups, metrics, 'arena', title, plots_dir, tables)
+            run_matched_rows(info, groups, common_rows([g.label for g in groups], units),
+                             metrics, title, os.path.join(plots_dir, 'MatchedRows'), tables)
 
     # ── Save ────────────────────────────────────────────────────────────────
     stat_tables = {k: pd.DataFrame(v) for k, v in tables.items()}

@@ -1,6 +1,9 @@
 """
 WallDistance_PerArenaPlots_v1.py
 
+SUPERSEDED (20 Nov 2026) by WallDistance_Continuum_v2.py (per-arena plots on the same y-axis
+as every other wall-distance plot of the metric). Do not re-run.
+
 Standalone re-plot of the ArenaType wall-distance figures, one arena at a time,
 without re-running ArenaSessionType_StatsComparison_v21.py.
 

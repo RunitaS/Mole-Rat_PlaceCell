@@ -61,7 +61,7 @@ NCS_FILE_LIST_CSV = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQlty
 
 # Common output folder: every CSV/XLSX/PKL/TXT result and all figures
 # (band-by-band, theta range, aperiodic properties) are saved under here.
-OUTPUT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2\PSD_FOOOF_NcsDropCorr'
+OUTPUT_DIR = r'X:\NMR_group_data\Runita\Analysis\Thesis\Corr_Data_SpkQltyFilt\SpikeQualityFilt\SpikeQualityFilt_v1_PlaceCellData\PC_True_SiSkaggsAdptBin_CI99_2\PSD_FOOOF_NcsDropCorr\Revised'
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')            # all figures
 
 # Which animals (by ID / subfolder name under ROOT_DIR) to include. Comment/
@@ -134,6 +134,12 @@ FOOOF_SETTINGS = dict(
     peak_threshold=2.0,
     aperiodic_mode='knee',    # use 'knee' if fitting a wide range with a spectral knee
 )
+# Fit quality (R^2 / error) used to accept or reject a file is judged only
+# over this low-frequency range, not the whole FOOOF_RANGE: over 1-100 Hz the
+# error is dominated by the fit edge at ~100 Hz and the broad high-frequency
+# peaks, which says nothing about how well the theta peak was fitted. The
+# model is still fitted over FOOOF_RANGE; only the quality score is restricted.
+QC_FREQ_RANGE  = (1.0, 20.0)    # Hz
 
 # ---- Theta extraction / property plotting (from notebook) ----
 THETA_BAND = (3.0, 7.0)        # Hz window used to pull the theta peak from FOOOF
@@ -585,6 +591,9 @@ def build_fooof_results(results, fooof_settings=None, fooof_range=None,
     fooof_results_to_df() works unchanged:
         animal, date, session, tetrode, channel,
         aperiodic_params, peak_params, r_squared, error
+    plus r_squared_qc / error_qc: the same two scores computed only over
+    QC_FREQ_RANGE (see fit_quality_in_range), which decide whether a file is
+    used for the theta range.
 
     If `save_fits` is True, also saves one model-fit figure (original spectrum,
     full model, aperiodic fit) per file under
@@ -608,18 +617,22 @@ def build_fooof_results(results, fooof_settings=None, fooof_range=None,
             os.makedirs(animal_dir, exist_ok=True)
 
         for i in range(psds_norm.shape[0]):
-            # regenerate=True so the modeled spectrum/aperiodic fit are
-            # available for plotting (regenerate=False only keeps params).
-            fm = fg.get_fooof(i, regenerate=save_fits)
+            # regenerate=True so the modeled spectrum is available for the
+            # low-frequency fit-quality score and for plotting
+            # (regenerate=False only keeps params).
+            fm = fg.get_fooof(i, regenerate=True)
             meta = parse_metadata_from_path(file_names[i])
+            r2_qc, err_qc = fit_quality_in_range(fm)
             fooof_results.append({
                 'animal':           animal,
                 'file':             file_names[i],
                 **meta,
                 'aperiodic_params': fm.aperiodic_params_,
                 'peak_params':      fm.peak_params_,
-                'r_squared':        fm.r_squared_,
-                'error':            fm.error_,
+                'r_squared':        fm.r_squared_,     # over FOOOF_RANGE
+                'error':            fm.error_,         # over FOOOF_RANGE
+                'r_squared_qc':     r2_qc,             # over QC_FREQ_RANGE
+                'error_qc':         err_qc,            # over QC_FREQ_RANGE
             })
 
             if save_fits:
@@ -635,6 +648,21 @@ def build_fooof_results(results, fooof_settings=None, fooof_range=None,
             print(f"    Saved {psds_norm.shape[0]} fit figures -> {animal_dir}")
 
     return fooof_results
+
+
+def fit_quality_in_range(fm, freq_range=None):
+    """R^2 and mean absolute error of a fitted FOOOF model, computed only over
+    freq_range (default QC_FREQ_RANGE). Same formulas FOOOF uses for
+    r_squared_ / error_ (squared Pearson r and MAE between the log-power
+    spectrum and the full model), just on a subset of frequencies. Needs
+    fm.fooofed_spectrum_, i.e. a model fitted directly or obtained with
+    FOOOFGroup.get_fooof(..., regenerate=True)."""
+    lo, hi = freq_range or QC_FREQ_RANGE
+    mask = (fm.freqs >= lo) & (fm.freqs <= hi)
+    data, model = fm.power_spectrum[mask], fm.fooofed_spectrum_[mask]
+    r_squared = np.corrcoef(data, model)[0, 1] ** 2
+    error = np.abs(data - model).mean()
+    return r_squared, error
 
 
 def extract_theta_peak(peak_params, theta_band=None):
@@ -695,6 +723,8 @@ def fooof_results_to_df(fooof_results, theta_band):
             'has_theta':  not np.isnan(theta_cf),
             'r_squared':  r['r_squared'],
             'error':      r['error'],
+            'r_squared_qc': r['r_squared_qc'],
+            'error_qc':     r['error_qc'],
         })
 
     df = pd.DataFrame(rows)
@@ -704,34 +734,42 @@ def fooof_results_to_df(fooof_results, theta_band):
     return df
 
 
-# ---- FOOOF fit-quality thresholds for flagging poor fits ----
-R_SQUARED_MIN = 0.98   # flag files with r_squared below this
-ERROR_MAX     = 0.05    # flag files with error above this
+# ---- FOOOF fit-quality thresholds (applied to the QC_FREQ_RANGE scores) ----
+# Only fits meeting these criteria contribute to the theta low/high estimate;
+# files failing them are listed in low_quality_fooof_fits.txt.
+# (Before 20 Nov 2026: R^2 > 0.9 and error < 0.05 over the full 1-100 Hz fit.)
+THETA_FIT_R2_MIN  = 0.9    # r_squared_qc must be above this
+THETA_FIT_ERR_MAX = 0.1    # error_qc must be below this
+R_SQUARED_MIN = THETA_FIT_R2_MIN    # kept as names for the run-metadata sheet
+ERROR_MAX     = THETA_FIT_ERR_MAX
+
+
+def _passes_fit_quality(df, r2_min=THETA_FIT_R2_MIN, error_max=THETA_FIT_ERR_MAX):
+    """Boolean mask: r_squared_qc > r2_min AND error_qc < error_max."""
+    return (df['r_squared_qc'] > r2_min) & (df['error_qc'] < error_max)
 
 
 def export_low_quality_fits(df, out_path, r2_min=R_SQUARED_MIN, error_max=ERROR_MAX):
-    """Write the list of files whose FOOOF fit has r_squared < r2_min OR
-    error > error_max to a .txt file (one file path per line)."""
-    flagged = df[(df['r_squared'] < r2_min) | (df['error'] > error_max)]
+    """Write the list of files whose FOOOF fit fails the QC_FREQ_RANGE quality
+    check (r_squared_qc <= r2_min OR error_qc >= error_max) to a .txt file
+    (one file path per line)."""
+    flagged = df[~_passes_fit_quality(df, r2_min, error_max)]
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w') as fh:
         for _, row in flagged.iterrows():
             fh.write(f"{row['file']}\n")
-    print(f"Flagged {len(flagged)}/{len(df)} files "
-          f"(r_squared < {r2_min} or error > {error_max}) -> {out_path}")
+    print(f"Flagged {len(flagged)}/{len(df)} files (over {QC_FREQ_RANGE[0]:g}-"
+          f"{QC_FREQ_RANGE[1]:g} Hz: r_squared <= {r2_min} or error >= {error_max}) "
+          f"-> {out_path}")
     return flagged
 
 
 # %% ==================== Theta-range summary + box plot ========================
 
-# Only fits meeting these criteria contribute to the theta low/high estimate
-THETA_FIT_R2_MIN  = 0.9
-THETA_FIT_ERR_MAX = 0.05
-
-
 def _good_theta_fits(df, r2_min=THETA_FIT_R2_MIN, error_max=THETA_FIT_ERR_MAX):
-    """Fits with a detected theta peak AND r_squared > r2_min AND error < error_max."""
-    return df[df['has_theta'] & (df['r_squared'] > r2_min) & (df['error'] < error_max)]
+    """Fits with a detected theta peak AND r_squared_qc > r2_min AND
+    error_qc < error_max (scores over QC_FREQ_RANGE)."""
+    return df[df['has_theta'] & _passes_fit_quality(df, r2_min, error_max)]
 
 
 def theta_range_summary(df):
@@ -1422,7 +1460,10 @@ def plot_fit_quality(df, group_col="animal", metrics="both", mode="box",
         ax.set_title(metric)
         ax.set_xlabel(group_col)
         ax.spines[["top", "right"]].set_visible(False)
-        ax.set_ylim(0.5, None)
+        if metric.startswith("r_squared"):
+            ax.set_ylim(0.5, None)
+        else:   # error values are ~0.02-0.15; a 0.5 floor would hide them all
+            ax.set_ylim(0, None)
     plt.tight_layout()
 
     if save:
@@ -1506,8 +1547,12 @@ def _style_fooof_fit_ax(ax, fm, xlim=(1, 20), title="Sample FOOOF fit",
     ax.set_xlim(xlim)
     ax.text(0.5, 1.11, title, transform=ax.transAxes,
             ha='center', va='bottom', fontsize=10)
-    ax.text(0.5, 1.01, f"R\u00b2={fm.r_squared_:.3f}, error={fm.error_:.3f}",
-            transform=ax.transAxes, ha='center', va='bottom', fontsize=8)
+    r2_qc, err_qc = fit_quality_in_range(fm)
+    ax.text(0.5, 1.01,
+            f"{QC_FREQ_RANGE[0]:g}-{QC_FREQ_RANGE[1]:g} Hz: R\u00b2={r2_qc:.3f}, "
+            f"error={err_qc:.3f}  |  full fit: R\u00b2={fm.r_squared_:.3f}, "
+            f"error={fm.error_:.3f}",
+            transform=ax.transAxes, ha='center', va='bottom', fontsize=7)
 
     theta_cf, _theta_pw, theta_bw = extract_theta_peak(fm.peak_params_, theta_band)
     theta_low, theta_high = theta_range_from_peak(theta_cf, theta_bw)
@@ -1567,6 +1612,12 @@ def plot_theta_prop_hist_on_ax(ax, df, prop, xlim=None, xlabel=None, title=None)
     _fmt(ax)
 
 
+# y-limits of the master-summary fit-quality panels (C1 / C2); wide enough to
+# show the files that fail THETA_FIT_R2_MIN / THETA_FIT_ERR_MAX
+FIT_QUALITY_YLIM_R2  = (0.85, 1.0)
+FIT_QUALITY_YLIM_ERR = (0, 0.16)
+
+
 def plot_master_summary(results, master_psds_dict, expanded_fooof_df,
                         file_counts, freqs, save=True):
     """Composite summary figure (adapted from notebook cell 61)."""
@@ -1596,8 +1647,9 @@ def plot_master_summary(results, master_psds_dict, expanded_fooof_df,
     plot_sample_psd_and_fooof_on_ax(axes["B"], freqs=s_freqs, psd=s_psd,
                                     freq_range=tuple(FOOOF_RANGE), xlim=(1, 20))
 
-    # C1 / C2: fit quality
-    def _quality_ax(ax, col, ylim, title):
+    # C1 / C2: fit quality over QC_FREQ_RANGE (the scores used to accept fits);
+    # dashed line = acceptance threshold
+    def _quality_ax(ax, col, ylim, title, threshold=None):
         order_animals = sorted(expanded_fooof_df["animal"].unique())
         palette = {a: animal_color(a) for a in order_animals}
         long_df = expanded_fooof_df[["animal", col]].dropna()
@@ -1605,6 +1657,8 @@ def plot_master_summary(results, master_psds_dict, expanded_fooof_df,
                     palette=palette, fliersize=0, linewidth=0.8)
         sns.stripplot(data=long_df, x="animal", y=col, ax=ax,
                       palette=palette, size=2.5, alpha=0.35, jitter=True)
+        if threshold is not None:
+            ax.axhline(threshold, color='#555555', ls='--', lw=0.8)
         ax.set_ylim(*ylim)
         ax.set_title(title, fontsize=AX_LABEL_FONTSIZE, pad=4)
         ax.set_xlabel("")
@@ -1613,8 +1667,11 @@ def plot_master_summary(results, master_psds_dict, expanded_fooof_df,
         ax.tick_params(axis='x', rotation=30, labelsize=TICK_LABEL_FONTSIZE)
         ax.tick_params(axis='y', labelsize=TICK_LABEL_FONTSIZE)
 
-    _quality_ax(axes["C1"], "r_squared", (0.9, 1.0), "R\u00b2")
-    _quality_ax(axes["C2"], "error", (0, 0.1), "Error")
+    _qc_lbl = f"({QC_FREQ_RANGE[0]:g}-{QC_FREQ_RANGE[1]:g} Hz)"
+    _quality_ax(axes["C1"], "r_squared_qc", FIT_QUALITY_YLIM_R2,
+                f"R\u00b2 {_qc_lbl}", threshold=THETA_FIT_R2_MIN)
+    _quality_ax(axes["C2"], "error_qc", FIT_QUALITY_YLIM_ERR,
+                f"Error {_qc_lbl}", threshold=THETA_FIT_ERR_MAX)
 
     # D / E / F: theta histograms
     plot_theta_prop_hist_on_ax(axes["D"], expanded_fooof_df, prop="theta_cf",
@@ -1799,6 +1856,7 @@ def _analysis_settings():
         },
         'FOOOF': {
             'FOOOF_RANGE':            FOOOF_RANGE,
+            'QC_FREQ_RANGE (fit-quality scores)': QC_FREQ_RANGE,
             'FOOOF_SETTINGS':         FOOOF_SETTINGS,
             'THETA_BAND':             THETA_BAND,
             'BANDS':                  {name: tuple(rng) for name, rng in BANDS},
@@ -1822,8 +1880,8 @@ def _analysis_settings():
             'sample_fit_xlim':        (1, 20),
             'mean_psd_plot_xlim':     (2, 20),
             'band_shaded_spectra_freq_range': (1, 90),
-            'fit_quality_ylim_summary_R2':    (0.9, 1.0),
-            'fit_quality_ylim_summary_error': (0, 0.1),
+            'fit_quality_ylim_summary_R2':    FIT_QUALITY_YLIM_R2,
+            'fit_quality_ylim_summary_error': FIT_QUALITY_YLIM_ERR,
             'plot_palette':           ANIMAL_COLORS,
         },
     }
@@ -1955,7 +2013,8 @@ df_fooof = pd.DataFrame(fooof_results)
 # 5) Expand into per-property dataframe and make the property/quality plots.
 expanded_fooof_df = fooof_results_to_df(fooof_results, theta_band=THETA_BAND)
 
-# Flag/export files with a poor FOOOF fit (r_squared < 0.98 or error > 0.4).
+# Flag/export files with a poor FOOOF fit over QC_FREQ_RANGE (1-20 Hz):
+# r_squared_qc <= THETA_FIT_R2_MIN or error_qc >= THETA_FIT_ERR_MAX.
 export_low_quality_fits(
     expanded_fooof_df,
     os.path.join(OUTPUT_DIR, 'low_quality_fooof_fits.txt'))
@@ -1964,7 +2023,9 @@ expanded_fooof_df.to_csv(os.path.join(OUTPUT_DIR, 'fooof_aperiodic_results.csv')
                          index=False)
 
 plot_theta_properties(expanded_fooof_df, props=list(THETA_SPECIFIC), save=True)
-plot_fit_quality(expanded_fooof_df, group_col="animal", metrics="both",
+# 1-20 Hz scores (used for selection) next to the full-range scores
+plot_fit_quality(expanded_fooof_df, group_col="animal",
+                 metrics=["r_squared_qc", "error_qc", "r_squared", "error"],
                  mode="box", save=True)
 
 # 5b) Aperiodic-parameter histograms (offset, knee, exponent), by animal.

@@ -82,17 +82,30 @@ except:
     Frequency/Power are set to NaN and the row is dropped with the other NaN
     bins), and the widened-run samples are left out of the relative-power
     denominator (TotalPower). Per-file counts -> Saturation_summary.xlsx.
+  * Arena / session-type comparisons (run_arena_session_comparisons): every
+    figure above is drawn again by session type within each arena, by arena
+    type and by animal-controlled arena type (Circle vs Open: Fa8477 + Fa5834;
+    Linear vs Open: Fa1059 + Fa23BD), as in
+    ACG_ArenaSessionType_StatsComparison_v2.py, with group tests, and the
+    proportion of speed-modulated files is compared between the groups
+    (chi-square) -> Comparisons/<level>/ and
+    Comparisons/ThetaVsSpeed_Comparison_Stats.xlsx. Re-run this part alone
+    from the saved parquet with StndAln_ThetaVsSpeed_ArenaSessionComparison.py.
 """
 
 import os
 import re
+import textwrap
 import warnings
+from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
-from scipy.stats import norm, linregress, ttest_1samp, wilcoxon
+from scipy.stats import (norm, linregress, ttest_1samp, wilcoxon, chi2, chi2_contingency,
+                         kruskal, mannwhitneyu)
 import matplotlib.pyplot as plt
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
@@ -108,6 +121,7 @@ if NCS_REPAIR_DIR not in sys.path:
     sys.path.insert(0, NCS_REPAIR_DIR)
 from ncs_repair import load_repaired_uv, open_ncs, find_runs
 from NcsFileList_Utils import listed_ncs_files, listed_copies, natural_key
+import PlotLayout_Utils as plu    # shared y-range of side-by-side panels, % labels on bars
 
 
 # %% ==================== Configuration ===========================================
@@ -1024,6 +1038,17 @@ def add_details_below(fig, ax, text, legend_handles=None, legend_ncol=3, fontsiz
             ha='center', va='top', fontsize=fontsize, linespacing=1.4)
 
 
+def fixed_effect_line(result, x, predictor="Speed"):
+    """Fixed-effect fit of a `response ~ predictor` mixed model at `x`, with its
+    95% CI: (y, y_ci_low, y_ci_high)."""
+    cov = result.cov_params()
+    y = result.params["Intercept"] + result.params[predictor] * x
+    se = np.sqrt(cov.loc["Intercept", "Intercept"] + x ** 2 * cov.loc[predictor, predictor]
+                 + 2 * x * cov.loc["Intercept", predictor])
+    z = norm.ppf(0.975)
+    return y, y - z * se, y + z * se
+
+
 def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, out_path,
                          xlabel="Speed bin center (cm/s)", group="Session", df_excluded=None):
     """Scatter the binned data plus the mixed model's fixed-effect fit and its 95% CI band.
@@ -1038,18 +1063,9 @@ def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, 
     slope_se = result.bse[predictor]
     slope_z = result.tvalues[predictor]
     slope_ci_low, slope_ci_high = result.conf_int().loc[predictor]
-    cov = result.cov_params()
 
     x_range = np.linspace(df[predictor].min(), df[predictor].max(), 100)
-    y_pred = intercept + slope * x_range
-    se = np.sqrt(
-        cov.loc["Intercept", "Intercept"]
-        + x_range**2 * cov.loc[predictor, predictor]
-        + 2 * x_range * cov.loc["Intercept", predictor]
-    )
-    z = norm.ppf(0.975)
-    y_ci_low = y_pred - z * se
-    y_ci_high = y_pred + z * se
+    y_pred, y_ci_low, y_ci_high = fixed_effect_line(result, x_range, predictor)
 
     fig, ax = plt.subplots(figsize=(7, 5))
     handles = []
@@ -1091,12 +1107,10 @@ def plot_mixed_model_fit(df, result, response, predictor, ylabel, title, color, 
     plt.close(fig)
 
 
-def run_speed_vs_theta_stats(df):
-    """Fit and plot mixed linear models of Frequency~Speed and, for each
-    POWER_MEASURES column, Power~Speed (random intercept per Session), on
-    SPEED_BIN_WIDTH_CMS-wide speed bins: per (session, bin) the representative
-    (BIN_AGG_METHOD) Frequency/Power, against the bin's center speed -- rather
-    than the raw per-time-bin rows (see aggregate_by_speed_bin)."""
+def mixed_model_speed_bins(df):
+    """The mixed-model input: per (session, SPEED_BIN_WIDTH_CMS speed bin) the
+    representative (BIN_AGG_METHOD) Frequency/Power, with Speed = the bin
+    center. InAnalysis = True for mobile bins (the fitted ones)."""
     df_clean = df.dropna(subset=["Frequency", "Power", "Speed"])
     # mobile and immobile time bins are aggregated separately, so a speed bin
     # that straddles MIN_SPEED_CMS can't mix the two (with 4 cm/s bins and a
@@ -1108,7 +1122,16 @@ def run_speed_vs_theta_stats(df):
     # the model's Speed predictor is the bin center; the within-bin
     # representative speed is kept (as SpeedWithinBin) for reference only
     df_all = df_all.rename(columns={"Speed": "SpeedWithinBin", "SpeedBinCenter": "Speed"})
-    df_all = df_all.sort_values(["Session", "Speed"]).reset_index(drop=True)
+    return df_all.sort_values(["Session", "Speed"]).reset_index(drop=True)
+
+
+def run_speed_vs_theta_stats(df):
+    """Fit and plot mixed linear models of Frequency~Speed and, for each
+    POWER_MEASURES column, Power~Speed (random intercept per Session), on
+    SPEED_BIN_WIDTH_CMS-wide speed bins: per (session, bin) the representative
+    (BIN_AGG_METHOD) Frequency/Power, against the bin's center speed -- rather
+    than the raw per-time-bin rows (see aggregate_by_speed_bin)."""
+    df_all = mixed_model_speed_bins(df)
     df_all.to_excel(OUTPUT_DIR / "ThetaVsSpeed_binned_medians.xlsx", index=False)
     df_stats = df_all[df_all["InAnalysis"]]
     df_excl = df_all[~df_all["InAnalysis"]]
@@ -1724,10 +1747,11 @@ def save_both_significant(cls_long, out_dir=OUTPUT_DIR):
     return tbl
 
 
-def run_individual_correlations(df):
-    """Per-file OLS fits, FDR classes, one PNG per file in INDIV_DIR, the
-    % summary figure and IndividualCorrel_per_file.xlsx."""
-    INDIV_DIR.mkdir(parents=True, exist_ok=True)
+def individual_fit_classes(df):
+    """Per-file OLS fits of every INDIV_MEASURES column and their FDR classes
+    (BH-FDR across all analysed files, per measure). Returns (cls_long: one row
+    per file and measure, {measure: its rows}, the fitted time-bin rows, the
+    speed-bin rows, the sorted session ids)."""
     df_clean, df_binned = fig3_trim_and_bin(df, upper_pctile=INDIV_SPEED_UPPER_PCTILE,
                                             min_bin_s=INDIV_MIN_TIME_PER_BIN_S)
     meta = (df[["Session", "Recording", "Animal"]].drop_duplicates("Session")
@@ -1739,6 +1763,14 @@ def run_individual_correlations(df):
         cls = classify_individual_fits(fit_per_session_ols(df_binned, col), sessions)
         per_measure[col] = cls.merge(meta, on="Session", how="left").assign(Measure=col)
     cls_long = pd.concat(per_measure.values(), ignore_index=True)
+    return cls_long, per_measure, df_clean, df_binned, sessions
+
+
+def run_individual_correlations(df):
+    """Per-file OLS fits, FDR classes, one PNG per file in INDIV_DIR, the
+    % summary figure and IndividualCorrel_per_file.xlsx."""
+    INDIV_DIR.mkdir(parents=True, exist_ok=True)
+    cls_long, per_measure, df_clean, df_binned, sessions = individual_fit_classes(df)
 
     raw_by_ses = dict(tuple(df_clean.groupby("Session")))
     bin_by_ses = dict(tuple(df_binned.groupby("Session")))
@@ -1772,6 +1804,872 @@ def run_individual_correlations(df):
         by_animal.reset_index().to_excel(xw, sheet_name="counts_by_animal", index=False)
     print(overall.to_string())
     return cls_long
+
+
+# %% ==================== Arena / session-type / animal-controlled comparisons =========
+#
+# The figures above pool every file (some also split it by animal). This section
+# draws each of them again split into groups, at the three levels of
+# ACG_ArenaSessionType_StatsComparison_v2.py (arena and session type parsed from
+# the recording folder the same way), into COMPARISON_DIR/<level>:
+#   SessionType/<arena>         session types within each arena
+#                                 Open: Cntrl, Rotate, Zero | Linear: 0, 90, 180, 270
+#                                 Circle: Stnd, NoRot, Rot
+#   ArenaType                   Circle / Linear / Open, session types pooled
+#   AnimalControlledArenaType   only the animals recorded in both arenas,
+#                                 Circle vs Open (Fa8477, Fa5834) and Linear vs
+#                                 Open (Fa1059, Fa23BD), side by side, each with
+#                                 its own statistics (they are not tested
+#                                 against each other)
+# Figures per level (same names as the pooled ones):
+#   * <measure>_vs_Speed_MixedModel.png -- one panel per group, each with its own
+#     LMM (response ~ Speed + (1 | file), REML, mobile speed bins). Whether the
+#     slopes differ: response ~ Speed * group + (1 | file), fit by ML, likelihood-
+#     ratio test against a common slope (response ~ Speed + group + (1 | file)),
+#     and pairwise Wald contrasts of the group slopes, Holm-corrected.
+#   * Fig3_recording_slopes_<measure>.png -- the Dunn Fig. 3 per-file OLS slopes
+#     (90th-percentile cut), channels averaged within a recording; per group the
+#     one-sample t / Wilcoxon test against 0 (as the pooled figure), across groups
+#     Kruskal-Wallis + pairwise Mann-Whitney U, Holm-corrected (recordings treated
+#     as independent).
+#   * IndividualCorrel_PercentPositive.png -- the 5 slope classes per group.
+#   * SpeedModulated_Proportion.png -- % of files speed-modulated (FDR-significant
+#     slope, either sign) per group, split into significantly positive and
+#     negative; per-animal % as markers.
+#   * IndividualCorrel_BothSignificant.png -- % of files significant for both
+#     Frequency and PowerRel, split by the signs of the two slopes.
+# Proportions (MODULATION_TESTS, and 'both significant'): unit = one LFP file,
+# denominator = every analysed file of the group (not-fitted files included, as
+# in the pooled % figure); each file keeps its class from the BH-FDR over all
+# analysed files (not redone within a group). Test: chi-square of independence on
+# groups x (yes, no), then pairwise chi-square (Yates for 2 x 2), Holm-corrected
+# within each measure and test. Files are treated as independent, although the
+# channels of one recording share its speed trace.
+# Every table -> ThetaVsSpeed_Comparison_Stats.xlsx (sheets '<prefix>_<table>',
+# prefix 'Ses<arena>', 'Arena', 'AC<A><B>') + ThetaVsSpeed_Comparison_AllStats.csv.
+
+COMPARISON_DIR = OUTPUT_DIR / 'Comparisons'
+CMP_ARENA_TYPES = ['Circle', 'Linear', 'Open']
+CMP_ARENA_SESSION_TYPES = {
+    'Open':   ['Cntrl', 'Rotate', 'Zero'],
+    'Linear': ['0', '90', '180', '270'],
+    'Circle': ['Stnd', 'NoRot', 'Rot'],
+}
+# {name: (animals, arenas)} -- each uses only the animals recorded in all its arenas
+CMP_ANIMAL_CONTROLLED = {
+    'Circle_vs_Open': (['Fa8477', 'Fa5834'], ['Circle', 'Open']),
+    'Linear_vs_Open': (['Fa1059', 'Fa23BD'], ['Linear', 'Open']),
+}
+CMP_ALPHA = 0.05
+# Speed-modulation proportions, per INDIV_MEASURES measure: (key, label, classes counted as 'yes')
+MODULATION_TESTS = [
+    ("modulated",    "Speed-modulated (significant, either sign)",
+     {"Positive, significant", "Negative, significant"}),
+    ("sig_positive", "Significantly positive", {"Positive, significant"}),
+    ("sig_negative", "Significantly negative", {"Negative, significant"}),
+]
+BOTH_TEST_LABEL = "Significant for both " + " and ".join(t for _c, t, _y in INDIV_MEASURES)
+ANIMAL_MARKERS = {'Fa8477': 'o', 'Fa1059': 's', 'Fa23BD': '^', 'Fa5834': 'v'}
+# figure layout (inches / points)
+CMP_PLOT_H = 4.3
+CMP_LINE_IN = 0.17           # stats text height per line
+CMP_LEGEND_ROW_IN = 0.27     # legend height per row
+CMP_CHARS_PER_IN = 16        # stats text wrap width
+CMP_STATS_FS = 8
+CMP_LEGEND_NCOL = 4
+CMP_DPI = 200
+
+
+def extract_arena_type(path):
+    """'Circle' / 'Linear' / 'Open' from a recording folder (a path component), else None."""
+    for part in re.split(r'[\\/]+', str(path)):
+        for arena in CMP_ARENA_TYPES:
+            if part.strip().lower() == arena.lower():
+                return arena
+    return None
+
+
+def extract_session_type(path, arena):
+    """Session type from the last folder name (as ACG_ArenaSessionType_StatsComparison_v2.py)."""
+    if arena is None:
+        return None
+    label = re.split(r'[\\/]+', str(path).strip())[-1].strip().lower()
+    if arena == 'Open':
+        for t in CMP_ARENA_SESSION_TYPES['Open']:
+            if t.lower() in label:
+                return t
+    elif arena == 'Linear':
+        m = re.search(r'_(270|180|90|0)$', label)
+        if m:
+            return m.group(1)
+    elif arena == 'Circle':
+        if 'norot' in label:          # before 'rot', which it contains
+            return 'NoRot'
+        if 'stnd' in label:
+            return 'Stnd'
+        if 'rot' in label:
+            return 'Rot'
+    return None
+
+
+def session_table(df):
+    """One row per analysed file (Session): Recording, Animal, ArenaType, SessionType."""
+    meta = (df[["Session", "Recording", "Animal"]].drop_duplicates("Session")
+              .sort_values("Session").reset_index(drop=True))
+    meta["ArenaType"] = meta["Recording"].map(extract_arena_type)
+    meta["SessionType"] = [extract_session_type(r, a)
+                           for r, a in zip(meta["Recording"], meta["ArenaType"])]
+    for col, what in (("ArenaType", "arena type"), ("SessionType", "session type")):
+        bad = meta.loc[meta[col].isna(), "Recording"].unique()
+        if len(bad):
+            print(f'WARNING: {len(bad)} recording(s) with no recognizable {what} '
+                  f'(left out of the comparisons that need it): {sorted(bad)}')
+    return meta
+
+
+def _group_label(g):
+    """Display label: Linear session types are angles."""
+    return f'{g}°' if str(g).isdigit() else str(g)
+
+
+def animal_marker(label, default='P'):
+    label = str(label).upper()
+    for animal_id, marker in ANIMAL_MARKERS.items():
+        if animal_id[2:].upper() in label:
+            return marker
+    return default
+
+
+@dataclass
+class Comparison:
+    """One set of groups compared with each other. `meta`: its files (session_table
+    rows) with the group label in column 'Group'."""
+    name: str        # workbook sheet prefix
+    title: str
+    noun: str        # plural, e.g. 'arena types'
+    order: list      # groups present, in plotting order
+    meta: pd.DataFrame
+
+    def sessions(self, group=None):
+        m = self.meta if group is None else self.meta[self.meta["Group"] == group]
+        return set(m["Session"])
+
+
+def _make_comparison(name, title, noun, col, wanted, meta):
+    m = meta[meta[col].isin(wanted)].copy()
+    m["Group"] = m[col]
+    return Comparison(name, title, noun, [g for g in wanted if (m["Group"] == g).any()], m)
+
+
+def build_comparison_levels(meta, out_dir):
+    """[(level name, output folder, [Comparison, ...]), ...]: session types per arena,
+    arena types, animal-controlled arena types."""
+    levels = []
+    for arena in CMP_ARENA_TYPES:
+        c = _make_comparison(f'Ses{arena}', f'{arena} arena', 'session types', 'SessionType',
+                             CMP_ARENA_SESSION_TYPES[arena], meta[meta["ArenaType"] == arena])
+        if len(c.meta):
+            levels.append((f'Session types, {arena}', Path(out_dir) / 'SessionType' / arena, [c]))
+    levels.append(('Arena types', Path(out_dir) / 'ArenaType',
+                   [_make_comparison('Arena', 'Arena types', 'arena types', 'ArenaType',
+                                     CMP_ARENA_TYPES, meta)]))
+    ac = []
+    for _name, (animals, arenas) in CMP_ANIMAL_CONTROLLED.items():
+        sel = meta[meta["Animal"].str.lower().isin({a.lower() for a in animals})]
+        order = [a for a in CMP_ARENA_TYPES if a in arenas]
+        c = _make_comparison('AC' + ''.join(order), f'{" + ".join(animals)} only', 'arena types',
+                             'ArenaType', order, sel)
+        for arena in order:
+            missing = [a for a in animals
+                       if not ((c.meta["Animal"].str.lower() == a.lower()) & (c.meta["Group"] == arena)).any()]
+            if missing:
+                print(f'WARNING ({c.name}): no files of {missing} in the {arena} arena.')
+        if len(c.meta):
+            ac.append(c)
+    if ac:
+        levels.append(('Animal-controlled arena types', Path(out_dir) / 'AnimalControlledArenaType', ac))
+    return levels
+
+
+# ---- statistics ----
+
+def _holm(p):
+    p = np.asarray(p, dtype=float)
+    out = np.full_like(p, np.nan)
+    ok = np.isfinite(p)
+    if ok.any():
+        out[ok] = multipletests(p[ok], method='holm')[1]
+    return out
+
+
+def _insufficient(note=''):
+    return {'test': 'insufficient data', 'stat_name': '', 'statistic': np.nan, 'dof': np.nan,
+            'p_raw': np.nan, 'note': note}
+
+
+def _finish_pairs(rows):
+    if rows:
+        p_holm = _holm([r['p_raw'] for r in rows])
+        for r, ph in zip(rows, p_holm):
+            r['p_holm'] = ph
+            r['significant'] = bool(np.isfinite(ph) and ph < CMP_ALPHA)
+    return rows
+
+
+def chi_square_by_group(counts):
+    """`counts`: [(group, n_yes, n_total), ...]. Chi-square test of independence on
+    groups x (yes, no), then pairwise chi-square tests (Yates-corrected, 2 x 2),
+    Holm-corrected. Returns (omnibus dict, pairwise rows)."""
+    present = [(g, k, n) for g, k, n in counts if n > 0]
+    arr = np.array([[k, n - k] for _g, k, n in present], dtype=float).reshape(-1, 2)
+    if len(present) < 2:
+        return _insufficient('fewer than 2 groups'), []
+    if (arr.sum(axis=0) == 0).any():
+        return _insufficient('all files in the same class'), []
+    c2, p, dof, expected = chi2_contingency(arr)
+    note = f'Chi-square, files treated as independent ({int(arr.sum())} files)'
+    n_low = int((expected < 5).sum())
+    if n_low:
+        note += f'; {n_low} of {expected.size} expected counts < 5, approximation may be unreliable'
+    omni = {'test': 'Chi-square test of independence', 'stat_name': 'χ²', 'statistic': c2,
+            'dof': dof, 'p_raw': p, 'note': note}
+    rows = []
+    for i, j in combinations(range(len(present)), 2):
+        sub = arr[[i, j]]
+        if (sub.sum(axis=0) == 0).any():
+            c, pp, d = np.nan, np.nan, np.nan
+        else:
+            c, pp, d, _e = chi2_contingency(sub)
+        rows.append({'comparison': f'{present[i][0]} vs {present[j][0]}',
+                     'test': 'Pairwise chi-square (Yates)', 'stat_name': 'χ²',
+                     'statistic': c, 'dof': d, 'p_raw': pp})
+    return omni, _finish_pairs(rows)
+
+
+def kw_mwu_by_group(values):
+    """`values`: {group: array}. Kruskal-Wallis omnibus + pairwise two-sided
+    Mann-Whitney U, Holm-corrected. Returns (omnibus dict, pairwise rows)."""
+    groups = {g: np.asarray(v, dtype=float)[np.isfinite(np.asarray(v, dtype=float))]
+              for g, v in values.items()}
+    groups = {g: v for g, v in groups.items() if len(v)}
+    if len(groups) < 2 or any(len(v) < 2 for v in groups.values()):
+        return _insufficient('fewer than 2 groups with >= 2 values'), []
+    try:
+        h, p = kruskal(*groups.values())
+    except ValueError as e:            # e.g. all values identical
+        return _insufficient(str(e)), []
+    omni = {'test': 'Kruskal-Wallis', 'stat_name': 'H', 'statistic': h,
+            'dof': len(groups) - 1, 'p_raw': p,
+            'note': 'Recordings treated as independent (several recordings per animal)'}
+    rows = []
+    for a, b in combinations(groups, 2):
+        u = mannwhitneyu(groups[a], groups[b], alternative='two-sided')
+        rows.append({'comparison': f'{a} vs {b}', 'test': 'Mann-Whitney U', 'stat_name': 'U',
+                     'statistic': u.statistic, 'dof': np.nan, 'p_raw': u.pvalue})
+    return omni, _finish_pairs(rows)
+
+
+def mixed_model_slope_test(d, response, order):
+    """Do the speed slopes differ between the groups (column 'Group') of `d`?
+    response ~ Speed * group + (1 | Session) against response ~ Speed + group +
+    (1 | Session), both fit by ML: likelihood-ratio test, plus pairwise Wald
+    contrasts of the group slopes of the interaction model, Holm-corrected.
+    Returns (omnibus dict, pairwise rows)."""
+    d = d.dropna(subset=[response, "Speed"]).copy()
+    present = [g for g in order if (d["Group"] == g).any()]
+    if len(present) < 2:
+        return _insufficient('fewer than 2 groups'), []
+    ks = range(1, len(present))
+    for k in ks:                       # treatment coding, first group = reference
+        d[f"g{k}"] = (d["Group"] == present[k]).astype(float)
+        d[f"sg{k}"] = d[f"g{k}"] * d["Speed"]
+    base = f"{response} ~ Speed" + "".join(f" + g{k}" for k in ks)
+    full = base + "".join(f" + sg{k}" for k in ks)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            r_full = smf.mixedlm(full, d, groups=d["Session"]).fit(reml=False)
+            r_base = smf.mixedlm(base, d, groups=d["Session"]).fit(reml=False)
+    except Exception as e:  # noqa: BLE001
+        return _insufficient(f'fit failed: {type(e).__name__}: {e}'), []
+    lr = max(2 * (r_full.llf - r_base.llf), 0.0)
+    dof = len(present) - 1
+    omni = {'test': 'LMM likelihood-ratio test, Speed x group vs common slope (ML)',
+            'stat_name': 'χ²', 'statistic': lr, 'dof': dof, 'p_raw': float(chi2.sf(lr, dof)),
+            'converged': bool(r_full.converged and r_base.converged),
+            'n_bins': int(r_full.nobs), 'n_files': int(d["Session"].nunique()),
+            'note': f'{response} ~ Speed * group + (1 | file), ML, {int(r_full.nobs)} speed bins '
+                    f'from {d["Session"].nunique()} files'}
+    fe = r_full.fe_params
+    cov = r_full.cov_params().loc[fe.index, fe.index].to_numpy()
+
+    def _slope_vec(k):
+        v = np.zeros(len(fe))
+        v[fe.index.get_loc("Speed")] = 1.0
+        if k:
+            v[fe.index.get_loc(f"sg{k}")] = 1.0
+        return v
+
+    rows = []
+    for i, j in combinations(range(len(present)), 2):
+        c = _slope_vec(i) - _slope_vec(j)
+        diff = float(c @ fe.to_numpy())
+        se = float(np.sqrt(c @ cov @ c))
+        z = diff / se if se > 0 else np.nan
+        rows.append({'comparison': f'{present[i]} vs {present[j]}', 'test': 'Wald contrast of slopes',
+                     'stat_name': 'z', 'statistic': z, 'dof': np.nan,
+                     'p_raw': float(2 * norm.sf(abs(z))) if np.isfinite(z) else np.nan,
+                     'slope_a': float(_slope_vec(i) @ fe.to_numpy()),
+                     'slope_b': float(_slope_vec(j) @ fe.to_numpy()),
+                     'slope_diff': diff, 'slope_diff_se': se})
+    return omni, _finish_pairs(rows)
+
+
+def _fmt_p(p):
+    if p is None or not np.isfinite(p):
+        return 'n/a'
+    return '< 0.001' if p < 0.001 else f'{p:.3f}'
+
+
+def _stars(p):
+    if p is None or not np.isfinite(p):
+        return ''
+    return '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < CMP_ALPHA else 'n.s.'
+
+
+def _pair_label(cmp):
+    return ' vs '.join(_group_label(g) for g in str(cmp).split(' vs '))
+
+
+def _test_lines(omni, rows, pairwise=True):
+    """Omnibus test (+ the Holm-corrected pairwise tests) as text lines."""
+    if omni['test'] == 'insufficient data':
+        return ['Insufficient data for a test' + (f" ({omni['note']})" if omni.get('note') else '')]
+    dof = f"({int(omni['dof'])})" if np.isfinite(omni.get('dof', np.nan)) else ''
+    lines = [f"{omni['test']}: {omni['stat_name']}{dof} = {omni['statistic']:.3f}, "
+             f"p = {_fmt_p(omni['p_raw'])} {_stars(omni['p_raw'])}"]
+    if pairwise and rows:
+        lines.append(f"Pairwise ({rows[0]['test'].replace('Pairwise ', '')}, Holm):")
+        for r in rows:
+            extra = (f"Δβ = {r['slope_diff']:+.3g}, " if 'slope_diff' in r else '')
+            fmt = '.1f' if r['stat_name'] == 'U' else '.3f'
+            lines.append(f"  {_pair_label(r['comparison'])}: {extra}{r['stat_name']} = "
+                         f"{r['statistic']:{fmt}}, p = {_fmt_p(r['p_raw'])}, "
+                         f"p(Holm) = {_fmt_p(r['p_holm'])} {_stars(r['p_holm'])}")
+    return lines
+
+
+def _test_rows(omni, rows, **tags):
+    """Omnibus + pairwise rows of one test as a table."""
+    out = [{**tags, 'comparison': 'omnibus', **omni}]
+    out += [{**tags, **r} for r in rows]
+    return out
+
+
+# ---- figure layout ----
+
+def _draw_brackets(ax, pairs, y_base, y_step, y_text):
+    """Line + stars over every (x1, x2, p) with p < CMP_ALPHA, narrower spans lowest.
+    Returns the y of the highest line, or None."""
+    sig = sorted((abs(x2 - x1), min(x1, x2), max(x1, x2), _stars(p))
+                 for x1, x2, p in pairs if p is not None and np.isfinite(p) and p < CMP_ALPHA)
+    y = y_base
+    for _span, x1, x2, stars in sig:
+        ax.plot([x1, x2], [y, y], color='k', lw=1, clip_on=False, zorder=5)
+        ax.text((x1 + x2) / 2, y + y_text, stars, ha='center', va='center', fontsize=12,
+                fontweight='bold', clip_on=False, zorder=5)
+        y += y_step
+    return y - y_step if sig else None
+
+
+def _fit_ylim(ax, y_lo, top, pairs):
+    """Brackets above `top` and a y-range that holds them."""
+    span = max(top - y_lo, 1e-9)
+    y_hi = _draw_brackets(ax, pairs, top + 0.06 * span, 0.09 * span, 0.03 * span)
+    ax.set_ylim(y_lo, max(top, y_hi if y_hi is not None else top) + 0.08 * span)
+
+
+def _pairs_at(rows, pos):
+    """(x1, x2, p_holm) of pairwise rows whose two groups are in `pos` {group: x}."""
+    out = []
+    for r in rows:
+        a, b = [s.strip() for s in str(r['comparison']).split(' vs ')]
+        if a in pos and b in pos:
+            out.append((pos[a], pos[b], r['p_holm']))
+    return out
+
+
+def _wrap_lines(lines, width_in):
+    width = max(40, int(width_in * CMP_CHARS_PER_IN))
+    return [w for line in lines for w in (textwrap.wrap(line, width, subsequent_indent='    ') or [''])]
+
+
+def _comparison_figure(comps, panels, draw_panel, info, panel_w, out_path, suptitle, share_y=True):
+    """One subfigure per Comparison in `comps`, side by side. Each holds a row of
+    panels -- `panels(comp)` -> panel keys, `draw_panel(ax, comp, key, i)` -> labelled
+    artists for the legend, `panel_w(comp, key)` -> width (in) -- with its legend and
+    the `info(comp)` text lines underneath. share_y: one y-range over every panel."""
+    keys = [panels(c) for c in comps]
+    widths = [max(4.2, sum(panel_w(c, k) for k in ks)) for c, ks in zip(comps, keys)]
+    # throw-away pass to count each subfigure's legend entries
+    probe = plt.figure()
+    n_handles = []
+    for c, ks in zip(comps, keys):
+        labels = set()
+        for i, k in enumerate(ks):
+            labels |= {a.get_label() for a in draw_panel(probe.add_subplot(), c, k, i)}
+        n_handles.append(len(labels))
+    plt.close(probe)
+    lines = [_wrap_lines(info(c), w - 0.3) for c, w in zip(comps, widths)]
+    n_leg = [int(np.ceil(n / CMP_LEGEND_NCOL)) for n in n_handles]
+    info_h = max(len(l) * CMP_LINE_IN + n * CMP_LEGEND_ROW_IN for l, n in zip(lines, n_leg)) + 0.3
+
+    fig = plt.figure(figsize=(sum(widths) + 0.3 * (len(comps) - 1), CMP_PLOT_H + info_h + 0.6),
+                     layout='constrained')
+    subfigs = fig.subfigures(1, len(comps), width_ratios=widths, wspace=0.03, squeeze=False)[0]
+    data_axes = []
+    for sf, c, ks, ls, n in zip(subfigs, comps, keys, lines, n_leg):
+        gs = sf.add_gridspec(2, len(ks), height_ratios=[CMP_PLOT_H, info_h],
+                             width_ratios=[panel_w(c, k) for k in ks])
+        handles = {}
+        for i, k in enumerate(ks):
+            ax = sf.add_subplot(gs[0, i])
+            for a in draw_panel(ax, c, k, i):
+                handles.setdefault(a.get_label(), a)
+            ax.spines[['top', 'right']].set_visible(False)
+            data_axes.append(ax)
+        ax_info = sf.add_subplot(gs[1, :])
+        ax_info.axis('off')
+        if handles:
+            ax_info.legend(list(handles.values()), list(handles.keys()), loc='upper center',
+                           ncol=CMP_LEGEND_NCOL, fontsize=8, frameon=False)
+        ax_info.text(0.5, 1 - (n * CMP_LEGEND_ROW_IN + 0.08) / info_h, '\n'.join(ls),
+                     transform=ax_info.transAxes, ha='center', va='top', fontsize=CMP_STATS_FS,
+                     linespacing=1.3)
+        sf.suptitle(c.title, fontsize=11, weight='bold')
+    if share_y:
+        plu.match_ylims(data_axes)
+    fig.suptitle(suptitle, fontsize=12, weight='bold')
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=CMP_DPI, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig)
+    print(f'  saved {out_path}')
+
+
+def _animal_scatter(ax, x, y, animals, s=25, **kw):
+    """Points coloured by animal (ANIMAL_COLORS), one labelled artist per animal."""
+    out = []
+    animals = pd.Series(list(animals))
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    for a in ordered_animals(animals):
+        m = (animals == a).to_numpy()
+        out.append(ax.scatter(x[m], y[m], s=s, color=animal_color(a), marker=animal_marker(a),
+                              edgecolor='k', linewidth=0.5, label=a, **kw))
+    return out
+
+
+# ---- 1. mixed model per group ----
+
+def _cmp_mixed_models(comps, df_stats, df_excl, out_dir, tables):
+    """<measure>_vs_Speed_MixedModel.png: per group its own LMM, plus the Speed x
+    group slope test."""
+    measures = [("Frequency", "Theta Frequency [Hz]", "Theta frequency vs. speed",
+                 "ThetaFrequency_vs_Speed_MixedModel")]
+    measures += [(col, ylabel, title, f"ThetaPower{suffix}_vs_Speed_MixedModel")
+                 for col, suffix, ylabel, title, _u in POWER_MEASURES]
+    fit_rows, test_rows = [], []
+    for col, ylabel, title, stem in measures:
+        fits, data, tests = {}, {}, {}
+        for c in comps:
+            grp = c.meta.set_index("Session")["Group"]
+            d_all = df_stats[df_stats["Session"].isin(grp.index)].dropna(subset=[col])
+            d_all = d_all.assign(Group=d_all["Session"].map(grp))
+            e_all = df_excl[df_excl["Session"].isin(grp.index)].dropna(subset=[col])
+            e_all = e_all.assign(Group=e_all["Session"].map(grp))
+            for g in c.order:
+                d, e = d_all[d_all["Group"] == g], e_all[e_all["Group"] == g]
+                data[c.name, g] = (d, e)
+                row = {'comparison_set': c.name, 'measure': col, 'group': g, 'n_bins': len(d),
+                       'n_files': d["Session"].nunique(), 'n_recordings': d["Recording"].nunique(),
+                       'n_animals': d["Animal"].nunique()}
+                res = None
+                if d["Session"].nunique() >= 2 and len(d) >= 5:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            res = fit_mixed_model(d, col)
+                        lo, hi = res.conf_int().loc["Speed"]
+                        row.update(slope=res.params["Speed"], slope_se=res.bse["Speed"],
+                                   ci_low=lo, ci_high=hi, z=res.tvalues["Speed"],
+                                   p=res.pvalues["Speed"], intercept=res.params["Intercept"],
+                                   re_var=res.cov_re.iloc[0, 0], resid_var=res.scale,
+                                   converged=res.converged)
+                    except Exception as ex:  # noqa: BLE001
+                        res = None
+                        row['error'] = f'{type(ex).__name__}: {ex}'
+                else:
+                    row['error'] = 'fewer than 2 files or 5 speed bins'
+                fits[c.name, g] = res
+                fit_rows.append(row)
+            tests[c.name] = mixed_model_slope_test(d_all, col, c.order)
+            test_rows += _test_rows(*tests[c.name], comparison_set=c.name, measure=col)
+
+        def draw(ax, c, g, i):
+            d, e = data[c.name, g]
+            res = fits[c.name, g]
+            out = []
+            if len(e):
+                out.append(ax.scatter(e["Speed"], e[col], color=EXCLUDED_COLOR, edgecolor='#707070',
+                                      linewidth=0.5, alpha=0.8, s=18,
+                                      label=f"< {MIN_SPEED_CMS:g} cm/s (not in fit)"))
+                ax.axvline(MIN_SPEED_CMS, color='#707070', linestyle=':', linewidth=1)
+            out += _animal_scatter(ax, d["Speed"], d[col], d["Animal"], s=18, alpha=0.8)
+            if res is not None:
+                x = np.linspace(d["Speed"].min(), d["Speed"].max(), 100)
+                y, lo, hi = fixed_effect_line(res, x)
+                out += ax.plot(x, y, color='black', lw=2, label="Mixed linear fit")
+                out.append(ax.fill_between(x, lo, hi, color='grey', alpha=0.5, label="95% CI"))
+            ax.set_title(f"{_group_label(g)}\n({d['Session'].nunique()} files, "
+                         f"{d['Animal'].nunique()} animals)", fontsize=10, weight='bold')
+            ax.set_xlabel("Speed bin center (cm/s)", fontsize=9)
+            if i == 0:
+                ax.set_ylabel(ylabel, fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.4)
+            ax.tick_params(labelsize=8)
+            return out
+
+        def info(c):
+            lines = [f"Per panel: {col} ~ Speed + (1 | file), REML, mobile speed bins "
+                     f"(≥ {MIN_SPEED_CMS:g} cm/s, {SPEED_BIN_WIDTH_CMS:g} cm/s bins, {BIN_AGG_METHOD}):"]
+            for g in c.order:
+                r = next(x for x in fit_rows if x['comparison_set'] == c.name and x['measure'] == col
+                         and x['group'] == g)
+                if 'slope' in r:
+                    lines.append(f"  {_group_label(g)} (n = {r['n_bins']} bins, {r['n_files']} files, "
+                                 f"{r['n_animals']} animals): β = {r['slope']:.4g} ± {r['slope_se']:.2g} "
+                                 f"SE per cm/s, 95% CI [{r['ci_low']:.3g}, {r['ci_high']:.3g}], "
+                                 f"p = {_fmt_p(r['p'])} {_stars(r['p'])}"
+                                 + ('' if r['converged'] else ' (not converged)'))
+                else:
+                    lines.append(f"  {_group_label(g)}: not fitted ({r.get('error', '')})")
+            lines.append(f"Slopes compared between {c.noun}:")
+            lines += _test_lines(*tests[c.name])
+            lines.append("Gray: immobility speed bins, shown but not fitted.")
+            return lines
+
+        for c in comps:
+            print(f"  {c.name} {col}: " + _test_lines(*tests[c.name], pairwise=False)[0])
+        _comparison_figure(comps, lambda c: c.order, draw, info, lambda c, g: 3.0,
+                           Path(out_dir) / f"{stem}.png", f"{title} (mixed model)")
+    for c in comps:
+        tables[f'{c.name}_MM_Fits'] = pd.DataFrame([r for r in fit_rows if r['comparison_set'] == c.name])
+        tables[f'{c.name}_MM_SlopeTest'] = pd.DataFrame(
+            [r for r in test_rows if r['comparison_set'] == c.name])
+
+
+# ---- 2. per-recording OLS slopes (Dunn Fig. 3) ----
+
+def _cmp_recording_slopes(comps, slope_fits, units, out_dir, tables):
+    """Fig3_recording_slopes_<measure>.png: per group the recording slopes (channels
+    averaged) and their test against 0; across groups Kruskal-Wallis + Mann-Whitney U."""
+    per_rec_all, desc_rows, test_rows = [], [], []
+    for col, unit in units.items():
+        fits = slope_fits[col][["Session", "beta1"]]
+        per_rec, tests = {}, {}
+        for c in comps:
+            m = c.meta[["Session", "Recording", "Animal", "Group"]]
+            f = fits.merge(m, on="Session", how="inner")
+            pr = (f.groupby(["Group", "Animal", "Recording"], as_index=False)
+                   .agg(beta1=("beta1", "mean"), n_channels=("beta1", "size")))
+            per_rec[c.name] = pr
+            per_rec_all.append(pr.assign(comparison_set=c.name, measure=col))
+            for g in c.order:
+                fg = f[f["Group"] == g]
+                if fg.empty:
+                    continue
+                grp, _pr, _pa = summarise_slopes_across_recordings(
+                    fg[["Session", "beta1"]], m[["Session", "Recording", "Animal"]])
+                desc_rows.append({'comparison_set': c.name, 'measure': col, 'group': g,
+                                  'n_files': len(fg), **grp,
+                                  'beta1_median': float(np.median(pr.loc[pr["Group"] == g, "beta1"]))})
+            tests[c.name] = kw_mwu_by_group({g: pr.loc[pr["Group"] == g, "beta1"] for g in c.order})
+            test_rows += _test_rows(*tests[c.name], comparison_set=c.name, measure=col)
+
+        def draw(ax, c, _key, _i):
+            pr = per_rec[c.name]
+            rng = np.random.default_rng(0)
+            pos = {g: i for i, g in enumerate(c.order)}
+            x = pr["Group"].map(pos).to_numpy(float) + rng.uniform(-0.12, 0.12, len(pr))
+            out = _animal_scatter(ax, x, pr["beta1"], pr["Animal"], s=40, zorder=3)
+            for g, i in pos.items():
+                v = pr.loc[pr["Group"] == g, "beta1"]
+                if len(v):
+                    ax.hlines(v.mean(), i - 0.25, i + 0.25, color='black', lw=2, zorder=4)
+            ax.axhline(0, color='grey', ls='--', lw=1)
+            ax.set_xticks(range(len(c.order)))
+            ax.set_xticklabels([f"{_group_label(g)}\n({int((pr['Group'] == g).sum())} rec)"
+                                for g in c.order], fontsize=9)
+            ax.set_xlim(-0.6, len(c.order) - 0.4)
+            ax.set_ylabel(f"β₁ ({unit} per cm/s)", fontsize=10)
+            ax.grid(True, axis='y', linestyle='--', alpha=0.4)
+            if len(pr):
+                lo, hi = pr["beta1"].min(), pr["beta1"].max()
+                span = hi - lo if hi > lo else 1.0
+                _fit_ylim(ax, lo - 0.05 * span, hi, _pairs_at(tests[c.name][1], pos))
+            return out
+
+        def info(c):
+            lines = ["Per file: OLS of speed-bin medians (Dunn Fig. 3, top "
+                     f"{100 - FIG3_SPEED_UPPER_PCTILE:g}% of mobile speeds dropped); channels "
+                     "averaged per recording. Against 0, per group:"]
+            for r in desc_rows:
+                if r['comparison_set'] == c.name and r['measure'] == col:
+                    lines.append(f"  {_group_label(r['group'])} (n = {r['n_recordings']} rec, "
+                                 f"{r['n_animals']} animals): mean β₁ = {r['beta1_mean']:.3g} ± "
+                                 f"{r['beta1_sem']:.2g} SEM; t p = {_fmt_p(r['t_pvalue'])}, Wilcoxon "
+                                 f"p = {_fmt_p(r['wilcoxon_pvalue'])}; {r['n_positive']}/"
+                                 f"{r['n_recordings']} positive")
+            lines.append(f"Between {c.noun} (one slope per recording):")
+            lines += _test_lines(*tests[c.name])
+            lines.append("Black bars: group mean; brackets: Holm p < 0.05.")
+            return lines
+
+        _comparison_figure(comps, lambda c: ['slopes'], draw, info,
+                           lambda c, k: 1.1 * len(c.order) + 1.8,
+                           Path(out_dir) / f"Fig3_recording_slopes_{col}.png",
+                           f"Theta {col} vs. speed slope (per recording)")
+    per_rec_all = pd.concat(per_rec_all, ignore_index=True)
+    for c in comps:
+        tables[f'{c.name}_Slopes_PerRec'] = per_rec_all[per_rec_all["comparison_set"] == c.name]
+        tables[f'{c.name}_Slopes_Desc'] = pd.DataFrame([r for r in desc_rows if r['comparison_set'] == c.name])
+        tables[f'{c.name}_Slopes_Tests'] = pd.DataFrame(
+            [r for r in test_rows if r['comparison_set'] == c.name])
+
+
+# ---- 3. proportion of speed-modulated files ----
+
+def _cmp_modulation(comps, files, out_dir, tables):
+    """SpeedModulated_Proportion.png, IndividualCorrel_PercentPositive.png and
+    IndividualCorrel_BothSignificant.png per group, with chi-square tests of the
+    proportions. `files`: both_significant_table rows (one per file)."""
+    # yes/no per file (indexed by Session) for every (measure, test)
+    files = files.set_index("Session")
+    flags = {}
+    for col, _t, _y in INDIV_MEASURES:
+        for key, _label, cats in MODULATION_TESTS:
+            flags[col, key] = files[f"Category_{col}"].isin(cats)
+    flags["Both", "both_significant"] = files["BothSignificant"].astype(bool)
+
+    desc_rows, animal_rows, test_rows, tests = [], [], [], {}
+    for c in comps:
+        f = files.loc[files.index.intersection(c.meta["Session"])].copy()
+        f["Group"] = c.meta.set_index("Session")["Group"]
+        for (col, key), flag in flags.items():
+            yes = flag.reindex(f.index).fillna(False).astype(bool)
+            counts = []
+            for g in c.order:
+                in_g = f["Group"] == g
+                k, n = int((yes & in_g).sum()), int(in_g.sum())
+                counts.append((g, k, n))
+                desc_rows.append({'comparison_set': c.name, 'measure': col, 'test': key, 'group': g,
+                                  'n_files': n, 'n_yes': k, 'pct': 100 * k / n if n else np.nan,
+                                  'n_recordings': f.loc[in_g, "Recording"].nunique(),
+                                  'n_recordings_with_yes': f.loc[in_g & yes, "Recording"].nunique(),
+                                  'n_animals': f.loc[in_g, "Animal"].nunique()})
+                for a in ordered_animals(f.loc[in_g, "Animal"]):
+                    m = in_g & (f["Animal"] == a)
+                    animal_rows.append({'comparison_set': c.name, 'measure': col, 'test': key, 'group': g,
+                                        'animal': a, 'n_files': int(m.sum()),
+                                        'n_yes': int((yes & m).sum()),
+                                        'pct': 100 * (yes & m).sum() / m.sum()})
+            tests[c.name, col, key] = chi_square_by_group(counts)
+            test_rows += _test_rows(*tests[c.name, col, key], comparison_set=c.name, measure=col,
+                                    test_measure=key)
+    desc = pd.DataFrame(desc_rows)
+    animal = pd.DataFrame(animal_rows)
+
+    def _d(c, col, key):
+        return desc[(desc["comparison_set"] == c.name) & (desc["measure"] == col)
+                    & (desc["test"] == key)].set_index("group").reindex(c.order)
+
+    def _animal_markers(ax, c, col, key, x):
+        """Per-animal % of a group as small markers right of the bar; returns their max."""
+        a = animal[(animal["comparison_set"] == c.name) & (animal["measure"] == col) & (animal["test"] == key)]
+        out, top = [], 0.0
+        for j, an in enumerate(ordered_animals(a["animal"])):
+            s = a[a["animal"] == an]
+            xs = [x[g] + 0.36 + 0.07 * j for g in s["group"]]
+            out.append(ax.scatter(xs, s["pct"], s=22, marker=animal_marker(an), color=animal_color(an),
+                                  edgecolor='k', linewidth=0.5, zorder=4, label=f"{an} (% of its files)"))
+            top = max(top, s["pct"].max())
+        return out, top
+
+    titles = {col: t for col, t, _y in INDIV_MEASURES}
+    sig_pos_c = dict(CORREL_CATEGORIES)["Positive, significant"]
+    sig_neg_c = dict(CORREL_CATEGORIES)["Negative, significant"]
+
+    # SpeedModulated_Proportion.png: significant + / - stacked, total = % modulated
+    def draw_prop(ax, c, col, i):
+        dp, dn = _d(c, col, "sig_positive"), _d(c, col, "sig_negative")
+        dm = _d(c, col, "modulated")
+        x = np.arange(len(c.order))
+        pos = dict(zip(c.order, x))
+        out = []
+        b1 = ax.bar(x, dp["pct"].fillna(0), width=0.6, color=sig_pos_c, edgecolor='white',
+                    label="Positive, significant")
+        b2 = ax.bar(x, dn["pct"].fillna(0), bottom=dp["pct"].fillna(0), width=0.6, color=sig_neg_c,
+                    edgecolor='white', label="Negative, significant")
+        out += [b1, b2]
+        for bars, d_ in ((b1, dp), (b2, dn)):     # no label in segments too thin for text
+            v = d_["pct"].to_numpy(float)
+            plu.label_bars(ax, bars, values=np.where(v >= 3, v, np.nan), inside=True, fontsize=7)
+        a_out, a_top = _animal_markers(ax, c, col, "modulated", pos)
+        out += a_out
+        top = max(np.nanmax(dm["pct"].to_numpy(float)) if dm["pct"].notna().any() else 0, a_top, 1)
+        _fit_ylim(ax, 0, top, _pairs_at(tests[c.name, col, "modulated"][1], pos))
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{_group_label(g)}\n{r.pct:.1f}%\n({r.n_yes}/{r.n_files})\n{r.n_recordings} rec"
+                            for g, r in zip(c.order, dm.itertuples())], fontsize=8)
+        ax.set_xlim(-0.6, len(c.order) - 0.1)
+        ax.set_title(titles[col], fontsize=10, weight='bold')
+        if i == 0:
+            ax.set_ylabel("% of LFP files", fontsize=10)
+        return out
+
+    def info_prop(c):
+        lines = [f"Speed-modulated = per-file OLS slope significant (BH-FDR q < {INDIV_FDR_Q:g} over "
+                 f"all analysed files, per measure), either sign; denominator = every file of the group. "
+                 f"Markers: % of each animal's files in that group."]
+        for col in titles:
+            lines.append(f"{titles[col]}, % modulated, between {c.noun}:")
+            lines += ['  ' + l for l in _test_lines(*tests[c.name, col, "modulated"])]
+            for key, label, _cats in MODULATION_TESTS[1:]:
+                lines.append(f"  {label}: " + _test_lines(*tests[c.name, col, key], pairwise=False)[0])
+        note = tests[c.name, next(iter(titles)), "modulated"][0].get('note', '')
+        if note:
+            lines.append(note + '.')
+        return lines
+
+    _comparison_figure(comps, lambda c: list(titles), draw_prop, info_prop,
+                       lambda c, k: 1.0 * len(c.order) + 1.6,
+                       Path(out_dir) / "SpeedModulated_Proportion.png",
+                       "Theta vs. running speed: proportion of speed-modulated LFP files")
+
+    # IndividualCorrel_PercentPositive.png: the 5 slope classes per group
+    def draw_classes(ax, c, col, i):
+        f = files.loc[files.index.intersection(c.meta["Session"])]
+        grp = c.meta.set_index("Session")["Group"].reindex(f.index)
+        dm = _d(c, col, "modulated")
+        _stacked_percent_bars(ax, [(f"{_group_label(g)}\n{int(r.n_recordings)} rec",
+                                    f.loc[grp == g, f"Category_{col}"].value_counts())
+                                   for g, r in zip(c.order, dm.itertuples())])
+        ax.set_title(titles[col], fontsize=10, weight='bold')
+        if i == 0:
+            ax.set_ylabel("% of LFP files", fontsize=10)
+        return [plt.Rectangle((0, 0), 1, 1, color=color, label=cat) for cat, color in CORREL_CATEGORIES]
+
+    def info_classes(c):
+        lines = []
+        for col in titles:
+            lines.append(f"{titles[col]}, % speed-modulated (significant, either sign) between {c.noun}: "
+                         + _test_lines(*tests[c.name, col, "modulated"], pairwise=False)[0])
+        lines.append(f"Classes from the per-file OLS (BH-FDR q < {INDIV_FDR_Q:g} over all analysed "
+                     f"files); pairwise tests: SpeedModulated_Proportion.png / workbook.")
+        return lines
+
+    _comparison_figure(comps, lambda c: list(titles), draw_classes, info_classes,
+                       lambda c, k: 1.0 * len(c.order) + 1.4,
+                       Path(out_dir) / "IndividualCorrel_PercentPositive.png",
+                       "Theta vs. running speed: individual-file correlations")
+
+    # IndividualCorrel_BothSignificant.png: % significant for both, by sign combination
+    def draw_both(ax, c, _key, _i):
+        f = files.loc[files.index.intersection(c.meta["Session"])]
+        grp = c.meta.set_index("Session")["Group"].reindex(f.index)
+        x = np.arange(len(c.order))
+        pos = dict(zip(c.order, x))
+        db = _d(c, "Both", "both_significant")
+        bottom = np.zeros(len(c.order))
+        out = []
+        for cat, color in BOTH_SIG_CATEGORIES:
+            pct = np.array([100 * ((grp == g) & (f["Combination"] == cat)).sum() / max((grp == g).sum(), 1)
+                            for g in c.order])
+            bars = ax.bar(x, pct, bottom=bottom, width=0.6, color=color, edgecolor='white', label=cat)
+            plu.label_bars(ax, bars, values=np.where(pct >= 3, pct, np.nan), inside=True, fontsize=7)
+            out.append(bars)
+            bottom += pct
+        a_out, a_top = _animal_markers(ax, c, "Both", "both_significant", pos)
+        out += a_out
+        _fit_ylim(ax, 0, max(bottom.max(), a_top, 1), _pairs_at(tests[c.name, "Both", "both_significant"][1], pos))
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{_group_label(g)}\n{r.pct:.1f}%\n({r.n_yes}/{r.n_files})"
+                            for g, r in zip(c.order, db.itertuples())], fontsize=8)
+        ax.set_xlim(-0.6, len(c.order) - 0.1)
+        ax.set_ylabel("% of LFP files", fontsize=10)
+        return out
+
+    def info_both(c):
+        lines = [f"{BOTH_TEST_LABEL} (BH-FDR q < {INDIV_FDR_Q:g}, per measure), by the signs of the "
+                 f"two slopes; markers: % of each animal's files. Between {c.noun}:"]
+        lines += _test_lines(*tests[c.name, "Both", "both_significant"])
+        return lines
+
+    _comparison_figure(comps, lambda c: ['both'], draw_both, info_both,
+                       lambda c, k: 1.1 * len(c.order) + 1.8,
+                       Path(out_dir) / "IndividualCorrel_BothSignificant.png",
+                       "Theta frequency and power both modulated by speed")
+
+    for c in comps:
+        print(f"  {c.name} speed-modulated: " + "; ".join(
+            f"{col} " + ", ".join(f"{_group_label(r.Index)} {r.pct:.1f}%" for r in _d(c, col, 'modulated').itertuples())
+            + f" (χ² p = {_fmt_p(tests[c.name, col, 'modulated'][0]['p_raw'])})" for col in titles))
+        tables[f'{c.name}_Prop_Desc'] = desc[desc["comparison_set"] == c.name]
+        tables[f'{c.name}_Prop_Animal'] = animal[animal["comparison_set"] == c.name]
+        tables[f'{c.name}_Prop_Tests'] = pd.DataFrame([r for r in test_rows if r['comparison_set'] == c.name])
+        tables[f'{c.name}_Files'] = files.loc[files.index.intersection(c.meta["Session"])].reset_index().merge(
+            c.meta[["Session", "Group"]], on="Session")
+
+
+def run_arena_session_comparisons(df, out_dir=None):
+    """Every figure of the pooled analysis split by session type (per arena), arena
+    type and animal-controlled arena type, with the group tests (see the section
+    header). `df`: the per-time-bin rows (OUTPUT_PARQUET). Fits that do not depend on
+    the grouping (per-file OLS, FDR classes, speed binning) are computed once over all
+    files, exactly as in the pooled analysis."""
+    out_dir = Path(out_dir) if out_dir is not None else COMPARISON_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta = session_table(df)
+    print('\nFiles by arena and session type:')
+    print(pd.crosstab(meta["ArenaType"].fillna('?'), meta["SessionType"].fillna('?'), margins=True))
+
+    df_all = mixed_model_speed_bins(df)
+    df_stats, df_excl = df_all[df_all["InAnalysis"]], df_all[~df_all["InAnalysis"]]
+    units = {"Frequency": "Hz", **{m[0]: m[4] for m in POWER_MEASURES}}
+    _clean, fig3_binned = fig3_trim_and_bin(df)
+    slope_fits = {col: fit_per_session_ols(fig3_binned, col) for col in units}
+    cls_long = individual_fit_classes(df)[0]
+    files = both_significant_table(cls_long).merge(
+        meta[["Session", "ArenaType", "SessionType"]], on="Session", how="left")
+
+    tables = {'Files_ArenaSession': meta}
+    for level, level_dir, comps in build_comparison_levels(meta, out_dir):
+        print(f'\n{"=" * 70}\n{level}: ' + ' | '.join(
+            f'{c.title}: ' + ', '.join(f'{_group_label(g)} ({len(c.sessions(g))} files)' for g in c.order)
+            for c in comps) + f'\n{"=" * 70}')
+        _cmp_mixed_models(comps, df_stats, df_excl, level_dir, tables)
+        _cmp_recording_slopes(comps, slope_fits, units, level_dir, tables)
+        _cmp_modulation(comps, files, level_dir, tables)
+
+    xlsx = out_dir / 'ThetaVsSpeed_Comparison_Stats.xlsx'
+    with pd.ExcelWriter(xlsx) as xw:
+        for sheet, t in tables.items():
+            t.to_excel(xw, sheet_name=sheet[:31], index=False)
+    long = pd.concat([t.assign(table=s) for s, t in tables.items() if len(t) and s != 'Files_ArenaSession'],
+                     ignore_index=True)
+    long.insert(0, 'table', long.pop('table'))
+    long.to_csv(out_dir / 'ThetaVsSpeed_Comparison_AllStats.csv', index=False, encoding='utf-8-sig')
+    print(f'\nComparison statistics -> {xlsx}')
+    return tables
 
 
 # %% ==================== Run metadata ===============================================
@@ -1865,8 +2763,22 @@ def save_run_metadata(meta_dir=META_DIR):
         'individual_correl':        f'per-file OLS of {[m[0] for m in INDIV_MEASURES]}, '
                                     f'Benjamini-Hochberg FDR q < {INDIV_FDR_Q} across fitted files '
                                     'per measure; % denominator = all analysed files',
+        # ---- arena / session-type comparisons ----
+        'COMPARISON_DIR':           COMPARISON_DIR,
+        'CMP_ARENA_SESSION_TYPES':  CMP_ARENA_SESSION_TYPES,
+        'CMP_ANIMAL_CONTROLLED':    CMP_ANIMAL_CONTROLLED,
+        'CMP_ALPHA':                CMP_ALPHA,
+        'cmp_mixed_model':          'per group: response ~ Speed + (1 | file), REML; slopes compared: '
+                                    'response ~ Speed * group + (1 | file) vs common slope, ML LRT, '
+                                    'pairwise Wald contrasts (Holm)',
+        'cmp_recording_slopes':     'Fig. 3 OLS slopes averaged per recording; vs 0: t / Wilcoxon; '
+                                    'between groups: Kruskal-Wallis + Mann-Whitney U (Holm)',
+        'cmp_proportions':          f'{[k for k, _l, _c in MODULATION_TESTS] + ["both_significant"]}; '
+                                    'unit = LFP file, denominator = all files of the group, classes '
+                                    'from the BH-FDR over all files; chi-square + pairwise Yates (Holm)',
         # ---- plots ----
         'ANIMAL_COLORS':            ANIMAL_COLORS,
+        'ANIMAL_MARKERS':           ANIMAL_MARKERS,
         'figure_dpi':               200,
     }
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -1901,5 +2813,6 @@ if __name__ == "__main__":
         run_speed_vs_theta_stats(df)                    # mixed model (session as random intercept)
         run_speed_vs_theta_persession_stats(df)          # Dunn et al. Fig. 3's per-session OLS
         run_individual_correlations(df)                  # one OLS plot per file + % positive
+        run_arena_session_comparisons(df)                # all of the above per session / arena type
     else:
         print('No sessions processed successfully -- skipping speed vs. theta statistics.')
