@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import matplotlib.colors as mcolors
+import matplotlib.patheffects as pe
 import glob
 import os
 
@@ -20,7 +22,7 @@ NTT_DTYPE = np.dtype([
 
 # ── Configuration ────────────────────────────────────────────────────────────
 NTT_FOLDER  = r'C:/Runita/NMR/Data/ClusterPlot'
-SAVE_FOLDER = r'C:/Runita/NMR/analysis/SurgeryPaperSpikeLFP/8477/ClusterProj_Wavfm_ISI_ACG/Figures/v5_ISI_Peaks'   # <-- output folder for all figures
+SAVE_FOLDER = r'C:/Runita/NMR/Thesis/Figs/QualityMetrics/ClusterProj_ISI_ACG/v1'   # <-- output folder for all figures
 NTT_FILES   = sorted(glob.glob(os.path.join(NTT_FOLDER, '*.ntt')))
 MAX_SPIKES  = 500    # max waveforms to overlay per neuron in waveform plots
 
@@ -33,11 +35,46 @@ print(f'Found {len(NTT_FILES)} neuron(s):')
 for f in NTT_FILES:
     print(f'  {os.path.basename(f)}')
 
-# ── Shared colour palette – Office chart colours (matches reference figures) ──
-_PALETTE  = ['#4472C4', '#ED7D31', '#70AD47', '#C00000', '#7030A0',
-             '#00B0F0', '#FFC000', '#375623', '#833C00', '#31849B']
+# ── Shared colour palette – qualitative colours from viridis + magma ─────────
+# Only the bright part of each map is used (dark ends cut off):
+#   viridis 0.40-1.00 : teal -> green -> yellow
+#   magma   0.50-0.93 : magenta -> coral -> pale orange
+# Odd clusters take viridis, even clusters take magma, so neighbouring clusters
+# always differ in hue. Within each map the positions step by the golden ratio,
+# which spreads them out and never repeats a position. The maps are interpolated
+# continuously, so every cluster gets a unique colour however many there are.
+_CMAP_RANGES = {'viridis': (0.40, 1.00), 'magma': (0.50, 0.93)}
+_PHI         = (np.sqrt(5) - 1) / 2
+
+
+def _cmap_at(name: str, t: float) -> list:
+    lut = np.asarray(plt.get_cmap(name).colors)[:, :3]   # type: ignore
+    x   = np.linspace(0, 1, len(lut))
+    return [float(np.interp(t, x, lut[:, k])) for k in range(3)]
+
+
+def _cluster_colours(n: int) -> list:
+    maps = list(_CMAP_RANGES)
+    out, seen, j, misses = [], set(), 0, 0
+    while len(out) < n:
+        name   = maps[j % 2]
+        lo, hi = _CMAP_RANGES[name]
+        t      = lo + (hi - lo) * ((0.5 + (j // 2) * _PHI) % 1.0)
+        hx     = mcolors.to_hex(_cmap_at(name, t))
+        if hx not in seen:          # guard against hex rounding collisions
+            seen.add(hx)
+            out.append(hx)
+            misses = 0
+        else:
+            misses += 1
+            if misses > 10000:
+                raise RuntimeError('Ran out of unique cluster colours')
+        j += 1
+    return out
+
+
 n_neurons = len(NTT_FILES)
-colors    = [_PALETTE[i % len(_PALETTE)] for i in range(n_neurons)]
+colors    = _cluster_colours(n_neurons)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _parse_adbitvolts(path: str) -> float:
@@ -106,7 +143,7 @@ neuron_ids = np.array(neuron_ids)   # (total_spikes,)
 N_CHANNELS    = 4
 T_AXIS        = np.linspace(0, 5, 32)
 ACG_MAX_LAG   = 1000.0
-ACG_BIN_SIZE  = 1.0
+ACG_BIN_SIZE  = 20.0
 acg_bin_edges = np.arange(-ACG_MAX_LAG, ACG_MAX_LAG + ACG_BIN_SIZE, ACG_BIN_SIZE)
 
 for neuron, color in zip(neurons, colors):
@@ -138,8 +175,11 @@ for neuron, color in zip(neurons, colors):
         mean_wf = wf_sub.mean(axis=0)
         std_wf  = wf_sub.std(axis=0)
         ax.fill_between(T_AXIS, mean_wf - std_wf, mean_wf + std_wf,
-                        color=color, alpha=0.3)
-        ax.plot(T_AXIS, mean_wf, color=color, linewidth=2)
+                        facecolor=mcolors.to_rgba(color, 0.3),
+                        edgecolor='none')
+        # Black outline around the mean: a thicker black stroke drawn under it
+        ax.plot(T_AXIS, mean_wf, color=color, linewidth=2,
+                path_effects=[pe.Stroke(linewidth=2.6, foreground='k'), pe.Normal()])
         ax.set_title(f'Channel {ch + 1}', fontsize=13)
         ax.set_xlabel('Time (ms)', fontsize=11)
         if ch == 0:
@@ -151,7 +191,8 @@ for neuron, color in zip(neurons, colors):
     ax_isi = fig.add_subplot(gs[1, :2])
     if len(isi) >= 2:
         isi_bins = np.logspace(np.log10(max(isi.min(), 0.1)), np.log10(isi.max()), 80).tolist()
-        counts, bin_edges, _ = ax_isi.hist(isi, bins=isi_bins, color=color, edgecolor='none', alpha=0.85)
+        counts, bin_edges, _ = ax_isi.hist(isi, bins=isi_bins, facecolor=mcolors.to_rgba(color, 0.85),
+                                             edgecolor='k', linewidth=0.2)
         ax_isi.axvline(1, color='k', linestyle='--', linewidth=1.2, alpha=0.6)
 
         # Mark the ISI bin with the highest count within 0-10 ms
@@ -177,7 +218,8 @@ for neuron, color in zip(neurons, colors):
     # ── Row 1 right: ACG ──
     ax_acg = fig.add_subplot(gs[1, 2:])
     if len(all_lags):
-        ax_acg.hist(all_lags, bins=acg_bin_edges, color=color, edgecolor='none', alpha=0.85) # type: ignore
+        ax_acg.hist(all_lags, bins=acg_bin_edges, facecolor=mcolors.to_rgba(color, 0.85), # type: ignore
+                    edgecolor='k', linewidth=0.2)
     ax_acg.set_xlim(-ACG_MAX_LAG, ACG_MAX_LAG)
     ax_acg.axvline(0, color='k', linewidth=0.8, alpha=0.4)
     ax_acg.set_xlabel('Time lag (ms)', fontsize=12)

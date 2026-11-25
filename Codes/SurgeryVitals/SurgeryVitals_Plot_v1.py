@@ -38,8 +38,9 @@ What is plotted per vital
   time since start. Each surgery first contributes its own mean within a bin,
   so densely sampled surgeries do not weigh more. A bin is shown only when at
   least MIN_SURG_PER_BIN surgeries contribute.
-Y limits are shared across groups; each panel has its own time axis, running
-from 0 to the last reading of that vital in that group.
+Y limits are shared across groups. All panels of one figure share one time
+axis, from 0 to the last reading of any vital in any group of that figure,
+rounded up to X_ROUND_H hours.
 """
 
 import os
@@ -60,6 +61,7 @@ OUT_DIR = r'C:\Runita\NMR\Thesis\Figs\Surgery\VitalsPlots_v1'
 
 BIN_MIN = 15             # width of time bins for the group mean +/- SD (min)
 MIN_SURG_PER_BIN = 3     # bins with fewer contributing surgeries are not drawn
+X_ROUND_H = 0.5          # per-figure time axis max is rounded up to this (h)
 FIG_FORMATS = ('png', 'pdf', 'svg')
 
 # Column positions (0-based) as in the sheet: A=0 ... K=10
@@ -272,14 +274,22 @@ def plot_vital(ax, df, vital, summary):
     style_axis(ax)
 
 
-def panel_xmax(dg, vital):
-    """Own time axis per panel: last reading of this vital in this group (h), up to 0.5 h."""
-    t = dg.loc[dg[vital].notna(), 't_min']
-    return np.ceil(t.max() / 60.0 * 2) / 2.0 if len(t) else 1.0
+def figure_xmax(df, groups):
+    """Common time axis for one figure: last reading of any vital in any of its
+    groups (h), rounded up to X_ROUND_H."""
+    vit = [v for v, _ in VITALS]
+    t_last = 0.0
+    for _, _, excl in groups:
+        dg = group_subset(df, excl)
+        t = dg.loc[dg[vit].notna().any(axis=1), 't_min']
+        if len(t):
+            t_last = max(t_last, t.max() / 60.0)
+    return max(np.ceil(t_last / X_ROUND_H) * X_ROUND_H, X_ROUND_H)
 
 
 def draw_grid(df, groups, summaries, ylims, title):
     nrow, ncol = len(VITALS), len(groups)
+    xmax = figure_xmax(df, groups)
     fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol + 0.8, 2.75 * nrow + 0.9),
                              sharex=False, squeeze=False)
     for j, (gname, gtitle, excl) in enumerate(groups):
@@ -290,7 +300,8 @@ def draw_grid(df, groups, summaries, ylims, title):
             ax = axes[i, j]
             plot_vital(ax, dg, v, summaries[(gname, v)])
             ax.set_ylim(*ylims[v])
-            ax.set_xlim(0, panel_xmax(dg, v))
+            ax.set_xlim(0, xmax)
+            ax.set_xticks(np.arange(0, xmax + 1e-9, 1.0))
             if j == 0:
                 ax.set_ylabel(vlabel, color=C_INK, fontsize=10)
             if i == 0:
@@ -363,13 +374,15 @@ def main():
     df.drop(columns=['breath_raw']).to_csv(os.path.join(OUT_DIR, 'Vitals_Clean_Long.csv'),
                                           index=False)
 
-    # Y limits shared across groups; each panel gets its own time axis
+    # Y limits shared across groups; one time axis per figure (see figure_xmax)
     ylims = {v: padded_limits(df[v]) for v, _ in VITALS}
 
     fig = draw_grid(df, GROUPS, summaries, ylims, 'Surgery vitals over time')
+    print(f'[info] time axis Vitals_AllGroups: 0-{figure_xmax(df, GROUPS):g} h')
     save_fig(fig, 'Vitals_AllGroups')
     for g in GROUPS:
         fig = draw_grid(df, [g], summaries, ylims, f'Surgery vitals over time - {g[1]}')
+        print(f'[info] time axis Vitals_{g[0]}: 0-{figure_xmax(df, [g]):g} h')
         save_fig(fig, f'Vitals_{g[0]}')
 
     print(f'[done] outputs in {OUT_DIR}')
